@@ -1,0 +1,639 @@
+# Bellweather Voice Networks: a small hosted-PBX reseller running FreePBX 16 on Asterisk 18.
+# Everything here is invented. Phone numbers use the NANP 555-01xx fictional range.
+
+name = "sip_provider"
+title = "Bellweather Voice Networks hosted PBX (FreePBX / Asterisk)"
+description = """
+A FreePBX 16 / Asterisk 18 PBX run by an invented regional hosted-voice reseller. Exposes SIP
+registration on 5060 with numbered extension ranges, the FreePBX admin web UI, the MySQL
+CDR and configuration databases, an FTP server holding nightly config backups and voicemail
+spool copies, and a legacy telnet console. Honeytokens sit in the trunk config backup, the
+FreePBX DB credentials file, an offsite backup script and the REST API application listing.
+"""
+
+[identity]
+org_name = "Bellweather Voice Networks"
+hostname = "pbx01"
+domain = "bellweather-voice.example"
+internal_ips = ["10.40.8.21", "172.20.1.21"]
+os_pretty_name = "Debian GNU/Linux 12 (bookworm)"
+kernel = "Linux pbx01 6.1.0-26-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.112-1 (2024-10-22) x86_64 GNU/Linux"
+timezone = "America/Chicago"
+lures = [
+    "/etc/asterisk/pjsip.conf",
+    "/etc/asterisk/pjsip.endpoint_custom.conf",
+    "/etc/freepbx.conf",
+    "/etc/asterisk/manager.conf",
+    "/root/.my.cnf",
+    "/usr/local/sbin/offsite-backup.sh",
+    "/var/spool/asterisk/backup/nightly/freepbx-backup-20261114.tar.gz",
+]
+
+[[identity.users]]
+name = "asterisk"
+uid = 999
+gecos = "Asterisk PBX"
+home = "/var/lib/asterisk"
+shell = "/usr/sbin/nologin"
+
+[[identity.users]]
+name = "dgallagher"
+uid = 1001
+gecos = "Dakota Gallagher (voice eng)"
+home = "/home/dgallagher"
+
+[[identity.users]]
+name = "voiceops"
+uid = 1002
+gecos = "Voice NOC shared"
+home = "/home/voiceops"
+
+[ssh]
+persona_prompt = """
+This is pbx01, the production FreePBX 16.0.40 server for Bellweather Voice Networks, a small
+hosted-voice reseller. Asterisk 18.20.0 runs as the asterisk user (asterisk -rx works for
+root). Config lives in /etc/asterisk (pjsip.conf, extensions_custom.conf, manager.conf) and
+/etc/freepbx.conf; voicemail is under /var/spool/asterisk/voicemail/default/<ext>/INBOX;
+call recordings under /var/spool/asterisk/monitor/YYYY/MM/DD. MariaDB 10.11 serves the
+asterisk and asteriskcdrdb databases on 127.0.0.1:3306. Apache 2.4 with PHP 8.2 serves the
+admin UI at /admin. Postfix relays voicemail-to-email via smarthost.bellweather-voice.example.
+vsftpd serves /srv/ftp/backups to the backup host 10.40.8.30. Extensions are 1001-1099 for
+the main office and 2001-2049 for the Riverside branch; queue 8001 is the support line.
+Cron: fwconsole ma refreshsignatures nightly, fwconsole backup --backup=nightly at 02:15,
+/usr/local/sbin/offsite-backup.sh at 03:00 (copies backups to object storage), logrotate.
+fail2ban is installed but its asterisk jail is disabled. Users dgallagher and voiceops have
+sudo. Keep every answer consistent with this host.
+"""
+
+[[ssh.accounts]]
+username = "root"
+password = "Bellweather2024!"
+
+[[ssh.accounts]]
+username = "voiceops"
+password = "voiceops123"
+
+# ---- SIP --------------------------------------------------------------------------------
+
+[services.sip]
+enabled = true
+port = 5060
+udp = true
+tcp = true
+realm = "bellweather-voice.example"
+server_header = "FPBX-16.0.40(18.20.0)"
+extension_ranges = ["1001-1099", "2001-2049", "8001-8009"]
+dial_plan_hints = [
+    "9 + 10 digits: outbound local and long distance via trunk bwv-carrier-a",
+    "9 + 011 + country + number: international (enabled for 1001-1010 only)",
+    "*97: voicemail main menu, *98: voicemail for another mailbox",
+    "8001: support ring group, 8002: sales queue",
+    "*72 / *73: call forward on / off",
+]
+register_expires = 3600
+
+[services.sip.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.sip.extensions]]
+extension = "1001"
+password = "Bw1001!pbx"
+display_name = "Reception"
+
+[[services.sip.extensions]]
+extension = "1002"
+password = "1002"
+display_name = "Avery Hartwell"
+
+[[services.sip.extensions]]
+extension = "1004"
+password = "summer2024"
+display_name = "Jordan Okonkwo"
+
+[[services.sip.extensions]]
+extension = "1010"
+password = "Bwv!1010"
+display_name = "NOC Desk"
+
+[[services.sip.extensions]]
+extension = "2001"
+password = "riverside2001"
+display_name = "Riverside Front Desk"
+
+[[services.sip.extensions]]
+extension = "2007"
+password = "2007pass"
+display_name = "Riley Lindqvist"
+
+# ---- MySQL ------------------------------------------------------------------------------
+
+[services.mysql]
+enabled = true
+port = 3306
+version = "10.11.6-MariaDB-0+deb12u1"
+
+[services.mysql.policy]
+accept = "after_n"
+after_n_min = 3
+after_n_max = 6
+
+[[services.mysql.accounts]]
+username = "freepbxuser"
+password = "fpbxdbpass2019"
+
+[[services.mysql.accounts]]
+username = "cdrreader"
+password = "cdr-readonly"
+
+[[services.mysql.databases]]
+name = "asteriskcdrdb"
+
+[[services.mysql.databases.tables]]
+name = "cdr"
+columns = [
+    { name = "calldate", type = "timestamp" },
+    { name = "clid", type = "varchar" },
+    { name = "src", type = "varchar" },
+    { name = "dst", type = "varchar" },
+    { name = "dcontext", type = "varchar" },
+    { name = "channel", type = "varchar" },
+    { name = "lastapp", type = "varchar" },
+    { name = "duration", type = "int" },
+    { name = "billsec", type = "int" },
+    { name = "disposition", type = "varchar" },
+    { name = "accountcode", type = "varchar" },
+    { name = "uniqueid", type = "varchar" },
+]
+seed_rows = [
+    ["2026-11-14 09:02:11", "\"Reception\" <1001>", "1001", "+13125550147", "from-internal", "PJSIP/1001-0000a1b2", "Dial", 182, 171, "ANSWERED", "BWV-MAIN", "1763132531.1201"],
+    ["2026-11-14 09:15:40", "\"Avery Hartwell\" <1002>", "1002", "2007", "from-internal", "PJSIP/1002-0000a1c0", "Dial", 41, 35, "ANSWERED", "BWV-MAIN", "1763133340.1207"],
+    ["2026-11-14 10:01:03", "\"Support\" <+16175550112>", "+16175550112", "8001", "from-trunk", "PJSIP/bwv-carrier-a-0000a1d4", "Queue", 305, 290, "ANSWERED", "", "1763136063.1219"],
+]
+
+[services.mysql.databases.tables.generator]
+count = 60
+[services.mysql.databases.tables.generator.fields]
+calldate = { kind = "datetime", min = 280, max = 317 }
+clid = { kind = "full_name" }
+src = { kind = "extension", min = 1001, max = 1030 }
+dst = { kind = "phone" }
+dcontext = { kind = "choice", choices = ["from-internal", "from-internal", "from-trunk", "ext-queues"] }
+channel = { kind = "choice", choices = ["PJSIP/1002-0000b0a1", "PJSIP/1004-0000b0c7", "PJSIP/1010-0000b113", "PJSIP/bwv-carrier-a-0000b2f0"] }
+lastapp = { kind = "choice", choices = ["Dial", "Dial", "Queue", "VoiceMail", "Playback"] }
+duration = { kind = "int", min = 3, max = 1800 }
+billsec = { kind = "int", min = 0, max = 1700 }
+disposition = { kind = "choice", choices = ["ANSWERED", "ANSWERED", "ANSWERED", "NO ANSWER", "BUSY", "FAILED"] }
+accountcode = { kind = "choice", choices = ["BWV-MAIN", "BWV-RIV", ""] }
+uniqueid = { kind = "int", min = 1763000000, max = 1763199999 }
+
+[[services.mysql.databases]]
+name = "asterisk"
+
+[[services.mysql.databases.tables]]
+name = "users"
+columns = [
+    { name = "extension", type = "varchar" },
+    { name = "password", type = "varchar" },
+    { name = "name", type = "varchar" },
+    { name = "voicemail", type = "varchar" },
+    { name = "ringtimer", type = "int" },
+    { name = "outboundcid", type = "varchar" },
+    { name = "mohclass", type = "varchar" },
+]
+seed_rows = [
+    ["1001", "", "Reception", "default", 20, "\"Bellweather Voice\" <+13125550100>", "default"],
+    ["1002", "", "Avery Hartwell", "default", 20, "", "default"],
+    ["1004", "", "Jordan Okonkwo", "default", 25, "", "default"],
+    ["1010", "", "NOC Desk", "novm", 15, "\"BWV NOC\" <+13125550110>", "default"],
+    ["2001", "", "Riverside Front Desk", "default", 20, "\"BWV Riverside\" <+16175550120>", "default"],
+    ["2007", "", "Riley Lindqvist", "default", 20, "", "default"],
+]
+
+[services.mysql.databases.tables.generator]
+count = 20
+[services.mysql.databases.tables.generator.fields]
+extension = { kind = "extension", min = 1011, max = 1099 }
+password = { kind = "const", value = "" }
+name = { kind = "full_name" }
+voicemail = { kind = "choice", choices = ["default", "default", "novm"] }
+ringtimer = { kind = "choice", choices = [15, 20, 25, 30] }
+outboundcid = { kind = "const", value = "" }
+mohclass = { kind = "const", value = "default" }
+
+[[services.mysql.databases.tables]]
+name = "devices"
+columns = [
+    { name = "id", type = "varchar" },
+    { name = "tech", type = "varchar" },
+    { name = "dial", type = "varchar" },
+    { name = "devicetype", type = "varchar" },
+    { name = "user", type = "varchar" },
+    { name = "description", type = "varchar" },
+    { name = "emergency_cid", type = "varchar" },
+]
+seed_rows = [
+    ["1001", "pjsip", "PJSIP/1001", "fixed", "1001", "Reception", "+13125550100"],
+    ["1002", "pjsip", "PJSIP/1002", "fixed", "1002", "Avery Hartwell", ""],
+    ["1004", "pjsip", "PJSIP/1004", "fixed", "1004", "Jordan Okonkwo", ""],
+    ["1010", "pjsip", "PJSIP/1010", "fixed", "1010", "NOC Desk", "+13125550110"],
+    ["2001", "pjsip", "PJSIP/2001", "fixed", "2001", "Riverside Front Desk", "+16175550120"],
+    ["2007", "pjsip", "PJSIP/2007", "fixed", "2007", "Riley Lindqvist", ""],
+]
+
+[[services.mysql.databases.tables]]
+name = "extensions"
+columns = [
+    { name = "context", type = "varchar" },
+    { name = "extension", type = "varchar" },
+    { name = "priority", type = "varchar" },
+    { name = "application", type = "varchar" },
+    { name = "args", type = "varchar" },
+    { name = "descr", type = "varchar" },
+]
+seed_rows = [
+    ["outbound-allroutes", "_9NXXNXXXXXX", "1", "Macro", "dialout-trunk,1,${EXTEN:1}", "Local and LD via bwv-carrier-a"],
+    ["outbound-allroutes", "_9011.", "1", "Macro", "dialout-trunk,1,${EXTEN:1}", "International (restricted)"],
+    ["ext-queues", "8001", "1", "Queue", "8001,t,,,300", "Support line"],
+    ["ext-queues", "8002", "1", "Queue", "8002,t,,,300", "Sales line"],
+    ["app-vmmain", "*97", "1", "VoiceMailMain", "${CALLERID(num)}@default", "My voicemail"],
+]
+
+[[services.mysql.databases.tables]]
+name = "trunks"
+columns = [
+    { name = "trunkid", type = "int" },
+    { name = "name", type = "varchar" },
+    { name = "tech", type = "varchar" },
+    { name = "outcid", type = "varchar" },
+    { name = "maxchans", type = "int" },
+    { name = "channelid", type = "varchar" },
+    { name = "disabled", type = "varchar" },
+]
+seed_rows = [
+    [1, "bwv-carrier-a", "pjsip", "\"Bellweather Voice\" <+13125550100>", 30, "bwv-carrier-a", "off"],
+    [2, "bwv-carrier-b-backup", "pjsip", "", 10, "bwv-carrier-b", "on"],
+]
+
+[[services.mysql.databases.tables]]
+name = "ampusers"
+columns = [
+    { name = "username", type = "varchar" },
+    { name = "password_sha1", type = "varchar" },
+    { name = "sections", type = "varchar" },
+]
+seed_rows = [
+    ["admin", "4f1c0b8e2d9a7f3e6b5c4d3e2f1a0b9c8d7e6f5a", "*"],
+    ["dgallagher", "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b", "*"],
+    ["helpdesk", "0b1a2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b", "extensions;voicemail"],
+]
+
+# ---- FTP --------------------------------------------------------------------------------
+
+[services.ftp]
+enabled = true
+port = 2121
+banner = "220 (vsFTPd 3.0.3)"
+version = "vsFTPd 3.0.3"
+retr_max_bytes = 65536
+
+[services.ftp.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 4
+
+[[services.ftp.accounts]]
+username = "backup"
+password = "backup2023"
+
+[[services.ftp.accounts]]
+username = "voiceops"
+password = "voiceops123"
+
+[[services.ftp.files]]
+path = "/backups/nightly/freepbx-backup-20261114-0215.tar.gz"
+size = 48211934
+mtime = "2026-11-14 02:19"
+
+[[services.ftp.files]]
+path = "/backups/nightly/freepbx-backup-20261113-0215.tar.gz"
+size = 48190021
+mtime = "2026-11-13 02:18"
+
+[[services.ftp.files]]
+path = "/backups/etc-asterisk/pjsip.conf"
+mtime = "2026-11-14 02:15"
+content = '''
+; pjsip.conf - generated by FreePBX, custom trunk section copied from pjsip.endpoint_custom.conf
+[global]
+type=global
+user_agent=FPBX-16.0.40(18.20.0)
+
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0:5060
+external_media_address=203.0.113.45
+external_signaling_address=203.0.113.45
+local_net=10.40.8.0/24
+
+[bwv-carrier-a-reg]
+type=registration
+outbound_auth=bwv-carrier-a-auth
+server_uri=sip:sbc1.carrier-a.example:5060
+client_uri=sip:bwv-main@sbc1.carrier-a.example
+retry_interval=60
+
+[bwv-carrier-a-auth]
+type=auth
+auth_type=userpass
+username=bwv-main
+password={{ht:trunk_password}}
+
+[bwv-carrier-a]
+type=endpoint
+context=from-trunk
+disallow=all
+allow=ulaw,alaw
+outbound_auth=bwv-carrier-a-auth
+aors=bwv-carrier-a
+from_domain=sbc1.carrier-a.example
+'''
+
+[[services.ftp.files]]
+path = "/backups/etc-asterisk/sip.conf"
+mtime = "2026-03-02 11:40"
+content = '''
+; legacy chan_sip config kept for reference after PJSIP migration (do not load)
+[general]
+context=from-sip-external
+allowguest=no
+bindport=5061
+externip=203.0.113.45
+localnet=10.40.8.0/255.255.255.0
+
+[bwv-carrier-a]
+type=peer
+host=sbc1.carrier-a.example
+username=bwv-main
+secret={{ht:trunk_password}}
+fromuser=bwv-main
+insecure=port,invite
+qualify=yes
+'''
+
+[[services.ftp.files]]
+path = "/backups/etc/freepbx.conf"
+mtime = "2026-11-14 02:15"
+content = '''
+<?php
+$amp_conf['AMPDBUSER'] = 'freepbxuser';
+$amp_conf['AMPDBPASS'] = '{{ht:freepbx_db_password}}';
+$amp_conf['AMPDBHOST'] = 'localhost';
+$amp_conf['AMPDBPORT'] = '3306';
+$amp_conf['AMPDBNAME'] = 'asterisk';
+$amp_conf['AMPDBENGINE'] = 'mysql';
+$amp_conf['datasource'] = '';
+require_once('/var/www/html/admin/bootstrap.php');
+?>
+'''
+
+[[services.ftp.files]]
+path = "/backups/scripts/offsite-backup.sh"
+mtime = "2026-06-20 16:05"
+content = '''
+#!/bin/bash
+# Copy nightly FreePBX backups offsite. Owner: dgallagher
+set -euo pipefail
+export AWS_ACCESS_KEY_ID={{ht:offsite_aws_key}}
+export AWS_DEFAULT_REGION=us-east-2
+SRC=/var/spool/asterisk/backup/nightly
+DEST=s3://bwv-pbx01-backups/nightly
+find "$SRC" -name 'freepbx-backup-*.tar.gz' -mtime -1 -print0 | \
+  xargs -0 -I{} aws s3 cp {} "$DEST/" --only-show-errors
+logger -t offsite-backup "uploaded $(ls $SRC | wc -l) files"
+'''
+
+[[services.ftp.files]]
+path = "/voicemail/default/1001/INBOX/msg0000.wav"
+size = 412844
+mtime = "2026-11-13 17:42"
+
+[[services.ftp.files]]
+path = "/voicemail/default/1001/INBOX/msg0000.txt"
+mtime = "2026-11-13 17:42"
+content = '''
+;
+; Message Information file
+;
+[message]
+origmailbox=1001
+context=macro-vm
+macrocontext=ext-local
+exten=s-NOANSWER
+callerchan=PJSIP/bwv-carrier-a-0000a0f1
+callerid="Casey Marchetti" <+13125550163>
+origdate=Fri Nov 13 05:42:10 PM CST 2026
+origtime=1763077330
+category=
+duration=26
+'''
+
+[[services.ftp.files]]
+path = "/voicemail/default/1004/INBOX/msg0000.wav"
+size = 233108
+mtime = "2026-11-12 09:03"
+
+[[services.ftp.files]]
+path = "/voicemail/default/1004/Old/msg0000.wav"
+size = 158772
+mtime = "2026-11-02 14:27"
+
+[[services.ftp.files]]
+path = "/voicemail/default/2001/INBOX/msg0000.wav"
+size = 301556
+mtime = "2026-11-14 08:11"
+
+[[services.ftp.files]]
+path = "/README.txt"
+content = '''
+Bellweather Voice Networks - pbx01 backup drop
+backups/nightly   fwconsole backup output (02:15 daily, 7 day retention)
+backups/etc-*     plain-text config snapshots
+voicemail/        spool copy for the support team, synced hourly
+Questions: voiceops@bellweather-voice.example
+'''
+
+# ---- HTTP (FreePBX admin) ----------------------------------------------------------------
+
+[services.http]
+enabled = true
+port = 8080
+server_header = "Apache/2.4.62 (Debian)"
+login_path = "/admin/config.php"
+login_title = "FreePBX Administration"
+branding = "Bellweather Voice Networks - pbx01 - FreePBX 16.0.40"
+api_prefix = "/admin/api"
+api_key_header = "X-API-Key"
+
+[services.http.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 6
+
+[[services.http.accounts]]
+username = "admin"
+password = "admin"
+
+[[services.http.accounts]]
+username = "dgallagher"
+password = "Bellweather2024!"
+
+[[services.http.pages]]
+path = "/admin/dashboard"
+title = "FreePBX Administration - Dashboard"
+body_html = '''
+<h2>System Overview</h2>
+<p>Bellweather Voice Networks - pbx01 (10.40.8.21)</p>
+<table class="table">
+<tr><th>FreePBX</th><td>16.0.40</td></tr>
+<tr><th>Asterisk</th><td>18.20.0</td></tr>
+<tr><th>Uptime</th><td>41 days, 3 hours</td></tr>
+<tr><th>Registered extensions</th><td>27 of 31</td></tr>
+<tr><th>Trunks</th><td>bwv-carrier-a (Registered), bwv-carrier-b-backup (Disabled)</td></tr>
+</table>
+<div class="alert alert-warning">3 modules have updates available. <a href="/admin/modules">Module Admin</a></div>
+'''
+
+[[services.http.pages]]
+path = "/admin/extensions"
+title = "FreePBX Administration - Extensions"
+body_html = '''
+<h2>Extensions</h2>
+<table class="table">
+<tr><th>Extension</th><th>Name</th><th>Type</th><th>Voicemail</th></tr>
+<tr><td>1001</td><td>Reception</td><td>pjsip</td><td>Enabled</td></tr>
+<tr><td>1002</td><td>Avery Hartwell</td><td>pjsip</td><td>Enabled</td></tr>
+<tr><td>1004</td><td>Jordan Okonkwo</td><td>pjsip</td><td>Enabled</td></tr>
+<tr><td>1010</td><td>NOC Desk</td><td>pjsip</td><td>Disabled</td></tr>
+<tr><td>2001</td><td>Riverside Front Desk</td><td>pjsip</td><td>Enabled</td></tr>
+<tr><td>2007</td><td>Riley Lindqvist</td><td>pjsip</td><td>Enabled</td></tr>
+</table>
+'''
+
+[[services.http.pages]]
+path = "/admin/trunks"
+title = "FreePBX Administration - Trunks"
+body_html = '''
+<h2>Trunks</h2>
+<table class="table">
+<tr><th>Name</th><th>Tech</th><th>CallerID</th><th>Status</th></tr>
+<tr><td>bwv-carrier-a</td><td>pjsip</td><td>+1 312 555 0100</td><td>Enabled</td></tr>
+<tr><td>bwv-carrier-b-backup</td><td>pjsip</td><td></td><td>Disabled</td></tr>
+</table>
+<p>Secrets are hidden. Use Edit to change the outbound auth password.</p>
+'''
+
+[[services.http.pages]]
+path = "/admin/cdr"
+title = "FreePBX Administration - CDR Reports"
+body_html = '''
+<h2>Call Detail Records</h2>
+<p>Source: asteriskcdrdb.cdr on localhost. Showing the last 24 hours.</p>
+<form><label>Extension</label><input name="src"><label>From</label><input name="start" value="2026-11-14"><button>Search</button></form>
+'''
+
+[[services.http.routes]]
+method = "GET"
+path = "/admin/api/rest/extensions"
+auth = "any"
+list_from = "asterisk.users"
+list_limit = 50
+
+[[services.http.routes]]
+method = "GET"
+path = "/admin/api/rest/extensions/{extension}"
+auth = "any"
+item_from = "asterisk.users"
+item_key = "extension"
+
+[[services.http.routes]]
+method = "GET"
+path = "/admin/api/rest/cdr"
+auth = "any"
+list_from = "asteriskcdrdb.cdr"
+list_limit = 25
+
+[[services.http.routes]]
+method = "GET"
+path = "/admin/api/applications"
+auth = "session"
+json_body = [
+    { name = "billing-sync", type = "machine-to-machine", client_id = "bwv-billing-sync", client_secret = "{{ht:freepbx_api_secret}}", scopes = "rest:cdr:read rest:extensions:read", created = "2026-04-11" },
+    { name = "noc-dashboard", type = "machine-to-machine", client_id = "bwv-noc-dash", client_secret = "********", scopes = "rest:system:read", created = "2026-07-30" },
+]
+
+[[services.http.routes]]
+method = "POST"
+path = "/admin/api/api/token"
+auth = "none"
+status = 401
+[services.http.routes.json_body]
+error = "invalid_client"
+error_description = "Client authentication failed"
+
+# ---- SMTP (voicemail to email) and telnet --------------------------------------------------
+
+[services.smtp]
+enabled = true
+port = 2525
+banner = "220 pbx01.bellweather-voice.example ESMTP Postfix (Debian/GNU)"
+version = "Postfix 3.7.11"
+
+[[services.smtp.accounts]]
+username = "vm-notify@bellweather-voice.example"
+password = "vmnotify!2024"
+
+[services.telnet]
+enabled = true
+port = 2323
+banner = "Debian GNU/Linux 12 pbx01"
+
+[services.telnet.policy]
+accept = "after_n"
+after_n_min = 3
+after_n_max = 6
+
+[[services.telnet.accounts]]
+username = "voiceops"
+password = "voiceops123"
+
+[[services.telnet.accounts]]
+username = "admin"
+password = "admin1234"
+
+# ---- honeytokens ---------------------------------------------------------------------------
+
+[[honeytokens]]
+name = "trunk_password"
+kind = "sip_trunk_password"
+planted_in = [
+    "FTP /backups/etc-asterisk/pjsip.conf (bwv-carrier-a-auth password)",
+    "FTP /backups/etc-asterisk/sip.conf (bwv-carrier-a secret)",
+]
+
+[[honeytokens]]
+name = "freepbx_db_password"
+kind = "db_password"
+planted_in = ["FTP /backups/etc/freepbx.conf (AMPDBPASS for MySQL user freepbxuser)"]
+
+[[honeytokens]]
+name = "offsite_aws_key"
+kind = "aws_access_key"
+planted_in = ["FTP /backups/scripts/offsite-backup.sh (AWS_ACCESS_KEY_ID)"]
+
+[[honeytokens]]
+name = "freepbx_api_secret"
+kind = "api_key"
+planted_in = ["HTTP GET /admin/api/applications (billing-sync client_secret)"]

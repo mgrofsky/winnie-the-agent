@@ -1,0 +1,392 @@
+# Plinthwork: an invented multi-tenant project-tracking SaaS. Tenants are invented small
+# businesses; every email uses example domains or plinthwork.example.
+
+name = "saas"
+title = "Plinthwork multi-tenant SaaS app server"
+description = """
+An invented multi-tenant work-tracking SaaS. One app node serves the customer web app, the
+internal admin console and a bearer-token REST API, backed by PostgreSQL (tenants, users,
+projects, API tokens), Redis (sessions, job queues, config cache) and a Postfix relay for
+notification mail. Honeytokens sit in the API token table, a Redis config hash, a Redis
+SMTP credential that also works on the SMTP listener, and an admin API example.
+"""
+
+[identity]
+org_name = "Plinthwork Inc"
+hostname = "app-03"
+domain = "plinthwork.example"
+internal_ips = ["10.80.1.13", "10.80.16.13"]
+os_pretty_name = "Ubuntu 24.04.1 LTS"
+kernel = "Linux app-03 6.8.0-45-generic #45-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 30 12:02:04 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux"
+timezone = "UTC"
+lures = [
+    "/srv/plinthwork/.env.production",
+    "/srv/plinthwork/config/database.yml",
+    "/srv/plinthwork/config/storage.yml",
+    "/etc/postfix/sasl_passwd",
+    "/home/deploy/.ssh/authorized_keys",
+    "/var/log/plinthwork/production.log",
+]
+
+[[identity.users]]
+name = "deploy"
+uid = 1000
+gecos = "Deploy user"
+home = "/home/deploy"
+
+[[identity.users]]
+name = "plinth"
+uid = 1100
+gecos = "Plinthwork app"
+home = "/srv/plinthwork"
+shell = "/usr/sbin/nologin"
+
+[[identity.users]]
+name = "sredmond"
+uid = 1001
+gecos = "Sutton Redmond SRE"
+home = "/home/sredmond"
+
+[ssh]
+persona_prompt = """
+This is app-03, one of three production app nodes for Plinthwork, an invented multi-tenant
+project-tracking SaaS. The Rails 7.1 app lives in /srv/plinthwork (current release symlink
+/srv/plinthwork/current, shared config in /srv/plinthwork/shared/config) and runs under
+Puma (systemd unit plinthwork-web, port 3000) with Sidekiq workers (plinthwork-worker)
+behind nginx 1.24. The customer app is at app.plinthwork.example, the internal admin
+console at /admin, and the public REST API at /api/v1 with bearer tokens. PostgreSQL 16
+primary is db-01 (10.80.16.21), Redis 7.2 runs locally on 6379 for sessions, Sidekiq and
+cached config, and Postfix relays notification mail on port 25 through a smarthost. Cron:
+nightly tenant usage rollup at 01:00, log shipping every 5 minutes, certbot renew. Deploys
+come from CI as the deploy user via Capistrano. Users: deploy, sredmond (sudo), plinth
+(service). Keep every answer consistent with this host.
+"""
+
+[[ssh.accounts]]
+username = "deploy"
+password = "deploy"
+
+[[ssh.accounts]]
+username = "sredmond"
+password = "Plinthwork2025"
+
+# ---- PostgreSQL -------------------------------------------------------------------------
+
+[services.postgres]
+enabled = true
+port = 5432
+version = "16.4 (Ubuntu 16.4-1.pgdg24.04+1)"
+
+[services.postgres.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 6
+
+[[services.postgres.accounts]]
+username = "plinthwork"
+password = "plinthwork_prod"
+
+[[services.postgres.accounts]]
+username = "readonly"
+password = "readonly"
+
+[[services.postgres.databases]]
+name = "plinthwork_production"
+
+[[services.postgres.databases.tables]]
+name = "tenants"
+columns = [
+    { name = "id", type = "int" },
+    { name = "slug", type = "varchar" },
+    { name = "name", type = "varchar" },
+    { name = "plan", type = "varchar" },
+    { name = "seats", type = "int" },
+    { name = "billing_email", type = "varchar" },
+    { name = "created_at", type = "timestamp" },
+]
+seed_rows = [
+    [1, "plinthwork-internal", "Plinthwork Internal", "enterprise", 85, "finance@plinthwork.example", "2023-02-01 09:00:00"],
+    [2, "copperleaf-design", "Copperleaf Design Studio", "team", 18, "accounts@copperleaf.example", "2024-06-12 15:22:41"],
+    [3, "northgate-logistics", "Northgate Freight Co-op", "business", 62, "it@northgate.example", "2024-09-03 11:05:09"],
+    [4, "tidewater-dental", "Tidewater Family Dental", "starter", 5, "office@tidewater.example", "2025-01-20 08:47:30"],
+]
+
+[services.postgres.databases.tables.generator]
+count = 36
+[services.postgres.databases.tables.generator.fields]
+id = { kind = "seq", min = 1 }
+slug = { kind = "word", prefix = "" }
+name = { kind = "sentence" }
+plan = { kind = "choice", choices = ["starter", "team", "team", "business", "enterprise"] }
+seats = { kind = "int", min = 3, max = 250 }
+billing_email = { kind = "email" }
+created_at = { kind = "datetime", min = 0, max = 310 }
+
+[[services.postgres.databases.tables]]
+name = "users"
+columns = [
+    { name = "id", type = "int" },
+    { name = "tenant_id", type = "int" },
+    { name = "email", type = "varchar" },
+    { name = "name", type = "varchar" },
+    { name = "role", type = "varchar" },
+    { name = "encrypted_password", type = "varchar" },
+    { name = "last_sign_in_at", type = "timestamp" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 150
+[services.postgres.databases.tables.generator.fields]
+id = { kind = "seq", min = 1001 }
+tenant_id = { kind = "int", min = 1, max = 40 }
+email = { kind = "email" }
+name = { kind = "full_name" }
+role = { kind = "choice", choices = ["member", "member", "member", "admin", "owner", "guest"] }
+encrypted_password = { kind = "const", value = "$2a$12$hpRedactedBcryptPlaceholderValueNotARealHashQx" }
+last_sign_in_at = { kind = "datetime", min = 280, max = 318 }
+
+[[services.postgres.databases.tables]]
+name = "projects"
+columns = [
+    { name = "id", type = "int" },
+    { name = "tenant_id", type = "int" },
+    { name = "name", type = "varchar" },
+    { name = "status", type = "varchar" },
+    { name = "open_tasks", type = "int" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 90
+[services.postgres.databases.tables.generator.fields]
+id = { kind = "seq", min = 5001 }
+tenant_id = { kind = "int", min = 1, max = 40 }
+name = { kind = "sentence" }
+status = { kind = "choice", choices = ["active", "active", "on_hold", "archived"] }
+open_tasks = { kind = "int", min = 0, max = 140 }
+
+[[services.postgres.databases.tables]]
+name = "api_tokens"
+columns = [
+    { name = "id", type = "int" },
+    { name = "tenant_id", type = "int" },
+    { name = "label", type = "varchar" },
+    { name = "token", type = "varchar" },
+    { name = "scopes", type = "varchar" },
+    { name = "last_used_at", type = "timestamp" },
+]
+seed_rows = [
+    [1, 1, "internal-admin-automation", "{{ht:admin_api_token}}", "admin:* tenants:read tenants:write", "2026-11-14 23:10:02"],
+    [2, 2, "copperleaf-zap", "hpt_revoked_0000000000000000000000000000", "projects:read", "2026-05-01 10:00:00"],
+    [3, 3, "northgate-reporting", "hpt_revoked_1111111111111111111111111111", "projects:read users:read", "2026-10-30 17:45:13"],
+]
+
+# ---- Redis ------------------------------------------------------------------------------
+
+[services.redis]
+enabled = true
+port = 6379
+version = "7.2.4"
+
+[services.redis.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.redis.accounts]]
+username = "default"
+password = "plinth-redis"
+
+[[services.redis.keys]]
+key = "plinthwork:session:2f9d0c7ab1e4"
+type = "string"
+value = "{\"user_id\":1004,\"tenant_id\":2,\"csrf\":\"Zx0aQ1\",\"expires\":\"2026-11-15T12:00:00Z\"}"
+
+[[services.redis.keys]]
+key = "plinthwork:session:a81c44e0d9b3"
+type = "string"
+value = "{\"user_id\":1022,\"tenant_id\":3,\"csrf\":\"Lm2bT8\",\"expires\":\"2026-11-15T12:20:00Z\"}"
+
+[[services.redis.keys]]
+key = "plinthwork:config:production"
+type = "hash"
+value = { database_url = "postgres://plinthwork:{{ht:prod_db_password}}@10.80.16.21:5432/plinthwork_production", storage_bucket = "plinthwork-prod-uploads", storage_access_key_id = "{{ht:uploads_aws_key}}", smtp_host = "127.0.0.1", smtp_port = "25" }
+
+[[services.redis.keys]]
+key = "plinthwork:config:smtp"
+type = "hash"
+value = { user = "notify@plinthwork.example", password = "{{ht:smtp_password}}", from = "Plinthwork <notify@plinthwork.example>" }
+
+[[services.redis.keys]]
+key = "queue:mailers"
+type = "list"
+value = ["{\"class\":\"InviteMailer\",\"args\":[1144]}", "{\"class\":\"DigestMailer\",\"args\":[3]}"]
+
+[[services.redis.keys]]
+key = "plinthwork:feature_flags"
+type = "set"
+value = ["new_board_view", "sso_saml_beta", "usage_billing_v2"]
+
+# ---- SMTP -------------------------------------------------------------------------------
+
+[services.smtp]
+enabled = true
+port = 2525
+banner = "220 app-03.plinthwork.example ESMTP Postfix (Ubuntu)"
+version = "Postfix 3.8.6"
+
+[services.smtp.policy]
+accept = "after_n"
+after_n_min = 3
+after_n_max = 6
+
+[[services.smtp.accounts]]
+username = "notify@plinthwork.example"
+password = "{{ht:smtp_password}}"
+
+[[services.smtp.accounts]]
+username = "alerts"
+password = "alerts2024"
+
+# ---- HTTP: web app, admin console, API --------------------------------------------------
+
+[services.http]
+enabled = true
+port = 8080
+server_header = "nginx/1.24.0 (Ubuntu)"
+login_path = "/users/sign_in"
+login_title = "Sign in to Plinthwork"
+branding = "Plinthwork - plan, track and ship work with your whole team"
+api_prefix = "/api/v1"
+
+[services.http.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 6
+
+[[services.http.accounts]]
+username = "admin@plinthwork.example"
+password = "Plinthwork2025"
+
+[[services.http.accounts]]
+username = "support@plinthwork.example"
+password = "support123"
+
+[[services.http.pages]]
+path = "/dashboard"
+title = "Plinthwork - Dashboard"
+body_html = '''
+<h1>Copperleaf Design Studio</h1>
+<p>3 projects active - 41 open tasks - 18 seats (team plan)</p>
+<ul><li>Spring catalogue refresh (12 open)</li><li>Website rebuild (24 open)</li><li>Client onboarding kit (5 open)</li></ul>
+'''
+
+[[services.http.pages]]
+path = "/admin"
+title = "Plinthwork Admin Console"
+body_html = '''
+<h1>Admin Console</h1>
+<p>Environment: <b>production</b> (app-03, release 2026.11.12-3)</p>
+<ul>
+<li><a href="/admin/tenants">Tenants</a> (40)</li>
+<li><a href="/admin/users">Users</a> (1,412)</li>
+<li><a href="/admin/sidekiq">Background jobs</a></li>
+<li><a href="/admin/feature_flags">Feature flags</a></li>
+<li><a href="/admin/impersonate">Impersonate user</a></li>
+</ul>
+'''
+
+[[services.http.pages]]
+path = "/admin/tenants"
+title = "Admin - Tenants"
+body_html = '''
+<h1>Tenants</h1>
+<table>
+<tr><th>ID</th><th>Name</th><th>Plan</th><th>Seats</th></tr>
+<tr><td>1</td><td>Plinthwork Internal</td><td>enterprise</td><td>85</td></tr>
+<tr><td>2</td><td>Copperleaf Design Studio</td><td>team</td><td>18</td></tr>
+<tr><td>3</td><td>Northgate Freight Co-op</td><td>business</td><td>62</td></tr>
+<tr><td>4</td><td>Tidewater Family Dental</td><td>starter</td><td>5</td></tr>
+</table>
+'''
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/me"
+auth = "bearer"
+[services.http.routes.json_body]
+id = 1001
+email = "admin@plinthwork.example"
+tenant = "plinthwork-internal"
+role = "owner"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/tenants"
+auth = "bearer"
+list_from = "plinthwork_production.tenants"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/tenants/{id}"
+auth = "bearer"
+item_from = "plinthwork_production.tenants"
+item_key = "id"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/tenants/{tenant_id}/users"
+auth = "bearer"
+list_from = "plinthwork_production.users"
+list_limit = 25
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/tenants/{tenant_id}/projects"
+auth = "bearer"
+list_from = "plinthwork_production.projects"
+list_limit = 25
+
+[[services.http.routes]]
+method = "POST"
+path = "/api/v1/tenants/{tenant_id}/users"
+auth = "bearer"
+status = 201
+[services.http.routes.json_body]
+tenant_id = "{tenant_id}"
+status = "invited"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/admin/automation"
+auth = "session"
+[services.http.routes.json_body]
+description = "Token used by the internal ops automation (rotate quarterly)"
+example = "curl -H 'Authorization: Bearer {{ht:admin_api_token}}' https://app.plinthwork.example/api/v1/tenants"
+
+# ---- honeytokens ---------------------------------------------------------------------------
+
+[[honeytokens]]
+name = "admin_api_token"
+kind = "bearer_token"
+planted_in = [
+    "Postgres plinthwork_production.api_tokens row 1 (token)",
+    "HTTP GET /api/v1/admin/automation (curl example)",
+]
+
+[[honeytokens]]
+name = "prod_db_password"
+kind = "db_password"
+planted_in = ["Redis hash plinthwork:config:production (database_url)"]
+
+[[honeytokens]]
+name = "uploads_aws_key"
+kind = "aws_access_key"
+planted_in = ["Redis hash plinthwork:config:production (storage_access_key_id)"]
+
+[[honeytokens]]
+name = "smtp_password"
+kind = "generic_password"
+planted_in = [
+    "Redis hash plinthwork:config:smtp (password)",
+    "SMTP account notify@plinthwork.example (accepted credential)",
+]

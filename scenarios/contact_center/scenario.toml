@@ -1,0 +1,529 @@
+# Larkspur Contact Solutions: an invented outsourced contact center (inbound support and
+# outbound collections reminders) running Asterisk queues with an in-house agent desktop.
+
+name = "contact_center"
+title = "Larkspur Contact Solutions agent platform"
+description = """
+An invented BPO contact center. Asterisk 20 handles SIP trunks and agent extensions, an
+in-house agent desktop / supervisor console sits behind nginx with a small REST API for
+queues and agents, PostgreSQL holds the CRM, and an FTP share carries call recordings and
+nightly CRM exports for clients. Honeytokens sit in the dialer env file, the trunk config
+backup, the recording-archive script and the CRM integration table.
+"""
+
+[identity]
+org_name = "Larkspur Contact Solutions"
+hostname = "cc-app02"
+domain = "larkspur-cx.example"
+internal_ips = ["10.60.2.12", "10.60.10.12"]
+os_pretty_name = "Ubuntu 22.04.4 LTS"
+kernel = "Linux cc-app02 5.15.0-118-generic #128-Ubuntu SMP Fri Jul 5 09:28:59 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux"
+timezone = "America/New_York"
+lures = [
+    "/opt/larkspur/desktop/.env",
+    "/opt/larkspur/dialer/dialer.env",
+    "/etc/asterisk/pjsip_trunks.conf",
+    "/etc/asterisk/queues.conf",
+    "/srv/recordings/archive.sh",
+    "/home/ccadmin/.pgpass",
+]
+
+[[identity.users]]
+name = "ccadmin"
+uid = 1000
+gecos = "Contact center admin"
+home = "/home/ccadmin"
+
+[[identity.users]]
+name = "lkdesk"
+uid = 1101
+gecos = "Agent desktop service"
+home = "/opt/larkspur/desktop"
+shell = "/usr/sbin/nologin"
+
+[[identity.users]]
+name = "asterisk"
+uid = 115
+gecos = "Asterisk PBX"
+home = "/var/lib/asterisk"
+shell = "/usr/sbin/nologin"
+
+[ssh]
+persona_prompt = """
+This is cc-app02, the main application server for Larkspur Contact Solutions, an outsourced
+contact center. Asterisk 20.9.2 runs queues 8100-8109 and agent extensions 3000-3199, with
+two SIP trunks (lk-trunk-primary and lk-trunk-dr). The agent desktop and supervisor console
+is a Node 20 app in /opt/larkspur/desktop (systemd unit lk-desktop, port 3000) behind nginx
+1.24; its REST API lives at /api/v1. The predictive dialer worker is in /opt/larkspur/dialer
+(dialer.env holds its settings). PostgreSQL 15 on 10.60.10.20 holds the crm database; psql
+access uses ~/.pgpass. Call recordings are written to /srv/recordings/YYYY/MM/DD and shared
+over vsftpd along with /srv/exports (nightly CRM CSV exports for clients). Cron:
+/srv/recordings/archive.sh at 01:30 moves recordings older than 30 days to object storage,
+/opt/larkspur/bin/crm-export.sh at 00:45, certbot renew twice daily. Users ccadmin (sudo)
+and lkdesk (service account). Keep every answer consistent with this host.
+"""
+
+[[ssh.accounts]]
+username = "ccadmin"
+password = "Larkspur#2023"
+
+[[ssh.accounts]]
+username = "root"
+password = "toor"
+
+# ---- SIP --------------------------------------------------------------------------------
+
+[services.sip]
+enabled = true
+port = 5060
+realm = "larkspur-cx.example"
+server_header = "Asterisk PBX 20.9.2"
+extension_ranges = ["3000-3199", "8100-8109", "9000-9001"]
+dial_plan_hints = [
+    "3000-3199: agent extensions (hot-desk, login with agent PIN)",
+    "8100: client A tier-1 support queue, 8101: tier-2, 8105: collections reminders",
+    "9000 / 9001: trunk peers lk-trunk-primary and lk-trunk-dr",
+    "Outbound: 1 + 10 digits on lk-trunk-primary, failover to lk-trunk-dr",
+    "*45: agent queue login/logout, *8: directed pickup",
+]
+
+[services.sip.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 6
+
+[[services.sip.extensions]]
+extension = "3001"
+password = "agent3001"
+display_name = "Agent Harper Pemberton"
+
+[[services.sip.extensions]]
+extension = "3002"
+password = "3002"
+display_name = "Agent Quinn Ferreira"
+
+[[services.sip.extensions]]
+extension = "3050"
+password = "Lk3050!"
+display_name = "Supervisor Morgan Whitlock"
+
+[[services.sip.extensions]]
+extension = "9000"
+password = "{{ht:trunk_password}}"
+display_name = "lk-trunk-primary"
+
+# ---- PostgreSQL CRM ---------------------------------------------------------------------
+
+[services.postgres]
+enabled = true
+port = 5432
+version = "15.8 (Ubuntu 15.8-1.pgdg22.04+1)"
+
+[services.postgres.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.postgres.accounts]]
+username = "crm_app"
+password = "crm_app_2022"
+
+[[services.postgres.accounts]]
+username = "reporting"
+password = "reporting"
+
+[[services.postgres.databases]]
+name = "crm"
+
+[[services.postgres.databases.tables]]
+name = "customers"
+columns = [
+    { name = "customer_id", type = "int" },
+    { name = "client_code", type = "varchar" },
+    { name = "full_name", type = "varchar" },
+    { name = "phone", type = "varchar" },
+    { name = "email", type = "varchar" },
+    { name = "account_ref", type = "varchar" },
+    { name = "balance_due", type = "numeric" },
+    { name = "created_at", type = "timestamp" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 80
+[services.postgres.databases.tables.generator.fields]
+customer_id = { kind = "seq", min = 10001 }
+client_code = { kind = "choice", choices = ["NRTH-UTIL", "BLUEFERN-ISP", "ORCHARD-INS"] }
+full_name = { kind = "full_name" }
+phone = { kind = "phone" }
+email = { kind = "email" }
+account_ref = { kind = "account_number", prefix = "LK-" }
+balance_due = { kind = "amount", min = 0, max = 2400 }
+created_at = { kind = "datetime", min = 0, max = 310 }
+
+[[services.postgres.databases.tables]]
+name = "interactions"
+columns = [
+    { name = "interaction_id", type = "uuid" },
+    { name = "customer_id", type = "int" },
+    { name = "agent_ext", type = "varchar" },
+    { name = "queue", type = "varchar" },
+    { name = "channel", type = "varchar" },
+    { name = "disposition", type = "varchar" },
+    { name = "notes", type = "text" },
+    { name = "started_at", type = "timestamp" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 120
+[services.postgres.databases.tables.generator.fields]
+interaction_id = { kind = "uuid" }
+customer_id = { kind = "int", min = 10001, max = 10080 }
+agent_ext = { kind = "extension", min = 3001, max = 3060 }
+queue = { kind = "choice", choices = ["8100", "8101", "8105"] }
+channel = { kind = "choice", choices = ["voice", "voice", "voice", "chat", "email"] }
+disposition = { kind = "choice", choices = ["resolved", "callback", "escalated", "promise_to_pay", "no_answer"] }
+notes = { kind = "sentence" }
+started_at = { kind = "datetime", min = 270, max = 317 }
+
+[[services.postgres.databases.tables]]
+name = "agents"
+columns = [
+    { name = "agent_id", type = "int" },
+    { name = "extension", type = "varchar" },
+    { name = "full_name", type = "varchar" },
+    { name = "email", type = "varchar" },
+    { name = "role", type = "varchar" },
+    { name = "team", type = "varchar" },
+    { name = "status", type = "varchar" },
+]
+seed_rows = [
+    [1, "3001", "Harper Pemberton", "harper.pemberton@larkspur-cx.example", "agent", "NRTH-UTIL", "available"],
+    [2, "3002", "Quinn Ferreira", "quinn.ferreira@larkspur-cx.example", "agent", "BLUEFERN-ISP", "on_call"],
+    [3, "3050", "Morgan Whitlock", "morgan.whitlock@larkspur-cx.example", "supervisor", "ALL", "available"],
+]
+
+[services.postgres.databases.tables.generator]
+count = 30
+[services.postgres.databases.tables.generator.fields]
+agent_id = { kind = "seq", min = 1 }
+extension = { kind = "extension", min = 3003, max = 3060 }
+full_name = { kind = "full_name" }
+email = { kind = "email" }
+role = { kind = "const", value = "agent" }
+team = { kind = "choice", choices = ["NRTH-UTIL", "BLUEFERN-ISP", "ORCHARD-INS"] }
+status = { kind = "choice", choices = ["available", "on_call", "wrap_up", "break", "offline"] }
+
+[[services.postgres.databases.tables]]
+name = "queues"
+columns = [
+    { name = "queue_id", type = "varchar" },
+    { name = "name", type = "varchar" },
+    { name = "client_code", type = "varchar" },
+    { name = "strategy", type = "varchar" },
+    { name = "sla_seconds", type = "int" },
+    { name = "agents_logged_in", type = "int" },
+]
+seed_rows = [
+    ["8100", "Tier 1 Support", "NRTH-UTIL", "rrmemory", 30, 14],
+    ["8101", "Tier 2 Support", "NRTH-UTIL", "leastrecent", 60, 4],
+    ["8102", "Billing", "BLUEFERN-ISP", "rrmemory", 45, 6],
+    ["8105", "Payment Reminders", "ORCHARD-INS", "ringall", 120, 3],
+]
+
+[[services.postgres.databases.tables]]
+name = "integration_keys"
+columns = [
+    { name = "id", type = "int" },
+    { name = "client_code", type = "varchar" },
+    { name = "purpose", type = "varchar" },
+    { name = "api_key", type = "varchar" },
+    { name = "created_by", type = "varchar" },
+    { name = "active", type = "bool" },
+]
+seed_rows = [
+    [1, "NRTH-UTIL", "ticket sync webhook", "{{ht:crm_api_key}}", "ccadmin", true],
+    [2, "BLUEFERN-ISP", "nightly export pull", "revoked-2026-08-01", "ccadmin", false],
+]
+
+# ---- FTP: recordings and exports --------------------------------------------------------
+
+# Workforce management (scheduling, adherence) on SQL Server, as many contact-center
+# WFM suites ship.
+[services.mssql]
+enabled = true
+port = 1433
+version = "15.0.4322.2"
+
+[services.mssql.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.mssql.accounts]]
+username = "wfm_svc"
+password = "Wfm-Svc-2021"
+
+[[services.mssql.databases]]
+name = "WFM"
+schema_name = "dbo"
+
+[[services.mssql.databases.tables]]
+name = "agent_schedule"
+columns = [
+    { name = "schedule_id", type = "int" },
+    { name = "agent_ext", type = "varchar" },
+    { name = "agent_name", type = "varchar" },
+    { name = "shift_date", type = "date" },
+    { name = "skill_group", type = "varchar" },
+]
+
+[services.mssql.databases.tables.generator]
+count = 60
+[services.mssql.databases.tables.generator.fields]
+schedule_id = { kind = "seq", min = 5001 }
+agent_ext = { kind = "extension", min = 2001, max = 2060 }
+agent_name = { kind = "full_name" }
+shift_date = { kind = "date", min = 280, max = 320 }
+skill_group = { kind = "choice", choices = ["billing", "outage", "retention", "collections"] }
+
+[services.ftp]
+enabled = true
+port = 2121
+banner = "220 (vsFTPd 3.0.5)"
+version = "vsFTPd 3.0.5"
+
+[services.ftp.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.ftp.accounts]]
+username = "nrth-util"
+password = "NrthExport2026"
+
+[[services.ftp.accounts]]
+username = "qa"
+password = "qa12345"
+
+[[services.ftp.files]]
+path = "/recordings/2026/11/14/q8100-3001-20261114-091502-a41c.wav"
+size = 2381044
+mtime = "2026-11-14 09:21"
+
+[[services.ftp.files]]
+path = "/recordings/2026/11/14/q8100-3002-20261114-093318-b7e0.wav"
+size = 1120388
+mtime = "2026-11-14 09:36"
+
+[[services.ftp.files]]
+path = "/recordings/2026/11/14/q8105-3017-20261114-101144-c2d9.wav"
+size = 3904112
+mtime = "2026-11-14 10:18"
+
+[[services.ftp.files]]
+path = "/recordings/2026/11/13/q8101-3050-20261113-161209-0f3a.wav"
+size = 5120876
+mtime = "2026-11-13 16:29"
+
+[[services.ftp.files]]
+path = "/recordings/archive.sh"
+mtime = "2026-05-02 10:12"
+content = '''
+#!/bin/bash
+# Move recordings older than 30 days to cold storage. Runs from cron at 01:30.
+export AWS_ACCESS_KEY_ID={{ht:recording_aws_key}}
+export AWS_DEFAULT_REGION=us-east-1
+find /srv/recordings -name '*.wav' -mtime +30 -print0 | while IFS= read -r -d '' f; do
+  aws s3 mv "$f" "s3://larkspur-recordings-archive/${f#/srv/recordings/}" --storage-class GLACIER
+done
+'''
+
+[[services.ftp.files]]
+path = "/exports/nrth-util/crm-export-20261114.csv"
+mtime = "2026-11-14 00:47"
+content = '''
+customer_id,full_name,phone,email,account_ref,last_disposition
+10004,Rowan Abernathy,+13125550131,rowan.abernathy@example.com,LK-4410928371,resolved
+10009,Teagan Rasmussen,+17025550188,teagan.r@larkspur-cx.example,LK-9902817364,callback
+10017,Ellis Nakashima,+19195550104,ellis.nakashima@example.com,LK-1182736450,promise_to_pay
+10022,Blair Szymanski,+15125550176,blair.szymanski@example.org,LK-6627381920,escalated
+'''
+
+[[services.ftp.files]]
+path = "/exports/nrth-util/crm-export-20261113.csv"
+size = 18822
+mtime = "2026-11-13 00:46"
+
+[[services.ftp.files]]
+path = "/config/dialer.env"
+mtime = "2026-09-18 14:40"
+content = '''
+# Larkspur predictive dialer worker
+DIALER_MODE=progressive
+AMI_HOST=127.0.0.1
+AMI_USER=dialer
+AMI_SECRET=amidialer2023
+CRM_DATABASE_URL=postgresql://crm_app:{{ht:crm_db_password}}@10.60.10.20:5432/crm
+MAX_CPS=4
+CALLER_ID=+16175550150
+'''
+
+[[services.ftp.files]]
+path = "/config/pjsip_trunks.conf"
+mtime = "2026-09-18 14:41"
+content = '''
+[lk-trunk-primary-auth]
+type=auth
+auth_type=userpass
+username=9000
+password={{ht:trunk_password}}
+
+[lk-trunk-primary]
+type=endpoint
+context=from-carrier
+outbound_auth=lk-trunk-primary-auth
+aors=lk-trunk-primary
+from_domain=sip.larkspur-cx.example
+'''
+
+# ---- HTTP: agent desktop, supervisor console, REST API -----------------------------------
+
+[services.http]
+enabled = true
+port = 8080
+server_header = "nginx/1.24.0 (Ubuntu)"
+login_path = "/login"
+login_title = "Larkspur Agent Desktop - Sign in"
+branding = "Larkspur Contact Solutions - Agent Desktop and Supervisor Console v4.12.3"
+api_prefix = "/api/v1"
+
+[services.http.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.http.accounts]]
+username = "mwhitlock"
+password = "Supervisor1!"
+
+[[services.http.accounts]]
+username = "agent3001"
+password = "Welcome1"
+
+[[services.http.pages]]
+path = "/desktop"
+title = "Agent Desktop"
+body_html = '''
+<h1>Agent Desktop</h1>
+<p>Extension 3001 - Status: <b>Available</b> - Queues: 8100 Tier 1 Support, 8102 Billing</p>
+<div id="softphone">Softphone: registered to sip.larkspur-cx.example</div>
+<div id="script">Greeting: "Thank you for calling, my name is ... how can I help you today?"</div>
+'''
+
+[[services.http.pages]]
+path = "/supervisor"
+title = "Supervisor Console"
+body_html = '''
+<h1>Supervisor Console</h1>
+<table>
+<tr><th>Queue</th><th>Waiting</th><th>Longest wait</th><th>Agents</th><th>SLA</th></tr>
+<tr><td>8100 Tier 1 Support</td><td>4</td><td>0:52</td><td>14</td><td>91%</td></tr>
+<tr><td>8101 Tier 2 Support</td><td>1</td><td>2:10</td><td>4</td><td>78%</td></tr>
+<tr><td>8102 Billing</td><td>0</td><td>0:00</td><td>6</td><td>97%</td></tr>
+<tr><td>8105 Payment Reminders</td><td>2</td><td>1:31</td><td>3</td><td>84%</td></tr>
+</table>
+<p><a href="/supervisor/recordings">Recordings</a> | <a href="/supervisor/exports">Client exports</a></p>
+'''
+
+[[services.http.pages]]
+path = "/supervisor/exports"
+title = "Client Exports"
+body_html = '''
+<h1>Client Exports</h1>
+<p>Nightly CSV exports are written to /srv/exports/&lt;client&gt;/ and published on the FTP share at 00:45.</p>
+<ul><li>nrth-util/crm-export-20261114.csv</li><li>bluefern-isp/crm-export-20261114.csv</li></ul>
+'''
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/queues"
+auth = "any"
+list_from = "crm.queues"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/queues/{queue_id}"
+auth = "any"
+item_from = "crm.queues"
+item_key = "queue_id"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/queues/{queue_id}/stats"
+auth = "any"
+[services.http.routes.json_body]
+queue_id = "{queue_id}"
+waiting = 3
+longest_wait_seconds = 74
+answered_today = 412
+abandoned_today = 19
+service_level_pct = 89.4
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/agents"
+auth = "any"
+list_from = "crm.agents"
+list_limit = 50
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/agents/{agent_id}"
+auth = "any"
+item_from = "crm.agents"
+item_key = "agent_id"
+
+[[services.http.routes]]
+method = "POST"
+path = "/api/v1/agents/{agent_id}/status"
+auth = "any"
+[services.http.routes.json_body]
+agent_id = "{agent_id}"
+status = "accepted"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/integrations"
+auth = "session"
+[services.http.routes.json_body]
+webhooks = [
+    { client = "NRTH-UTIL", url = "https://hooks.larkspur-cx.example/nrth/tickets", header = "X-Larkspur-Key", key = "{{ht:crm_api_key}}" },
+]
+
+# ---- honeytokens ---------------------------------------------------------------------------
+
+[[honeytokens]]
+name = "trunk_password"
+kind = "sip_trunk_password"
+planted_in = [
+    "FTP /config/pjsip_trunks.conf (lk-trunk-primary-auth password)",
+    "SIP extension 9000 (trunk peer) password",
+]
+
+[[honeytokens]]
+name = "crm_db_password"
+kind = "db_password"
+planted_in = ["FTP /config/dialer.env (CRM_DATABASE_URL for postgres user crm_app)"]
+
+[[honeytokens]]
+name = "recording_aws_key"
+kind = "aws_access_key"
+planted_in = ["FTP /recordings/archive.sh (AWS_ACCESS_KEY_ID)"]
+
+[[honeytokens]]
+name = "crm_api_key"
+kind = "api_key"
+planted_in = [
+    "Postgres crm.integration_keys row 1 (api_key)",
+    "HTTP GET /api/v1/integrations (webhook key)",
+]

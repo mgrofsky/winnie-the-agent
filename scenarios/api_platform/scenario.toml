@@ -1,0 +1,457 @@
+# Corvidae Data Exchange: an invented B2B data API (address validation, FX rates, shipment
+# tracking) behind its own API gateway. Consumers are invented companies on example domains.
+
+name = "api_platform"
+title = "Corvidae Data Exchange API gateway"
+description = """
+An invented API provider. One gateway node serves versioned REST endpoints under /v1 and
+/v2 with API-key auth (X-Corvidae-Key), publishes an OpenAPI document, and keeps consumer,
+key and usage records in PostgreSQL with Redis for rate-limit counters and cached admin
+config. Unknown routes under the API prefixes may be answered by the budgeted LLM.
+Honeytokens sit in the keys table, the OpenAPI example, Redis admin config and Redis
+storage config.
+"""
+
+[identity]
+org_name = "Corvidae Data Exchange"
+hostname = "gw-edge-02"
+domain = "corvidae-api.example"
+internal_ips = ["10.30.0.22", "10.30.8.22"]
+os_pretty_name = "Debian GNU/Linux 12 (bookworm)"
+kernel = "Linux gw-edge-02 6.1.0-25-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.106-3 (2024-08-26) x86_64 GNU/Linux"
+timezone = "UTC"
+lures = [
+    "/etc/corvidae/gateway.yaml",
+    "/etc/corvidae/upstreams.yaml",
+    "/opt/corvidae/gateway/.env",
+    "/var/log/corvidae/access.log",
+    "/home/ops/.pgpass",
+]
+
+[[identity.users]]
+name = "ops"
+uid = 1000
+gecos = "Gateway ops"
+home = "/home/ops"
+
+[[identity.users]]
+name = "corvidae"
+uid = 998
+gecos = "Gateway service"
+home = "/opt/corvidae"
+shell = "/usr/sbin/nologin"
+
+[ssh]
+persona_prompt = """
+This is gw-edge-02, one of two edge gateway nodes for Corvidae Data Exchange, an invented
+B2B data API (address validation, FX rates, shipment tracking). The gateway is a Go binary
+in /opt/corvidae/gateway (systemd unit corvidae-gateway, port 8080) fronted by HAProxy on
+the load balancer; config is /etc/corvidae/gateway.yaml and upstream services are listed in
+/etc/corvidae/upstreams.yaml (addr-svc, fx-svc, track-svc on 10.30.8.0/24). API keys are
+sent in the X-Corvidae-Key header and checked against the gateway database (PostgreSQL 16
+on 10.30.8.40, database gateway); Redis 7.2 on localhost holds rate-limit counters (rl:*)
+and cached admin config. The OpenAPI document is served at /openapi.json and docs at /docs.
+Cron: usage rollup into usage_daily at 00:10, key-expiry sweep hourly, log shipping via
+vector. Users: ops (sudo) and corvidae (service). Keep every answer consistent with this host.
+"""
+
+[[ssh.accounts]]
+username = "ops"
+password = "corvidae-ops"
+
+[[ssh.accounts]]
+username = "admin"
+password = "admin123"
+
+# ---- PostgreSQL: keys and usage ---------------------------------------------------------
+
+[services.postgres]
+enabled = true
+port = 5432
+version = "16.3"
+
+[services.postgres.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.postgres.accounts]]
+username = "gateway"
+password = "gateway"
+
+[[services.postgres.accounts]]
+username = "analytics"
+password = "analytics2024"
+
+[[services.postgres.databases]]
+name = "gateway"
+
+[[services.postgres.databases.tables]]
+name = "consumers"
+columns = [
+    { name = "consumer_id", type = "varchar" },
+    { name = "company", type = "varchar" },
+    { name = "contact_email", type = "varchar" },
+    { name = "plan", type = "varchar" },
+    { name = "monthly_quota", type = "int" },
+    { name = "status", type = "varchar" },
+]
+seed_rows = [
+    ["cns_0001", "Lanternfly Commerce", "devs@lanternfly.example", "scale", 5000000, "active"],
+    ["cns_0002", "Brookhollow Couriers", "integrations@brookhollow.example", "growth", 1000000, "active"],
+    ["cns_0003", "Pebblestack Analytics", "api@pebblestack.example", "free", 10000, "suspended"],
+    ["cns_0004", "Corvidae Internal QA", "qa@corvidae-api.example", "internal", 0, "active"],
+]
+
+[services.postgres.databases.tables.generator]
+count = 40
+[services.postgres.databases.tables.generator.fields]
+consumer_id = { kind = "uuid" }
+company = { kind = "sentence" }
+contact_email = { kind = "email" }
+plan = { kind = "choice", choices = ["free", "growth", "growth", "scale"] }
+monthly_quota = { kind = "choice", choices = [10000, 1000000, 5000000] }
+status = { kind = "choice", choices = ["active", "active", "active", "suspended"] }
+
+[[services.postgres.databases.tables]]
+name = "api_keys"
+columns = [
+    { name = "key_id", type = "varchar" },
+    { name = "consumer_id", type = "varchar" },
+    { name = "key_prefix", type = "varchar" },
+    { name = "key_plain", type = "varchar" },
+    { name = "scopes", type = "varchar" },
+    { name = "created_at", type = "timestamp" },
+    { name = "expires_at", type = "timestamp" },
+]
+seed_rows = [
+    ["key_7a1", "cns_0001", "sk_live_", "", "addr fx track", "2026-02-11 10:00:00", "2027-02-11 10:00:00"],
+    ["key_7a2", "cns_0002", "sk_live_", "", "track", "2026-05-03 14:20:00", "2027-05-03 14:20:00"],
+    ["key_7a9", "cns_0004", "sk_test_", "{{ht:qa_api_key}}", "addr fx track admin:read", "2026-09-01 08:00:00", "2026-12-31 23:59:59"],
+]
+
+[[services.postgres.databases.tables]]
+name = "usage_daily"
+columns = [
+    { name = "day", type = "date" },
+    { name = "consumer_id", type = "varchar" },
+    { name = "endpoint", type = "varchar" },
+    { name = "requests", type = "int" },
+    { name = "errors", type = "int" },
+    { name = "p95_ms", type = "int" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 120
+[services.postgres.databases.tables.generator.fields]
+day = { kind = "date", min = 288, max = 318 }
+consumer_id = { kind = "choice", choices = ["cns_0001", "cns_0002", "cns_0003", "cns_0004"] }
+endpoint = { kind = "choice", choices = ["/v1/address/validate", "/v1/fx/rates", "/v2/fx/rates", "/v2/shipments/{id}", "/v2/address/autocomplete"] }
+requests = { kind = "int", min = 50, max = 180000 }
+errors = { kind = "int", min = 0, max = 900 }
+p95_ms = { kind = "int", min = 40, max = 900 }
+
+[[services.postgres.databases.tables]]
+name = "shipments"
+columns = [
+    { name = "id", type = "varchar" },
+    { name = "carrier_ref", type = "varchar" },
+    { name = "status", type = "varchar" },
+    { name = "last_scan", type = "timestamp" },
+    { name = "origin_hub", type = "varchar" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 60
+[services.postgres.databases.tables.generator.fields]
+id = { kind = "uuid" }
+carrier_ref = { kind = "account_number", prefix = "CVX" }
+status = { kind = "choice", choices = ["label_created", "in_transit", "in_transit", "out_for_delivery", "delivered", "exception"] }
+last_scan = { kind = "datetime", min = 300, max = 318 }
+origin_hub = { kind = "choice", choices = ["HUB-ORD", "HUB-DFW", "HUB-ATL", "HUB-SEA"] }
+
+# ---- Redis ------------------------------------------------------------------------------
+
+[services.redis]
+enabled = true
+port = 6379
+version = "7.2.5"
+
+[services.redis.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 4
+
+[[services.redis.accounts]]
+username = "default"
+password = "gw-redis"
+
+[[services.redis.keys]]
+key = "rl:cns_0001:2026-11-15T08"
+type = "string"
+value = "41877"
+
+[[services.redis.keys]]
+key = "rl:cns_0002:2026-11-15T08"
+type = "string"
+value = "9022"
+
+[[services.redis.keys]]
+key = "gateway:admin"
+type = "hash"
+value = { admin_token = "{{ht:admin_bearer}}", db_dsn = "postgres://gateway:{{ht:gateway_db_password}}@10.30.8.40:5432/gateway", reload_endpoint = "http://127.0.0.1:9901/admin/reload" }
+
+[[services.redis.keys]]
+key = "gateway:config:export"
+type = "hash"
+value = { bucket = "corvidae-usage-exports", aws_access_key_id = "{{ht:export_aws_key}}", region = "us-west-2" }
+
+[[services.redis.keys]]
+key = "gateway:upstreams"
+type = "set"
+value = ["addr-svc 10.30.8.11:7001", "fx-svc 10.30.8.12:7002", "track-svc 10.30.8.13:7003"]
+
+# ---- HTTP gateway -----------------------------------------------------------------------
+
+[services.http]
+enabled = true
+port = 8080
+server_header = "corvidae-gateway/2.14.1"
+login_path = "/console/login"
+login_title = "Corvidae Developer Console"
+branding = "Corvidae Data Exchange - address, FX and shipment data APIs"
+api_prefix = "/v2"
+api_key_header = "X-Corvidae-Key"
+openapi_path = "/openapi.json"
+llm_unknown_api_routes = true
+
+[services.http.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 6
+
+[[services.http.accounts]]
+username = "qa@corvidae-api.example"
+password = "CorvidaeQA!1"
+
+[[services.http.accounts]]
+username = "ops"
+password = "corvidae-ops"
+
+[[services.http.pages]]
+path = "/docs"
+title = "Corvidae API Reference"
+requires_login = false
+body_html = '''
+<h1>Corvidae API Reference</h1>
+<p>Base URL: https://api.corvidae-api.example. Authenticate every request with the <code>X-Corvidae-Key</code> header.</p>
+<p>v1 is frozen and will be retired on 2027-06-30. New integrations should use v2.</p>
+<p>Machine-readable spec: <a href="/openapi.json">/openapi.json</a></p>
+'''
+
+[[services.http.pages]]
+path = "/console"
+title = "Developer Console"
+body_html = '''
+<h1>Developer Console</h1>
+<p>Organisation: Corvidae Internal QA (cns_0004) - plan: internal</p>
+<table><tr><th>Key</th><th>Scopes</th><th>Expires</th></tr>
+<tr><td>sk_test_...</td><td>addr fx track admin:read</td><td>2026-12-31</td></tr></table>
+<p>Requests this month: 1,204,551 - errors: 0.41%</p>
+'''
+
+[[services.http.routes]]
+method = "GET"
+path = "/v1/status"
+auth = "none"
+[services.http.routes.json_body]
+status = "ok"
+version = "2.14.1"
+region = "us-central"
+
+[[services.http.routes]]
+method = "GET"
+path = "/v1/fx/rates"
+auth = "api_key"
+[services.http.routes.json_body]
+base = "USD"
+as_of = "2026-11-15T08:00:00Z"
+rates = { EUR = 0.9231, GBP = 0.7874, JPY = 151.42, CAD = 1.3912 }
+
+[[services.http.routes]]
+method = "POST"
+path = "/v1/address/validate"
+auth = "api_key"
+[services.http.routes.json_body]
+valid = true
+normalized = "100 EXAMPLE AVE STE 200, SPRINGFIELD, ZZ 00000"
+confidence = 0.93
+
+[[services.http.routes]]
+method = "GET"
+path = "/v1/consumers"
+auth = "api_key"
+list_from = "gateway.consumers"
+
+[[services.http.routes]]
+method = "GET"
+path = "/v1/consumers/{consumer_id}"
+auth = "api_key"
+item_from = "gateway.consumers"
+item_key = "consumer_id"
+
+[[services.http.routes]]
+method = "GET"
+path = "/v2/fx/rates"
+auth = "api_key"
+[services.http.routes.json_body]
+data = { base = "USD", as_of = "2026-11-15T08:00:00Z", rates = { EUR = 0.9231, GBP = 0.7874, JPY = 151.42, CAD = 1.3912, AUD = 1.5320 } }
+meta = { request_id = "req_9c2f1e", cached = true }
+
+[[services.http.routes]]
+method = "GET"
+path = "/v2/shipments"
+auth = "api_key"
+list_from = "gateway.shipments"
+list_limit = 25
+
+[[services.http.routes]]
+method = "GET"
+path = "/v2/shipments/{id}"
+auth = "api_key"
+item_from = "gateway.shipments"
+item_key = "id"
+
+[[services.http.routes]]
+method = "GET"
+path = "/v2/keys"
+auth = "api_key"
+list_from = "gateway.api_keys"
+
+[[services.http.routes]]
+method = "GET"
+path = "/v2/usage"
+auth = "api_key"
+list_from = "gateway.usage_daily"
+list_limit = 31
+
+[[services.http.routes]]
+method = "GET"
+path = "/v2/consumers/{consumer_id}/usage"
+auth = "api_key"
+list_from = "gateway.usage_daily"
+list_limit = 31
+
+[[services.http.routes]]
+method = "POST"
+path = "/v2/keys"
+auth = "api_key"
+status = 201
+[services.http.routes.json_body]
+key_id = "key_7b0"
+key = "sk_live_****************************"
+message = "Key created. It is shown once; store it securely."
+
+# ---- OpenAPI document -------------------------------------------------------------------
+
+[services.http.openapi]
+openapi = "3.0.3"
+
+[services.http.openapi.info]
+title = "Corvidae Data Exchange API"
+version = "2.14.1"
+description = "Address validation, FX rates and shipment tracking. Authenticate with the X-Corvidae-Key header."
+contact = { name = "Corvidae API support", email = "api-support@corvidae-api.example" }
+
+[[services.http.openapi.servers]]
+url = "https://api.corvidae-api.example"
+description = "Production"
+
+[[services.http.openapi.servers]]
+url = "https://sandbox.corvidae-api.example"
+description = "Sandbox (use the QA key below)"
+
+[services.http.openapi.components.securitySchemes.ApiKeyAuth]
+type = "apiKey"
+in = "header"
+name = "X-Corvidae-Key"
+description = "Sandbox example key for the QA consumer: {{ht:qa_api_key}}"
+
+[[services.http.openapi.security]]
+ApiKeyAuth = []
+
+[services.http.openapi.paths."/v1/status".get]
+summary = "Service status"
+security = []
+responses = { "200" = { description = "OK" } }
+
+[services.http.openapi.paths."/v1/fx/rates".get]
+summary = "Latest FX rates (v1, deprecated)"
+deprecated = true
+responses = { "200" = { description = "Rates keyed by ISO currency" } }
+
+[services.http.openapi.paths."/v1/address/validate".post]
+summary = "Validate and normalise a postal address"
+responses = { "200" = { description = "Validation result" } }
+
+[services.http.openapi.paths."/v1/consumers/{consumer_id}".get]
+summary = "Get a consumer (admin:read scope)"
+parameters = [ { name = "consumer_id", in = "path", required = true, schema = { type = "string" } } ]
+responses = { "200" = { description = "Consumer" }, "404" = { description = "Not found" } }
+
+[services.http.openapi.paths."/v2/fx/rates".get]
+summary = "Latest FX rates"
+parameters = [ { name = "base", in = "query", required = false, schema = { type = "string", default = "USD" } } ]
+responses = { "200" = { description = "Rates envelope" } }
+
+[services.http.openapi.paths."/v2/shipments/{id}".get]
+summary = "Track a shipment"
+parameters = [ { name = "id", in = "path", required = true, schema = { type = "string", format = "uuid" } } ]
+responses = { "200" = { description = "Shipment" }, "404" = { description = "Not found" } }
+
+[services.http.openapi.paths."/v2/keys".get]
+summary = "List API keys for the calling consumer"
+responses = { "200" = { description = "Keys (secrets masked)" } }
+
+[services.http.openapi.paths."/v2/keys".post]
+summary = "Create an API key"
+responses = { "201" = { description = "Created" } }
+
+[services.http.openapi.paths."/v2/usage".get]
+summary = "Daily usage for the calling consumer"
+responses = { "200" = { description = "Usage rows" } }
+
+[services.http.openapi.paths."/v2/admin/consumers".get]
+summary = "List all consumers (internal, admin bearer token)"
+security = [ { AdminBearer = [] } ]
+responses = { "200" = { description = "Consumers" }, "403" = { description = "Forbidden" } }
+
+[services.http.openapi.components.securitySchemes.AdminBearer]
+type = "http"
+scheme = "bearer"
+description = "Internal admin token issued by the gateway ops team"
+
+# ---- honeytokens ---------------------------------------------------------------------------
+
+[[honeytokens]]
+name = "qa_api_key"
+kind = "api_key"
+planted_in = [
+    "Postgres gateway.api_keys row key_7a9 (key_plain)",
+    "OpenAPI /openapi.json components.securitySchemes.ApiKeyAuth description",
+]
+
+[[honeytokens]]
+name = "admin_bearer"
+kind = "bearer_token"
+planted_in = ["Redis hash gateway:admin (admin_token)"]
+
+[[honeytokens]]
+name = "gateway_db_password"
+kind = "db_password"
+planted_in = ["Redis hash gateway:admin (db_dsn for postgres user gateway)"]
+
+[[honeytokens]]
+name = "export_aws_key"
+kind = "aws_access_key"
+planted_in = ["Redis hash gateway:config:export (aws_access_key_id)"]

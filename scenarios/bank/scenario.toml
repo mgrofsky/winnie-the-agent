@@ -1,0 +1,543 @@
+# Quillmere Savings & Trust: an invented community bank. Card numbers use the non-issued 0000
+# prefix with failing Luhn digits; IBAN-like values use the non-country code XX; account
+# numbers carry a QM- prefix. Nothing here is a real institution or customer.
+
+name = "bank"
+title = "Quillmere Savings & Trust online banking and core"
+description = """
+An invented community bank. One host fronts online banking and the back-office portal
+(nginx + Java app), exposes a REST API for accounts, cards, transfers and statements, and
+shares a PostgreSQL core-banking database, a Redis session cache and an FTP drop for
+inbound and outbound payment batch files. Honeytokens sit in the batch-upload script, the
+SFTP/FTP partner config, the core DB API client table and a Redis config hash.
+"""
+
+[identity]
+org_name = "Quillmere Savings & Trust"
+hostname = "qst-obk01"
+domain = "quillmere-bank.example"
+internal_ips = ["10.12.4.31", "10.12.20.31"]
+os_pretty_name = "Red Hat Enterprise Linux 9.4 (Plow)"
+kernel = "Linux qst-obk01 5.14.0-427.24.1.el9_4.x86_64 #1 SMP PREEMPT_DYNAMIC Fri Jun 21 05:23:07 EDT 2024 x86_64 x86_64 x86_64 GNU/Linux"
+timezone = "America/New_York"
+lures = [
+    "/opt/qst/obk/conf/application.properties",
+    "/opt/qst/batch/bin/upload-batches.sh",
+    "/opt/qst/batch/conf/partners.conf",
+    "/etc/redis/redis.conf",
+    "/home/svc_batch/.pgpass",
+    "/var/log/qst/obk/audit.log",
+]
+
+[[identity.users]]
+name = "qstadmin"
+uid = 1000
+gecos = "Platform admin"
+home = "/home/qstadmin"
+
+[[identity.users]]
+name = "svc_obk"
+uid = 1201
+gecos = "Online banking service"
+home = "/opt/qst/obk"
+shell = "/sbin/nologin"
+
+[[identity.users]]
+name = "svc_batch"
+uid = 1202
+gecos = "Payment batch service"
+home = "/home/svc_batch"
+
+[ssh]
+persona_prompt = """
+This is qst-obk01 at Quillmere Savings & Trust, an invented community bank. It runs the
+online banking front end and back-office portal: a Spring Boot 3 app in /opt/qst/obk
+(systemd unit qst-obk, port 8443 behind nginx 1.26), with config in
+/opt/qst/obk/conf/application.properties. Its REST API lives at /api/v1 (accounts, cards,
+transfers, statements). PostgreSQL 16 on 10.12.20.40 holds the corebank database; Redis 7.2
+on localhost:6379 caches sessions (keys sess:*) and rate limits. The payment batch service
+in /opt/qst/batch picks up files dropped by partners via vsftpd under /srv/batches/inbound,
+validates them and writes acknowledgements to /srv/batches/outbound. Cron:
+/opt/qst/batch/bin/upload-batches.sh every 15 minutes (pushes settled batches to object
+storage), statement generation at 04:00 on the 1st, logrotate, and an AIDE check at 05:00.
+Users: qstadmin (sudo), svc_obk and svc_batch service accounts. Keep every answer
+consistent with this host.
+"""
+
+[[ssh.accounts]]
+username = "qstadmin"
+password = "Quillmere!2025"
+
+[[ssh.accounts]]
+username = "svc_batch"
+password = "batch2024"
+
+# ---- PostgreSQL core banking ------------------------------------------------------------
+
+[services.postgres]
+enabled = true
+port = 5432
+version = "16.4"
+
+[services.postgres.policy]
+accept = "after_n"
+after_n_min = 3
+after_n_max = 6
+
+[[services.postgres.accounts]]
+username = "obk_app"
+password = "obk_app_pw"
+
+[[services.postgres.accounts]]
+username = "postgres"
+password = "postgres"
+
+[[services.postgres.databases]]
+name = "corebank"
+schema_name = "core"
+
+[[services.postgres.databases.tables]]
+name = "customers"
+columns = [
+    { name = "customer_id", type = "int" },
+    { name = "first_name", type = "varchar" },
+    { name = "last_name", type = "varchar" },
+    { name = "email", type = "varchar" },
+    { name = "phone", type = "varchar" },
+    { name = "segment", type = "varchar" },
+    { name = "kyc_status", type = "varchar" },
+    { name = "opened_on", type = "date" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 60
+[services.postgres.databases.tables.generator.fields]
+customer_id = { kind = "seq", min = 500001 }
+first_name = { kind = "first_name" }
+last_name = { kind = "last_name" }
+email = { kind = "email" }
+phone = { kind = "phone" }
+segment = { kind = "choice", choices = ["retail", "retail", "retail", "small_business", "private"] }
+kyc_status = { kind = "choice", choices = ["verified", "verified", "verified", "pending_review"] }
+opened_on = { kind = "date", min = 0, max = 300 }
+
+[[services.postgres.databases.tables]]
+name = "accounts"
+columns = [
+    { name = "account_id", type = "int" },
+    { name = "customer_id", type = "int" },
+    { name = "account_number", type = "varchar" },
+    { name = "iban", type = "varchar" },
+    { name = "product", type = "varchar" },
+    { name = "currency", type = "varchar" },
+    { name = "balance", type = "numeric" },
+    { name = "status", type = "varchar" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 80
+[services.postgres.databases.tables.generator.fields]
+account_id = { kind = "seq", min = 70001 }
+customer_id = { kind = "int", min = 500001, max = 500060 }
+account_number = { kind = "account_number", prefix = "QM-" }
+iban = { kind = "iban_like" }
+product = { kind = "choice", choices = ["everyday_checking", "high_yield_savings", "business_checking", "cd_12m"] }
+currency = { kind = "const", value = "USD" }
+balance = { kind = "amount", min = 12, max = 98000 }
+status = { kind = "choice", choices = ["open", "open", "open", "open", "frozen", "dormant"] }
+
+[[services.postgres.databases.tables]]
+name = "cards"
+columns = [
+    { name = "card_id", type = "int" },
+    { name = "account_id", type = "int" },
+    { name = "pan", type = "varchar" },
+    { name = "expiry", type = "varchar" },
+    { name = "network", type = "varchar" },
+    { name = "status", type = "varchar" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 50
+[services.postgres.databases.tables.generator.fields]
+card_id = { kind = "seq", min = 9001 }
+account_id = { kind = "int", min = 70001, max = 70080 }
+pan = { kind = "card_number" }
+expiry = { kind = "choice", choices = ["03/28", "07/28", "11/28", "02/29", "09/29", "12/30"] }
+network = { kind = "const", value = "debit" }
+status = { kind = "choice", choices = ["active", "active", "active", "blocked", "expired"] }
+
+[[services.postgres.databases.tables]]
+name = "transactions"
+columns = [
+    { name = "txn_id", type = "uuid" },
+    { name = "account_id", type = "int" },
+    { name = "posted_at", type = "timestamp" },
+    { name = "amount", type = "numeric" },
+    { name = "direction", type = "varchar" },
+    { name = "channel", type = "varchar" },
+    { name = "memo", type = "varchar" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 200
+[services.postgres.databases.tables.generator.fields]
+txn_id = { kind = "uuid" }
+account_id = { kind = "int", min = 70001, max = 70080 }
+posted_at = { kind = "datetime", min = 250, max = 317 }
+amount = { kind = "amount", min = 2, max = 4800 }
+direction = { kind = "choice", choices = ["debit", "debit", "credit"] }
+channel = { kind = "choice", choices = ["card", "ach", "wire", "internal_transfer", "atm", "bill_pay"] }
+memo = { kind = "choice", choices = ["Payroll deposit", "Grocery", "Utilities autopay", "Rent", "Transfer to savings", "ATM withdrawal", "Insurance premium"] }
+
+[[services.postgres.databases.tables]]
+name = "statements"
+columns = [
+    { name = "statement_id", type = "int" },
+    { name = "account_id", type = "int" },
+    { name = "period", type = "varchar" },
+    { name = "opening_balance", type = "numeric" },
+    { name = "closing_balance", type = "numeric" },
+    { name = "pdf_path", type = "varchar" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 40
+[services.postgres.databases.tables.generator.fields]
+statement_id = { kind = "seq", min = 300001 }
+account_id = { kind = "int", min = 70001, max = 70080 }
+period = { kind = "choice", choices = ["2026-07", "2026-08", "2026-09", "2026-10"] }
+opening_balance = { kind = "amount", min = 50, max = 60000 }
+closing_balance = { kind = "amount", min = 50, max = 60000 }
+pdf_path = { kind = "const", value = "/srv/statements/pending" }
+
+[[services.postgres.databases.tables]]
+name = "api_clients"
+columns = [
+    { name = "client_id", type = "varchar" },
+    { name = "name", type = "varchar" },
+    { name = "client_secret", type = "varchar" },
+    { name = "scopes", type = "varchar" },
+    { name = "active", type = "bool" },
+]
+seed_rows = [
+    ["qst-mobile-ios", "Mobile app (iOS)", "pkce-public-client", "accounts:read transfers:write", true],
+    ["qst-mobile-android", "Mobile app (Android)", "pkce-public-client", "accounts:read transfers:write", true],
+    ["qst-aggregator-feed", "Aggregator data feed", "{{ht:aggregator_api_key}}", "accounts:read statements:read", true],
+]
+
+[[services.postgres.databases.tables]]
+name = "backoffice_users"
+columns = [
+    { name = "username", type = "varchar" },
+    { name = "full_name", type = "varchar" },
+    { name = "role", type = "varchar" },
+    { name = "mfa", type = "bool" },
+    { name = "last_login", type = "timestamp" },
+]
+seed_rows = [
+    ["bo.pfairbanks", "Peyton Fairbanks", "ops_manager", true, "2026-11-14 08:02:51"],
+    ["bo.kduquesne", "Kendall Duquesne", "fraud_analyst", true, "2026-11-14 07:44:10"],
+    ["bo.svc-recon", "Reconciliation job", "service", false, "2026-11-15 04:00:03"],
+]
+
+# ---- Redis session cache ----------------------------------------------------------------
+
+[services.redis]
+enabled = true
+port = 6379
+version = "7.2.5"
+
+[services.redis.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 4
+
+[[services.redis.accounts]]
+username = "default"
+password = "redis-obk-cache"
+
+[[services.redis.keys]]
+key = "sess:7f3a9c1e2b4d"
+type = "hash"
+value = { customer_id = "500014", channel = "web", mfa = "passed", created = "2026-11-15T07:58:12Z", ip = "10.12.4.5" }
+
+[[services.redis.keys]]
+key = "sess:0be4d81a77c2"
+type = "hash"
+value = { customer_id = "500033", channel = "ios", mfa = "passed", created = "2026-11-15T08:01:40Z", ip = "10.12.4.5" }
+
+[[services.redis.keys]]
+key = "sess:bo:c19e55f02a8d"
+type = "hash"
+value = { user = "bo.kduquesne", role = "fraud_analyst", created = "2026-11-15T07:44:10Z" }
+
+[[services.redis.keys]]
+key = "ratelimit:login:10.12.4.5"
+type = "string"
+value = "17"
+
+[[services.redis.keys]]
+key = "config:obk"
+type = "hash"
+value = { db_url = "jdbc:postgresql://10.12.20.40:5432/corebank", db_user = "obk_app", db_password = "{{ht:core_db_password}}", session_ttl = "900" }
+
+[[services.redis.keys]]
+key = "svc:recon:token"
+type = "string"
+value = "{{ht:recon_bearer}}"
+
+[[services.redis.keys]]
+key = "queue:transfers:pending"
+type = "list"
+value = ["TRF-20261115-00412", "TRF-20261115-00413", "TRF-20261115-00415"]
+
+# ---- FTP payment batch drop -------------------------------------------------------------
+
+[services.ftp]
+enabled = true
+port = 2121
+banner = "220 (vsFTPd 3.0.5)"
+version = "vsFTPd 3.0.5"
+
+[services.ftp.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.ftp.accounts]]
+username = "payroll-partner"
+password = "Payroll#2026"
+
+[[services.ftp.accounts]]
+username = "svc_batch"
+password = "batch2024"
+
+[[services.ftp.files]]
+path = "/inbound/payroll/PAY-20261114-0001.csv"
+mtime = "2026-11-14 16:02"
+content = '''
+batch_id,effective_date,debit_account,credit_account,credit_iban,beneficiary,amount,reference
+PAY-20261114-0001,2026-11-15,QM-4401928374,QM-7712093847,XX001234567890123456789012,Harper Pemberton,2416.55,NOV PAYROLL
+PAY-20261114-0001,2026-11-15,QM-4401928374,QM-2209384756,XX009876543210987654321098,Ellis Okonkwo,1988.10,NOV PAYROLL
+PAY-20261114-0001,2026-11-15,QM-4401928374,QM-5530192837,XX005551234509876123450987,Reese Castellanos,3120.00,NOV PAYROLL
+'''
+
+[[services.ftp.files]]
+path = "/inbound/vendor-payments/VP-20261113-0007.csv"
+size = 28114
+mtime = "2026-11-13 21:15"
+
+[[services.ftp.files]]
+path = "/outbound/acks/PAY-20261114-0001.ack"
+mtime = "2026-11-14 16:04"
+content = '''
+ACK PAY-20261114-0001 RECEIVED 3 ITEMS TOTAL 7524.65 USD STATUS=ACCEPTED
+'''
+
+[[services.ftp.files]]
+path = "/outbound/returns/RET-20261112.csv"
+size = 1408
+mtime = "2026-11-12 06:00"
+
+[[services.ftp.files]]
+path = "/scripts/upload-batches.sh"
+mtime = "2026-08-27 11:20"
+content = '''
+#!/bin/bash
+# Push settled payment batches to the archive bucket. Owner: qstadmin
+export AWS_ACCESS_KEY_ID={{ht:batch_aws_key}}
+export AWS_DEFAULT_REGION=us-east-1
+aws s3 sync /srv/batches/settled s3://qst-payment-batches-archive/ --sse aws:kms --only-show-errors
+'''
+
+[[services.ftp.files]]
+path = "/scripts/partners.conf"
+mtime = "2026-08-27 11:22"
+content = '''
+# Partner drop accounts (vsftpd virtual users). Keep in sync with /etc/vsftpd/virtual_users.db
+[payroll-partner]
+home=/srv/batches/inbound/payroll
+notify=ops@quillmere-bank.example
+
+[vendor-payments]
+home=/srv/batches/inbound/vendor-payments
+notify=ap@quillmere-bank.example
+
+[core-db]
+host=10.12.20.40
+user=svc_batch
+password={{ht:core_db_password}}
+'''
+
+# ---- HTTP: online banking, back office, API ---------------------------------------------
+
+[services.http]
+enabled = true
+port = 8080
+server_header = "nginx/1.26.1"
+login_path = "/login"
+login_title = "Quillmere Online Banking - Sign in"
+branding = "Quillmere Savings & Trust. Member FDIC-style deposit insurance notice (sample). Secure online banking."
+api_prefix = "/api/v1"
+
+[services.http.policy]
+accept = "after_n"
+after_n_min = 3
+after_n_max = 6
+
+[[services.http.accounts]]
+username = "bo.pfairbanks"
+password = "Quillmere2025!"
+
+[[services.http.accounts]]
+username = "demo.customer"
+password = "Password1"
+
+[[services.http.pages]]
+path = "/accounts"
+title = "My Accounts"
+body_html = '''
+<h1>Welcome back</h1>
+<table>
+<tr><th>Account</th><th>Number</th><th>Available balance</th></tr>
+<tr><td>Everyday Checking</td><td>QM-...8374</td><td>$4,218.77</td></tr>
+<tr><td>High Yield Savings</td><td>QM-...2290</td><td>$18,940.12</td></tr>
+</table>
+<p><a href="/transfers">Transfer money</a> | <a href="/statements">Statements</a></p>
+'''
+
+[[services.http.pages]]
+path = "/transfers"
+title = "Transfers"
+body_html = '''
+<h1>Transfer money</h1>
+<form method="post" action="/api/v1/transfers">
+<label>From</label><select name="from"><option>Everyday Checking QM-...8374</option></select>
+<label>To account or IBAN</label><input name="to">
+<label>Amount</label><input name="amount">
+<button>Continue</button>
+</form>
+'''
+
+[[services.http.pages]]
+path = "/backoffice/login"
+title = "Quillmere Back Office"
+requires_login = false
+body_html = '''
+<h1>Back Office Portal</h1>
+<p>Authorised staff only. Activity is logged.</p>
+<form method="post" action="/login"><input name="username" placeholder="bo.username"><input type="password" name="password"><button>Sign in</button></form>
+'''
+
+[[services.http.pages]]
+path = "/backoffice/dashboard"
+title = "Back Office - Dashboard"
+body_html = '''
+<h1>Operations dashboard</h1>
+<ul>
+<li>Pending transfers awaiting review: 3</li>
+<li>Payment batches received today: 2 (PAY-20261114-0001 accepted)</li>
+<li>Fraud alerts open: 5</li>
+<li>Frozen accounts: 4</li>
+</ul>
+'''
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/accounts"
+auth = "any"
+list_from = "corebank.accounts"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/accounts/{account_id}"
+auth = "any"
+item_from = "corebank.accounts"
+item_key = "account_id"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/accounts/{account_id}/transactions"
+auth = "any"
+list_from = "corebank.transactions"
+list_limit = 25
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/accounts/{account_id}/statements"
+auth = "any"
+list_from = "corebank.statements"
+list_limit = 12
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/statements/{statement_id}"
+auth = "any"
+item_from = "corebank.statements"
+item_key = "statement_id"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/cards"
+auth = "any"
+list_from = "corebank.cards"
+
+[[services.http.routes]]
+method = "POST"
+path = "/api/v1/transfers"
+auth = "any"
+status = 202
+[services.http.routes.json_body]
+transfer_id = "TRF-20261115-00419"
+status = "pending_review"
+message = "Transfer queued for review"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/transfers/{transfer_id}"
+auth = "any"
+[services.http.routes.json_body]
+transfer_id = "{transfer_id}"
+status = "pending_review"
+from_account = "QM-4401928374"
+to_iban = "XX001234567890123456789012"
+amount = 1250.0
+currency = "USD"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/partners/aggregator/config"
+auth = "basic"
+[services.http.routes.json_body]
+client_id = "qst-aggregator-feed"
+client_secret = "{{ht:aggregator_api_key}}"
+token_url = "https://api.quillmere-bank.example/oauth/token"
+
+# ---- honeytokens ---------------------------------------------------------------------------
+
+[[honeytokens]]
+name = "core_db_password"
+kind = "db_password"
+planted_in = [
+    "Redis hash config:obk (db_password)",
+    "FTP /scripts/partners.conf ([core-db] password)",
+]
+
+[[honeytokens]]
+name = "recon_bearer"
+kind = "bearer_token"
+planted_in = ["Redis string svc:recon:token (back-office reconciliation job bearer token)"]
+
+[[honeytokens]]
+name = "batch_aws_key"
+kind = "aws_access_key"
+planted_in = ["FTP /scripts/upload-batches.sh (AWS_ACCESS_KEY_ID)"]
+
+[[honeytokens]]
+name = "aggregator_api_key"
+kind = "api_key"
+planted_in = [
+    "Postgres corebank.api_clients row qst-aggregator-feed (client_secret)",
+    "HTTP GET /api/v1/partners/aggregator/config (client_secret)",
+]

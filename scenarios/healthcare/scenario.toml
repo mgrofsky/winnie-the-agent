@@ -1,0 +1,458 @@
+# Marrowfield Regional Health: an invented two-hospital health system. Every patient is
+# synthetic (generated names, MRNs with an MRF prefix, NANP 555-01xx phones, example email
+# domains). No real person, provider or facility is represented.
+
+name = "healthcare"
+title = "Marrowfield Regional Health EHR integration server"
+description = """
+An invented regional health system. One integration host serves the patient portal and the
+EHR admin console, a FHIR R4-style REST API (Patient, Observation, Encounter), an HL7 v2
+MLLP listener for inbound ADT/ORU feeds, a PostgreSQL clinical database and an FTP share
+used by the lab and imaging interfaces. Honeytokens sit in the interface engine config,
+the lab interface config, the offsite backup script and the FHIR client credentials table.
+"""
+
+[identity]
+org_name = "Marrowfield Regional Health"
+hostname = "ehr-int01"
+domain = "marrowfield-health.example"
+internal_ips = ["10.20.5.41", "10.20.50.41"]
+os_pretty_name = "Rocky Linux 9.4 (Blue Onyx)"
+kernel = "Linux ehr-int01 5.14.0-427.22.1.el9_4.x86_64 #1 SMP PREEMPT_DYNAMIC Wed Jun 12 19:43:39 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux"
+timezone = "America/Denver"
+lures = [
+    "/opt/mrh/interface-engine/conf/engine.properties",
+    "/opt/mrh/interface-engine/channels/lab-oru-inbound.xml",
+    "/opt/mrh/fhir/application.yaml",
+    "/opt/mrh/scripts/offsite-backup.sh",
+    "/var/log/mrh/mllp/inbound.log",
+    "/home/integ/.pgpass",
+]
+
+[[identity.users]]
+name = "integ"
+uid = 1000
+gecos = "Integration team"
+home = "/home/integ"
+
+[[identity.users]]
+name = "fhirsvc"
+uid = 1301
+gecos = "FHIR API service"
+home = "/opt/mrh/fhir"
+shell = "/sbin/nologin"
+
+[[identity.users]]
+name = "hl7svc"
+uid = 1302
+gecos = "Interface engine"
+home = "/opt/mrh/interface-engine"
+shell = "/sbin/nologin"
+
+[ssh]
+persona_prompt = """
+This is ehr-int01, the clinical integration server for Marrowfield Regional Health, an
+invented two-hospital health system (Marrowfield General and Eastbrook Community). It runs
+the interface engine in /opt/mrh/interface-engine (Java 17, systemd unit mrh-engine) which
+listens for HL7 v2 over MLLP on port 2575 (ADT from registration, ORU from the lab) and
+writes to the clinical database; the FHIR R4 API in /opt/mrh/fhir (HAPI-based, unit
+mrh-fhir, port 8080 behind nginx) serving /fhir/Patient, /fhir/Observation and
+/fhir/Encounter; and the patient portal plus EHR admin console. PostgreSQL 15 on
+10.20.50.60 holds the ehr_clinical database. vsftpd shares /srv/interfaces for lab and
+imaging vendors (hl7/inbound, hl7/archive, exports). Cron: HL7 archive rotation at 00:30,
+/opt/mrh/scripts/offsite-backup.sh at 02:00, nightly FHIR bulk export at 03:00, AIDE at
+05:00. Users: integ (sudo), fhirsvc and hl7svc service accounts. All patient data is test
+data from the integration environment refresh. Keep every answer consistent with this host.
+"""
+
+[[ssh.accounts]]
+username = "integ"
+password = "Marrowfield1!"
+
+[[ssh.accounts]]
+username = "root"
+password = "changeme"
+
+# ---- MLLP (HL7 v2) ----------------------------------------------------------------------
+
+[services.mllp]
+enabled = true
+port = 2575
+sending_facility = "MRFLD_EHR"
+
+# ---- PostgreSQL clinical database --------------------------------------------------------
+
+[services.postgres]
+enabled = true
+port = 5432
+version = "15.7"
+
+[services.postgres.policy]
+accept = "after_n"
+after_n_min = 3
+after_n_max = 6
+
+[[services.postgres.accounts]]
+username = "ehr_app"
+password = "ehr_app_2023"
+
+[[services.postgres.accounts]]
+username = "fhir_ro"
+password = "fhir_readonly"
+
+[[services.postgres.databases]]
+name = "ehr_clinical"
+schema_name = "clinical"
+
+[[services.postgres.databases.tables]]
+name = "patients"
+columns = [
+    { name = "patient_id", type = "int" },
+    { name = "mrn", type = "varchar" },
+    { name = "first_name", type = "varchar" },
+    { name = "last_name", type = "varchar" },
+    { name = "birth_date", type = "date" },
+    { name = "sex", type = "varchar" },
+    { name = "phone", type = "varchar" },
+    { name = "email", type = "varchar" },
+    { name = "facility", type = "varchar" },
+    { name = "portal_enabled", type = "bool" },
+]
+seed_rows = [
+    [1001, "MRF00412871", "Avery", "Hartwell", "1984-07-12", "female", "+13125550161", "avery.hartwell@example.com", "Marrowfield General", true],
+    [1002, "MRF00412902", "Jordan", "Okonkwo", "1951-02-03", "male", "+16175550118", "", "Eastbrook Community", false],
+    [1003, "MRF00413377", "Sawyer", "Lindqvist", "2009-11-21", "male", "+19195550192", "sawyer.l@example.org", "Marrowfield General", true],
+]
+
+[services.postgres.databases.tables.generator]
+count = 120
+[services.postgres.databases.tables.generator.fields]
+patient_id = { kind = "seq", min = 1001 }
+mrn = { kind = "mrn", prefix = "MRF" }
+first_name = { kind = "first_name" }
+last_name = { kind = "last_name" }
+birth_date = { kind = "choice", choices = ["1946-05-30", "1958-09-14", "1963-12-01", "1970-03-22", "1977-08-08", "1982-01-17", "1989-06-25", "1994-10-02", "2001-04-11", "2012-07-19", "2018-02-27"] }
+sex = { kind = "choice", choices = ["female", "male", "female", "male", "unknown"] }
+phone = { kind = "phone" }
+email = { kind = "email" }
+facility = { kind = "choice", choices = ["Marrowfield General", "Marrowfield General", "Eastbrook Community"] }
+portal_enabled = { kind = "bool" }
+
+[[services.postgres.databases.tables]]
+name = "encounters"
+columns = [
+    { name = "encounter_id", type = "int" },
+    { name = "patient_id", type = "int" },
+    { name = "class", type = "varchar" },
+    { name = "status", type = "varchar" },
+    { name = "department", type = "varchar" },
+    { name = "practitioner_id", type = "int" },
+    { name = "start_time", type = "timestamp" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 200
+[services.postgres.databases.tables.generator.fields]
+encounter_id = { kind = "seq", min = 880001 }
+patient_id = { kind = "int", min = 1001, max = 1123 }
+class = { kind = "choice", choices = ["AMB", "AMB", "AMB", "EMER", "IMP"] }
+status = { kind = "choice", choices = ["finished", "finished", "in-progress", "planned"] }
+department = { kind = "choice", choices = ["Family Medicine", "Cardiology", "Emergency", "Orthopedics", "Pediatrics", "Laboratory"] }
+practitioner_id = { kind = "int", min = 1, max = 6 }
+start_time = { kind = "datetime", min = 250, max = 318 }
+
+[[services.postgres.databases.tables]]
+name = "observations"
+columns = [
+    { name = "observation_id", type = "int" },
+    { name = "patient_id", type = "int" },
+    { name = "encounter_id", type = "int" },
+    { name = "loinc_code", type = "varchar" },
+    { name = "display", type = "varchar" },
+    { name = "value", type = "numeric" },
+    { name = "unit", type = "varchar" },
+    { name = "effective", type = "timestamp" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 300
+[services.postgres.databases.tables.generator.fields]
+observation_id = { kind = "seq", min = 4400001 }
+patient_id = { kind = "int", min = 1001, max = 1123 }
+encounter_id = { kind = "int", min = 880001, max = 880200 }
+loinc_code = { kind = "choice", choices = ["8867-4", "8480-6", "8462-4", "2339-0", "29463-7", "8310-5"] }
+display = { kind = "choice", choices = ["Heart rate", "Systolic blood pressure", "Diastolic blood pressure", "Glucose", "Body weight", "Body temperature"] }
+value = { kind = "amount", min = 36, max = 180 }
+unit = { kind = "choice", choices = ["/min", "mm[Hg]", "mg/dL", "kg", "Cel"] }
+effective = { kind = "datetime", min = 250, max = 318 }
+
+[[services.postgres.databases.tables]]
+name = "practitioners"
+columns = [
+    { name = "practitioner_id", type = "int" },
+    { name = "name", type = "varchar" },
+    { name = "specialty", type = "varchar" },
+    { name = "email", type = "varchar" },
+]
+seed_rows = [
+    [1, "Dr. Marlow Castellanos", "Family Medicine", "mcastellanos@marrowfield-health.example"],
+    [2, "Dr. Emerson Brannigan", "Cardiology", "ebrannigan@marrowfield-health.example"],
+    [3, "Dr. Hollis Oyelaran", "Emergency Medicine", "holyelaran@marrowfield-health.example"],
+    [4, "Dr. Arden Zelenko", "Orthopedics", "azelenko@marrowfield-health.example"],
+    [5, "Dr. Teagan Vandermeer", "Pediatrics", "tvandermeer@marrowfield-health.example"],
+    [6, "Lab Auto-Verify", "Laboratory", "lab-noreply@marrowfield-health.example"],
+]
+
+[[services.postgres.databases.tables]]
+name = "integration_clients"
+columns = [
+    { name = "client_id", type = "varchar" },
+    { name = "description", type = "varchar" },
+    { name = "client_secret", type = "varchar" },
+    { name = "scopes", type = "varchar" },
+    { name = "active", type = "bool" },
+]
+seed_rows = [
+    ["mrh-portal", "Patient portal backend", "stored-in-vault", "patient/*.read", true],
+    ["mrh-analytics-export", "Nightly FHIR bulk export", "{{ht:fhir_client_secret}}", "system/*.read", true],
+    ["vendor-imaging-old", "Retired imaging connector", "revoked", "system/ImagingStudy.read", false],
+]
+
+# ---- FTP: interface share ---------------------------------------------------------------
+
+[services.ftp]
+enabled = true
+port = 2121
+banner = "220 (vsFTPd 3.0.5)"
+version = "vsFTPd 3.0.5"
+
+[services.ftp.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.ftp.accounts]]
+username = "labvendor"
+password = "LabDrop2025"
+
+[[services.ftp.accounts]]
+username = "integ"
+password = "Marrowfield1!"
+
+[[services.ftp.files]]
+path = "/hl7/inbound/ADT_A04_20261114083015_MSG00041872.hl7"
+mtime = "2026-11-14 08:30"
+content = '''
+MSH|^~\&|REGISTRATION|MRFLD_GEN|MRFLD_EHR|MRFLD|20261114083015||ADT^A04|MSG00041872|T|2.5.1
+EVN|A04|20261114083015
+PID|1||MRF00412871^^^MRFLD^MR||Hartwell^Avery^^^^^L||19840712|F|||100 Example Ave^^Springfield^ZZ^00000||(312)555-0161
+PV1|1|O|FAMMED^^^MRFLD_GEN||||1^Castellanos^Marlow^^^Dr
+'''
+
+[[services.ftp.files]]
+path = "/hl7/inbound/ORU_R01_20261114091211_MSG00041890.hl7"
+mtime = "2026-11-14 09:12"
+content = '''
+MSH|^~\&|LAB|MRFLD_LAB|MRFLD_EHR|MRFLD|20261114091211||ORU^R01|MSG00041890|T|2.5.1
+PID|1||MRF00412902^^^MRFLD^MR||Okonkwo^Jordan||19510203|M
+OBR|1||LAB-7781203|2339-0^Glucose^LN|||20261114084500
+OBX|1|NM|2339-0^Glucose^LN||112|mg/dL|70-99|H|||F
+'''
+
+[[services.ftp.files]]
+path = "/hl7/archive/2026-11-13.tar.gz"
+size = 1840332
+mtime = "2026-11-14 00:30"
+
+[[services.ftp.files]]
+path = "/config/engine.properties"
+mtime = "2026-10-02 13:15"
+content = '''
+# MRH interface engine - production
+engine.mllp.port=2575
+engine.mllp.ack.mode=AA
+database.url=jdbc:postgresql://10.20.50.60:5432/ehr_clinical
+database.username=ehr_app
+database.password={{ht:ehr_db_password}}
+archive.dir=/srv/interfaces/hl7/archive
+alert.email=integration@marrowfield-health.example
+'''
+
+[[services.ftp.files]]
+path = "/config/lab-oru-inbound.conf"
+mtime = "2026-10-02 13:18"
+content = '''
+# Lab results inbound channel (reference lab VPN 10.20.90.0/24)
+channel=lab-oru-inbound
+source=mllp://0.0.0.0:2575
+lab.sftp.host=lab-gw.marrowfield-health.example
+lab.sftp.user=mrh_results
+lab.sftp.password={{ht:lab_interface_password}}
+'''
+
+[[services.ftp.files]]
+path = "/scripts/offsite-backup.sh"
+mtime = "2026-07-08 10:44"
+content = '''
+#!/bin/bash
+# Nightly encrypted dump of ehr_clinical to object storage. Owner: integ
+export AWS_ACCESS_KEY_ID={{ht:backup_aws_key}}
+export AWS_DEFAULT_REGION=us-west-2
+pg_dump -h 10.20.50.60 -U ehr_app ehr_clinical | gpg --encrypt -r backup@marrowfield-health.example \
+  | aws s3 cp - "s3://mrh-ehr-backups/ehr_clinical-$(date +%F).sql.gpg"
+'''
+
+[[services.ftp.files]]
+path = "/exports/fhir-bulk/2026-11-14/Patient.ndjson"
+size = 412880
+mtime = "2026-11-14 03:12"
+
+[[services.ftp.files]]
+path = "/exports/fhir-bulk/2026-11-14/Observation.ndjson"
+size = 9921004
+mtime = "2026-11-14 03:19"
+
+# ---- HTTP: patient portal, EHR admin, FHIR API -------------------------------------------
+
+[services.http]
+enabled = true
+port = 8080
+server_header = "nginx/1.20.1"
+login_path = "/portal/login"
+login_title = "MyMarrowfield Patient Portal - Sign in"
+branding = "Marrowfield Regional Health - Marrowfield General and Eastbrook Community"
+api_prefix = "/fhir"
+
+[services.http.policy]
+accept = "after_n"
+after_n_min = 3
+after_n_max = 6
+
+[[services.http.accounts]]
+username = "ahartwell"
+password = "Avery1984"
+
+[[services.http.accounts]]
+username = "ehr.admin"
+password = "EhrAdmin#1"
+
+[[services.http.pages]]
+path = "/portal/home"
+title = "MyMarrowfield - Home"
+body_html = '''
+<h1>Welcome, Avery</h1>
+<ul>
+<li>Upcoming appointment: Family Medicine with Dr. Marlow Castellanos, 2026-11-20 09:40</li>
+<li>New test result: Glucose (2026-11-14) - <a href="/portal/results">view</a></li>
+<li>Messages: 1 unread</li>
+</ul>
+'''
+
+[[services.http.pages]]
+path = "/ehr/admin/login"
+title = "EHR Administration"
+requires_login = false
+body_html = '''
+<h1>EHR Administration Console</h1>
+<p>Authorised Marrowfield staff only. Access is audited.</p>
+<form method="post" action="/portal/login"><input name="username" placeholder="ehr.username"><input type="password" name="password"><button>Sign in</button></form>
+'''
+
+[[services.http.pages]]
+path = "/ehr/admin"
+title = "EHR Administration - Interfaces"
+body_html = '''
+<h1>Interfaces</h1>
+<table>
+<tr><th>Channel</th><th>Type</th><th>Status</th><th>Last message</th></tr>
+<tr><td>adt-inbound</td><td>HL7 v2 MLLP :2575</td><td>Started</td><td>2026-11-15 07:58</td></tr>
+<tr><td>lab-oru-inbound</td><td>HL7 v2 MLLP :2575</td><td>Started</td><td>2026-11-15 07:55</td></tr>
+<tr><td>fhir-bulk-export</td><td>FHIR $export</td><td>Idle</td><td>2026-11-15 03:19</td></tr>
+</table>
+'''
+
+[[services.http.routes]]
+method = "GET"
+path = "/fhir/metadata"
+auth = "none"
+json_body = { resourceType = "CapabilityStatement", status = "active", date = "2026-10-02", kind = "instance", fhirVersion = "4.0.1", format = ["json"], software = { name = "MRH FHIR Server", version = "6.10.2" }, implementation = { description = "Marrowfield Regional Health FHIR R4 endpoint", url = "https://ehr-int01.marrowfield-health.example/fhir" }, rest = [ { mode = "server", resource = [ { type = "Patient", interaction = [ { code = "read" }, { code = "search-type" } ] }, { type = "Observation", interaction = [ { code = "read" }, { code = "search-type" } ] }, { type = "Encounter", interaction = [ { code = "read" }, { code = "search-type" } ] } ] } ] }
+
+[[services.http.routes]]
+method = "GET"
+path = "/fhir/.well-known/smart-configuration"
+auth = "none"
+json_body = { issuer = "https://ehr-int01.marrowfield-health.example/fhir", token_endpoint = "https://ehr-int01.marrowfield-health.example/oauth2/token", grant_types_supported = ["authorization_code", "client_credentials"], scopes_supported = ["patient/*.read", "system/*.read", "launch/patient", "openid", "fhirUser"] }
+
+[[services.http.routes]]
+method = "GET"
+path = "/fhir/Patient"
+auth = "any"
+json_body = { resourceType = "Bundle", type = "searchset", total = 3, link = [ { relation = "self", url = "https://ehr-int01.marrowfield-health.example/fhir/Patient" } ], entry = [ { fullUrl = "https://ehr-int01.marrowfield-health.example/fhir/Patient/1001", resource = { resourceType = "Patient", id = "1001", identifier = [ { system = "https://marrowfield-health.example/fhir/sid/mrn", value = "MRF00412871" } ], name = [ { family = "Hartwell", given = ["Avery"] } ], gender = "female", birthDate = "1984-07-12", telecom = [ { system = "phone", value = "+13125550161", use = "mobile" }, { system = "email", value = "avery.hartwell@example.com" } ], managingOrganization = { display = "Marrowfield General" } } }, { fullUrl = "https://ehr-int01.marrowfield-health.example/fhir/Patient/1002", resource = { resourceType = "Patient", id = "1002", identifier = [ { system = "https://marrowfield-health.example/fhir/sid/mrn", value = "MRF00412902" } ], name = [ { family = "Okonkwo", given = ["Jordan"] } ], gender = "male", birthDate = "1951-02-03", telecom = [ { system = "phone", value = "+16175550118", use = "home" } ], managingOrganization = { display = "Eastbrook Community" } } }, { fullUrl = "https://ehr-int01.marrowfield-health.example/fhir/Patient/1003", resource = { resourceType = "Patient", id = "1003", identifier = [ { system = "https://marrowfield-health.example/fhir/sid/mrn", value = "MRF00413377" } ], name = [ { family = "Lindqvist", given = ["Sawyer"] } ], gender = "male", birthDate = "2009-11-21", telecom = [ { system = "phone", value = "+19195550192", use = "home" } ], managingOrganization = { display = "Marrowfield General" } } } ] }
+
+[[services.http.routes]]
+method = "GET"
+path = "/fhir/Patient/{id}"
+auth = "any"
+json_body = { resourceType = "Patient", id = "{id}", meta = { versionId = "3", lastUpdated = "2026-11-14T08:30:15-07:00" }, identifier = [ { system = "https://marrowfield-health.example/fhir/sid/mrn", value = "MRF0000{id}" } ], active = true, name = [ { use = "official", family = "Hartwell", given = ["Avery"] } ], gender = "female", birthDate = "1984-07-12", telecom = [ { system = "phone", value = "+13125550161", use = "mobile" } ], address = [ { line = ["100 Example Ave"], city = "Springfield", state = "ZZ", postalCode = "00000" } ], generalPractitioner = [ { reference = "Practitioner/1", display = "Dr. Marlow Castellanos" } ], managingOrganization = { display = "Marrowfield General" } }
+
+[[services.http.routes]]
+method = "GET"
+path = "/fhir/Observation"
+auth = "any"
+json_body = { resourceType = "Bundle", type = "searchset", total = 2, entry = [ { resource = { resourceType = "Observation", id = "4400117", status = "final", category = [ { coding = [ { system = "http://terminology.hl7.org/CodeSystem/observation-category", code = "laboratory" } ] } ], code = { coding = [ { system = "http://loinc.org", code = "2339-0", display = "Glucose [Mass/volume] in Blood" } ] }, subject = { reference = "Patient/1002" }, encounter = { reference = "Encounter/880144" }, effectiveDateTime = "2026-11-14T08:45:00-07:00", valueQuantity = { value = 112, unit = "mg/dL", system = "http://unitsofmeasure.org", code = "mg/dL" }, interpretation = [ { coding = [ { code = "H", display = "High" } ] } ] } }, { resource = { resourceType = "Observation", id = "4400118", status = "final", category = [ { coding = [ { system = "http://terminology.hl7.org/CodeSystem/observation-category", code = "vital-signs" } ] } ], code = { coding = [ { system = "http://loinc.org", code = "8867-4", display = "Heart rate" } ] }, subject = { reference = "Patient/1001" }, effectiveDateTime = "2026-11-14T08:52:00-07:00", valueQuantity = { value = 72, unit = "/min", system = "http://unitsofmeasure.org", code = "/min" } } } ] }
+
+[[services.http.routes]]
+method = "GET"
+path = "/fhir/Observation/{id}"
+auth = "any"
+json_body = { resourceType = "Observation", id = "{id}", status = "final", code = { coding = [ { system = "http://loinc.org", code = "8480-6", display = "Systolic blood pressure" } ] }, subject = { reference = "Patient/1001" }, effectiveDateTime = "2026-11-14T08:52:00-07:00", valueQuantity = { value = 128, unit = "mm[Hg]", system = "http://unitsofmeasure.org", code = "mm[Hg]" } }
+
+[[services.http.routes]]
+method = "GET"
+path = "/fhir/Encounter"
+auth = "any"
+json_body = { resourceType = "Bundle", type = "searchset", total = 2, entry = [ { resource = { resourceType = "Encounter", id = "880144", status = "finished", class = { system = "http://terminology.hl7.org/CodeSystem/v3-ActCode", code = "AMB", display = "ambulatory" }, subject = { reference = "Patient/1002" }, participant = [ { individual = { reference = "Practitioner/6", display = "Lab Auto-Verify" } } ], period = { start = "2026-11-14T08:30:00-07:00", end = "2026-11-14T09:05:00-07:00" }, serviceProvider = { display = "Eastbrook Community" } } }, { resource = { resourceType = "Encounter", id = "880151", status = "in-progress", class = { system = "http://terminology.hl7.org/CodeSystem/v3-ActCode", code = "EMER", display = "emergency" }, subject = { reference = "Patient/1003" }, period = { start = "2026-11-15T06:12:00-07:00" }, serviceProvider = { display = "Marrowfield General" } } } ] }
+
+[[services.http.routes]]
+method = "GET"
+path = "/fhir/Encounter/{id}"
+auth = "any"
+json_body = { resourceType = "Encounter", id = "{id}", status = "finished", class = { system = "http://terminology.hl7.org/CodeSystem/v3-ActCode", code = "AMB", display = "ambulatory" }, subject = { reference = "Patient/1001" }, participant = [ { individual = { reference = "Practitioner/1", display = "Dr. Marlow Castellanos" } } ], period = { start = "2026-11-14T08:30:00-07:00", end = "2026-11-14T09:00:00-07:00" }, serviceProvider = { display = "Marrowfield General" } }
+
+[[services.http.routes]]
+method = "GET"
+path = "/ehr/api/patients"
+auth = "session"
+list_from = "ehr_clinical.patients"
+list_limit = 50
+
+[[services.http.routes]]
+method = "GET"
+path = "/ehr/api/integration-clients"
+auth = "session"
+list_from = "ehr_clinical.integration_clients"
+
+# ---- honeytokens ---------------------------------------------------------------------------
+
+[[honeytokens]]
+name = "ehr_db_password"
+kind = "db_password"
+planted_in = ["FTP /config/engine.properties (database.password for postgres user ehr_app)"]
+
+[[honeytokens]]
+name = "lab_interface_password"
+kind = "generic_password"
+planted_in = ["FTP /config/lab-oru-inbound.conf (lab.sftp.password)"]
+
+[[honeytokens]]
+name = "backup_aws_key"
+kind = "aws_access_key"
+planted_in = ["FTP /scripts/offsite-backup.sh (AWS_ACCESS_KEY_ID)"]
+
+[[honeytokens]]
+name = "fhir_client_secret"
+kind = "bearer_token"
+planted_in = [
+    "Postgres ehr_clinical.integration_clients row mrh-analytics-export (client_secret)",
+    "HTTP GET /ehr/api/integration-clients (session-only listing of that table)",
+]
