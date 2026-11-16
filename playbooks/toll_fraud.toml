@@ -1,0 +1,26 @@
+name = "toll_fraud"
+description = "SIP source dialing international or premium-rate numbers."
+enabled = true
+cooldown_minutes = 120
+max_runs_per_day = 200
+
+[when]
+protocols = ["sip"]
+dialed_international_or_premium = true
+
+[[steps]]
+action = "tag_source"
+tag = "toll_fraud"
+
+[[steps]]
+action = "tarpit"
+delay_ms = 2000
+hours = 48
+
+[[steps]]
+action = "notify"
+connectors = ["webhook", "siem_http", "email"]
+include = ["dialed_numbers", "tags"]
+
+[[steps]]
+action = "export_blocklist"

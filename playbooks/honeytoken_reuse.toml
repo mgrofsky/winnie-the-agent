@@ -1,0 +1,27 @@
+name = "honeytoken_reuse"
+description = "A planted fake secret was used: whoever holds it read our decoy data."
+enabled = true
+priority = true
+cooldown_minutes = 60
+max_runs_per_day = 200
+
+[when]
+honeytoken = true
+
+[[steps]]
+action = "tag_source"
+tag = "honeytoken_reuse"
+
+[[steps]]
+action = "capture_more"
+
+[[steps]]
+action = "notify"
+connectors = ["webhook", "siem_http", "email"]
+include = ["tags", "credentials"]
+
+[[steps]]
+action = "export_blocklist"
+
+[[steps]]
+action = "block_webhook"

@@ -1,0 +1,25 @@
+name = "database_takeover"
+description = "Redis takeover chain, SQL command execution or credential dump attempt."
+enabled = true
+priority = true
+cooldown_minutes = 60
+max_runs_per_day = 200
+
+[when]
+signals = ["redis_takeover", "sql_exec_attempt", "sql_cred_dump"]
+
+[[steps]]
+action = "tag_source"
+tag = "database_takeover"
+
+[[steps]]
+action = "deepen"
+hours = 24
+
+[[steps]]
+action = "plant_token"
+
+[[steps]]
+action = "notify"
+connectors = ["webhook", "siem_http", "email"]
+include = ["tags", "credentials"]

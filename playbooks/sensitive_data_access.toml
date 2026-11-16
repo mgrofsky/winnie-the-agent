@@ -1,0 +1,26 @@
+name = "sensitive_data_access"
+description = "Patient or financial records touched on the healthcare or bank decoys."
+enabled = true
+priority = true
+cooldown_minutes = 60
+max_runs_per_day = 200
+
+[when]
+scenarios = ["healthcare", "bank"]
+sensitive_data_access = true
+
+[[steps]]
+action = "tag_source"
+tag = "sensitive_data_access"
+
+[[steps]]
+action = "plant_token"
+
+[[steps]]
+action = "deepen"
+hours = 24
+
+[[steps]]
+action = "notify"
+connectors = ["webhook", "siem_http", "email"]
+include = ["tags", "credentials"]

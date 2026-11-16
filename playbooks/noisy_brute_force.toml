@@ -1,0 +1,20 @@
+name = "noisy_brute_force"
+description = "High-volume password guessing with nothing new: stop spending model budget on it."
+enabled = true
+cooldown_minutes = 360
+max_runs_per_day = 1000
+
+[when]
+kinds = ["campaign"]
+nothing_novel = true
+min_attempts = 50
+
+[[steps]]
+action = "shallow"
+hours = 48
+
+[[steps]]
+action = "export_blocklist"
+
+[steps.only_if]
+min_attempts = 5000
