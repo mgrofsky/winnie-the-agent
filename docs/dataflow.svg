@@ -1,0 +1,243 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2265 1420" width="2265" height="1420" role="img" aria-labelledby="t d" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title id="t">Winnie the Agent data flow</title>
+<desc id="d">Attackers connect to the SSH honeypot and the protocol traps, which write one event log. An hourly agents pipeline reads the log and runs triage, respond, digest, tune, detect and an optional export to S3. Its outputs are reports, per-source state, notifications, an approval queue, the overlay file and detection drafts. Enforcement happens only after the operator approves. The overlay and per-source state feed back to the front-ends read-only.</desc>
+<rect width="2265" height="1420" fill="#ffffff"/>
+<rect x="850" y="130" width="240" height="70" rx="10" fill="#ffc9c9" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="570" y="300" width="300" height="90" rx="10" fill="#a5d8ff" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="1070" y="300" width="340" height="90" rx="10" fill="#a5d8ff" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="170" y="300" width="290" height="90" rx="10" fill="#d0bfff" stroke="#1e1e1e" stroke-width="2" stroke-dasharray="8 6"/>
+<rect x="1550" y="300" width="300" height="90" rx="10" fill="#e9ecef" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="800" y="530" width="340" height="80" rx="10" fill="#ffec99" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="1250" y="530" width="260" height="80" rx="10" fill="#ffec99" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="340" y="700" width="1660" height="160" rx="10" fill="none" stroke="#868e96" stroke-width="2" stroke-dasharray="8 6"/>
+<rect x="370" y="750" width="200" height="90" rx="10" fill="#b2f2bb" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="650" y="750" width="200" height="90" rx="10" fill="#b2f2bb" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="930" y="750" width="200" height="90" rx="10" fill="#b2f2bb" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="1210" y="750" width="200" height="90" rx="10" fill="#b2f2bb" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="1490" y="750" width="200" height="90" rx="10" fill="#b2f2bb" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="1770" y="750" width="200" height="90" rx="10" fill="#b2f2bb" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="40" y="750" width="230" height="90" rx="10" fill="#d0bfff" stroke="#1e1e1e" stroke-width="2" stroke-dasharray="8 6"/>
+<rect x="230" y="990" width="220" height="90" rx="10" fill="#ffec99" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="490" y="990" width="200" height="90" rx="10" fill="#ffec99" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="720" y="990" width="200" height="90" rx="10" fill="#e9ecef" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="950" y="990" width="200" height="90" rx="10" fill="#ffc9c9" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="1210" y="990" width="200" height="90" rx="10" fill="#ffec99" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="1490" y="990" width="210" height="90" rx="10" fill="#ffec99" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="1770" y="990" width="210" height="90" rx="10" fill="#e9ecef" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="950" y="1220" width="200" height="80" rx="10" fill="#a5d8ff" stroke="#1e1e1e" stroke-width="2"/>
+<rect x="1230" y="1220" width="300" height="80" rx="10" fill="#ffc9c9" stroke="#1e1e1e" stroke-width="2"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="930.0,200.0 750.0,300.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="757.4,290.5 750.0,300.0 761.9,298.7"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1010.0,200.0 1210.0,300.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1198.0,299.2 1210.0,300.0 1202.2,290.9"/>
+<polyline fill="none" stroke="#6741d9" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="460.0,345.0 570.0,345.0"/>
+<polyline fill="none" stroke="#6741d9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="558.9,349.7 570.0,345.0 558.9,340.3"/>
+<polyline fill="none" stroke="#6741d9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="471.1,340.3 460.0,345.0 471.1,349.7"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1550.0,345.0 1410.0,345.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1421.1,340.3 1410.0,345.0 1421.1,349.7"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="720.0,390.0 910.0,530.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="898.3,527.2 910.0,530.0 903.9,519.7"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1190.0,390.0 1030.0,530.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1035.2,519.2 1030.0,530.0 1041.4,526.2"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1330.0,390.0 1380.0,530.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1371.9,521.2 1380.0,530.0 1380.7,518.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="970.0,610.0 470.0,750.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="479.4,742.5 470.0,750.0 481.9,751.5"/>
+<polyline fill="none" stroke="#6741d9" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="270.0,795.0 370.0,795.0"/>
+<polyline fill="none" stroke="#6741d9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="358.9,799.7 370.0,795.0 358.9,790.3"/>
+<polyline fill="none" stroke="#6741d9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="281.1,790.3 270.0,795.0 281.1,799.7"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="570.0,795.0 650.0,795.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="638.9,799.7 650.0,795.0 638.9,790.3"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="850.0,795.0 930.0,795.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="918.9,799.7 930.0,795.0 918.9,790.3"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1130.0,795.0 1210.0,795.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1198.9,799.7 1210.0,795.0 1198.9,790.3"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1410.0,795.0 1490.0,795.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1478.9,799.7 1490.0,795.0 1478.9,790.3"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1690.0,795.0 1770.0,795.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1758.9,799.7 1770.0,795.0 1758.9,790.3"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="450.0,840.0 370.0,990.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="371.1,978.0 370.0,990.0 379.3,982.4"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="710.0,840.0 600.0,990.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="602.8,978.3 600.0,990.0 610.3,983.9"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="750.0,840.0 810.0,990.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="801.6,981.5 810.0,990.0 810.2,978.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="810.0,840.0 1030.0,990.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1018.2,987.6 1030.0,990.0 1023.5,979.9"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1310.0,840.0 1310.0,990.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1305.3,978.9 1310.0,990.0 1314.7,978.9"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1590.0,840.0 1590.0,990.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1585.3,978.9 1590.0,990.0 1594.7,978.9"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1870.0,840.0 1870.0,990.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1865.3,978.9 1870.0,990.0 1874.7,978.9"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1050.0,1080.0 1050.0,1220.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1045.3,1208.9 1050.0,1220.0 1054.7,1208.9"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1150.0,1260.0 1230.0,1260.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1218.9,1264.7 1230.0,1260.0 1218.9,1255.3"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="1590.0,1080.0 1470.0,1220.0"/>
+<polyline fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1473.6,1208.6 1470.0,1220.0 1480.7,1214.6"/>
+<polyline fill="none" stroke="#2f9e44" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="8 6" points="1310.0,1080.0 1310.0,1150.0 2050.0,1150.0 2050.0,250.0 720.0,250.0 720.0,300.0"/>
+<polyline fill="none" stroke="#2f9e44" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="715.3,288.9 720.0,300.0 724.7,288.9"/>
+<polyline fill="none" stroke="#2f9e44" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="8 6" points="590.0,1080.0 590.0,1150.0 1310.0,1150.0"/>
+<polyline fill="none" stroke="#2f9e44" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="8 6" points="1240.0,250.0 1240.0,300.0"/>
+<polyline fill="none" stroke="#2f9e44" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="1235.3,288.9 1240.0,300.0 1244.7,288.9"/>
+<text x="70" font-size="28" fill="#1e1e1e" text-anchor="start">
+<tspan x="70" y="68" font-weight="600">Winnie the Agent: data flow</tspan>
+</text>
+<text x="970" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="970" y="171">Attackers</tspan>
+</text>
+<text x="720" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="720" y="340" font-weight="600">SSH honeypot</tspan>
+<tspan x="720" y="361">LLM persona shell (budgeted)</tspan>
+</text>
+<text x="1240" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1240" y="330" font-weight="600">Protocol traps</tspan>
+<tspan x="1240" y="351">SIP FTP Telnet SMTP HTTP Redis</tspan>
+<tspan x="1240" y="372">PostgreSQL MySQL MSSQL HL7</tspan>
+</text>
+<text x="315" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="315" y="330" font-weight="600">Persona model API</tspan>
+<tspan x="315" y="351">(optional; canned replies</tspan>
+<tspan x="315" y="372">without a key)</tspan>
+</text>
+<text x="1700" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1700" y="330" font-weight="600">config.ini + scenario.toml</tspan>
+<tspan x="1700" y="351">fake org, accounts, data,</tspan>
+<tspan x="1700" y="372">honeytokens</tspan>
+</text>
+<text x="970" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="970" y="565" font-weight="600">Event log (JSON lines)</tspan>
+<tspan x="970" y="586">logins, commands, registers, calls</tspan>
+</text>
+<text x="1380" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1380" y="565" font-weight="600">Quarantine</tspan>
+<tspan x="1380" y="586">uploads by SHA-256, never run</tspan>
+</text>
+<text x="1070" font-size="14" fill="#868e96" text-anchor="start">
+<tspan x="1070" y="722">python -m agents run-all (hourly, separate container)</tspan>
+</text>
+<text x="470" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="470" y="780" font-weight="600">triage</tspan>
+<tspan x="470" y="801">one record per</tspan>
+<tspan x="470" y="822">session or campaign</tspan>
+</text>
+<text x="750" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="750" y="780" font-weight="600">respond</tspan>
+<tspan x="750" y="801">playbooks matched</tspan>
+<tspan x="750" y="822">by code</tspan>
+</text>
+<text x="1030" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1030" y="790" font-weight="600">digest</tspan>
+<tspan x="1030" y="811">daily top three</tspan>
+</text>
+<text x="1310" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1310" y="780" font-weight="600">tune</tspan>
+<tspan x="1310" y="801">adjust the bait</tspan>
+<tspan x="1310" y="822">within a fixed schema</tspan>
+</text>
+<text x="1590" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1590" y="790" font-weight="600">detect</tspan>
+<tspan x="1590" y="811">draft rules</tspan>
+</text>
+<text x="1870" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1870" y="780" font-weight="600">ship</tspan>
+<tspan x="1870" y="801">export events</tspan>
+<tspan x="1870" y="822">(optional)</tspan>
+</text>
+<text x="155" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="155" y="780" font-weight="600">Analyst model API</tspan>
+<tspan x="155" y="801">output must pass</tspan>
+<tspan x="155" y="822">a schema check</tspan>
+</text>
+<text x="340" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="340" y="1020" font-weight="600">reports/</tspan>
+<tspan x="340" y="1041">triage records,</tspan>
+<tspan x="340" y="1062">daily digest, run log</tspan>
+</text>
+<text x="590" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="590" y="1020" font-weight="600">Per-source state</tspan>
+<tspan x="590" y="1041">tarpit, depth,</tspan>
+<tspan x="590" y="1062">planted tokens</tspan>
+</text>
+<text x="820" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="820" y="1020" font-weight="600">Notify connectors</tspan>
+<tspan x="820" y="1041">webhook, SIEM, email</tspan>
+<tspan x="820" y="1062">(off by default)</tspan>
+</text>
+<text x="1050" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1050" y="1020" font-weight="600">Approval queue</tspan>
+<tspan x="1050" y="1041">enforce actions</tspan>
+<tspan x="1050" y="1062">wait here</tspan>
+</text>
+<text x="1310" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1310" y="1020" font-weight="600">decoy/overlay.json</tspan>
+<tspan x="1310" y="1041">accounts, lures,</tspan>
+<tspan x="1310" y="1062">SIP extensions</tspan>
+</text>
+<text x="1595" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1595" y="1020" font-weight="600">detections/pending</tspan>
+<tspan x="1595" y="1041">Sigma drafts,</tspan>
+<tspan x="1595" y="1062">blocklist candidates</tspan>
+</text>
+<text x="1875" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1875" y="1020" font-weight="600">S3 bucket for a SIEM</tspan>
+<tspan x="1875" y="1041">events, passwords</tspan>
+<tspan x="1875" y="1062">hashed by default</tspan>
+</text>
+<text x="1050" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1050" y="1255" font-weight="600">Operator</tspan>
+<tspan x="1050" y="1276">approve / reject</tspan>
+</text>
+<text x="1380" font-size="16" fill="#1e1e1e" text-anchor="middle">
+<tspan x="1380" y="1245" font-weight="600">Enforce (after approval only)</tspan>
+<tspan x="1380" y="1266">blocklist file, publish detection,</tspan>
+<tspan x="1380" y="1287">ticket, block webhook</tspan>
+</text>
+<text x="670" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="670" y="244">logins, commands</tspan>
+</text>
+<text x="1140" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="1140" y="244">logins, registers, queries</tspan>
+</text>
+<text x="465" font-size="14" fill="#6741d9" text-anchor="start">
+<tspan x="465" y="409">prompts / replies</tspan>
+</text>
+<text x="1430" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="1430" y="412">what to fake</tspan>
+</text>
+<text x="750" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="750" y="464">events</tspan>
+</text>
+<text x="1130" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="1130" y="464">events</tspan>
+</text>
+<text x="1370" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="1370" y="464">FTP uploads</tspan>
+</text>
+<text x="660" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="660" y="669">read</tspan>
+</text>
+<text x="663" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="663" y="917">local</tspan>
+</text>
+<text x="788" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="788" y="917">notify</tspan>
+</text>
+<text x="940" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="940" y="914">enforce</tspan>
+</text>
+<text x="1585" font-size="14" fill="#1e1e1e" text-anchor="start">
+<tspan x="1585" y="1182">published on approval</tspan>
+</text>
+<text x="2065" font-size="14" fill="#2f9e44" text-anchor="start">
+<tspan x="2065" y="564">feedback, read-only</tspan>
+<tspan x="2065" y="582">for the front-ends:</tspan>
+<tspan x="2065" y="601">overlay and</tspan>
+<tspan x="2065" y="619">per-source state</tspan>
+</text>
+<text x="70" font-size="16" fill="#1e1e1e" text-anchor="start">
+<tspan x="70" y="1356">Front-ends only write events. Agents never talk to attackers. Models get no tools.</tspan>
+<tspan x="70" y="1377">Nothing outside the honeypot changes without the operator's approval.</tspan>
+</text>
+</svg>

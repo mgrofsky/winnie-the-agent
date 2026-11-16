@@ -1,0 +1,354 @@
+# Architecture
+
+This page describes the components, how data moves between them, the log format they share,
+and the budgets that bound model use. Related pages:
+[scenarios](scenarios.md), [playbooks](playbooks.md), [operations](operations.md),
+[security model](security-model.md).
+
+## Components
+
+The system has two halves. **Front-ends** face attackers and write events. **Agents** read
+those events afterwards and produce records, reports, tuning changes and responses. The two
+halves share files, never a network connection.
+
+| Component | Location | Role |
+|---|---|---|
+| SSH honeypot | `SSH/ssh_server.py`, `agents/hooks.py` | The upstream DECEIVE server: a model plays a Linux shell. `ssh_server.py` stays close to upstream; each addition is a small call into `agents/hooks.py`, marked with an `agent layer` comment. |
+| Listeners | `listeners/` | Low-interaction traps for SIP (UDP and TCP), FTP, Telnet, PostgreSQL, MySQL, MSSQL, Redis, SMTP, HTTP and HL7 MLLP, all in one asyncio process (`python -m listeners`). |
+| Scenarios | `scenarios/` | One strict schema describing the fake target; loader, synthetic-data checker and describer. See [scenarios.md](scenarios.md). |
+| Budgets | `agents/budget.py` | Spend and concurrency limits for every model call, shared by the SSH and listener processes. |
+| Triage | `agents/triage.py`, `agents/sessions.py` | Turns the log into one validated record per SSH session or trap campaign; writes the daily digest. |
+| Response | `agents/respond.py`, `agents/playbooks.py`, `agents/source_state.py`, `agents/connectors/` | Runs playbooks on new records. See [playbooks.md](playbooks.md). |
+| Tuner | `agents/tuner.py` | Adjusts fake accounts, SIP extensions, lures and login thresholds in the overlay. |
+| Detect | `agents/detect.py` | Writes Sigma rule drafts and blocklist candidates to `detections/pending/`. |
+| Event export | `agents/ship.py` | Copies new event log lines to S3 as JSON lines for a SIEM (`[connector.s3_events]`, off by default). See [operations.md](operations.md#event-export-to-s3). |
+| CLI | `agents/__main__.py` | `python -m agents <command>`; `run-all` runs triage, respond, digest, tune and detect in that order, then the event export when it is enabled. |
+
+### SSH persona
+
+Every persona model call goes through `agents.hooks.persona_invoke`, which:
+
+1. reserves the estimated cost in the budget, and returns a canned
+   `fork: Resource temporarily unavailable` reply (and the session closes) when a limit
+   would be exceeded;
+2. adds the active scenario's host profile to the prompt, pinned for the whole session so
+   a returning attacker sees the same host;
+3. applies the source's tarpit delay, if a playbook set one.
+
+If the model call fails (provider error, timeout), the session continues with a plausible
+canned reply instead: `-bash: <command>: command not found` followed by a prompt, and
+`exit` or `logout` end the session. If the configured provider needs an API key from the
+environment (`anthropic`, `openai`, `gemini`, `azure`) and the variable is not set, the
+persona runs offline from the start: no network attempt is made and every command gets a
+canned reply. A warning is logged once at startup. Offline replies charge no tokens to any
+budget; the per-session command cap and the concurrency limits still apply.
+
+A model reply that reads as the model talking and not as shell output (for example "As an
+AI", "I'm sorry, but", "I apologize, but", or a mention of its instructions or system
+prompt; straight and curly apostrophes alike) is not sent. A phrase counts only in the
+first two non-empty lines of the reply, or anywhere when the reply has no shell prompt
+line; for content viewers (`cat`, `less`, `more`, `head`, `tail`, `man`, `grep`,
+`strings`, `git log`) only in the first line, so file text that mentions a language model
+passes. The attacker instead gets what a shell would print: for `echo` or `printf` of
+literal arguments the real output computed in code, for anything else empty output, then
+the prompt (`#` for root, `$` otherwise). The sent text also replaces the model's reply in
+the session history, so the model never sees its own break again. A `Persona break` event
+records the original reply (base64 in `details`, clipped to 2,000 characters). A phrase
+the attacker typed themselves is allowed through. The check is a short list of patterns in
+`agents/hooks.py`; it catches the common ways a model steps out of the role, not every
+one.
+
+Sessions have a login timeout (60 s), an idle timeout (300 s) and an absolute lifetime
+(1800 s); each frees a concurrency slot. Chat history is dropped when a session closes. The
+session summary at the end uses the same budget and is skipped when the session ran no
+model-backed command.
+
+Telnet uses the same persona path, with the `[llm]` provider, when `[listeners] llm = true`
+and that provider's API key is present (providers without a key, such as Ollama or Bedrock,
+count as available); otherwise it answers with a small deterministic shell.
+
+### Listeners
+
+All listeners share one event loop, so anything that blocks it takes every protocol down.
+And with the default `after_n` login policy any client gets in within a few tries, so all
+post-login code is treated as reachable without authentication. The shared framework in
+`listeners/base.py` therefore enforces:
+
+- connection slots globally, per source (IPv6 per /64), per service and per source per
+  service, plus a per-source connection rate;
+- shorter read timeouts before login than after; connections that send almost nothing
+  within `progress_window` seconds are closed;
+- per-line, per-connection byte and per-connection command caps;
+- no regular expression or `fnmatch` on attacker-supplied patterns: SQL `LIKE` uses a
+  linear matcher and Redis glob patterns use `listeners/glob.py` (linear time, 256-byte
+  cap);
+- repetitive low-value events (refused connections, malformed datagrams) are logged once,
+  then as periodic counters, under a global events-per-second ceiling;
+- exceptions never escape a handler: they are logged as an `error` event and the
+  connection is closed.
+
+Login policy per service: `all` (any credentials), `listed` (only configured accounts),
+`after_n` (accept after a random number of attempts between `after_n_min` and
+`after_n_max`, per source) or `none`.
+
+Protocol notes:
+
+- **SIP** (`listeners/sip.py`): `REGISTER` gets a Digest challenge; the password is
+  recovered when it is a configured extension password, a common password or the username.
+  `INVITE` is logged with the dialed number and always ends in 486 or 480; from a source
+  with no live registration it is first challenged with 407. Over UDP there is at most one
+  response per request, responses are never larger than the request (compact header names,
+  optional headers dropped, otherwise no answer), more than 5 Via hops and SIP responses are
+  never answered, and per-source and global response rates are capped.
+  `[listeners] sip_udp_slack_bytes` (0 to 512, default 0) lets a response exceed its
+  request by that many bytes, so that minimal REGISTERs from clients such as `sipsak` get
+  their 401 challenge, at the cost of a small, rate-capped amplification factor. A UDP source
+  counts as verified only after it echoes a nonce the trap issued, and every UDP event
+  says which it is (`data.source_verified`). Each datagram passes the per-source request
+  limit first, then a global inbound limit (`udp_requests_per_second`, default 200), both
+  before any parsing, so one busy source cannot use up the shared budget; datagrams over
+  the global limit are dropped and reported in one aggregated `limit` event per
+  minute. Events from unverified UDP sources go through the low-value gate in a pool of
+  their own (first event of each kind per source, then periodic lines with a `suppressed`
+  count), so log growth does not depend on how many source addresses a flood forges, and a
+  forged flood cannot crowd out log lines about real sources.
+- **Low-value gate**: refused connections, malformed input and unverified-source events
+  are logged once per source and reason, then at most once per minute with a `suppressed`
+  count, under per-second ceilings (`low_value_events_per_second` and
+  `unverified_events_per_second`). Counts that never got a line of their own (sources that
+  never returned, keys evicted from memory, lines over a ceiling) are written every minute
+  as one `Suppressed N low-value log lines` event per protocol and pool (`src_ip` `-`,
+  `data.reason` `suppressed_summary`). Triage keeps these sensor-level lines, and the
+  inbound drop lines, per day, and the digest lists them under "Sensor limits".
+- **FTP**: passive mode only, on `ftp_pasv_ports`, advertising `ftp_pasv_address` (default:
+  the control connection's local address). Data connections are accepted only from the
+  control connection's source. `PORT`/`EPRT` are refused. An unused passive listener
+  closes after `ftp_pasv_accept_timeout` seconds (default 30), and one source may hold at
+  most `ftp_pasv_per_ip` open passive listeners (default 2). Uploads stream into the
+  quarantine with caps enforced while reading; upload bytes are bounded by the quarantine
+  caps, not by `max_conn_bytes`. An upload over `quarantine_max_file_bytes` is cut at the
+  cap, stored, and logged as truncated with the size and SHA-256 of the part kept; over a
+  per-source or total quota reading stops and nothing is stored. Identical files are stored
+  once; hitting a quota is a high-signal event. A session's fake tree holds at most 500
+  files and directories (parents included) and paths at most 32 components deep.
+- **PostgreSQL**: SSL requests are declined; md5 password exchange by default (the password
+  is recovered from the bundled common-password list when possible), `postgres_auth =
+  cleartext` for the cleartext exchange. Simple query protocol, with best-effort extended
+  protocol support so drivers do not hang.
+- **MySQL**: `mysql_native_password` handshake without TLS; the password is recovered from
+  the scramble for native and `caching_sha2_password` clients.
+- **MSSQL**: TDS 7.x without TLS. `PRELOGIN` is answered with "encryption not supported";
+  a client that requires encryption is logged and disconnected. Works with impacket
+  `mssqlclient` and `sqlcmd` using ODBC Driver 13; ODBC Driver 18 requires encryption by
+  default and is refused. Enabled in the `contact_center` scenario.
+- **SQL** (all three): statements go to `listeners/sqlfake.py`, an in-memory fake engine.
+  File, program and command-execution primitives get a believable permission error and a
+  `sql_exec_attempt` signal; catalog queries and scenario tables get canned or generated
+  answers; anything else may go to the budgeted model (when `[listeners] llm = true`)
+  through a strict schema, and otherwise gets a syntax error.
+- **Redis**: RESP and inline protocol, fake per-connection keyspace. The takeover chain
+  (`CONFIG SET dir/dbfilename`, `SAVE`, `SLAVEOF`/`REPLICAOF`, `MODULE LOAD`, `EVAL`,
+  `FLUSHALL`) answers plausibly and is logged as high-signal; nothing touches disk or
+  connects out.
+- **SMTP**: Postfix-like; captures `AUTH`; messages after `DATA` are logged (headers,
+  recipients, size, SHA-256, first 2 KB) and discarded. Recipients outside the scenario
+  domain are relay attempts.
+- **HTTP**: login form and Basic, Bearer and API-key capture; after login a small site and
+  JSON API built from the scenario. Unknown routes under the API prefix may be answered by
+  the budgeted model when the scenario enables `llm_unknown_api_routes`; otherwise 404.
+- **HL7 MLLP**: frames are logged and answered with an `AA` acknowledgement; nothing is
+  forwarded.
+
+### Triage
+
+`python -m agents triage` reads the log from a high-water mark (byte offset plus the file's
+inode), groups events, and writes one `TriageRecord` (JSON) per item to `reports/`:
+
+- **Sessions**: SSH connections where the attacker ran at least one command.
+- **Campaigns**: everything else, aggregated per source, per protocol, per time window
+  (60 minutes). A brute forcer making thousands of connections becomes one record. IPv6
+  sources are grouped by /64, like every other per-source control: the record's `src_ip`
+  is the /64, `src_addresses` keeps up to 20 of the addresses seen and
+  `src_address_count` counts them all.
+  Unverified UDP sources (seen only over UDP, no nonce round trip; the address may be
+  forged) are folded into one aggregate record per protocol and window, with source
+  `unverified`; while parsing, at most 1,000 such sources per window get their own
+  campaign and counters per campaign are bounded.
+
+At most `[agents] max_records_per_run` records (default 1,000) are written per run; the rest
+stay pending for the next run. Session and campaign records older than
+`[agents] record_retention_days` (default 90; 0 keeps them) are removed at the end of each
+triage run.
+
+Each record carries intent, kill-chain stage, skill, judgement, MITRE technique IDs, IOCs,
+a short narrative, high-signal counts, honeytoken use and credential statistics. Values
+come from the analyst model when one is used and validate against a strict schema;
+otherwise they are computed by code.
+
+Deterministic rules set floors the model cannot lower:
+
+- In SSH sessions, code detects download-and-execute, persistence (cron, systemd, shell rc
+  files, `authorized_keys`), and reads of credential files (`/etc/shadow`, SSH private
+  keys, cloud and tool credential files). Each one, and any honeytoken use, makes the
+  judgement `MALICIOUS` and raises the stage.
+- Campaigns get a model look only when there was a fake login followed by activity, a
+  high-signal event or honeytoken use, and the source is verified. Failed-only brute force
+  is always handled by code.
+
+Model-suggested IOCs are kept only if they appear verbatim in the transcript and match their
+type's format.
+
+Without any model configured (no Anthropic credentials, or `--no-llm`), every SSH session
+and campaign gets a deterministic record. When a model is configured but temporarily
+unavailable (rate limit, outage, timeout) or the call cap is reached, model work stops for
+that run and the affected items are deferred to the next run; nothing is lost because the
+cursor is saved after every item.
+
+The digest (`reports/daily/YYYY-MM-DD.md`) lists counts, the top three items (honeytoken
+use first, then judgement, stage, high-signal events and novelty), high-signal events,
+credential statistics per protocol, and SIP extensions and dialed numbers. Attacker strings
+are rendered inside escaped code spans.
+
+### Tuner
+
+`python -m agents tune` looks at the last 14 days of triage records and:
+
+- adds fake accounts (for SSH and every listener service) and SIP extensions that
+  attackers actually try;
+- removes accounts it added itself once nobody has tried them for a full window (never a
+  configured account, never the last account of a service);
+- adds lure files built only from fixed allowlists of directories and bait names;
+- adjusts `after_n` bounds.
+
+It writes only the overlay (`$WINNIE_OVERLAY`, else `[scenario] overlay`, else
+`decoy/overlay.json`). Every change
+first stores a numbered snapshot, so any run can be undone (`tune --history`,
+`tune --rollback N`). `--dry-run` prints the diff. `--git-commit` additionally commits the
+overlay when running from a checkout; if the commit fails the overlay is rolled back.
+Candidate selection is deterministic; the model may only reorder candidates by index. The
+fences are listed in [security-model.md](security-model.md#tuner-fences).
+
+The SSH server re-reads accounts from `config.ini` and the overlay when either file changes
+(checked at the next login attempt) and reloads the host profile for new sessions;
+listeners poll the overlay every 30 seconds. Configured accounts always win over overlay
+accounts.
+
+### Detect
+
+`python -m agents detect` writes drafts only, to `detections/pending/`:
+
+- Sigma rules for IOCs and high-signal behaviour seen across several sessions or sources.
+  The rule body comes from a template in code; the model may only supply a title and
+  description, which are length-capped and limited to a safe character set. Each draft
+  lists the triage records it was built from.
+- `blocklist-candidates.csv`, one row per source across all protocols. Private, reserved
+  and documentation addresses and unverified sources are skipped.
+
+See [detections/README.md](../detections/README.md).
+
+## Data flow and trust boundaries
+
+```
+attacker --> SSH server ----+                       +--> reports/ (records, digests,
+attacker --> listeners -----+--> event log --> agents     response runs, honeytokens)
+                            |    quarantine       |  +--> detections/pending/
+                            |    budget state     |  +--> connectors (opt-in)
+                            |    sensor seed      |  +--> S3 event export (opt-in)
+                            +<-- overlay <--------+
+                            +<-- source state <---+
+```
+
+| Store | Written by | Read by | Docker volume |
+|---|---|---|---|
+| Event log, quarantine, budget state, sensor seed | SSH server, listeners | agents (read-only) | `frontend` |
+| Overlay, per-source state | agents | SSH server, listeners (read-only) | `overlay` |
+| Triage records, digests, response runs, approval queue, tuner snapshots, honeytoken registry, detection drafts, event export cursor | agents | operator | `agentdata` |
+| `config.ini`, host key, `prompt.txt` | operator | all (read-only) | bind mount |
+
+The sensor seed (`<data dir>/sensor_seed`, mode 0600, random on first start) drives every
+generated record and honeytoken value, so a sensor keeps showing the same fake data across
+restarts and rebuilds. `[scenario] seed` can set it explicitly. It is never derived from the
+sensor name or anything else public.
+
+Per-source state (`agents/source_state.py`) holds what playbooks decided about one source:
+tags, tarpit delay (at most 5 s), budget mode (`deep` or `shallow`), fuller capture, and a
+planted honeytoken. Each effect has its own expiry. The file is bounded to 10,000 entries;
+over the bound, entries are evicted by priority (plain tags and tarpits first, planted
+tokens last). Front-ends reload it when its modification time changes.
+
+## Logging contract
+
+All components append to one JSON-lines file. The SSH server uses upstream DECEIVE's
+`JSONFormatter`; listener events (`listeners/events.py`) use the same top-level fields plus
+an event type. This file is the only interface between front-ends and agents
+(`agents/sessions.py` parses it).
+
+Common fields:
+
+| Field | Meaning |
+|---|---|
+| `timestamp` | UTC, ISO 8601 with milliseconds. |
+| `level` | `INFO`, `WARNING` or `ERROR`. |
+| `task_name` | Unique per connection (SSH: `session-<uuid>`; listeners: `<protocol>-<uuid>`). |
+| `src_ip`, `src_port`, `dst_ip`, `dst_port` | Connection endpoints as seen by the process. |
+| `message` | Human-readable event name. |
+| `sensor_name` | `[honeypot] sensor_name`. |
+
+SSH `message` values include `SSH connection received`, `User attempting to authenticate`,
+`Authentication success` / `Authentication failed` (with `username` and `password`),
+`User input` (base64 text in `details`, plus `interactive`), `LLM response` (base64 text in
+`details`), `Session summary` (summary in `details`, `judgement` field: `BENIGN`,
+`SUSPICIOUS`, `MALICIOUS`, or `UNKNOWN` when no summary was made, for example without a
+model), `Budget exceeded`
+(with `reason`), `Model error`, `Persona break`, `Session timeout` and
+`SSH connection closed`.
+
+Listener events add:
+
+| Field | Meaning |
+|---|---|
+| `sensor_protocol` | `sip`, `ftp`, `telnet`, `postgres`, `mysql`, `mssql`, `redis`, `smtp`, `http`, `mllp` (SSH lines carry `ssh`). |
+| `event` | `connection`, `auth_attempt`, `command`, `register`, `invite`, `options`, `limit`, `error`, `close`. |
+| `transport` | `tcp` or `udp`. |
+| `username`, `password` | Submitted credentials, when the protocol reveals them. |
+| `client` | Client software string (User-Agent, connect attributes). |
+| `success` | `true` only for an accepted fake login or registration. |
+| `data` | Up to 32 protocol-specific keys (for example `dialed`, `high_signal`, `signal`, `reason`, `sha256`). |
+
+Every attacker-supplied value is length-capped (512 characters) and has control characters
+escaped before it is written. Listener writes use `O_APPEND`, so lines from the SSH and
+listener processes never interleave.
+
+## Budgets
+
+`agents/budget.py` enforces limits before any model call. When a limit would be exceeded the
+model is not called: the attacker gets a canned error and the session closes, and a
+`Budget exceeded` event with the reason is logged.
+
+| Limit (`[budget]`) | Default |
+|---|---|
+| `max_line_bytes` (input is truncated) | 2048 |
+| `max_commands_per_session` | 200 |
+| `max_tokens_per_session` | 400,000 |
+| `max_tokens_per_ip_per_day` (IPv6 per /64) | 1,000,000 |
+| `max_tokens_per_day` (global) | 3,000,000 |
+| `max_concurrent_sessions` | 20 |
+| `max_concurrent_sessions_per_ip` | 3 |
+
+- The estimated cost (history length / 4 plus 512 output tokens) is reserved before the
+  call and corrected from the provider's usage data afterwards, so concurrent sessions can
+  overshoot a cap by at most one estimate's error. Failed calls keep their charge.
+- Daily counters live in a JSON file in the data directory (`state_file`), updated under
+  an exclusive file lock, so the SSH server and the listeners on one host share the caps
+  and a restart does not reset the day. A malformed file restarts the day from zero with a
+  warning.
+- A source in `shallow` mode (set by a playbook) gets canned replies only; `deep` doubles
+  its per-session and per-source limits. The global cap never changes.
+- Listener model calls (SQL, HTTP and Telnet fallbacks) use the same budget, take a session
+  slot, run at most `llm_max_inflight` at a time, make one request with no retries, and
+  fail closed when no budget is initialised.
+- Analyst calls are capped per run (`[agents] max_llm_calls_per_run`, shared by all stages)
+  and per UTC day (`max_analyst_calls_per_day`).
+
+SSH reads a whole line before the line cap applies (the SSH library buffers it), so a very
+long line without a newline still costs memory before it is truncated.

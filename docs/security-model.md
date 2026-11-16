@@ -1,0 +1,196 @@
+# Security model
+
+A honeypot invites hostile input on purpose. This page states what the system assumes, what
+it defends against, how, and where the limits are.
+
+## Assets and adversaries
+
+What must be protected:
+
+- the host and network the sensor runs on, and anything reachable from it;
+- third parties: the sensor must not become a reflector, relay, scanner or source of
+  attacks;
+- the operator's model spend;
+- the operator's other systems reached by outbound connectors (chat, SIEM, ticketing,
+  firewall managers);
+- the captured data itself (credentials, commands, uploads).
+
+Adversaries:
+
+- **Attackers on the network** connect to the front-ends and control every byte they send:
+  commands, usernames, passwords, SIP headers, SQL, HTTP requests, uploaded files. They may
+  spoof UDP source addresses.
+- **Prompt injection.** Everything an attacker sends may be crafted to steer a model: the
+  persona model sees it directly, and analyst models see it in transcripts.
+- **Resource exhaustion.** Attackers may try to burn model budget, exhaust connections or
+  memory, or stall the shared event loop.
+
+Out of scope: an attacker with code execution on the sensor host, a compromised model
+provider, and a malicious operator.
+
+## Fences
+
+### Nothing real behind the traps
+
+- The SSH and Telnet shells are model output or canned text. Nothing an attacker types is
+  executed.
+- SQL goes to an in-memory fake engine; Redis `SAVE` writes nothing and `SLAVEOF` never
+  dials; SMTP accepts and discards; SIP never sends media or places a call; HL7 messages
+  are acknowledged and logged only.
+- Uploaded files go to a capped quarantine (stored once per SHA-256, mode 0600) and are
+  never read back, parsed or executed.
+
+### Front-ends do not connect out
+
+No listener opens an outbound connection: FTP active mode is refused, and passive data
+connections are accepted only from the control connection's source. The only outbound
+traffic a front-end originates is a model API call, when a model is configured. Enforce
+this with a host firewall as well (see [operations.md](operations.md#egress-control-in-production)).
+
+### Not a reflector
+
+Over UDP, SIP sends at most one response per request, never larger than the request by
+default (`sip_udp_slack_bytes` can allow up to 512 extra bytes), ignores SIP responses and
+requests with more than 5 Via hops, and caps responses per source and globally. Datagrams
+over the size limit are dropped.
+
+Spoofed-source floods are bounded too: a per-source limit and then a global inbound limit
+(`udp_requests_per_second`) drop excess datagrams before any parsing, events from sources
+that never completed a nonce round trip are aggregated by the low-value gate in a pool of
+their own (so they cannot crowd out log lines about real sources), and triage folds those
+sources into one record per protocol and window instead of one file per forged address.
+Suppressed log lines are never lost silently: every count is written in a periodic summary
+line and appears in the daily digest.
+
+### Bounded resources
+
+- Model spend: per session, per source per day (IPv6 per /64) and global daily token caps,
+  command caps and concurrency limits, reserved before every call
+  ([architecture.md](architecture.md#budgets)).
+- Listeners: connection slots globally, per source, per service and per source per service;
+  rate limits; read timeouts; minimum-progress checks; byte and command caps per connection;
+  rate-limited logging of low-value events.
+- No regular expression or `fnmatch` runs on attacker-supplied patterns; Redis globs and SQL
+  `LIKE` use linear-time matchers. A test feeds every listener long runs of its protocol's
+  special characters under a time bound.
+- Analyst calls: capped per run and per day.
+
+### Logged data is inert
+
+Attacker-supplied values in the log are length-capped and have control characters escaped.
+SSH input and model output are base64-encoded. The digest renders attacker strings inside
+escaped code spans.
+
+## What the model can and cannot influence
+
+Models get no tools, shell, files or network. They return text (the persona) or one JSON
+object (analysts).
+
+| Model | Can influence | Cannot influence |
+|---|---|---|
+| Persona (SSH, Telnet) | the text the attacker sees in that session | anything else: its output is sent to the attacker and logged, nothing more |
+| SQL / HTTP fallback | column names and capped cell values, or a JSON body, validated against a strict schema | protocol state, other connections, files |
+| Triage analyst | intent, stage, skill, judgement, techniques, a narrative and extra IOCs, all schema-validated | severity below the deterministic floor; IOCs that do not appear verbatim in the transcript; which playbooks run beyond what those enum fields select |
+| Tuner ranking | the order of candidates the code generated, by index | any value written to the overlay |
+| Detect | a length-capped, character-restricted title and description | the rule body and selectors |
+
+Every analyst output must validate against a strict pydantic schema (unknown keys
+forbidden, enums, patterns, length caps). Output that fails is dropped and logged, never
+applied. Attacker text is passed to analysts inside a block delimited by a random per-call
+nonce, so it cannot forge the end marker; this is a convenience, not the control. The
+control is schema validation plus the fact that no free-form model text flows into the
+persona prompt, the config, the overlay or a playbook decision.
+
+Playbooks match only on enum and numeric fields of a validated record plus facts computed by
+code. The model-written narrative leaves the honeypot only if
+`[respond] include_narrative = true`, labelled untrusted, stripped of markup, and cut to
+fit the 300-character summary.
+
+### Tuner fences
+
+All fences use full-string matching, so a trailing newline never passes.
+
+- Account username `[a-z_][a-z0-9_-]{0,31}`; password printable ASCII, at most 64
+  characters, no leading or trailing space. At most 20 accounts per service. The tuner
+  removes only accounts it added, never the last account of a service, and never a
+  configured account.
+- SIP extension `[0-9]{2,6}`, at most 20.
+- Lures are built only from fixed allowlists of directories and bait file names; attacker
+  activity only raises a candidate's score. At most 25.
+- Hostname `[a-z][a-z0-9-]{0,62}` (manual changes only).
+- `after_n` bounds 1 to 20, min not above max.
+- It never writes `config.ini` or a scenario file, never switches scenarios and never
+  changes the SSH banner.
+
+Usernames, extensions and passwords taken from attacker activity are used for
+authentication only and are never rendered into a prompt.
+
+## Response and outbound rules
+
+- **Tiers fixed in code.** Local actions change only this honeypot. Notify actions go only
+  to connectors the operator enabled. Enforce actions (blocklist, detection publishing,
+  tickets, block webhook) never run without `python -m agents approve <id>`, and only if
+  `[respond] queue_enforce = true`. Approvals expire.
+- **Source gates.** UDP sources that never completed a nonce round trip, non-global
+  addresses and `never_act_on` ranges get no per-source action of any tier. This prevents
+  an attacker from spoofing a victim's address into a blocklist or a tarpit. Gates are
+  checked again at approval time.
+- **Proxy guard.** If one non-global address accounts for most records, per-source actions
+  are refused for the run, since every client would otherwise share one identity.
+- **Connectors.** `https` only (SMTP requires STARTTLS before credentials); no private or
+  loopback destinations unless explicitly allowed; the destination address is resolved
+  once, validated and pinned, defeating DNS rebinding; no redirects, proxies or retries;
+  one overall deadline per call; a 64 KB response cap; a daily cap per connector. Secrets
+  come from environment variables named in config and never appear in config, logs or
+  reports.
+- **Event export.** With `[connector.s3_events]` enabled, the agents process (never a
+  front-end) sends the event log to the configured S3 bucket: attacker addresses, ports,
+  user names, commands and request content. Unless `passwords = clear`, these are replaced
+  by keyed hashes (`drop` removes them instead):
+  - every `password` field, and the protocol fields listed in `SECRET_FIELDS` in
+    `agents/ship.py` (SIP digest responses and recovered passwords, MySQL and PostgreSQL
+    password responses, HTTP bodies and unparsed `Authorization` values, FTP `PASS` lines,
+    Redis `AUTH`/`HELLO`/`MIGRATE`/`CONFIG SET requirepass` command lines), plus any data
+    key whose name looks like a secret;
+  - inside every other string field: values of URL query or form parameters whose name
+    contains `pass`, `pwd`, `secret`, `token`, `key`, `auth`, `cred`, `sig` or `session`;
+    the password in URL userinfo (`scheme://user:secret@host`) and SIP URIs
+    (`sip:user:secret@host`); Redis `ACL SETUSER` `>password`/`<password` rules and the
+    password after `AUTH`.
+
+  At the source, an HTTP Basic token without a colon is logged as the password (user
+  `<basic>`), and SMTP lines a client pipelined after a refused `AUTH` are logged as the
+  password of an `AUTH_DATA` event, so both are covered above. Not covered: secrets in
+  other free-text shapes, for example a password typed as a plain argument of an SSH or
+  Telnet command (`mysql -pSecret`), a credential inside an FTP file name, or SSH
+  `User input` text, which is shipped as captured. The client
+  uses the default AWS credential chain, `https`, connect and read timeouts, at most two
+  attempts, and refuses every operation but `PutObject`, so the bucket can be write-only
+  for the sensor. AWS endpoints are not pinned the way connector destinations are; the
+  TLS certificate check against the AWS host name is the protection. Delivery is at least
+  once.
+- **Notification content.** Built from structured fields; attacker-derived URLs, domains,
+  addresses and `@` are defanged in chat, email and ticket outputs; the enrichment
+  response is treated as untrusted and flattened to a few short scalar fields.
+- **Caps.** Per-playbook and per-connector daily notification caps, with a share reserved for
+  priority playbooks, so a flood of routine events cannot spam the operator or crowd out
+  important alerts.
+
+## Container boundaries
+
+Non-root, read-only root filesystem, no capabilities, `no-new-privileges`. Front-ends can
+write only their own data volume; they read the overlay and per-source state but cannot
+change them. The agents read the front-end volume read-only and do not mount the
+repository. A compromised listener therefore cannot alter what the agents produce, and a
+compromised agents process cannot change the front-ends' code or configuration.
+
+## Known limits
+
+- Docker's userland proxy hides client addresses; per-source controls are meaningless until
+  it is disabled.
+- The SSH library buffers a whole input line before the line cap applies.
+- Token reservations are estimates; a cap can be exceeded by at most one call's estimation
+  error.
+- The daily budget is shared per host, not across hosts.
+- The captured data contains real-looking and sometimes real credentials. Protecting it is
+  the operator's job.

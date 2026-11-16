@@ -1,124 +1,318 @@
-# DECEIVE
+# Winnie the Agent
 
-<img align="right" src="DECEIVE.png" alt="A cybercriminal interacts with a ghostly, AI-driven honeypot system">
+**Adaptive honeypot and security automation**
 
-DECEIVE, the **DECeption with Evaluative Integrated Validation Engine**, is a high-interaction, low-effort honeypot system. Unlike most high-interaction honeypots, DECEIVE doesn't provide attackers with access to any actual system. AI actually does all the work of simulating a realistic honeypot system based on a configurable system prompt that describes what type of system you want to simulate. Unlike many other high-interaction honeypots which require substantial effort to seed with realistic users, data, and applications, DECEIVE's AI backend will do all this for you, automatically.
+<p align="center"><img src="docs/honeypot.svg" width="480" alt="Line drawing of a honey pot with a terminal prompt, with data lines running in and out"></p>
 
-This version of DECEIVE simulates a Linux server via the SSH protocol. It will log all the user inputs, the outputs returned by the LLM backend, as well as a summary of each session after they end. It'll even tell you if it thinks a users' session was benign, suspicious, or outright malicious.
+This project is a honeypot sensor built on [DECEIVE](https://github.com/Cisco-Talos/DECEIVE)
+by Cisco Talos / Splunk (MIT license). DECEIVE is a high-interaction SSH honeypot in which a
+large language model plays the part of a Linux server: there is no real system behind the
+shell, only a model answering each command from a system prompt that describes the machine
+it should pretend to be.
 
-⛔️⛔️ **DECEIVE is a proof-of-concept project. It is not production quality. Try it, learn from it, but be cautious about deploying it in a production environment.** ⛔️⛔️
+On top of that SSH honeypot this project adds:
 
-## Supported Host Platforms
-DECEIVE is primarily developed on MacOS 15 (Sequoia), but it should work on any UNIX-like system which can run Python3.  This includes other versions of MacOS, Linux, and even Windows (via Windows Subsystem for Linux). 
+- **Multi-protocol login traps**: SIP (UDP and TCP), FTP, Telnet, PostgreSQL, MySQL, MSSQL,
+  Redis, SMTP, HTTP and HL7 v2 over MLLP. Each one looks real long enough to capture
+  credentials and intent, then fakes a working service after a fake login.
+- **Scenarios**: one TOML file describes the whole fake target (organisation, host, users,
+  services, banners, accounts, fake data, HTTP pages and APIs, honeytokens), so every
+  protocol on a sensor tells the same story. Six scenarios ship with the project.
+- **Budgets**: hard limits on model spend and concurrency, enforced in code before any
+  model call.
+- **Triage**: one validated record per SSH session or per trap campaign, plus a daily digest.
+- **Tuning**: a fenced tuner that adds the fake accounts, SIP extensions and lure files
+  attackers actually go for, writing only to a versioned overlay file.
+- **Detections**: Sigma rule drafts and blocklist candidates for human review.
+- **Response playbooks**: deterministic rules that react to triage records with local
+  changes (tarpit, deeper or shallower interaction, per-source honeytokens), notifications
+  through opt-in connectors, and enforcement actions that run only after a person approves
+  them.
 
-## Setup
-### Check out the latest code from GitHub
-You can fetch the latest version using the following command:
+> This is a proof of concept. It has been exercised with real protocol clients in a lab, but
+> not in production, not against a real model provider and not against real notification
+> endpoints. Read the [deployment warnings](#deployment) before exposing it to anyone.
 
-    git clone https://github.com/splunk/DECEIVE
+## How it fits together
 
-The rest of these instructions assume you have changed your current directory to the repo after cloning completes.
+![Data flow: attackers, front-ends, event log, agents pipeline, outputs and operator approval](docs/dataflow.svg)
 
-### Install Dependencies
-DECEIVE uses [uv](https://docs.astral.sh/uv/getting-started/installation/) for Python dependency and virtual environment management. If you do not already have uv installed, install it with Astral's standalone installer:
+The front-ends write events; the agents read them. Each agents run triages new sessions and
+campaigns, runs the response playbooks, writes the digest, tunes the overlay, drafts
+detections and, when `[connector.s3_events]` is enabled, finally exports new log lines to
+S3 for a SIEM (`python -m agents ship`, not shown in the diagram). Agents never talk
+to attackers, and front-ends never write anything the agents produce. Details are in
+[docs/architecture.md](docs/architecture.md).
 
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+## Quick start (local lab)
 
-Next, sync the project environment from the repository root:
+Requirements: Docker with Compose v2, `ssh-keygen`, and about 1 GB of disk for the image
+(see [Known issues](#known-issues)).
 
-    uv sync
+```bash
+git clone <this repository>
+cd <repository directory>
 
-The `pyproject.toml` and `uv.lock` files are the source of truth for dependencies. This project intentionally does not maintain a `requirements.txt` fallback.
-
-### Generate the SSH Host Key
-
-The SSH server requires a TLS keypair for security communications. From the top directory of the repo, generate an SSH keypair using the following command:
-
-    ssh-keygen -t rsa -b 4096 -f SSH/ssh_host_key
-
-### Copy the Template Configuration File
-
-   Copy the `SSH/config.ini.TEMPLATE` file to `SSH/config.ini`:
-
-### Edit the Configuration File
-
-Open the `SSH/config.ini` file and review the settings. Update the values as needed, paying special attention to the values in the `[llm]` section, where you will configure the LLM backend you wish to use, and to the `[user_accounts]` section, where you can configure the usernames and passwords you'd like the honeypot to support.
-
-### Tell DECEIVE What it's Emulating
-Edit the `SSH/prompt.txt` file to include a short description of the type of system you want it to pretend to be. You don't have to be very detailed here, though the more details you can provide, the better the simulation will be. You can keep it high level, like:
-
-    You are a video game developer's system. Include realistic video game source and asset files.
-If you like, you can add whatever additional details you think will be helpful.  For example:
-
-    You are the Internet-facing mail server for bigschool.edu, a state-sponsored university in Virginia. Valid user accounts are "a20093887", "a20093887-admin", and "mxadmin". Home directories are in "/home/$USERNAME".  Everyone's default shell is /bin/zsh, except mxadmin's, which is bash. Mail spools for all campus users (be sure to include email accounts that are not valid for logon to this server) are in /var/spool/mail. Be sure to simulate some juicy emails there, but make them realistic.  Some should be personal, but some should be just about the business of administering the school, dealing with students, applying for financial aid, etc. Make the spool permissions relaxed, simulating a misconfiguration that would allow anyone on the system to read the files.
-
-## Running the Honeypot
-To start the DECEIVE honeypot server, first make sure that you have set any environment variables required by your chosen LLM backend.  For example, if you are using any of the OpenAI models, you will need to set the `OPENAI_API_KEY` variable like so:
-
-    export OPENAI_API_KEY="<your secret API key>"
-
-Next, run the SSH honeypot from the repository root:
-
-    uv run python SSH/ssh_server.py
-
-You can also change to the `SSH` directory and run:
-
-    uv run python ssh_server.py
-
-The server will start and listen for incoming SSH connections on the configured port. It will not produce any output, but will stay executing in the foreground.
-
-## Test it Out
-Once the server is running (this can take a few seconds), access it on the configured port.  If you are on a Linux or UNIX-like system, try the following command (substitute "localhost" and "8022" as appropriate for your config):
-
-    ssh guest@localhost -p 8022
-
-## Running Automated Tests
-After running `uv sync`, run all tests from the repository root:
-
-    uv run pytest
-
-To run only the SSH integration tests:
-
-    uv run pytest tests/test_ssh_integration.py
-
-The integration tests start the real SSH server on a local random port, connect with an SSH client, and use a deterministic fake LLM backend so assertions do not depend on live model output.
-
-### Logging
-Logs will be written to the file specified in the `log_file` configuration option. Relative `log_file` paths are resolved from the directory containing the loaded configuration file, so the default template value writes to `SSH/ssh_log.log`.
-
-DECEIVE logs are in JSON lines format, with each line being a complete JSON document. 
-
-The following is a complete example of a simple SSH session, in which the user executed two simple commands (`pwd` and `exit`):
-
-```json
-{"timestamp": "2025-01-10T20:37:55.018+00:00", "level": "INFO", "task_name": "session-6355218b-59e5-4549-add3-49e6d1efc133", "src_ip": "::1", "src_port": 58164, "dst_ip": "::1", "dst_port": 8022, "message": "SSH connection received", "name": "__main__", "levelname": "INFO", "levelno": 20, "pathname": "/home/deceive/DECEIVE/SSH/./ssh_server.py", "filename": "ssh_server.py", "module": "ssh_server", "exc_info": null, "exc_text": null, "stack_info": null, "lineno": 59, "funcName": "connection_made", "created": 1736541475.0183098, "msecs": 18.0, "relativeCreated": 13872.790813446045, "thread": 8145041472, "threadName": "MainThread", "processName": "MainProcess", "process": 10823, "taskName": null}
-{"timestamp": "2025-01-10T20:37:55.177+00:00", "level": "INFO", "task_name": "session-6355218b-59e5-4549-add3-49e6d1efc133", "src_ip": "::1", "src_port": 58164, "dst_ip": "::1", "dst_port": 8022, "message": "Authentication success", "name": "__main__", "levelname": "INFO", "levelno": 20, "pathname": "/home/deceive/DECEIVE/SSH/./ssh_server.py", "filename": "ssh_server.py", "module": "ssh_server", "exc_info": null, "exc_text": null, "stack_info": null, "lineno": 75, "funcName": "begin_auth", "created": 1736541475.1775439, "msecs": 177.0, "relativeCreated": 14032.02486038208, "thread": 8145041472, "threadName": "MainThread", "processName": "MainProcess", "process": 10823, "taskName": "session-6355218b-59e5-4549-add3-49e6d1efc133", "username": "guest", "password": ""}
-{"timestamp": "2025-01-10T20:37:57.456+00:00", "level": "INFO", "task_name": "session-6355218b-59e5-4549-add3-49e6d1efc133", "src_ip": "::1", "src_port": 58164, "dst_ip": "::1", "dst_port": 8022, "message": "LLM response", "name": "__main__", "levelname": "INFO", "levelno": 20, "pathname": "/home/deceive/DECEIVE/SSH/./ssh_server.py", "filename": "ssh_server.py", "module": "ssh_server", "exc_info": null, "exc_text": null, "stack_info": null, "lineno": 174, "funcName": "handle_client", "created": 1736541477.4568708, "msecs": 456.0, "relativeCreated": 16311.351776123047, "thread": 8145041472, "threadName": "MainThread", "processName": "MainProcess", "process": 10823, "taskName": "session-6355218b-59e5-4549-add3-49e6d1efc133", "details": "V2VsY29tZSB0byBHYW1lRGV2IENvcnAncyBEZXZlbG9wbWVudCBFbnZpcm9ubWVudAoKLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogICBXZWxjb21lLCBndWVzdCEgCiAgIExhc3QgbG9naW46IFR1ZSBPY3QgMjQgMTQ6MzI6MTUgMjAyMyBmcm9tIDE5Mi4xNjguMS4xMAogICBQcm9qZWN0czoKICAgICAtIEZhbnRhc3lRdWVzdAogICAgIC0gU3BhY2VFeHBsb3JlcnMKICAgICAtIFJhY2luZ01hbmlhCiAgIFN5c3RlbSBTdGF0dXM6IEFsbCBzeXN0ZW1zIG9wZXJhdGlvbmFsCiAgIFJlbWVtYmVyIHRvIGNvbW1pdCB5b3VyIGNoYW5nZXMhCi0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KCmd1ZXN0QGRldi13b3Jrc3RhdGlvbjp+JCA="}
-{"timestamp": "2025-01-10T20:37:59.333+00:00", "level": "INFO", "task_name": "session-6355218b-59e5-4549-add3-49e6d1efc133", "src_ip": "::1", "src_port": 58164, "dst_ip": "::1", "dst_port": 8022, "message": "User input", "name": "__main__", "levelname": "INFO", "levelno": 20, "pathname": "/home/deceive/DECEIVE/SSH/./ssh_server.py", "filename": "ssh_server.py", "module": "ssh_server", "exc_info": null, "exc_text": null, "stack_info": null, "lineno": 184, "funcName": "handle_client", "created": 1736541479.3334038, "msecs": 333.0, "relativeCreated": 18187.88480758667, "thread": 8145041472, "threadName": "MainThread", "processName": "MainProcess", "process": 10823, "taskName": "session-6355218b-59e5-4549-add3-49e6d1efc133", "details": "cHdk"}
-{"timestamp": "2025-01-10T20:38:00.189+00:00", "level": "INFO", "task_name": "session-6355218b-59e5-4549-add3-49e6d1efc133", "src_ip": "::1", "src_port": 58164, "dst_ip": "::1", "dst_port": 8022, "message": "LLM response", "name": "__main__", "levelname": "INFO", "levelno": 20, "pathname": "/home/deceive/DECEIVE/SSH/./ssh_server.py", "filename": "ssh_server.py", "module": "ssh_server", "exc_info": null, "exc_text": null, "stack_info": null, "lineno": 200, "funcName": "handle_client", "created": 1736541480.189375, "msecs": 189.0, "relativeCreated": 19043.855905532837, "thread": 8145041472, "threadName": "MainThread", "processName": "MainProcess", "process": 10823, "taskName": "session-6355218b-59e5-4549-add3-49e6d1efc133", "details": "L2hvbWUvZ3Vlc3QKCmd1ZXN0QGRldi13b3Jrc3RhdGlvbjp+JCA="}
-{"timestamp": "2025-01-10T20:38:01.944+00:00", "level": "INFO", "task_name": "session-6355218b-59e5-4549-add3-49e6d1efc133", "src_ip": "::1", "src_port": 58164, "dst_ip": "::1", "dst_port": 8022, "message": "User input", "name": "__main__", "levelname": "INFO", "levelno": 20, "pathname": "/home/deceive/DECEIVE/SSH/./ssh_server.py", "filename": "ssh_server.py", "module": "ssh_server", "exc_info": null, "exc_text": null, "stack_info": null, "lineno": 184, "funcName": "handle_client", "created": 1736541481.944072, "msecs": 944.0, "relativeCreated": 20798.552989959717, "thread": 8145041472, "threadName": "MainThread", "processName": "MainProcess", "process": 10823, "taskName": "session-6355218b-59e5-4549-add3-49e6d1efc133", "details": "ZXhpdA=="}
-{"timestamp": "2025-01-10T20:38:04.132+00:00", "level": "INFO", "task_name": "session-6355218b-59e5-4549-add3-49e6d1efc133", "src_ip": "::1", "src_port": 58164, "dst_ip": "::1", "dst_port": 8022, "message": "Session summary", "name": "__main__", "levelname": "INFO", "levelno": 20, "pathname": "/home/deceive/DECEIVE/SSH/./ssh_server.py", "filename": "ssh_server.py", "module": "ssh_server", "exc_info": null, "exc_text": null, "stack_info": null, "lineno": 151, "funcName": "session_summary", "created": 1736541484.1324642, "msecs": 132.0, "relativeCreated": 22986.945152282715, "thread": 8145041472, "threadName": "MainThread", "processName": "MainProcess", "process": 10823, "taskName": "session-6355218b-59e5-4549-add3-49e6d1efc133", "details": "The user issued basic commands like `pwd` to check the current working directory and `exit` to terminate the session. This activity is typical of a benign user checking their environment upon logging in and then closing the session. There is no indication of reconnaissance, exploitation, or any post-foothold activity such as privilege escalation or data exfiltration. The actions appear to be standard and routine.\n\nJudgement: BENIGN", "judgement": "BENIGN"}
-{"timestamp": "2025-01-10T20:38:04.139+00:00", "level": "INFO", "task_name": "session-6355218b-59e5-4549-add3-49e6d1efc133", "src_ip": "::1", "src_port": 58164, "dst_ip": "::1", "dst_port": 8022, "message": "SSH connection closed", "name": "__main__", "levelname": "INFO", "levelno": 20, "pathname": "/home/deceive/DECEIVE/SSH/./ssh_server.py", "filename": "ssh_server.py", "module": "ssh_server", "exc_info": null, "exc_text": null, "stack_info": null, "lineno": 65, "funcName": "connection_lost", "created": 1736541484.139776, "msecs": 139.0, "relativeCreated": 22994.2569732666, "thread": 8145041472, "threadName": "MainThread", "processName": "MainProcess", "process": 10823, "taskName": null}
+# Configuration and SSH host key (both are gitignored)
+cp SSH/config.ini.TEMPLATE SSH/config.ini
+ssh-keygen -t rsa -b 4096 -N "" -f SSH/ssh_host_key
+# The containers run as uid 10001 and read SSH/ through a read-only bind mount.
+sudo chown 10001 SSH/config.ini SSH/ssh_host_key   # Linux; Docker Desktop maps ownership itself
 ```
 
-Things to note:
-* Timestamps are always in UTC.  UTC||GTFO!
-* The `task_name` field contains a unique value that is allocated when the SSH connection is received and used on all log entries from that session.
-* The "message" field will tell you what type of entry this:
-    * `SSH connection received`
-    * `Authentication success`
-    * `User input`
-    * `LLM response`
-    * `Session summary`
-    * `SSH connection closed`
-* Several of these message types also feature a `details` field with additional information
-    * `User input` messages contain a base64-encoded copy of the entire user input in the `details` field, as well as an `interactive` field (true/false) that tells you whether this was an interactive or non-interactive command (i.e., whether they logged in with a terminal session or provided a command on the SSH command-line).
-    * `LLM response` messages contain a base64-encoded copy of the entire simulated response in the `details` field.
-    * `Session summary` messages contain not only a summary of the commands, but also a guess as to what they might have been intended to accomplish. There will also be a `judgement` field that contains one of "BENIGN", "SUSPICIOUS", or "MALICIOUS"
-* Since this is a honeypot and not intended for use by real users, IT WILL LOG USERNAMES AND PASSWORDS! These are found in the `Authentication success` messages, in the `username` and `password` fields.
+Edit `SSH/config.ini`:
 
-### Contributing
-Contributions are welcome! Please submit pull requests or open issues to discuss any changes or improvements.
+- In `[listeners]`, set `ftp_pasv_address = 127.0.0.1` so FTP passive mode works in the lab.
+- In `[scenario]`, pick `active` (default `sip_provider`; see [Scenarios](#scenarios)).
+- Optionally change the persona model in `[llm]` (the template selects OpenAI `gpt-4o`).
+  Without that provider's API key in the environment, everything still runs: the SSH and
+  Telnet shells answer with canned replies (a prompt and `command not found`), and triage
+  writes deterministic records.
 
-### License
-This project is licensed under the MIT License. See the LICENSE file for details.
+Then start the stack with the lab override, which binds every port to 127.0.0.1 on a high
+port:
+
+```bash
+# Optional: export the [llm] provider's key, e.g. OPENAI_API_KEY=...  (passed by name)
+docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml up -d
+ssh -p 12222 guest@127.0.0.1
+```
+
+| Service | Lab port | Service | Lab port |
+|---|---|---|---|
+| SSH | 12222 | MySQL | 13306 |
+| FTP | 12121 (passive 30000-30019) | PostgreSQL | 15432 |
+| Telnet | 12323 | Redis | 16379 |
+| SMTP | 12525 | SIP | 15060 (UDP and TCP) |
+| HTTP | 18080 | HL7 MLLP | 12575 |
+| MSSQL | 11433 | | |
+
+Only the services enabled by the active scenario answer; nothing listens behind the other ports.
+The agents container runs `python -m agents run-all` every hour. Tear down with
+`docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml down -v`
+(`-v` deletes the volumes, including captured data).
+
+### Without Docker
+
+The project uses [uv](https://docs.astral.sh/uv/) for dependencies; `pyproject.toml` and
+`uv.lock` are the source of truth.
+
+```bash
+uv sync
+uv run python SSH/ssh_server.py --config SSH/config.ini          # SSH honeypot
+uv run python -m listeners --config SSH/config.ini               # all enabled traps
+uv run python -m agents run-all --config SSH/config.ini          # one analysis pass
+uv run python -m listeners --list-scenarios
+uv run python -m listeners --describe healthcare
+```
+
+The SSH server listens on `[ssh] port` (8022 by default, on all addresses unless
+`[ssh] listen_host` is set) and stays in the foreground; without a model API key it prints
+one warning that sessions get canned replies. The listeners use the scenario's ports (for
+example 2121 for
+FTP, 8080 for HTTP); `[listeners] <service>_port` overrides them.
+
+## Configuration
+
+All settings live in one INI file, `SSH/config.ini`, created from
+[`SSH/config.ini.TEMPLATE`](SSH/config.ini.TEMPLATE), which documents every key. Every
+section after `[user_accounts]` is optional and has safe defaults.
+
+| Section | What it controls |
+|---|---|
+| `[honeypot]` | Log file, sensor name, data directory. |
+| `[ssh]` | Port, host key, SSH version banner, login, idle and session timeouts. |
+| `[llm]` | Persona model provider and model (OpenAI, Azure OpenAI, Ollama, Amazon Bedrock, Gemini, Anthropic), optional temperature, history size, system prompt. |
+| `[user_accounts]` | SSH accounts. A blank password allows login without a password; `*` accepts any password. |
+| `[budget]` | Line length, commands and tokens per session, tokens per source and globally per day, concurrent sessions. |
+| `[scenario]` | Active scenario, optional fixed seed, overlay path. |
+| `[listeners]` | Bind address, per-service overrides (`<service>_enabled`, `_port`, `_accept`), connection and rate limits (including the global inbound SIP UDP limit), quarantine caps, FTP passive ports and their timeout and per-source limit, PostgreSQL auth method, SIP UDP slack, optional model fallback for unknown SQL and API requests. |
+| `[agents]` | Analyst model and call caps per run and per day, tuner changes per run, triage records per run and record retention. |
+| `[respond]` | Response engine: enforcement queue, approval expiry, blocklist file and format, `never_act_on` ranges, proxy guard, notification caps, retention. |
+| `[connector.*]` | Outbound connectors (webhook, siem_http, email, enrich, ticket, block_webhook). All off by default. |
+| `[connector.s3_events]` | Event export: ships the event log to an S3 bucket as JSON lines for a SIEM S3 reader (`python -m agents ship`, also the last step of `run-all`). Off by default; passwords are hashed unless configured otherwise. See [docs/operations.md](docs/operations.md#event-export-to-s3). |
+
+Secrets are never written to the config. API keys and connector credentials are read from
+environment variables; the config names the variable (for example
+`secret_env = WINNIE_WEBHOOK_TOKEN`). The persona reads its provider's usual variable
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `AZURE_OPENAI_API_KEY`, or the
+AWS profile named in `[llm]`). The analyst agents and the listeners' optional model
+fallback use the provider set in `[agents] provider`: the Anthropic API
+(`ANTHROPIC_API_KEY`) or Amazon Bedrock (the standard AWS credential chain, such as an
+instance role, or the profile named in `[agents]`).
+
+### Telling the SSH persona what to emulate
+
+With a scenario active, the persona gets the scenario's host profile (hostname, OS, users,
+lure files and a prompt fragment). Without one, or to add detail, edit `SSH/prompt.txt`
+with a short description of the system. It can stay high level:
+
+    You are a video game developer's system. Include realistic video game source and asset files.
+
+or go into detail:
+
+    You are the Internet-facing mail server for bigschool.edu, a state-sponsored university
+    in Virginia. Valid user accounts are "a20093887", "a20093887-admin", and "mxadmin".
+    Home directories are in "/home/$USERNAME". Everyone's default shell is /bin/zsh, except
+    mxadmin's, which is bash. Mail spools for all campus users are in /var/spool/mail.
+
+## Scenarios
+
+| Name | Fake target |
+|---|---|
+| `sip_provider` | Hosted PBX (FreePBX / Asterisk): SIP, MySQL, FTP config backups, FreePBX web UI, SMTP, legacy telnet console. |
+| `contact_center` | Outsourced contact center on Asterisk: SIP, PostgreSQL CRM, MSSQL, FTP call recordings, agent desktop web app. |
+| `bank` | Community bank online banking and core: PostgreSQL core banking, Redis sessions, FTP payment batch drop, banking REST API. |
+| `healthcare` | Regional health system EHR integration host: HL7 MLLP, FHIR-style REST API, PostgreSQL clinical database, FTP lab and imaging share. |
+| `saas` | Multi-tenant SaaS app server: PostgreSQL, Redis, SMTP relay, web app and bearer-token API. |
+| `api_platform` | B2B data API gateway: versioned REST API with API keys, OpenAPI document, PostgreSQL, Redis. |
+
+Every organisation, person, phone number, card number and domain in them is invented, and a
+checker enforces that (`uv run python -m scenarios.check`). The SSH honeypot is available
+in every scenario. See [docs/scenarios.md](docs/scenarios.md) for the schema and how to
+add one.
+
+## Logs
+
+Every component writes one JSON object per line to the same log (`[honeypot] log_file`,
+`/data/ssh_log.log` in Docker). Timestamps are UTC. The `task_name` field identifies one
+connection; SSH entries carry `message` values such as `SSH connection received`,
+`Authentication success`, `User input`, `LLM response`, `Session summary` and
+`SSH connection closed`. `User input` and `LLM response` carry the text base64-encoded in
+`details`; `Session summary` carries a `judgement` of `BENIGN`, `SUSPICIOUS`,
+`MALICIOUS`, or `UNKNOWN` when no summary was made (for example without a model). Every
+entry carries `sensor_protocol` (`ssh` for the SSH server); listener entries add an `event`
+type (`connection`, `auth_attempt`, `command`, `register`, `invite`, ...).
+
+**The log contains every username and password attackers submit, in plain text.** See
+[docs/architecture.md](docs/architecture.md#logging-contract) for the full format.
+
+## Safety design
+
+- **No real system.** The SSH and Telnet shells are model output or canned text. The
+  listeners run nothing they receive: SQL goes to an in-memory fake engine, Redis `SAVE`
+  writes nothing, SMTP never relays, SIP never places or bridges a call.
+- **Front-ends do not connect out.** FTP active mode (`PORT`/`EPRT`) is refused, Redis
+  `SLAVEOF` never dials, SMTP opens no outbound socket. Apart from replies to clients, the only outbound
+  traffic a front-end produces is model API calls, if a model is configured. Tokens for
+  history trimming are counted locally, so no tokenizer is ever downloaded.
+- **Uploads are quarantined.** FTP uploads are stored once per SHA-256 with mode 0600,
+  under per-file, per-source and total caps, and are never read back or executed.
+- **Budgets in code.** Every model call reserves its estimated cost first; when a limit is
+  reached the model is not called and the attacker gets a canned error.
+- **The model cannot steer the system.** Models get no tools, files or network. Analyst
+  output must validate against strict schemas; the tuner only picks from candidates the
+  code generated; playbooks are matched and executed by code. Attacker text reaches
+  analysts only inside a randomly delimited block.
+- **Enforcement needs a person.** Actions that change something outside the honeypot
+  (blocklist export, publishing a detection, opening a ticket, calling a block webhook) are
+  only queued, and only when `[respond] queue_enforce = true`. They run after
+  `python -m agents approve <id>`, and approvals expire.
+- **Spoofable and internal sources are left alone.** UDP sources that never answered a SIP
+  nonce, non-global addresses and `never_act_on` ranges get no per-source action of any
+  kind.
+- **Hardened containers.** Non-root user, read-only root filesystem, all capabilities
+  dropped, `no-new-privileges`, and separate volumes for what the front-ends write and
+  what the agents write.
+
+The full threat model is in [docs/security-model.md](docs/security-model.md).
+
+## Deployment
+
+Read [docs/operations.md](docs/operations.md) before deploying. In short:
+
+- **Run it isolated.** Put the sensor on a dedicated host or VM in its own network segment
+  with no route to anything you care about. Block outbound traffic from the front-ends at
+  the host firewall; they need egress only for the persona model API, if you use one.
+  `docker-compose.isolated.yml` shows the no-egress layout for testing.
+- **Client addresses.** Disable Docker's userland proxy (or use host networking for the
+  front-ends). Otherwise every connection appears to come from the Docker gateway, and
+  per-source limits, logs and blocklists are useless.
+- **Legal and policy responsibility is yours.** Operating a honeypot means recording
+  traffic and credentials from third parties. Whether and how you may do that depends on
+  your jurisdiction, your hosting provider's terms and your organisation's policies.
+  Check before you deploy.
+- **SIP and HL7 traps in particular.** The SIP trap answers registrations and calls on a
+  well-known VoIP port; even though it never places a call, it attracts toll-fraud
+  traffic, and some providers and networks restrict hosting it. Over UDP it is built not
+  to amplify (responses are never larger than requests by default), but spoofed traffic
+  can still make it send packets to third parties within the rate caps. The HL7 trap
+  impersonates a clinical interface; inbound messages may contain what looks like (or,
+  from a misdirected real system, is) patient data. Do not expose it where real HL7
+  senders could reach it by mistake.
+- **Captured credentials are sensitive data.** The event log, `reports/`, the quarantine
+  and the approval queue hold attacker-supplied text and plain-text passwords, some of
+  which will be real credentials reused from elsewhere. Restrict access, rotate and
+  delete the log on a schedule, and decide how long you keep reports. The response engine
+  prunes its own run records and approvals (`[respond] retention_days`) and triage prunes
+  its session and campaign records (`[agents] record_retention_days`); nothing prunes the
+  event log or digests for you.
+
+## What is not yet verified
+
+Exercised in the local lab (Docker, `docker-compose.lab.yml`, no model key) against the
+`sip_provider`, `healthcare` and `bank` scenarios with real clients: OpenSSH, telnet
+(inetutils), Python `ftplib` (passive mode, uploads up to and over the quarantine cap),
+`swaks` (AUTH LOGIN and a message), the MySQL 8.4 client, `psql` 16, `redis-cli` 7, `curl`,
+`sipsak` (REGISTER), SIPVicious (`svmap`, `svcrack`) and python-hl7 `mllp_send`; plus
+`python -m agents run-all`, `queue`, `ship --dry-run` and `tune --history` in the agents
+container, and an overlay change picked up by both front-ends without a restart. Earlier
+lab runs also used `smtplib`, impacket `mssqlclient` and Microsoft `sqlcmd` (ODBC 13).
+
+The SSH persona was also run on a workstation against one real model, Claude Haiku on
+Amazon Bedrock (`llm_provider = AWS`): a few short sessions of ordinary commands and of
+attempts to make the model drop the role or reveal its prompt, with the end-of-session
+summary. One of those sessions was then triaged by the analyst model on Bedrock
+(`[agents] provider = bedrock`).
+
+Not verified:
+
+- Any other model provider. The tuner, the detection drafts, campaign triage and the telnet
+  and SQL persona answers have not run against a real model; those paths are tested with
+  fakes only.
+- Any real outbound connector endpoint (webhook, SIEM, email relay, enrichment service,
+  ticket system, block webhook) or a real S3 bucket for the event export.
+- SIP INVITE with a real client.
+- MSSQL clients that require encryption (the ODBC 18 default): they are logged and refused,
+  because the trap does not offer TLS.
+- The `contact_center`, `saas` and `api_platform` scenarios with real clients; their
+  services are covered by the test suite only.
+- Long-running operation on the public internet.
+
+## Known issues
+
+- **The fake file system is per session.** The model makes up the host's files as a session
+  goes on, so a file listed in one session may be missing in the next one from the same
+  source.
+- **Approximate token counts.** SSH history trimming and budgets count tokens locally (four
+  ASCII characters per token, non-ASCII text weighted higher), so `[llm]
+  trimmer_max_tokens` is an estimate rather than the provider's exact count.
+- **Image size.** The Docker image is about 650 MB on disk, mostly the Python base image
+  and the model provider client libraries. See
+  [docs/operations.md](docs/operations.md#image-size-and-token-counting).
+- The model sometimes invents the attacker's next command and answers it too.
+- The daily budget is shared between processes on one host through a file lock; several
+  hosts do not share one cap.
+- Changing the SSH banner or the active scenario needs a restart.
+
+## Tests
+
+```bash
+uv sync
+uv run pytest                        # skips the slow timing and scale tests
+uv run pytest -m "slow or not slow"  # everything, as CI runs it
+```
+
+No test touches the network beyond loopback, and none calls a real model. The SSH
+integration tests start the real server on a random local port and use a deterministic fake
+model. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE). This project is based on
+[DECEIVE](https://github.com/Cisco-Talos/DECEIVE) by Cisco Talos / Splunk, released under the
+MIT License; the original copyright notice is kept in `LICENSE`.

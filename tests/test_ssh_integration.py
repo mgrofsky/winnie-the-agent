@@ -17,7 +17,7 @@ sys.path.insert(0, str(SSH_DIR))
 import ssh_server  # noqa: E402
 
 
-PROMPT = "guest@deceive-test:~$ "
+PROMPT = "guest@winnie-test:~$ "
 SESSION_LOG_MESSAGES = {
     "SSH connection received",
     "Authentication success",
@@ -42,7 +42,7 @@ class ScriptedMessageHistory:
         if "Examine the list of all the SSH commands" in message:
             return FakeLLMResponse("The user ran a simple test command.\n\nJudgement: BENIGN")
         if message == "":
-            return FakeLLMResponse(f"Welcome to deceive-test\n{PROMPT}")
+            return FakeLLMResponse(f"Welcome to winnie-test\n{PROMPT}")
         if message == "exit":
             return FakeLLMResponse("YYY-END-OF-SESSION-YYY")
         if message == "pwd":
@@ -200,7 +200,7 @@ async def test_interactive_session_runs_commands_and_exits(connect, log_records)
     async with await connect() as conn:
         process = await conn.create_process(term_type="xterm")
         banner = await asyncio.wait_for(process.stdout.readuntil(PROMPT), timeout=2)
-        assert "Welcome to deceive-test" in banner
+        assert "Welcome to winnie-test" in banner
 
         process.stdin.write("pwd\n")
         output = await asyncio.wait_for(process.stdout.readuntil(PROMPT), timeout=2)
