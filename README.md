@@ -248,39 +248,10 @@ Read [docs/operations.md](docs/operations.md) before deploying. In short:
   its session and campaign records (`[agents] record_retention_days`); nothing prunes the
   event log or digests for you.
 
-## What is not yet verified
-
-Exercised in the local lab (Docker, `docker-compose.lab.yml`, no model key) against the
-`sip_provider`, `healthcare` and `bank` scenarios with real clients: OpenSSH, telnet
-(inetutils), Python `ftplib` (passive mode, uploads up to and over the quarantine cap),
-`swaks` (AUTH LOGIN and a message), the MySQL 8.4 client, `psql` 16, `redis-cli` 7, `curl`,
-`sipsak` (REGISTER), SIPVicious (`svmap`, `svcrack`) and python-hl7 `mllp_send`; plus
-`python -m agents run-all`, `queue`, `ship --dry-run` and `tune --history` in the agents
-container, and an overlay change picked up by both front-ends without a restart. Earlier
-lab runs also used `smtplib`, impacket `mssqlclient` and Microsoft `sqlcmd` (ODBC 13).
-
-The SSH persona was also run on a workstation against one real model, Claude Haiku on
-Amazon Bedrock (`llm_provider = AWS`): a few short sessions of ordinary commands and of
-attempts to make the model drop the role or reveal its prompt, with the end-of-session
-summary. One of those sessions was then triaged by the analyst model on Bedrock
-(`[agents] provider = bedrock`).
-
-Not verified:
-
-- Any other model provider. The tuner, the detection drafts, campaign triage and the telnet
-  and SQL persona answers have not run against a real model; those paths are tested with
-  fakes only.
-- Any real outbound connector endpoint (webhook, SIEM, email relay, enrichment service,
-  ticket system, block webhook) or a real S3 bucket for the event export.
-- SIP INVITE with a real client.
-- MSSQL clients that require encryption (the ODBC 18 default): they are logged and refused,
-  because the trap does not offer TLS.
-- The `contact_center`, `saas` and `api_platform` scenarios with real clients; their
-  services are covered by the test suite only.
-- Long-running operation on the public internet.
-
 ## Known issues
 
+- **MSSQL without TLS.** The MSSQL trap does not offer encryption, so clients that require
+  it (the ODBC 18 default) are logged and refused.
 - **The fake file system is per session.** The model makes up the host's files as a session
   goes on, so a file listed in one session may be missing in the next one from the same
   source.
