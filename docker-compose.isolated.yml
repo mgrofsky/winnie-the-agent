@@ -1,0 +1,39 @@
+# Isolation override: the front-ends (ssh, listeners and the per-scenario listeners-*
+# services) join only an internal network, so they have no route out and no DNS. Use it
+# to verify that nothing they do connects outward, with clients run as containers on the
+# same network:
+#
+#   docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.isolated.yml up -d
+#   docker run --rm --network winnie-lab_frontend winnie-agents:local python -c \
+#     "import urllib.request; print(urllib.request.urlopen('http://listeners:8080/').status)"
+#
+# Docker does not publish ports for containers that are only on an internal network, so
+# this layout serves no external traffic. For production egress control see
+# docs/operations.md (host firewall rule on the front-end subnet).
+
+services:
+  ssh:
+    networks: [frontend]
+    ports: !override []
+  listeners:
+    networks: [frontend]
+    ports: !override []
+  listeners-bank:
+    networks: [frontend]
+    ports: !override []
+  listeners-healthcare:
+    networks: [frontend]
+    ports: !override []
+  listeners-contact-center:
+    networks: [frontend]
+    ports: !override []
+  listeners-saas:
+    networks: [frontend]
+    ports: !override []
+  listeners-api-platform:
+    networks: [frontend]
+    ports: !override []
+
+networks:
+  frontend:
+    internal: true

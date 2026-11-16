@@ -1,0 +1,65 @@
+# Local lab override: every port on 127.0.0.1 and a high port, so the stack can run on a
+# workstation next to other services without exposing anything.
+#
+#   docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml up -d
+#   docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml down -v
+#
+# Lab ports: SSH 12222, FTP 12121 (passive 30000-30019), Telnet 12323, SMTP 12525,
+# HTTP 18080, MySQL 13306, PostgreSQL 15432, Redis 16379, SIP 15060 (udp+tcp),
+# HL7 MLLP 12575, MSSQL 11433. Set [listeners] ftp_pasv_address = 127.0.0.1 for the lab.
+# The per-scenario listeners-* services (started with --profile) also bind 127.0.0.1 only,
+# on ports of their own: bank 21xxx, healthcare 22xxx, contact_center 23xxx, saas 24xxx,
+# api_platform 25xxx, HTTP on 8443-8447.
+
+services:
+  ssh:
+    ports: !override
+      - "127.0.0.1:12222:8022"
+
+  listeners:
+    ports: !override
+      - "127.0.0.1:12121:2121"
+      - "127.0.0.1:12323:2323"
+      - "127.0.0.1:12525:2525"
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:11433:1433"
+      - "127.0.0.1:13306:3306"
+      - "127.0.0.1:15060:5060/udp"
+      - "127.0.0.1:15060:5060/tcp"
+      - "127.0.0.1:15432:5432"
+      - "127.0.0.1:16379:6379"
+      - "127.0.0.1:12575:2575"
+      - "127.0.0.1:30000-30019:30000-30019"
+
+  listeners-bank:
+    ports: !override
+      - "127.0.0.1:8443:8080"
+      - "127.0.0.1:21432:5432"
+      - "127.0.0.1:21379:6379"
+      - "127.0.0.1:21121:2121"
+
+  listeners-healthcare:
+    ports: !override
+      - "127.0.0.1:8444:8080"
+      - "127.0.0.1:22575:2575"
+      - "127.0.0.1:22432:5432"
+
+  listeners-contact-center:
+    ports: !override
+      - "127.0.0.1:23060:5060/udp"
+      - "127.0.0.1:23060:5060/tcp"
+      - "127.0.0.1:8445:8080"
+      - "127.0.0.1:23432:5432"
+      - "127.0.0.1:23433:1433"
+
+  listeners-saas:
+    ports: !override
+      - "127.0.0.1:8446:8080"
+      - "127.0.0.1:24432:5432"
+      - "127.0.0.1:24379:6379"
+      - "127.0.0.1:24525:2525"
+
+  listeners-api-platform:
+    ports: !override
+      - "127.0.0.1:8447:8080"
+      - "127.0.0.1:25432:5432"

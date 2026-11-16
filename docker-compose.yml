@@ -1,0 +1,192 @@
+# Winnie the Agent: SSH honeypot, login traps and the agents loop.
+#
+#   export ANTHROPIC_API_KEY=...        # passed by name only; never written to any file
+#   docker compose up --build           # SSH + listeners (scenario from SSH/config.ini) + agents
+#   docker compose --profile bank up    # add the example 'bank' sensor (one scenario per container)
+#
+# Trust boundaries (volumes):
+#   frontend  written only by ssh + listeners: event log, quarantine, budget state, sensor
+#             seed. Mounted read-only into agents.
+#   agentdata written only by agents: triage records, digests, tuner state and overlay
+#             snapshots, honeytoken registry, detection drafts. Front-ends never mount it.
+#   overlay   the tuner overlay and per-source response state: written by agents,
+#             read-only for the front-ends.
+# The agents container does not mount the repository. Tuner changes are versioned as
+# numbered overlay snapshots:  docker compose run --rm agents python -m agents tune --history --state-dir /agents/state
+#                              docker compose run --rm agents python -m agents tune --rollback N --state-dir /agents/state
+#
+# Client addresses: per-source limits, logs and blocklists need the real client IP. Docker's
+# userland proxy (the default on some setups) replaces it with the bridge gateway address,
+# for TCP and UDP. Run the daemon with "userland-proxy": false (iptables DNAT keeps the
+# source address) or use network_mode: host for the front-ends, and check the first log
+# lines show external addresses before relying on any per-IP control.
+#
+# Host ports default to the real service ports. For a laptop lab where 22/80 are taken,
+# override e.g. SSH_HOST_PORT=2222 HTTP_HOST_PORT=8080.
+
+x-hardening: &hardening
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+x-frontend-env: &frontend-env
+  # Persona provider keys, passed by name; set only the one [llm] llm_provider uses.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+  AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+  WINNIE_DATA_DIR: /data
+  WINNIE_OVERLAY: /overlay/overlay.json
+  WINNIE_SOURCE_STATE: /overlay/source_state.json
+
+x-frontend-volumes: &frontend-volumes
+  - ./SSH:/app/SSH:ro           # config.ini, host key, prompt (read-only)
+  - frontend:/data
+  - overlay:/overlay:ro
+
+services:
+  ssh:
+    <<: *hardening
+    build: .
+    image: winnie-agents:local
+    command: ["python", "SSH/ssh_server.py", "--config", "/app/SSH/config.ini",
+              "--log-file", "/data/ssh_log.log"]
+    environment: *frontend-env
+    networks: [frontend]
+    ports:
+      - "${SSH_HOST_PORT:-22}:8022"
+    volumes: *frontend-volumes
+
+  listeners:
+    <<: *hardening
+    image: winnie-agents:local
+    depends_on: [ssh]
+    command: ["python", "-m", "listeners", "--config", "/app/SSH/config.ini",
+              "--log-file", "/data/ssh_log.log", "--data-dir", "/data"]
+    environment: *frontend-env
+    networks: [frontend]
+    ports:
+      - "21:2121"
+      - "23:2323"
+      - "25:2525"
+      - "${HTTP_HOST_PORT:-80}:8080"
+      - "1433:1433"
+      - "3306:3306"
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "5432:5432"
+      - "6379:6379"
+      - "2575:2575"
+      # FTP passive data ports: must match [listeners] ftp_pasv_ports in config.ini. Set
+      # ftp_pasv_address to the sensor's public address, or clients will be told to connect
+      # to the container's internal address.
+      - "30000-30019:30000-30019"
+    volumes: *frontend-volumes
+
+  agents:
+    <<: *hardening
+    image: winnie-agents:local
+    depends_on: [ssh, listeners]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      WINNIE_DATA_DIR: /data
+      WINNIE_OVERLAY: /overlay/overlay.json
+      WINNIE_SOURCE_STATE: /overlay/source_state.json
+      RUN_ALL_INTERVAL_SECONDS: "3600"
+      # Event export ([connector.s3_events]): only the region is passed. Credentials come
+      # from the instance role or the environment, never from files in the repository.
+      AWS_REGION: ${AWS_REGION:-}
+      # Connector secrets are passed by name only, e.g.:
+      # WINNIE_WEBHOOK_TOKEN: ${WINNIE_WEBHOOK_TOKEN:-}
+    command:
+      - /bin/sh
+      - -c
+      - >
+        while true; do
+        python -m agents run-all --config /config/config.ini --log /data/ssh_log.log
+        --data-dir /data --reports-dir /agents/reports --state-dir /agents/state
+        --detections-dir /agents/detections;
+        sleep "$${RUN_ALL_INTERVAL_SECONDS}";
+        done
+    volumes:
+      - ./SSH/config.ini:/config/config.ini:ro   # read only; the tuner never writes it
+      - frontend:/data:ro
+      - agentdata:/agents
+      - overlay:/overlay
+
+  # One example sensor per scenario. Only the default stack above runs unless a profile
+  # is chosen. Each needs its own host ports (or address) in a real deployment, and would
+  # get its own frontend volume and agents service.
+  listeners-bank:
+    <<: *hardening
+    image: winnie-agents:local
+    profiles: ["bank"]
+    command: ["python", "-m", "listeners", "--config", "/app/SSH/config.ini", "--scenario", "bank",
+              "--log-file", "/data/ssh_log.log", "--data-dir", "/data"]
+    environment: *frontend-env
+    ports: ["8443:8080", "15432:5432", "16379:6379", "12121:2121"]
+    networks: [frontend]
+    volumes: [./SSH:/app/SSH:ro, frontend-bank:/data, overlay:/overlay:ro]
+
+  listeners-healthcare:
+    <<: *hardening
+    image: winnie-agents:local
+    profiles: ["healthcare"]
+    command: ["python", "-m", "listeners", "--config", "/app/SSH/config.ini", "--scenario",
+              "healthcare", "--log-file", "/data/ssh_log.log", "--data-dir", "/data"]
+    environment: *frontend-env
+    ports: ["8444:8080", "12575:2575", "25432:5432"]
+    networks: [frontend]
+    volumes: [./SSH:/app/SSH:ro, frontend-healthcare:/data, overlay:/overlay:ro]
+
+  listeners-contact-center:
+    <<: *hardening
+    image: winnie-agents:local
+    profiles: ["contact_center"]
+    command: ["python", "-m", "listeners", "--config", "/app/SSH/config.ini", "--scenario",
+              "contact_center", "--log-file", "/data/ssh_log.log", "--data-dir", "/data"]
+    environment: *frontend-env
+    ports: ["15060:5060/udp", "15060:5060/tcp", "8445:8080", "15433:5432", "11433:1433"]
+    networks: [frontend]
+    volumes: [./SSH:/app/SSH:ro, frontend-cc:/data, overlay:/overlay:ro]
+
+  listeners-saas:
+    <<: *hardening
+    image: winnie-agents:local
+    profiles: ["saas"]
+    command: ["python", "-m", "listeners", "--config", "/app/SSH/config.ini", "--scenario", "saas",
+              "--log-file", "/data/ssh_log.log", "--data-dir", "/data"]
+    environment: *frontend-env
+    ports: ["8446:8080", "35432:5432", "36379:6379", "12525:2525"]
+    networks: [frontend]
+    volumes: [./SSH:/app/SSH:ro, frontend-saas:/data, overlay:/overlay:ro]
+
+  listeners-api-platform:
+    <<: *hardening
+    image: winnie-agents:local
+    profiles: ["api_platform"]
+    command: ["python", "-m", "listeners", "--config", "/app/SSH/config.ini", "--scenario",
+              "api_platform", "--log-file", "/data/ssh_log.log", "--data-dir", "/data"]
+    environment: *frontend-env
+    ports: ["8447:8080", "45432:5432"]
+    networks: [frontend]
+    volumes: [./SSH:/app/SSH:ro, frontend-api:/data, overlay:/overlay:ro]
+
+# The front-ends get their own network so egress from them can be controlled on its own
+# (e.g. a host firewall rule on this subnet) without affecting the agents service.
+networks:
+  frontend: {}
+
+volumes:
+  frontend:
+  agentdata:
+  overlay:
+  frontend-bank:
+  frontend-healthcare:
+  frontend-cc:
+  frontend-saas:
+  frontend-api:

@@ -1,0 +1,13 @@
+.git
+.venv
+.pytest_cache
+**/__pycache__
+*.log
+reports
+quarantine
+detections/pending
+SSH/config.ini
+SSH/*host_key*
+SSH/*.pub
+*_budget_state.json
+budget_state.json
