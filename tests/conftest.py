@@ -12,6 +12,25 @@ if str(SSH_DIR) not in sys.path:
 import ssh_server  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_data_dir(tmp_path_factory, monkeypatch):
+    # Runtime state (budget counters, sensor seed) must never land in the repository.
+    monkeypatch.setenv("WINNIE_DATA_DIR", str(tmp_path_factory.mktemp("data")))
+    monkeypatch.setenv("WINNIE_SOURCE_STATE", str(tmp_path_factory.mktemp("state") / "source_state.json"))
+
+
+@pytest.fixture(autouse=True)
+def default_budget():
+    # Production entry points initialise the budget; tests that drive handle_client
+    # directly get an explicit in-memory one (the hooks fail closed without it).
+    from agents import hooks
+    from agents.budget import Budget, BudgetConfig
+
+    hooks.set_budget(Budget(BudgetConfig()))
+    yield
+    hooks.reset()
+
+
 @pytest.fixture
 def ssh_module():
     return ssh_server
@@ -42,3 +61,13 @@ def reset_ssh_server_state():
     ssh_server.accounts = original_accounts
     ssh_server.llm_sessions = original_llm_sessions
     ssh_server.with_message_history = original_with_message_history
+
+
+@pytest.fixture
+def public_test_net():
+    """Treat the TEST-NET-2 documentation range as public, for tests that need a source
+    address that per-source actions, blocklists and connectors accept."""
+    from agents.addresses import public_for_tests
+
+    with public_for_tests("198.51.100.0/24"):
+        yield

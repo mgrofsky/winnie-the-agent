@@ -235,11 +235,11 @@ def test_json_formatter_emits_documented_log_shape(ssh_module):
 
 
 class FakeExtraInfoSource:
-    def __init__(self, peername=None, sockname=None, deceive_session_id=None):
+    def __init__(self, peername=None, sockname=None, winnie_session_id=None):
         self._extra_info = {
             "peername": peername,
             "sockname": sockname,
-            "deceive_session_id": deceive_session_id,
+            "winnie_session_id": winnie_session_id,
         }
 
     def get_extra_info(self, name, default=None):
@@ -255,8 +255,8 @@ def test_new_session_id_uses_session_prefix(ssh_module):
     assert first != second
 
 
-def test_get_session_id_reads_deceive_session_extra(ssh_module):
-    source = FakeExtraInfoSource(deceive_session_id="session-test")
+def test_get_session_id_reads_winnie_session_extra(ssh_module):
+    source = FakeExtraInfoSource(winnie_session_id="session-test")
 
     assert ssh_module.get_session_id(source) == "session-test"
     assert ssh_module.get_session_id(None, fallback="session-fallback") == "session-fallback"
@@ -302,7 +302,7 @@ def test_get_session_log_extra_combines_connection_metadata_and_task_name(ssh_mo
     source = FakeExtraInfoSource(
         peername=("192.0.2.10", 4444),
         sockname=("198.51.100.20", 22),
-        deceive_session_id="session-test",
+        winnie_session_id="session-test",
     )
 
     assert ssh_module.get_session_log_extra(source) == {
@@ -372,7 +372,7 @@ def test_choose_llm_instantiates_supported_providers_with_configured_options(
         "azure_endpoint": "https://azure.example",
         "azure_api_version": "2025-01-01-preview",
         "aws_region": "us-west-2",
-        "aws_credentials_profile": "deceive-profile",
+        "aws_credentials_profile": "winnie-profile",
     }
 
     openai = ssh_module.choose_llm("OpenAI", "model-x")
@@ -388,7 +388,7 @@ def test_choose_llm_instantiates_supported_providers_with_configured_options(
     assert aws.kwargs == {
         "model": "model-x",
         "region_name": "us-west-2",
-        "credentials_profile_name": "deceive-profile",
+        "credentials_profile_name": "winnie-profile",
         "temperature": 0.3,
     }
 
@@ -473,3 +473,96 @@ async def test_session_summary_logs_judgement_once(tmp_path, ssh_module):
     assert records[0]["task_name"] == "session-a"
     assert records[0]["details"].endswith("Judgement: MALICIOUS")
     assert records[0]["judgement"] == "MALICIOUS"
+
+
+@pytest.mark.parametrize("provider", ["openai", "azure", "ollama", "aws", "gemini", "anthropic"])
+def test_history_trimming_counts_tokens_locally_for_every_provider(ssh_module, monkeypatch,
+                                                                   provider):
+    """Trimming works offline: no tokenizer files and no provider token-count call."""
+    from langchain_core.language_models import base as lm_base
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    def no_tokenizer(*_args, **_kwargs):
+        raise OSError("tokenizer files are not available")
+
+    monkeypatch.setattr(lm_base, "get_tokenizer", no_tokenizer)
+    seen = []
+
+    class Recorder(FakeListChatModel):
+        def _call(self, messages, stop=None, run_manager=None, **kwargs):
+            seen.append(list(messages))
+            return super()._call(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+        def get_num_tokens_from_messages(self, messages, tools=None):
+            raise AssertionError("token counting must not go through the provider")
+
+    monkeypatch.setattr(ssh_module, "choose_llm", lambda *_a, **_k: Recorder(responses=["ok"]))
+    cfg = ConfigParser()
+    cfg["llm"] = {"llm_provider": provider, "model_name": "m", "trimmer_max_tokens": "200"}
+    monkeypatch.setattr(ssh_module, "config", cfg)
+    monkeypatch.setattr(ssh_module, "llm_sessions", {})
+    history = ssh_module.llm_get_session_history("s1")
+    for i in range(40):
+        history.add_message(HumanMessage(content=f"command {i} " + "x" * 200))
+        history.add_message(AIMessage(content=f"output {i} " + "y" * 200))
+
+    chain = ssh_module.build_message_history("system prompt", "")
+    chain.invoke({"messages": [HumanMessage(content="whoami")]},
+                 config={"configurable": {"session_id": "s1"}})
+
+    (sent,) = seen
+    assert len(sent) < 20                      # older turns were trimmed away
+    assert sent[-1].content == "whoami"
+
+
+@pytest.mark.parametrize("provider,key_env", [("openai", "OPENAI_API_KEY"),
+                                              ("anthropic", "ANTHROPIC_API_KEY"),
+                                              ("gemini", "GOOGLE_API_KEY"),
+                                              ("azure", "AZURE_OPENAI_API_KEY")])
+async def test_server_starts_offline_when_the_provider_key_is_not_set(
+        tmp_path, monkeypatch, ssh_module, provider, key_env):
+    """The template config with no API key in the environment must start and answer with
+    canned shell replies instead of failing while the model client is built."""
+    from agents import hooks
+
+    monkeypatch.delenv(key_env, raising=False)
+    config_file = tmp_path / "config.ini"
+    _write_config(config_file, log_file=str(tmp_path / "ssh_log.log"))
+    config_file.write_text(config_file.read_text().replace("llm_provider = openai",
+                                                           f"llm_provider = {provider}"))
+    args = ssh_module.parse_args(["--config", str(config_file), "--prompt", "a mail server"])
+
+    ssh_module.configure_runtime(args)
+
+    assert ssh_module.with_message_history is not None
+    reply = await hooks.persona_invoke(
+        ssh_module.with_message_history, session_id="s1", src_ip="198.51.100.7",
+        username="guest", text="uname -a", interactive=True,
+        llm_config={"configurable": {"session_id": "s1"}})
+    assert "command not found" in reply.content
+
+
+def test_history_trim_counter_weights_non_ascii_text(ssh_module):
+    from langchain_core.messages import HumanMessage
+
+    counted = ssh_module.trim_token_counter([HumanMessage(content="文" * 1000)])
+    assert counted >= 1000
+
+
+def test_temperature_is_not_sent_unless_configured(ssh_module, monkeypatch):
+    captured = {}
+
+    class Fake:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(ssh_module, "ChatBedrockConverse", Fake)
+    ssh_module.config = ConfigParser()
+    ssh_module.config["llm"] = {"llm_provider": "AWS", "model_name": "model-x"}
+    ssh_module.choose_llm()
+    assert "temperature" not in captured
+    captured.clear()
+    ssh_module.config["llm"]["temperature"] = "0.4"
+    ssh_module.choose_llm()
+    assert captured["temperature"] == 0.4

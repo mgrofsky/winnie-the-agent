@@ -18,15 +18,25 @@ from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_aws import ChatBedrock, ChatBedrockConverse
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama 
-from langchain_core.messages import HumanMessage, SystemMessage, trim_messages
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, trim_messages
 from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from asyncssh.misc import ConnectionLost
 import socket
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Agent layer (budgets, scenario persona, account reload); see docs/architecture.md.
+if os.path.dirname(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
+from agents import hooks as agent_hooks  # noqa: E402
+from agents.budget import count_message_tokens as trim_token_counter  # noqa: E402
+
+# Sent instead of an empty first message; some providers reject empty content.
+SESSION_OPENER = "[new login session started]"
+IDLE_LOGOUT = "\r\ntimed out waiting for input: auto-logout\r\n"
 config = ConfigParser()
 config_base_dir = SCRIPT_DIR
 accounts = {}
@@ -66,7 +76,7 @@ def new_session_id() -> str:
 def get_session_id(source, fallback=None):
     if source is None:
         return fallback
-    return source.get_extra_info('deceive_session_id', fallback)
+    return source.get_extra_info('winnie_session_id', fallback)
 
 
 def get_session_log_extra(source, session_id: Optional[str] = None) -> dict:
@@ -114,7 +124,7 @@ class MySSHServer(asyncssh.SSHServer):
         self.log_extra = get_session_log_extra(None, self.session_id)
 
     def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
-        conn.set_extra_info(deceive_session_id=self.session_id)
+        conn.set_extra_info(winnie_session_id=self.session_id)
         self.log_extra = get_session_log_extra(conn, self.session_id)
         logger.info("SSH connection received", extra=self.log_extra)
 
@@ -130,6 +140,7 @@ class MySSHServer(asyncssh.SSHServer):
             asyncio.create_task(session_summary(self._process, self._llm_config, self._session, self, self.log_extra))
 
     def begin_auth(self, username: str) -> bool:
+        _refresh_accounts()  # agent layer: pick up config/overlay account changes
         if accounts.get(username) != '':
             logger.info("User attempting to authenticate", extra=merge_log_extra(self.log_extra, username=username))
             return True
@@ -193,13 +204,17 @@ representative examples.
 '''
 
     # Ask the LLM for its summary
-    llm_response = await session.ainvoke(
-        {
-            "messages": [HumanMessage(content=prompt)],
-            "username": process.get_extra_info('username'),
-            "interactive": True  # Ensure interactive flag is passed
-        },
-            config=llm_config
+    # Agent layer: summaries share the session, per-source and daily budgets.
+    summary_extra = log_extra or {}
+    llm_response = await agent_hooks.summary_invoke(
+        session,
+        session_id=llm_config.get("configurable", {}).get("session_id", "-"),
+        src_ip=str(summary_extra.get("src_ip", "-")),
+        username=process.get_extra_info('username'),
+        prompt=prompt,
+        llm_config=llm_config,
+        logger=logger,
+        log_extra=log_extra,
     )
 
     # Extract the judgement from the response
@@ -232,22 +247,34 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
     llm_config = {"configurable": {"session_id": task_uuid}}
     log_extra = get_session_log_extra(process, task_uuid)
 
+    # Agent layer: concurrency caps, and one budgeted path for every persona call.
+    src_ip = str(log_extra.get("src_ip", "-"))
+    refusal = agent_hooks.session_open(task_uuid, src_ip, logger, log_extra)
+    if refusal is not None:
+        process.stdout.write(refusal)
+        process.exit(1)
+        return
+
+    async def persona_call(text: str, interactive: bool, counts_as_command: bool = True):
+        return await agent_hooks.persona_invoke(
+            with_message_history, session_id=task_uuid, src_ip=src_ip,
+            username=process.get_extra_info('username'), text=text, interactive=interactive,
+            llm_config=llm_config, logger=logger, log_extra=log_extra,
+            counts_as_command=counts_as_command)
+
+    ssh_cfg = config['ssh'] if 'ssh' in config else {}
+    idle_timeout = float(ssh_cfg.get('idle_timeout', 300))
+    session_deadline = asyncio.get_running_loop().time() + float(ssh_cfg.get('session_timeout', 1800))
+
     try:
         if process.command:
             # Handle non-interactive command execution
-            command = process.command
+            command = agent_hooks.clip_input(process.command)  # line length cap
             logger.info(
                 "User input",
                 extra=merge_log_extra(log_extra, details=b64encode(command.encode('utf-8')).decode('utf-8'), interactive=False)
             )
-            llm_response = await with_message_history.ainvoke(
-                {
-                    "messages": [HumanMessage(content=command)],
-                    "username": process.get_extra_info('username'),
-                    "interactive": False
-                },
-                    config=llm_config
-            )
+            llm_response = await persona_call(command, False)
             process.stdout.write(f"{llm_response.content}")
             logger.info(
                 "LLM response",
@@ -257,37 +284,37 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
             process.exit(0)
         else:
             # Handle interactive session
-            llm_response = await with_message_history.ainvoke(
-                {
-                    "messages": [HumanMessage(content="")],
-                    "username": process.get_extra_info('username'),
-                    "interactive": True
-                },
-                    config=llm_config
-            )
+            llm_response = await persona_call("", True, counts_as_command=False)
 
             process.stdout.write(f"{llm_response.content}")
             logger.info(
                 "LLM response",
                 extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8')).decode('utf-8'), interactive=True)
             )
+            if getattr(llm_response, "budget_exceeded", False):  # canned reply, then close
+                return
 
-            async for line in process.stdin:
-                line = line.rstrip('\n')
+            while True:
+                # Idle and absolute session timeouts free the concurrency slot.
+                remaining = session_deadline - asyncio.get_running_loop().time()
+                try:
+                    line = await asyncio.wait_for(process.stdin.readline(),
+                                                  timeout=max(0.0, min(idle_timeout, remaining)))
+                except asyncio.TimeoutError:
+                    process.stdout.write(IDLE_LOGOUT)
+                    logger.info("Session timeout", extra=merge_log_extra(
+                        log_extra, reason="idle" if remaining > idle_timeout else "session"))
+                    return
+                if not line:
+                    break
+                line = agent_hooks.clip_input(line.rstrip('\n'))  # line length cap
                 logger.info(
                     "User input",
                     extra=merge_log_extra(log_extra, details=b64encode(line.encode('utf-8')).decode('utf-8'), interactive=True)
                 )
 
                 # Send the command to the LLM and give the response to the user
-                llm_response = await with_message_history.ainvoke(
-                    {
-                        "messages": [HumanMessage(content=line)],
-                        "username": process.get_extra_info('username'),
-                        "interactive": True
-                    },
-                        config=llm_config
-                )
+                llm_response = await persona_call(line, True)
                 if llm_response.content == "YYY-END-OF-SESSION-YYY":
                     await session_summary(process, llm_config, with_message_history, server, log_extra)
                     process.exit(0)
@@ -298,11 +325,17 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
                         "LLM response",
                         extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8')).decode('utf-8'), interactive=True)
                     )
+                    if getattr(llm_response, "budget_exceeded", False):  # canned reply, close
+                        return
 
     except asyncssh.BreakReceived:
         pass
     finally:
-        await session_summary(process, llm_config, with_message_history, server, log_extra)
+        try:
+            await session_summary(process, llm_config, with_message_history, server, log_extra)
+        finally:
+            # Release the concurrency slot and free this session's chat history.
+            agent_hooks.session_close(task_uuid, llm_sessions)
         process.exit(0)
 
     # Just in case we ever get here, which we probably shouldn't
@@ -335,7 +368,8 @@ async def start_server():
         server_factory=MySSHServer,
         server_host_keys=resolve_runtime_path(config['ssh'].get("host_priv_key", "ssh_host_key")),
         process_factory=lambda process: handle_client(process, MySSHServer()),
-        server_version=config['ssh'].get("server_version_string", "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.3")
+        server_version=config['ssh'].get("server_version_string", "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.3"),
+        login_timeout=config['ssh'].getint("login_timeout", 60),  # agent layer: bound pre-auth slots
     )
 
 class ContextFilter(logging.Filter):
@@ -379,18 +413,26 @@ def get_user_accounts() -> dict:
 
     return accounts
 
+def _refresh_accounts() -> None:
+    # Agent layer: re-read accounts when config.ini or the tuner overlay changes (mtime).
+    global accounts
+    accounts = agent_hooks.reload_accounts_if_changed(accounts)
+
+
 def choose_llm(llm_provider: Optional[str] = None, model_name: Optional[str] = None):
     llm_provider_name = llm_provider or config['llm'].get("llm_provider", "openai")
     llm_provider_name = llm_provider_name.lower()
     model_name = model_name or config['llm'].get("model_name", "gpt-4o-mini")
     
-    # Get temperature parameter from config, default to 0.2 if not specified
-    temperature = config['llm'].getfloat("temperature", 0.2)
+    # temperature is sent only when it is set: some current models reject the parameter
+    # and every call then fails, so the provider's default is used otherwise.
+    raw_temperature = config['llm'].get("temperature", "").strip()
+    sampling = {"temperature": float(raw_temperature)} if raw_temperature else {}
 
     if llm_provider_name == 'openai':
         llm_model = ChatOpenAI(
             model=model_name,
-            temperature=temperature
+            **sampling
         )
     elif llm_provider_name == 'azure':
         llm_model = AzureChatOpenAI(
@@ -398,24 +440,33 @@ def choose_llm(llm_provider: Optional[str] = None, model_name: Optional[str] = N
             azure_endpoint=config['llm'].get("azure_endpoint"),
             api_version=config['llm'].get("azure_api_version"),
             model=config['llm'].get("model_name"),  # Ensure model_name is passed here
-            temperature=temperature
+            **sampling
         )
     elif llm_provider_name == 'ollama':
         llm_model = ChatOllama(
             model=model_name,
-            temperature=temperature
+            **sampling
         )
     elif llm_provider_name == 'aws':
         llm_model = ChatBedrockConverse(
             model=model_name,
             region_name=config['llm'].get("aws_region", "us-east-1"),
             credentials_profile_name=config['llm'].get("aws_credentials_profile", "default"),
-            temperature=temperature
+            **sampling
         )
     elif llm_provider_name == 'gemini':
         llm_model = ChatGoogleGenerativeAI(
             model=model_name,
-            temperature=temperature
+            **sampling
+        )
+    elif llm_provider_name == 'anthropic':
+        # Claude provider. The key comes from ANTHROPIC_API_KEY in the
+        # environment. temperature is not sent: current Claude models reject non-default
+        # sampling parameters.
+        llm_model = ChatAnthropic(
+            model=model_name,
+            max_tokens=config['llm'].getint("max_tokens", 2048),
+            max_retries=2,
         )
     else:
         raise ValueError(f"Invalid LLM provider {llm_provider_name}.")
@@ -462,6 +513,7 @@ def parse_args(argv=None):
     parser.add_argument('-L', '--log-file', type=str, help='The name of the file you wish to write the honeypot log to')
     parser.add_argument('-S', '--sensor-name', type=str, help='The name of the sensor, used to identify this honeypot in the logs')
     parser.add_argument('-u', '--user-account', action='append', help='User account in the form username=password. Can be repeated.')
+    parser.add_argument('--scenario', type=str, help='Active scenario pack name (overrides [scenario] active)')
     return parser.parse_args(argv)
 
 
@@ -511,6 +563,10 @@ def apply_args_to_config(args) -> None:
         config['honeypot']['log_file'] = args.log_file
     if args.sensor_name:
         config['honeypot']['sensor_name'] = args.sensor_name
+    if getattr(args, "scenario", None):
+        if 'scenario' not in config:
+            config['scenario'] = {}
+        config['scenario']['active'] = args.scenario
 
     if args.user_account:
         if 'user_accounts' not in config:
@@ -542,43 +598,70 @@ def configure_logging() -> None:
     logger.addFilter(ContextFilter())
 
 
+def _non_empty_messages(messages):
+    # Never send empty content to a provider: the session opener is an empty human turn,
+    # and a model may return an empty reply that is replayed as history.
+    out = []
+    for m in messages:
+        if isinstance(m, HumanMessage) and not str(m.content).strip():
+            m = HumanMessage(content=SESSION_OPENER)
+        elif isinstance(m, AIMessage) and not str(m.content).strip():
+            m = AIMessage(content="[no output]")
+        out.append(m)
+    return out
+
+
+def _profile_messages(inputs: dict):
+    # Scenario persona block (rendered only from schema-validated scenario/overlay fields),
+    # passed on every call; omitted entirely when there is no scenario.
+    profile = str(inputs.get("decoy_profile") or "")
+    return [SystemMessage(content=profile)] if profile.strip() else []
+
+
+def build_persona_prompt(llm_system_prompt: str, llm_user_prompt: str, llm_trimmer=None):
+    """Prompt runnable (everything before the model) with no empty content blocks."""
+    system_parts = [("system", text) for text in (llm_system_prompt, llm_user_prompt)
+                    if text and text.strip()]
+    llm_prompt = ChatPromptTemplate.from_messages(
+        system_parts + [
+            MessagesPlaceholder(variable_name="profile_messages"),
+            MessagesPlaceholder(variable_name="messages"),
+        ]
+    )
+    messages = itemgetter("messages") | RunnableLambda(_non_empty_messages)
+    if llm_trimmer is not None:
+        messages = messages | llm_trimmer
+    return (
+        RunnablePassthrough.assign(messages=messages,
+                                   profile_messages=RunnableLambda(_profile_messages))
+        | llm_prompt
+    )
+
+
 def build_message_history(llm_system_prompt: str, llm_user_prompt: str):
     llm = choose_llm(config['llm'].get("llm_provider"), config['llm'].get("model_name"))
-
+    # Tokens are counted locally with an approximate counter for every provider: no
+    # count_tokens API call per turn and no tokenizer download, so trimming works offline.
     llm_trimmer = trim_messages(
         max_tokens=config['llm'].getint("trimmer_max_tokens", 64000),
         strategy="last",
-        token_counter=llm,
+        token_counter=trim_token_counter,
         include_system=True,
         allow_partial=False,
         start_on="human",
     )
 
-    llm_prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                llm_system_prompt
-            ),
-            (
-                "system",
-                llm_user_prompt
-            ),
-            MessagesPlaceholder(variable_name="messages"),
-        ]
-    )
-
-    llm_chain = (
-        RunnablePassthrough.assign(messages=itemgetter("messages") | llm_trimmer)
-        | llm_prompt
-        | llm
-    )
+    llm_chain = build_persona_prompt(llm_system_prompt, llm_user_prompt, llm_trimmer) | llm
 
     return RunnableWithMessageHistory(
         llm_chain,
         llm_get_session_history,
         input_messages_key="messages"
     )
+
+
+# Stands in for the model chain when the persona runs offline; never invoked.
+OFFLINE_HISTORY = object()
 
 
 def configure_runtime(args, message_history=None) -> None:
@@ -592,11 +675,26 @@ def configure_runtime(args, message_history=None) -> None:
     llm_sessions = {}
     configure_logging()
 
-    if message_history is None:
+    # Agent layer: budgets, scenario persona, tuner overlay accounts.
+    config_path = args.config if args.config is not None else resolve_runtime_path("config.ini")
+    cli_accounts = {}
+    for account in (args.user_account or []):
+        key, _, value = account.partition('=')
+        cli_accounts[key.strip()] = value.strip()
+    agent_hooks.init_runtime(
+        config, config_path if config_path and os.path.exists(config_path) else None,
+        config_base_dir, cli_accounts)
+    accounts = agent_hooks.merged_accounts(accounts)
+
+    if message_history is not None:
+        with_message_history = message_history
+    elif agent_hooks.offline_reason():
+        # No API key for the provider: some clients refuse to be built without one, and
+        # offline sessions never call the model, so no model client is built at all.
+        with_message_history = OFFLINE_HISTORY
+    else:
         prompts = get_prompts(args.prompt, args.prompt_file)
         with_message_history = build_message_history(prompts["system_prompt"], prompts["user_prompt"])
-    else:
-        with_message_history = message_history
 
 
 def main(argv=None) -> int:

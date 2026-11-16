@@ -1,4 +1,4 @@
-# THIS IS A TEMPLATE CONFIG FILE FOR HADES
+# Template configuration for Winnie the Agent. Copy it to SSH/config.ini and edit.
 # We provide reasonable defaults for most configuration items, but you should 
 # review this before using it in production. 
 
@@ -9,13 +9,21 @@ log_file = ssh_log.log
 
 # The name of the sensor, used to identify this honeypot in the logs.
 # If you leave this blank, the honeypot will use the system's hostname.
-sensor_name = deceive
+sensor_name = winnie
+
+# Writable runtime state (budget counters, sensor seed). Relative paths resolve from this
+# file's directory. Defaults to <repo>/data; the WINNIE_DATA_DIR environment variable
+# overrides it (containers set it to their data volume).
+#data_dir = ../data
 
 # Settings for the SSH honeypot
 [ssh]
 # The port the SSH honeypot will listen on. You will probably want to set 
 # this to 22 for production use.
 port = 8022
+# Address to listen on. Empty (the default) listens on every address; set 127.0.0.1 to
+# keep a local test off the network.
+#listen_host = 127.0.0.1
 # The host key to use for the SSH server. This should be a private key.
 # See the README for how to generate this key.
 host_priv_key = ssh_host_key
@@ -23,6 +31,11 @@ host_priv_key = ssh_host_key
 # prepends "SSH-2.0-" to this. So "OpenSSH_8.2p1 Ubuntu-4ubuntu0.3" will 
 # be transformed to "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.3".
 server_version_string = OpenSSH_8.2p1 Ubuntu-4ubuntu0.3
+# Seconds allowed to finish authenticating, seconds without input before an interactive
+# session is logged out, and the absolute session lifetime. Each frees a concurrency slot.
+login_timeout = 60
+idle_timeout = 300
+session_timeout = 1800
 
 # Settings to configure which LLM backend to use.  Only one stanza 
 # should be uncommented at a time.
@@ -54,17 +67,31 @@ model_name = gpt-4o
 #llm_provider = gemini
 #model_name = gemini-1.5-pro
 
+##### Anthropic Claude (direct API)
+# The API key is read from the ANTHROPIC_API_KEY environment variable. Never put a
+# key in this file. temperature is ignored for this provider (current Claude models
+# reject non-default sampling parameters).
+#llm_provider = anthropic
+#model_name = claude-haiku-5-5
+#max_tokens = 2048
+
 # Temperature controls randomness in LLM responses. Values usually range from 0.0 to 2.0.
 # Lower values (e.g., 0.2) make responses more focused and deterministic.
 # Higher values (e.g., 0.8) make responses more creative and variable.
-# Default is 0.2.
-temperature = 0.2
+# Not set by default: the provider's own default is used. Some current models (for example
+# recent Claude models on Amazon Bedrock) reject this parameter, and every model call then
+# fails with a `Model error` event. The anthropic provider never sends it.
+#temperature = 0.2
 
 # The maximum number of tokens to send to the LLM backend in a single 
 # request. This includes the message history for the session, so should
 # be fairly high. Not all models support large token counts, so be sure 
 # to test this with your model.
 trimmer_max_tokens = 64000
+
+# Description of the emulated system for the telnet persona, relative to this file. The
+# SSH server takes it from --prompt-file instead (default: prompt.txt).
+#prompt_file = prompt.txt
 
 # System prompt for the LLM. This will be the same for any running instance.
 # Change this if you need to tweak behaviors of the simulation itself.
@@ -106,3 +133,257 @@ guest =
 user1 = secretpw
 user2 = password123
 root = *
+
+# ---------------------------------------------------------------------------
+# Agent layer (see docs/architecture.md). Everything below is optional; the server
+# runs with safe defaults when a section is missing.
+# ---------------------------------------------------------------------------
+
+# Spend and concurrency limits for the persona model, enforced in code. When a
+# limit is hit the model is not called: the attacker gets a canned fork/resource
+# error and the session closes. Token counts use provider usage metadata when
+# present, otherwise characters/4 over the session history.
+[budget]
+# A command costs about the size of the system prompt plus the session so far; with the
+# default prompt and a scenario that is roughly 5,000 tokens for an early command, so the
+# session default allows on the order of 50 commands.
+max_line_bytes = 2048
+max_commands_per_session = 200
+max_tokens_per_session = 400000
+max_tokens_per_ip_per_day = 1000000
+max_tokens_per_day = 3000000
+max_concurrent_sessions = 20
+max_concurrent_sessions_per_ip = 3
+# Daily counters (global and per source; IPv6 sources count per /64) persist here, shared
+# by the SSH server and the listeners on the same host through a file lock, so a restart
+# does not reset the day. Relative paths resolve inside the data directory.
+state_file = budget_state.json
+
+# One scenario pack makes the whole sensor look like one coherent target.
+# Names: sip_provider, contact_center, bank, saas, api_platform, healthcare
+# (python -m listeners --list-scenarios). Changing it needs a restart.
+[scenario]
+active = sip_provider
+# Seed for deterministic fake data and honeytokens. By default a random seed is created
+# once in the data directory (file sensor_seed, mode 0600); keep that file to keep the same
+# records across rebuilds. Never derive it from anything public.
+#seed =
+# Tuner-owned overlay: fake accounts for every service (including SSH), SIP extensions,
+# lures, after_n bounds. Merged over [user_accounts] (configured accounts always win).
+# The tuner writes only this file. WINNIE_OVERLAY overrides the path.
+overlay = ../decoy/overlay.json
+
+# Low-interaction login traps (python -m listeners). Per-service keys override
+# the scenario: <service>_enabled, <service>_port, <service>_accept
+# (all | listed | after_n | none) and <service>_auth (only postgres uses it, see below).
+# Services: sip ftp telnet postgres mysql mssql redis smtp http mllp.
+[listeners]
+bind_host = 0.0.0.0
+# Defaults to [honeypot] log_file so all protocols share one log.
+#log_file = ssh_log.log
+#sip_port = 5060
+#mssql_enabled = false
+# Reads before login time out sooner than after login. A connection that sends fewer
+# than min_progress_bytes within progress_window seconds is closed.
+pre_login_timeout = 20
+read_timeout = 60
+session_timeout = 600
+min_progress_bytes = 8
+progress_window = 30
+max_line_bytes = 4096
+max_conn_bytes = 1048576
+# Connection slots: all services, one source (IPv6: per /64), one service, one source on
+# one service.
+max_connections = 256
+max_connections_per_ip = 8
+max_connections_per_service = 64
+max_connections_per_ip_per_service = 4
+rate_per_ip_per_minute = 60
+# UDP (SIP) responses: per source and for all sources together.
+udp_responses_per_ip_per_minute = 20
+udp_responses_per_second = 50
+# Inbound UDP datagrams from all sources together, checked before any parsing. The rest
+# are dropped silently and counted in one aggregated log line per minute. Events from
+# sources that never completed a SIP nonce round trip are aggregated like low-value lines.
+udp_requests_per_second = 200
+# A UDP response is never larger than its request. Some real clients send REGISTERs
+# smaller than the 401 challenge and then get no answer; allowing a little slack
+# (e.g. 128 bytes, max 512) answers them at the cost of a small, rate-capped
+# amplification factor.
+sip_udp_slack_bytes = 0
+# Ceilings for low-value log lines (refused connections, malformed datagrams). Lines about
+# UDP sources that never answered a SIP nonce (possibly forged) have their own ceiling, so
+# a forged flood cannot crowd out the rest. Suppressed lines are counted and reported in a
+# summary line per protocol every minute, which the daily digest lists.
+low_value_events_per_second = 20
+unverified_events_per_second = 20
+max_commands_per_connection = 500
+# Uploads (FTP STOR): stored once per SHA-256, mode 0600, never read back or run. Usage is
+# recomputed from disk at start. Upload bytes are bounded by these caps, not by
+# max_conn_bytes: an upload over quarantine_max_file_bytes is cut at the cap, stored and
+# logged as truncated; over a per-source or total quota reading stops and nothing is kept.
+quarantine_dir = ../quarantine
+quarantine_max_file_bytes = 5242880
+quarantine_per_ip_bytes = 20971520
+quarantine_total_bytes = 104857600
+# FTP passive mode: data ports to listen on (publish the same range in Docker) and the
+# address to advertise (default: the local address of the control connection).
+ftp_pasv_ports = 30000-30019
+#ftp_pasv_address = 203.0.113.10
+# An unused passive listener closes after this many seconds; one source may hold at most
+# ftp_pasv_per_ip open passive listeners.
+ftp_pasv_accept_timeout = 30
+ftp_pasv_per_ip = 2
+# PostgreSQL password exchange: md5 (default) or cleartext.
+#postgres_auth = md5
+# Post-login free-form answers (unknown SQL, unknown API routes, telnet persona)
+# use the budgeted model only when this is true; otherwise protocol errors.
+llm = false
+model = claude-haiku-5-5
+llm_max_inflight = 4
+llm_timeout = 20
+# With llm = true and the [llm] provider's key set, telnet sessions use the SSH persona
+# model; false keeps the canned telnet shell.
+#telnet_persona = true
+
+# Analyst agents (python -m agents ...)
+[agents]
+# Analyst model provider: anthropic (key from ANTHROPIC_API_KEY in the environment) or
+# bedrock (Amazon Bedrock, credentials from the standard AWS chain: an instance role, the
+# environment, or the profile named below). With bedrock, model is a Bedrock model or
+# inference profile id, for example us.anthropic.claude-haiku-5-5. The same provider answers
+# the listeners' free-form questions when [listeners] llm is true.
+provider = anthropic
+model = claude-haiku-5-5
+#aws_region = us-east-1
+#aws_credentials_profile = default
+# Analyst model calls: shared by every stage of one run, and capped per UTC day.
+max_llm_calls_per_run = 20
+max_analyst_calls_per_day = 500
+max_tuner_changes_per_run = 3
+# Triage writes at most this many records per run (the rest wait for the next run), and
+# removes session and campaign records older than record_retention_days (0 keeps them).
+max_records_per_run = 1000
+record_retention_days = 90
+
+# Response playbooks (playbooks/*.toml; python -m agents respond / queue / approve / reject).
+# Local steps (tarpit, deepen, shallow, plant_token, tag_source, capture_more) change only
+# this honeypot and run automatically. Notify steps run only through connectors enabled
+# below. Enforce steps (export_blocklist, publish_detection, open_ticket, block_webhook)
+# never run automatically: with queue_enforce on they are queued and run only after
+# `python -m agents approve <id>`; approvals expire.
+[respond]
+enabled = true
+queue_enforce = false
+approval_ttl_hours = 72
+lookback_hours = 48
+# Approved blocklist written for the firewall to consume (nothing is pushed anywhere).
+#blocklist_file = /agents/reports/blocklist/approved.txt
+# blocklist_format: plain | nftables (a complete `nft -f` file: table inet winnie with
+# separate IPv4 and IPv6 interval sets) | csv
+blocklist_format = plain
+# Approved entries expire after this many days; `python -m agents unblock <ip-or-network>`
+# removes one sooner.
+blocklist_ttl_days = 30
+# A rejected request is not queued again for the same (playbook, source, action) for this
+# long; an approval that expired undecided is held back for expired_suppress_hours.
+reject_suppress_hours = 168
+expired_suppress_hours = 24
+# Notifications and approval summaries are built from structured fields. The model-written
+# narrative is left out unless this is true; then it is labelled untrusted and stripped of
+# mentions and markup.
+include_narrative = false
+# Addresses and networks no action of any tier may target (your own, monitoring, CDN and
+# resolver ranges), comma or space separated. Non-global addresses (private, loopback,
+# link-local, CGNAT, multicast, reserved) are always refused.
+#never_act_on = 198.51.100.0/24, 2001:db8:10::/48
+# When more than proxy_threshold of at least proxy_min_records records in the window come
+# from one non-global address (a proxy hiding client addresses), per-source local and
+# enforce actions are refused for that run and a warning is logged.
+proxy_threshold = 0.5
+proxy_min_records = 20
+# Notify caps: each playbook may send at most notify_max_per_playbook notifications per
+# connector per day; notify_reserved_share of each connector's max_per_day is kept for
+# priority playbooks (priority = true). Dropped notifications are recorded and reported in
+# one "N notifications suppressed" notice per connector at most every
+# suppressed_notice_minutes.
+notify_max_per_playbook = 50
+notify_reserved_share = 0.25
+# Daily cap assumed for a connector whose own max_per_day is unknown.
+#notify_default_cap = 200
+suppressed_notice_minutes = 60
+# Retention: keep the last snapshot_keep source-state snapshots plus any younger than
+# snapshot_keep_days; decided approvals and run records older than retention_days are
+# removed. A warning is logged when approvals, run records and snapshots together exceed
+# size_alarm_mb.
+snapshot_keep = 200
+snapshot_keep_days = 7
+retention_days = 30
+size_alarm_mb = 500
+
+# Outbound connectors. All disabled by default. Destinations must be https and public
+# (allow_private = true to permit internal ones). Secrets are environment variable NAMES.
+# Every connector below also accepts these keys (defaults shown):
+#   max_per_day = 200       sends per day before the connector stops
+#   timeout = 10            seconds per send (at most 30)
+#   allow_private = false
+# The HTTP connectors (all but email) send secret_env's value in the header named by
+# header (default Authorization).
+#[connector.webhook]
+#enabled = false
+#url = https://hooks.example.com/services/T000/B000/XXXX
+#secret_env = WINNIE_WEBHOOK_TOKEN
+#max_per_day = 200
+
+#[connector.siem_http]
+#enabled = false
+#url = https://siem.example.com/collector/event
+#secret_env = WINNIE_SIEM_TOKEN
+
+#[connector.email]
+#enabled = false
+#host = smtp.example.com
+#port = 587
+#starttls = true
+#from = honeypot@example.com
+#to = soc@example.com
+#username_env = WINNIE_SMTP_USER
+#password_env = WINNIE_SMTP_PASSWORD
+
+# Enrichment sends attacker IP addresses to the configured third party.
+#[connector.enrich]
+#enabled = false
+#url = https://reputation.example.com/v1/ip/{ip}
+#secret_env = WINNIE_ENRICH_KEY
+#header = X-API-Key
+
+#[connector.ticket]
+#enabled = false
+#url = https://tickets.example.com/api/issues
+
+#[connector.block_webhook]
+#enabled = false
+#url = https://firewall-manager.example.com/api/block
+
+# Event export (python -m agents ship; also the last step of run-all). Sends the event log
+# to S3 as JSON lines, from the agents process only. Credentials come from the default AWS
+# chain (instance role or environment), never from this file. Delivery is at least once.
+# Keys: <prefix>YYYY/MM/DD/HH-<epoch>-<sensor>-<n>-<random>.jsonl (UTC time of the run;
+# <random> is 8 hex digits so runs in the same second never share a key).
+#[connector.s3_events]
+#enabled = false
+#bucket = example-honeypot-events
+#prefix = events/
+# Optional: the bucket's region, and the bucket owner's account id (ExpectedBucketOwner).
+#region = us-east-1
+#bucket_owner = 111122223333
+#source = aws.honeypot
+# layout: wrapped ({"source": ..., "detail": event} per line) | flat (the event itself)
+#layout = wrapped
+# passwords: hash (keyed with the sensor seed; equal passwords compare equal on one sensor)
+# | clear | drop. Covers every captured password or secret field on every protocol.
+#passwords = hash
+#max_events_per_object = 5000
+#max_objects_per_run = 50
+#max_bytes_per_object = 5242880
+#timeout = 10

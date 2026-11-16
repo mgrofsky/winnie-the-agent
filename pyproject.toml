@@ -1,20 +1,23 @@
 [project]
-name = "deceive"
+name = "winnie-the-agent"
 version = "0.1.0"
-description = "AI-driven high-interaction SSH honeypot"
+description = "LLM-driven SSH honeypot with multi-protocol login traps, scenario packs, triage, decoy tuning and response playbooks (based on DECEIVE)"
 readme = "README.md"
+license = "MIT"
+keywords = ["honeypot", "deception", "ssh", "sip", "threat-intelligence", "llm"]
 requires-python = ">=3.11"
 dependencies = [
     "asyncssh",
-    "langchain",
-    "langchain-community",
+    "langchain-core",
     "langchain-openai",
     "langchain-google-genai",
     "langchain-ollama",
     "langchain-aws",
-    "transformers",
-    "torch",
+    "boto3",
+    "botocore",
     "anthropic",
+    "langchain-anthropic>=1.7.10",
+    "pyyaml>=6.0.3",
 ]
 
 [dependency-groups]
@@ -26,6 +29,10 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Slow tests (pathological-input timing, large-history runs) are skipped by default;
+# run everything with: uv run pytest -m "slow or not slow"
+addopts = "-m 'not slow'"
+markers = ["slow: long-running timing and scale tests (excluded from the default run)"]
 
 [tool.uv]
 package = false
