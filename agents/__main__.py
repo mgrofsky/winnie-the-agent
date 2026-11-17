@@ -102,7 +102,8 @@ def _run(argv=None) -> dict:
     parser.add_argument("--max-llm-calls", type=int, default=None)
     parser.add_argument("--max-changes", type=int, default=None)
     parser.add_argument("--day", default=None, help="digest day YYYY-MM-DD (default today, UTC)")
-    parser.add_argument("--by", default=None, help="approve/reject: who decided (default: OS user)")
+    parser.add_argument("--by", default=None,
+                        help="approve/reject/unblock: who decided (default: OS user)")
     parser.add_argument("--list", action="store_true", help="playbooks: list them")
     parser.add_argument("--validate", action="store_true", help="playbooks: validate all files")
     parser.add_argument("--all", action="store_true", help="queue: include decided/expired items")
@@ -133,19 +134,10 @@ def _run(argv=None) -> dict:
     respond_cfg = cp["respond"] if "respond" in cp else {}
 
     def _settings():
-        from agents.respond import RespondSettings
-
-        return RespondSettings.from_config(respond_cfg)
+        return runtime.respond_settings(cp)
 
     def _connectors():
-        try:
-            from agents.connectors import Connectors
-        except ImportError:
-            return None
-        conn = Connectors(cp, state)
-        for err in getattr(conn, "errors", []):
-            log.error("connector config: %s", err)
-        return conn
+        return runtime.respond_connectors(cp, state)
 
     if args.command == "playbooks":
         from agents.playbooks import load_playbooks, tier_of
@@ -184,7 +176,8 @@ def _run(argv=None) -> dict:
                     never_act_on=settings.never_act_on)
             else:
                 results["approval"] = reject(args.target or "", state, by=args.by,
-                                             suppress_hours=settings.reject_suppress_hours)
+                                             suppress_hours=settings.reject_suppress_hours,
+                                             reports_dir=reports)
         except ApprovalError as exc:
             results["approval"] = {"error": str(exc)}
         return results
@@ -195,7 +188,7 @@ def _run(argv=None) -> dict:
             results["unblock"] = unblock(args.target or "", state, reports,
                                          blocklist_file=settings.blocklist_file,
                                          blocklist_format=settings.blocklist_format,
-                                         ttl_days=settings.blocklist_ttl_days)
+                                         ttl_days=settings.blocklist_ttl_days, by=args.by)
         except ValueError as exc:
             results["unblock"] = {"error": f"not an address or network: {str(exc)[:100]}"}
         return results

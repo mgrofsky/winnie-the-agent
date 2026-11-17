@@ -322,6 +322,24 @@ class DailyCallCounter:
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
+    def peek(self) -> dict:
+        """Today's count without counting a call. Creates nothing (no lock file, directory
+        or counter file), so it is safe against a read-only state directory; the read is
+        unlocked, which at worst misses a call being counted at that moment."""
+        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        if self.path is None:
+            calls = self._memory if self._day == today else 0
+            return {"day": today, "calls": calls, "limit": self.limit}
+        calls = 0
+        try:
+            data = json.loads(self.path.read_text())
+            if isinstance(data, dict) and data.get("day") == today and \
+                    isinstance(data.get("calls"), int) and data["calls"] >= 0:
+                calls = data["calls"]
+        except (OSError, ValueError):
+            pass
+        return {"day": today, "calls": calls, "limit": self.limit}
+
 
 class BudgetedJsonLLM:
     """Wraps a JsonLLM with a per-run call cap (shared by every stage) and a daily cap."""

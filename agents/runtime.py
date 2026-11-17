@@ -127,3 +127,26 @@ def event_log_state(path: Optional[os.PathLike | str]) -> tuple[str, Optional[st
     if not os.access(path, os.R_OK):
         return "error", f"event log not readable (permission denied): {path}"
     return "ok", None
+
+
+def respond_settings(config: Optional[ConfigParser]):
+    """``RespondSettings`` from ``[respond]`` (defaults without the section). Raises
+    ValueError for a bad value."""
+    from agents.respond import RespondSettings
+
+    return RespondSettings.from_config(config["respond"] if config is not None
+                                       and "respond" in config else {})
+
+
+def respond_connectors(config: ConfigParser, state_dir: os.PathLike | str):
+    """The configured ``Connectors``, or None when the connectors package cannot be
+    imported. Configuration errors are logged and leave that connector disabled."""
+    try:
+        from agents.connectors import Connectors
+    except ImportError:
+        return None
+    conn = Connectors(config, Path(state_dir))
+    for err in getattr(conn, "errors", []):
+        # Logged under the CLI's logger so the line reads as it did before the move.
+        logging.getLogger("agents").error("connector config: %s", err)
+    return conn

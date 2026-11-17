@@ -554,6 +554,34 @@ def list_queue(state_dir: os.PathLike | str, now: Optional[datetime.datetime] = 
     return out
 
 
+def peek_queue(state_dir: os.PathLike | str, now: Optional[datetime.datetime] = None,
+               include_closed: bool = False) -> list[dict]:
+    """What ``list_queue`` returns, as a pure read for a read-only state directory: no lock,
+    no directory, index or approval file is created or changed. An overdue pending item is
+    returned as an ``expired`` copy (a closed item). Unreadable or malformed files are
+    skipped."""
+    adir = _approvals_dir(Path(state_dir))
+    now = now or _now()
+    out = []
+    try:
+        paths = sorted(adir.glob("a-*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        if not re.fullmatch(APPROVAL_ID_RE + r"\.json", path.name):
+            continue
+        a = _read_json(path, {})
+        try:
+            expires = _parse(str(a["expires_at"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if a.get("status") == "pending" and expires <= now:
+            a = {**a, "status": "expired"}
+        if include_closed or a.get("status") == "pending":
+            out.append(a)
+    return out
+
+
 class ApprovalError(ValueError):
     pass
 
@@ -656,9 +684,11 @@ def _write_blocklist_files(state_dir: Path, reports_dir: Path, entries: dict, bl
 
 def unblock(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike | str,
             blocklist_file: Optional[os.PathLike | str] = None, blocklist_format: str = "plain",
-            now: Optional[datetime.datetime] = None, ttl_days: float = 30) -> dict:
+            now: Optional[datetime.datetime] = None, ttl_days: float = 30,
+            by: Optional[str] = None) -> dict:
     """Remove an address (its IPv4 address or IPv6 /64 key) or every entry inside a
-    network from the approved blocklist, then rewrite the blocklist file."""
+    network from the approved blocklist, then rewrite the blocklist file. An audit record
+    goes to ``<reports_dir>/response``."""
     state_dir, reports_dir = Path(state_dir), Path(reports_dir)
     now = now or _now()
     value = str(target).strip()
@@ -676,6 +706,13 @@ def unblock(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike 
                 del entries[key]
         path = _write_blocklist_files(state_dir, reports_dir, entries, blocklist_file,
                                       blocklist_format)
+    # "unblock" never matches APPROVAL_ID_RE, so this cannot overwrite an approval record;
+    # the leading stamp keeps it under apply_retention.
+    _atomic_json(reports_dir / "response" /
+                 f"{now.strftime('%Y%m%dT%H%M%SZ')}-unblock-{secrets.token_hex(3)}.json",
+                 {"timestamp": _iso(now),
+                  "unblock": {"target": sanitize(value, 64), "removed": sorted(removed),
+                              "by": sanitize(by or getpass.getuser(), 64)}})
     return {"removed": sorted(removed), "entries": len(entries), "file": path.name}
 
 
@@ -755,9 +792,11 @@ def approve(aid: str, state_dir: os.PathLike | str, reports_dir: os.PathLike | s
 
 
 def reject(aid: str, state_dir: os.PathLike | str, by: Optional[str] = None,
-           now: Optional[datetime.datetime] = None, suppress_hours: float = 168) -> dict:
+           now: Optional[datetime.datetime] = None, suppress_hours: float = 168,
+           reports_dir: Optional[os.PathLike | str] = None) -> dict:
     """Reject one queued action. The same (playbook, source, action) is not queued again
-    for ``suppress_hours``."""
+    for ``suppress_hours``. With ``reports_dir``, an audit record goes to its ``response``
+    directory, as for an approval."""
     state_dir = Path(state_dir)
     now = now or _now()
     with _locked(state_dir):
@@ -770,6 +809,10 @@ def reject(aid: str, state_dir: os.PathLike | str, by: Optional[str] = None,
         idx = _load_index(state_dir)
         _close_in_index(idx, a, now, "rejected", suppress_hours)
         _save_index(state_dir, idx, now)
+    if reports_dir is not None:
+        _atomic_json(Path(reports_dir) / "response" /
+                     f"{now.strftime('%Y%m%dT%H%M%SZ')}-{aid}.json",
+                     {"timestamp": _iso(now), "approval": a})
     return a
 
 
