@@ -355,7 +355,9 @@ def _sensor_limit(parsed: "ParsedLog", task: str, ts: datetime.datetime, protoco
 
 
 def parse_log(path: os.PathLike | str, window_minutes: int = 60,
-              start_offset: int = 0) -> ParsedLog:
+              start_offset: int = 0, end_offset: Optional[int] = None) -> ParsedLog:
+    """Parse complete lines from ``start_offset``; with ``end_offset``, only lines that
+    start before it (the console replays one session's byte range this way)."""
     sessions: dict[str, Session] = {}
     campaigns: dict[str, Campaign] = {}
     ssh_auth: dict[str, list[tuple[datetime.datetime, AuthAttempt]]] = {}
@@ -366,6 +368,8 @@ def parse_log(path: os.PathLike | str, window_minutes: int = 60,
                        end_offset=start_offset, window_minutes=window_minutes)
 
     for start, end, rec in iter_records(path, start_offset):
+        if end_offset is not None and start >= end_offset:
+            break
         parsed.end_offset = end
         if rec == {}:
             continue  # blank line

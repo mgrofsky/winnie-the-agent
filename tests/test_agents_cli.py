@@ -222,3 +222,100 @@ def test_every_writing_command_waits_for_the_run_lock(tmp_path, monkeypatch):
         assert not (tmp_path / "det").exists()
     assert "error" not in cli.run(["triage", *args])["triage"]      # released: runs normally
     assert "history" in cli.run(["tune", "--history", *args])       # read-only: no lock needed
+
+
+# ---- ui -------------------------------------------------------------------------------------
+
+def _ui_setup(tmp_path, monkeypatch, ui_section=""):
+    args = _setup(tmp_path, monkeypatch)
+    cfg = tmp_path / "config.ini"
+    cfg.write_text(cfg.read_text() + ui_section)
+    monkeypatch.delenv("WINNIE_UI_TOKEN", raising=False)
+    return args
+
+
+def _capture_serve(monkeypatch):
+    from agents.ui import server
+
+    seen = {}
+
+    def fake_serve(settings, routes):
+        seen["settings"], seen["routes"] = settings, routes
+
+    monkeypatch.setattr(server, "serve", fake_serve)
+    return seen
+
+
+def test_ui_reads_its_section_and_flags_override(tmp_path, monkeypatch):
+    args = _ui_setup(tmp_path, monkeypatch,
+                     "[ui]\nport = 9001\nbind = ::1\nactions = false\noperator = alice\n")
+    seen = _capture_serve(monkeypatch)
+    assert cli.run(["ui", *args]) == {"ui": {"status": "stopped"}}
+    s = seen["settings"]
+    assert (s.port, s.bind, s.actions, s.operator, s.allow_non_loopback, s.token) == \
+        (9001, "::1", False, "alice", False, "")
+    cli.run(["ui", "--port", "0", "--bind", "127.0.0.1", "--actions", "--by", "bob",
+             "--allow-non-loopback", *args])
+    s = seen["settings"]
+    assert (s.port, s.bind, s.actions, s.operator, s.allow_non_loopback) == \
+        (0, "127.0.0.1", True, "bob", True)
+    paths = seen["routes"].paths
+    assert paths.reports == tmp_path / "reports" and paths.state == tmp_path / "reports" / "state"
+    assert paths.log == tmp_path / "log.jsonl" and paths.data == tmp_path / "data"
+
+
+def test_ui_defaults_without_a_section_and_token_only_from_the_environment(tmp_path, monkeypatch):
+    args = _ui_setup(tmp_path, monkeypatch, "[ui]\ntoken = from-the-config-file-never-used\n")
+    seen = _capture_serve(monkeypatch)
+    cli.run(["ui", *args])
+    s = seen["settings"]
+    assert (s.port, s.bind, s.actions, s.operator, s.token) == (8480, "127.0.0.1", False, "", "")
+    monkeypatch.setenv("WINNIE_UI_TOKEN", "e" * 32)
+    cli.run(["ui", *args])
+    assert seen["settings"].token == "e" * 32
+
+
+def test_ui_takes_no_run_lock_builds_no_model_and_writes_nothing(tmp_path, monkeypatch):
+    import fcntl
+
+    args = _ui_setup(tmp_path, monkeypatch)
+    _capture_serve(monkeypatch)
+    monkeypatch.setattr(cli, "_llm", lambda *a, **k: (_ for _ in ()).throw(AssertionError("llm")))
+    monkeypatch.setattr(cli, "build_json_llm",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("llm")))
+    state = tmp_path / "reports" / "state"
+    state.mkdir(parents=True)
+    with open(state / "agents.lock", "a+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert cli.run(["ui", *args]) == {"ui": {"status": "stopped"}}
+    assert sorted(p.name for p in state.iterdir()) == ["agents.lock"]
+    assert not (tmp_path / "data").exists() and not (tmp_path / "det").exists()
+
+
+def test_ui_logs_the_sign_in_link_exactly_once(tmp_path, monkeypatch, caplog):
+    from agents.ui import server
+
+    args = _ui_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("WINNIE_UI_TOKEN", "t" * 40)
+
+    def stop(self, *a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(server.UiServer, "serve_forever", stop)
+    with caplog.at_level("INFO", logger="agents.ui"):
+        assert cli.run(["ui", "--port", "0", *args]) == {"ui": {"status": "stopped"}}
+    links = [r for r in caplog.records if "t" * 40 in r.getMessage()]
+    assert len(links) == 1 and links[0].name == "agents.ui" and links[0].levelname == "INFO"
+    assert "sign in at http://127.0.0.1:" in links[0].getMessage()
+
+
+def test_ui_refuses_bad_settings_with_an_error(tmp_path, monkeypatch):
+    args = _ui_setup(tmp_path, monkeypatch)
+    result = cli.run(["ui", "--bind", "0.0.0.0", "--port", "0", *args])
+    assert "non-loopback" in result["ui"]["error"]
+    monkeypatch.setenv("WINNIE_UI_TOKEN", "short")
+    result = cli.run(["ui", "--port", "0", *args])
+    assert "at least" in result["ui"]["error"] and "short" not in result["ui"]["error"]
+    assert cli.main(["ui", "--port", "0", *args]) == 2
+    args = _ui_setup(tmp_path, monkeypatch, "[ui]\nport = eighty\n")
+    assert "error" in cli.run(["ui", *args])["ui"]

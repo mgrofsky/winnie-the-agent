@@ -321,6 +321,19 @@ snapshot_keep_days = 7
 retention_days = 30
 size_alarm_mb = 500
 
+# Operator console (python -m agents ui): a small web UI on loopback, reached through an SSH
+# or SSM tunnel. The sign-in token comes from WINNIE_UI_TOKEN or is generated at start and
+# logged once as a sign-in link; it is never read from this file.
+[ui]
+# Port to listen on.
+port = 8480
+# Address to bind; anything but loopback is refused unless --allow-non-loopback is given.
+bind = 127.0.0.1
+# Allow approve, reject and unblock from the console (--actions turns it on for one run).
+actions = false
+# Name recorded with decisions made in the console (--by overrides it).
+#operator = oncall
+
 # Outbound connectors. All disabled by default. Destinations must be https and public
 # (allow_private = true to permit internal ones). Secrets are environment variable NAMES.
 # Every connector below also accepts these keys (defaults shown):

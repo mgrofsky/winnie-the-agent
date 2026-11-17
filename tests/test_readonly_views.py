@@ -18,6 +18,7 @@ from agents.respond import (
     apply_retention,
     approve,
     list_queue,
+    peek_blocklist,
     peek_queue,
     reject,
     unblock,
@@ -277,3 +278,29 @@ def test_cli_reject_and_unblock_record_who(tmp_path):
     whos = sorted(x["approval"]["rejected_by"] if "approval" in x else x["unblock"]["by"]
                   for x in bodies)
     assert whos == ["night-shift", "night-shift"]
+
+
+# ---- peek_blocklist --------------------------------------------------------------------------
+
+def test_peek_blocklist_drops_expired_entries_without_writing(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    store = state / "approved_blocklist.json"
+    store.write_text(json.dumps({
+        "198.51.100.1": {"approved_at": (NOW - 2 * H).isoformat(),
+                         "expires_at": (NOW + H).isoformat()},
+        "198.51.100.2": {"approved_at": (NOW - 48 * H).isoformat(),
+                         "expires_at": (NOW - H).isoformat()},
+        "198.51.100.3": (NOW - 24 * H).isoformat(),            # legacy: approval time only
+        "198.51.100.4": {"approved_at": "not a time"}}))
+    before = tree(tmp_path)
+    os.chmod(state, stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        live = peek_blocklist(state, now=NOW, ttl_days=30)
+    finally:
+        os.chmod(state, stat.S_IRWXU)
+    assert set(live) == {"198.51.100.1", "198.51.100.3"}
+    assert live["198.51.100.3"]["expires_at"] == (NOW - 24 * H + 30 * 24 * H).isoformat()
+    assert tree(tmp_path) == before
+    assert peek_blocklist(tmp_path / "missing", now=NOW) == {}
+    assert not (tmp_path / "missing").exists()

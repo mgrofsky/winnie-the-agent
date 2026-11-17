@@ -1,5 +1,5 @@
 """CLI: python -m agents {triage,respond,digest,tune,detect,ship,run-all,queue,approve,reject,unblock,
-playbooks}.
+playbooks,ui}.
 
 Directories:
 - ``--data-dir``: the front-ends' data directory (log, sensor seed). Only read here.
@@ -10,6 +10,10 @@ Directories:
 
 ``ship`` sends the event log to S3 when ``[connector.s3_events]`` is enabled; ``run-all``
 runs it as its last step.
+
+``ui`` serves the operator console on loopback (``[ui]``; ``--bind``, ``--port``,
+``--actions``, ``--by``). It reads the same directories, takes no run lock and never calls
+a model. The sign-in token comes from ``WINNIE_UI_TOKEN`` or is generated at start.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from configparser import ConfigParser, Error as ConfigParserError
 from pathlib import Path
@@ -75,12 +80,69 @@ def _scenario(cp: ConfigParser, data_dir: Path, overlay: Path):
     return load_scenario(cp["scenario"]["active"].strip(), seed, overlay)
 
 
+UI_TOKEN_ENV = "WINNIE_UI_TOKEN"
+
+
+def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, state: Path,
+        detections: Path, overlay: Path, source_state: Path, log_path: Optional[str]) -> dict:
+    """Serve the operator console until interrupted. The token is never read from the
+    config file: ``WINNIE_UI_TOKEN`` or a fresh one (``serve`` logs the sign-in link)."""
+    from agents.budget import BudgetConfig
+    from agents.respond import RespondSettings
+    from agents.ui.api import Api, ApiLimits, ApiPaths
+    from agents.ui.server import UiSettings, serve
+
+    ui_cfg = cp["ui"] if "ui" in cp else {}
+    agents_cfg = cp["agents"] if "agents" in cp else {}
+    try:
+        settings = UiSettings(
+            bind=args.bind or str(ui_cfg.get("bind", "127.0.0.1")).strip() or "127.0.0.1",
+            port=args.port if args.port is not None else int(ui_cfg.get("port", 8480)),
+            actions=args.actions or str(ui_cfg.get("actions", "false")).strip().lower()
+            in ("1", "true", "yes", "on"),
+            operator=(args.by or str(ui_cfg.get("operator", ""))).strip()[:64],
+            allow_non_loopback=args.allow_non_loopback,
+            token=os.environ.get(UI_TOKEN_ENV, ""))
+        analyst_cap = int(agents_cfg.get("max_analyst_calls_per_day", 500))
+    except ValueError:
+        return {"error": "[ui] port or [agents] max_analyst_calls_per_day is not a number"}
+    try:
+        respond_settings = runtime.respond_settings(cp)
+    except ValueError as exc:
+        log.warning("%s; the console uses the [respond] defaults", str(exc)[:200])
+        respond_settings = RespondSettings()
+    budget_state, token_cap = data_dir / "budget_state.json", None
+    try:
+        budget = BudgetConfig.from_config(cp, str(base), str(data_dir))
+        budget_state = Path(budget.state_file) if budget.state_file else budget_state
+        token_cap = budget.max_tokens_per_day
+    except ValueError:
+        pass
+    api = Api(ApiPaths(reports=reports, state=state, data=data_dir, detections=detections,
+                       overlay=overlay, source_state=source_state,
+                       log=Path(log_path) if log_path else None, budget_state=budget_state),
+              settings=respond_settings,
+              limits=ApiLimits(analyst_calls_per_day=analyst_cap,
+                               frontend_tokens_per_day=token_cap))
+    try:
+        serve(settings, api)
+    except (ValueError, OSError) as exc:
+        # build_server refuses a non-loopback bind, a bad port or a short token; the
+        # message names only settings, never the token.
+        reason = getattr(exc, "strerror", None) or type(exc).__name__
+        msg = str(exc)[:300] if isinstance(exc, ValueError) else \
+            f"cannot listen on {settings.bind}:{settings.port} ({reason})"
+        log.error("%s", msg)
+        return {"error": msg}
+    return {"status": "stopped"}
+
+
 def _run(argv=None) -> dict:
     """Parse args and run the requested agents. Returns a summary dict (also used by tests)."""
     parser = argparse.ArgumentParser(prog="python -m agents", description=__doc__)
     parser.add_argument("command", choices=["triage", "respond", "digest", "tune", "detect",
                                             "ship", "run-all", "queue", "approve", "reject", "unblock",
-                                            "playbooks"])
+                                            "playbooks", "ui"])
     parser.add_argument("target", nargs="?", help="approval id for approve / reject; address "
                                                   "or network for unblock")
     parser.add_argument("--log", help="honeypot JSON-lines log (default: [honeypot] log_file)")
@@ -103,7 +165,15 @@ def _run(argv=None) -> dict:
     parser.add_argument("--max-changes", type=int, default=None)
     parser.add_argument("--day", default=None, help="digest day YYYY-MM-DD (default today, UTC)")
     parser.add_argument("--by", default=None,
-                        help="approve/reject/unblock: who decided (default: OS user)")
+                        help="approve/reject/unblock: who decided (default: OS user); ui: the "
+                             "operator label (default [ui] operator)")
+    parser.add_argument("--bind", default=None, help="ui: address (default [ui] bind, 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=None, help="ui: port (default [ui] port, 8480)")
+    parser.add_argument("--actions", action="store_true",
+                        help="ui: allow approve/reject/unblock even when [ui] actions is off")
+    parser.add_argument("--allow-non-loopback", action="store_true",
+                        help="ui: allow a non-loopback bind (only inside a container whose port "
+                             "is published on loopback)")
     parser.add_argument("--list", action="store_true", help="playbooks: list them")
     parser.add_argument("--validate", action="store_true", help="playbooks: validate all files")
     parser.add_argument("--all", action="store_true", help="queue: include decided/expired items")
@@ -139,6 +209,15 @@ def _run(argv=None) -> dict:
     def _connectors():
         return runtime.respond_connectors(cp, state)
 
+    if args.command == "ui":
+        # Before anything that takes the run lock or builds a model: the console only reads.
+        from agents.source_state import source_state_path
+
+        results["ui"] = _ui(args, cp, base, data_dir=data_dir, reports=reports, state=state,
+                            detections=detections, overlay=overlay,
+                            source_state=source_state_path(args.source_state),
+                            log_path=log_path)
+        return results
     if args.command == "playbooks":
         from agents.playbooks import load_playbooks, tier_of
 

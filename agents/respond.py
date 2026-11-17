@@ -674,6 +674,15 @@ def _load_blocklist(state_dir: Path, now: datetime.datetime,
     return live, changed
 
 
+def peek_blocklist(state_dir: os.PathLike | str, now: Optional[datetime.datetime] = None,
+                   ttl_days: float = 30.0) -> dict:
+    """Live approved blocklist entries, {key: {approved_at, expires_at}}, as a pure read for
+    a read-only state directory: no lock, and expired or legacy entries are left on disk
+    (the next writer prunes them)."""
+    entries, _ = _load_blocklist(Path(state_dir), now or _now(), ttl_days)
+    return entries
+
+
 def _write_blocklist_files(state_dir: Path, reports_dir: Path, entries: dict, blocklist_file,
                            fmt: str) -> Path:
     _atomic_json(_blocklist_store(state_dir), entries)
