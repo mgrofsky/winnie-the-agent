@@ -30,9 +30,8 @@ On top of that SSH honeypot this project adds:
   through opt-in connectors, and enforcement actions that run only after a person approves
   them.
 
-> It has been exercised with real protocol clients in a lab, but
-> not in production, not against a real model provider and not against real notification
-> endpoints. Read the [deployment warnings](#deployment) before exposing it to anyone.
+> Winnie is used in a live production environment. Review the [deployment guidance](#deployment)
+> before setting up your own instance.
 
 ## How it fits together
 
