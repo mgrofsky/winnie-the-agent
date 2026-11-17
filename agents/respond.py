@@ -74,6 +74,7 @@ from agents.source_state import (
     SourceEntry,
     SourceState,
     new_entry,
+    legacy_source_token,
     source_token,
     source_token_name,
     update as update_source_state,
@@ -787,11 +788,19 @@ def register_source_tokens(reports_dir: Path, state: SourceState, seed: str) -> 
         if not entry.plant_token:
             continue
         access, secret = source_token(seed, key)
-        for value, kind in ((access, "aws_access_key"), (secret, "generic_password")):
+        old_access, _ = legacy_source_token(seed, key)
+        for value, kind, legacy in ((access, "aws_access_key", False),
+                                    (secret, "generic_password", False),
+                                    (old_access, "aws_access_key", True)):
             if value in known:
                 continue
-            tokens.append({"name": source_token_name(key), "kind": kind, "value": value,
-                           "planted_in": ["per-source fake data"], "planted_for": key})
+            entry = {"name": source_token_name(key), "kind": kind, "value": value,
+                     "planted_in": ["per-source fake data"], "planted_for": key}
+            if legacy:
+                # The key id earlier versions planted for this source: recognised, never
+                # planted again.
+                entry["legacy"] = True
+            tokens.append(entry)
     reg["tokens"] = tokens
     reg.setdefault("note", "Fake secrets planted in decoy data. Any use of one is a top-priority signal.")
     _atomic_json(path, reg, mode=0o644)

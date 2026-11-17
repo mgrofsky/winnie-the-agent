@@ -1,30 +1,36 @@
-# Corvidae Data Exchange: an invented B2B data API (address validation, FX rates, shipment
-# tracking) behind its own API gateway. Consumers are invented companies on example domains.
+# An invented B2B data API (address validation, FX rates, shipment tracking) behind its own
+# API gateway. Consumers are invented companies on example domains. The organisation, hosts,
+# networks and credentials are {{...}} templates expanded from each sensor's seed (see
+# docs/scenarios.md), so no two sensors show the same ones.
 
 name = "api_platform"
-title = "Corvidae Data Exchange API gateway"
+title = "{{org.name}} API gateway"
 description = """
 An invented API provider. One gateway node serves versioned REST endpoints under /v1 and
-/v2 with API-key auth (X-Corvidae-Key), publishes an OpenAPI document, and keeps consumer,
+/v2 with API-key auth (X-{{org.short}}-Key), publishes an OpenAPI document, and keeps consumer,
 key and usage records in PostgreSQL with Redis for rate-limit counters and cached admin
 config. Unknown routes under the API prefixes may be answered by the budgeted LLM.
 Honeytokens sit in the keys table, the OpenAPI example, Redis admin config and Redis
 storage config.
 """
 
+[bait]
+org_suffixes = ["Data Exchange", "Data", "Data Services", "APIs", "Data Networks", "Data Labs"]
+domain_words = ["api", "data", "dev"]
+
 [identity]
-org_name = "Corvidae Data Exchange"
-hostname = "gw-edge-02"
-domain = "corvidae-api.example"
-internal_ips = ["10.30.0.22", "10.30.8.22"]
+org_name = "{{org.name}}"
+hostname = "{{host:gw-edge}}"
+domain = "{{org.domain}}"
+internal_ips = ["{{net:edge}}.22", "{{net:svc}}.22"]
 os_pretty_name = "Debian GNU/Linux 12 (bookworm)"
-kernel = "Linux gw-edge-02 6.1.0-25-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.106-3 (2024-08-26) x86_64 GNU/Linux"
+kernel = "Linux {{host:gw-edge}} 6.1.0-25-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.106-3 (2024-08-26) x86_64 GNU/Linux"
 timezone = "UTC"
 lures = [
-    "/etc/corvidae/gateway.yaml",
-    "/etc/corvidae/upstreams.yaml",
-    "/opt/corvidae/gateway/.env",
-    "/var/log/corvidae/access.log",
+    "/etc/{{org.slug}}/gateway.yaml",
+    "/etc/{{org.slug}}/upstreams.yaml",
+    "/opt/{{org.slug}}/gateway/.env",
+    "/var/log/{{org.slug}}/access.log",
     "/home/ops/.pgpass",
 ]
 
@@ -35,33 +41,33 @@ gecos = "Gateway ops"
 home = "/home/ops"
 
 [[identity.users]]
-name = "corvidae"
+name = "{{org.slug}}"
 uid = 998
 gecos = "Gateway service"
-home = "/opt/corvidae"
+home = "/opt/{{org.slug}}"
 shell = "/usr/sbin/nologin"
 
 [ssh]
 persona_prompt = """
-This is gw-edge-02, one of two edge gateway nodes for Corvidae Data Exchange, an invented
+This is {{host:gw-edge}}, one of two edge gateway nodes for {{org.name}}, an invented
 B2B data API (address validation, FX rates, shipment tracking). The gateway is a Go binary
-in /opt/corvidae/gateway (systemd unit corvidae-gateway, port 8080) fronted by HAProxy on
-the load balancer; config is /etc/corvidae/gateway.yaml and upstream services are listed in
-/etc/corvidae/upstreams.yaml (addr-svc, fx-svc, track-svc on 10.30.8.0/24). API keys are
-sent in the X-Corvidae-Key header and checked against the gateway database (PostgreSQL 16
-on 10.30.8.40, database gateway); Redis 7.2 on localhost holds rate-limit counters (rl:*)
+in /opt/{{org.slug}}/gateway (systemd unit {{org.slug}}-gateway, port 8080) fronted by HAProxy on
+the load balancer; config is /etc/{{org.slug}}/gateway.yaml and upstream services are listed in
+/etc/{{org.slug}}/upstreams.yaml (addr-svc, fx-svc, track-svc on {{net:svc}}.0/24). API keys are
+sent in the X-{{org.short}}-Key header and checked against the gateway database (PostgreSQL 16
+on {{host:pg}} {{net:svc}}.40, database gateway); Redis 7.2 on localhost holds rate-limit counters (rl:*)
 and cached admin config. The OpenAPI document is served at /openapi.json and docs at /docs.
 Cron: usage rollup into usage_daily at 00:10, key-expiry sweep hourly, log shipping via
-vector. Users: ops (sudo) and corvidae (service). Keep every answer consistent with this host.
+vector. Users: ops (sudo) and {{org.slug}} (service). Keep every answer consistent with this host.
 """
 
 [[ssh.accounts]]
 username = "ops"
-password = "corvidae-ops"
+password = "{{password:ops:user}}"
 
 [[ssh.accounts]]
 username = "admin"
-password = "admin123"
+password = "{{password:ssh_admin:weak}}"
 
 # ---- PostgreSQL: keys and usage ---------------------------------------------------------
 
@@ -77,11 +83,11 @@ after_n_max = 5
 
 [[services.postgres.accounts]]
 username = "gateway"
-password = "gateway"
+password = "{{ht:gateway_db_password}}"
 
 [[services.postgres.accounts]]
 username = "analytics"
-password = "analytics2024"
+password = "{{password:analytics:user}}"
 
 [[services.postgres.databases]]
 name = "gateway"
@@ -97,10 +103,10 @@ columns = [
     { name = "status", type = "varchar" },
 ]
 seed_rows = [
-    ["cns_0001", "Lanternfly Commerce", "devs@lanternfly.example", "scale", 5000000, "active"],
-    ["cns_0002", "Brookhollow Couriers", "integrations@brookhollow.example", "growth", 1000000, "active"],
-    ["cns_0003", "Pebblestack Analytics", "api@pebblestack.example", "free", 10000, "suspended"],
-    ["cns_0004", "Corvidae Internal QA", "qa@corvidae-api.example", "internal", 0, "active"],
+    ["cns_0001", "{{company:1.name}}", "devs@{{company:1.domain}}", "scale", 5000000, "active"],
+    ["cns_0002", "{{company:2.name}}", "integrations@{{company:2.domain}}", "growth", 1000000, "active"],
+    ["cns_0003", "{{company:3.name}}", "api@{{company:3.domain}}", "free", 10000, "suspended"],
+    ["cns_0004", "{{org.short}} Internal QA", "qa@{{org.domain}}", "internal", 0, "active"],
 ]
 
 [services.postgres.databases.tables.generator]
@@ -119,7 +125,7 @@ columns = [
     { name = "key_id", type = "varchar" },
     { name = "consumer_id", type = "varchar" },
     { name = "key_prefix", type = "varchar" },
-    { name = "key_plain", type = "varchar" },
+    { name = "key_plain", type = "varchar", secret = true },
     { name = "scopes", type = "varchar" },
     { name = "created_at", type = "timestamp" },
     { name = "expires_at", type = "timestamp" },
@@ -165,7 +171,7 @@ columns = [
 count = 60
 [services.postgres.databases.tables.generator.fields]
 id = { kind = "uuid" }
-carrier_ref = { kind = "account_number", prefix = "CVX" }
+carrier_ref = { kind = "account_number", prefix = "{{org.ABBR}}" }
 status = { kind = "choice", choices = ["label_created", "in_transit", "in_transit", "out_for_delivery", "delivered", "exception"] }
 last_scan = { kind = "datetime", min = 300, max = 318 }
 origin_hub = { kind = "choice", choices = ["HUB-ORD", "HUB-DFW", "HUB-ATL", "HUB-SEA"] }
@@ -184,7 +190,7 @@ after_n_max = 4
 
 [[services.redis.accounts]]
 username = "default"
-password = "gw-redis"
+password = "{{password:redis:service}}"
 
 [[services.redis.keys]]
 key = "rl:cns_0001:2026-11-15T08"
@@ -199,29 +205,29 @@ value = "9022"
 [[services.redis.keys]]
 key = "gateway:admin"
 type = "hash"
-value = { admin_token = "{{ht:admin_bearer}}", db_dsn = "postgres://gateway:{{ht:gateway_db_password}}@10.30.8.40:5432/gateway", reload_endpoint = "http://127.0.0.1:9901/admin/reload" }
+value = { admin_token = "{{ht:admin_bearer}}", db_dsn = "postgres://gateway:{{url:ht:gateway_db_password}}@{{net:svc}}.40:5432/gateway", reload_endpoint = "http://127.0.0.1:9901/admin/reload" }
 
 [[services.redis.keys]]
 key = "gateway:config:export"
 type = "hash"
-value = { bucket = "corvidae-usage-exports", aws_access_key_id = "{{ht:export_aws_key}}", region = "us-west-2" }
+value = { bucket = "{{org.slug}}-usage-exports", aws_access_key_id = "{{ht:export_aws_key}}", region = "us-west-2" }
 
 [[services.redis.keys]]
 key = "gateway:upstreams"
 type = "set"
-value = ["addr-svc 10.30.8.11:7001", "fx-svc 10.30.8.12:7002", "track-svc 10.30.8.13:7003"]
+value = ["addr-svc {{net:svc}}.11:7001", "fx-svc {{net:svc}}.12:7002", "track-svc {{net:svc}}.13:7003"]
 
 # ---- HTTP gateway -----------------------------------------------------------------------
 
 [services.http]
 enabled = true
 port = 8080
-server_header = "corvidae-gateway/2.14.1"
+server_header = "{{org.slug}}-gateway/2.14.1"
 login_path = "/console/login"
-login_title = "Corvidae Developer Console"
-branding = "Corvidae Data Exchange - address, FX and shipment data APIs"
+login_title = "{{org.short}} Developer Console"
+branding = "{{org.name}} - address, FX and shipment data APIs"
 api_prefix = "/v2"
-api_key_header = "X-Corvidae-Key"
+api_key_header = "X-{{org.short}}-Key"
 openapi_path = "/openapi.json"
 llm_unknown_api_routes = true
 
@@ -231,20 +237,20 @@ after_n_min = 2
 after_n_max = 6
 
 [[services.http.accounts]]
-username = "qa@corvidae-api.example"
-password = "CorvidaeQA!1"
+username = "qa@{{org.domain}}"
+password = "{{password:qa}}"
 
 [[services.http.accounts]]
 username = "ops"
-password = "corvidae-ops"
+password = "{{password:ops:user}}"
 
 [[services.http.pages]]
 path = "/docs"
-title = "Corvidae API Reference"
+title = "{{org.short}} API Reference"
 requires_login = false
 body_html = '''
-<h1>Corvidae API Reference</h1>
-<p>Base URL: https://api.corvidae-api.example. Authenticate every request with the <code>X-Corvidae-Key</code> header.</p>
+<h1>{{org.short}} API Reference</h1>
+<p>Base URL: https://api.{{org.domain}}. Authenticate every request with the <code>X-{{org.short}}-Key</code> header.</p>
 <p>v1 is frozen and will be retired on 2027-06-30. New integrations should use v2.</p>
 <p>Machine-readable spec: <a href="/openapi.json">/openapi.json</a></p>
 '''
@@ -254,7 +260,7 @@ path = "/console"
 title = "Developer Console"
 body_html = '''
 <h1>Developer Console</h1>
-<p>Organisation: Corvidae Internal QA (cns_0004) - plan: internal</p>
+<p>Organisation: {{org.short}} Internal QA (cns_0004) - plan: internal</p>
 <table><tr><th>Key</th><th>Scopes</th><th>Expires</th></tr>
 <tr><td>sk_test_...</td><td>addr fx track admin:read</td><td>2026-12-31</td></tr></table>
 <p>Requests this month: 1,204,551 - errors: 0.41%</p>
@@ -306,7 +312,7 @@ path = "/v2/fx/rates"
 auth = "api_key"
 [services.http.routes.json_body]
 data = { base = "USD", as_of = "2026-11-15T08:00:00Z", rates = { EUR = 0.9231, GBP = 0.7874, JPY = 151.42, CAD = 1.3912, AUD = 1.5320 } }
-meta = { request_id = "req_9c2f1e", cached = true }
+meta = { request_id = "req_{{hex:6:request_id}}", cached = true }
 
 [[services.http.routes]]
 method = "GET"
@@ -358,23 +364,23 @@ message = "Key created. It is shown once; store it securely."
 openapi = "3.0.3"
 
 [services.http.openapi.info]
-title = "Corvidae Data Exchange API"
+title = "{{org.name}} API"
 version = "2.14.1"
-description = "Address validation, FX rates and shipment tracking. Authenticate with the X-Corvidae-Key header."
-contact = { name = "Corvidae API support", email = "api-support@corvidae-api.example" }
+description = "Address validation, FX rates and shipment tracking. Authenticate with the X-{{org.short}}-Key header."
+contact = { name = "{{org.short}} API support", email = "api-support@{{org.domain}}" }
 
 [[services.http.openapi.servers]]
-url = "https://api.corvidae-api.example"
+url = "https://api.{{org.domain}}"
 description = "Production"
 
 [[services.http.openapi.servers]]
-url = "https://sandbox.corvidae-api.example"
+url = "https://sandbox.{{org.domain}}"
 description = "Sandbox (use the QA key below)"
 
 [services.http.openapi.components.securitySchemes.ApiKeyAuth]
 type = "apiKey"
 in = "header"
-name = "X-Corvidae-Key"
+name = "X-{{org.short}}-Key"
 description = "Sandbox example key for the QA consumer: {{ht:qa_api_key}}"
 
 [[services.http.openapi.security]]

@@ -416,6 +416,40 @@ Per-source state: there is no rollback command. Each snapshot in
 restore it by writing that content back to the state file, or delete the state file to
 clear every per-source effect at once.
 
+### When the bait changes
+
+The bait a sensor shows (organisation, hosts, people, account passwords, hashes, keys and
+honeytokens) is derived from the sensor seed and the scenario. It stays the same across
+restarts and rebuilds, and it changes when any of these change:
+
+- the scenario file, including an upgrade that changes a bundled scenario or the way a
+  template is expanded (the upgrade that introduced per-sensor bait replaced every fixed
+  value in the bundled scenarios, and the upgrade that removed the fixed markers from
+  honeytokens replaced every honeytoken value and per-source key id);
+- the seed (`[scenario] seed`, or the seed file in the data directory);
+- the active scenario.
+
+After such a change, credentials attackers collected earlier stop working: a returning
+attacker's old password for a trap account is refused (or accepted only by the `after_n`
+policy like any guess), and the files they read now hold different values. Honeytokens are
+the exception: the values earlier versions handed out are still recognised when they come
+back (they are written to `reports/honeytokens.json` with `"legacy": true` and checked by
+the listeners and triage), but they are never handed out again. Per-source pairs keep their
+secret; only the key id changed, and the old key id is recognised too.
+
+Pinning the identity (`[bait] org_name`, `domain`, `hosts`) keeps the organisation and
+host names but not the credentials. To keep a password across an upgrade or a seed change,
+pin it by label in the scenario:
+
+```toml
+[bait]
+passwords = { root_admin = "the value attackers already have", voiceops = "..." }
+```
+
+`--describe` lists every template and its current value, so take that list before the
+upgrade if you want to pin what attackers have seen. A pinned value is used for that
+label whatever its style, and `{{sha1:LABEL}}` hashes the pinned value.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

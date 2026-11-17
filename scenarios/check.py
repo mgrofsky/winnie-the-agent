@@ -16,7 +16,8 @@ Rules (see ``check_text``):
   scenario's own identity.domain (or a subdomain of it);
 - identity.domain must itself be reserved (as above);
 - US SSN-shaped ###-##-#### only with area 000, 666 or 9xx;
-- AWS access-key-shaped AKIA... only with the AKIAFAKE prefix;
+- AWS access-key-shaped AKIA... only when it is one of the sensor's own planted tokens
+  (a literal one in a scenario could be someone's real key);
 - no well-known real bank / hospital / carrier / vendor customer names;
 - IPv4 addresses must be private, loopback, link-local, reserved, unspecified or in the
   documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24).
@@ -136,8 +137,9 @@ def ip_is_allowed(ip: ipaddress.IPv4Address) -> bool:
             or ip.is_unspecified or ip.is_multicast or any(ip in n for n in _DOC_NETS))
 
 
-def check_text(text: str, own_domain: str = "") -> list[str]:
-    """Return problems found in one string."""
+def check_text(text: str, own_domain: str = "", issued: frozenset = frozenset()) -> list[str]:
+    """Return problems found in one string. ``issued`` holds token values the sensor itself
+    generated (honeytokens), which may look like real keys."""
     problems: list[str] = []
     own = own_domain.lower()
 
@@ -182,8 +184,8 @@ def check_text(text: str, own_domain: str = "") -> list[str]:
         problems.append(f"SSN-like value with issuable area number: {m.group(0)}")
 
     for m in _AWS_RE.finditer(text):
-        if not m.group(0).startswith("AKIAFAKE"):
-            problems.append(f"AWS access key id without AKIAFAKE prefix: {m.group(0)}")
+        if m.group(0) not in issued:
+            problems.append(f"AWS access key id that is not a planted token: {m.group(0)}")
 
     for m in _DENY_RE.finditer(text):
         problems.append(f"real organisation name: {m.group(0)}")
@@ -225,8 +227,10 @@ def check_scenario(loaded) -> list[str]:
     # The scenario's own domain is only an acceptable email domain if it is itself reserved.
     own = domain if domain_is_reserved(domain) else ""
 
+    issued = frozenset(loaded.recognised_tokens())
+
     def scan(path: str, text: str) -> None:
-        for p in check_text(text, own):
+        for p in check_text(text, own, issued):
             problems.append(f"{sc.name}: {path}: {p}")
 
     for path, text in _walk(sc.model_dump(mode="json"), "scenario"):

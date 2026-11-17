@@ -7,8 +7,11 @@ honeytokens.
 Scenario files are human-authored. The tuner never edits them; its fenced changes live
 in an overlay (``decoy/overlay.json``, see ``Overlay``) merged on top at load time.
 
-String values inside fake data may contain ``{{ht:<name>}}`` placeholders, replaced at
-load time with per-sensor honeytoken values (see ``scenarios.loader``).
+Any string value may contain ``{{...}}`` templates (``{{ht:<name>}}`` honeytokens,
+``{{password:<label>}}``, ``{{org.name}}`` and the rest, see ``scenarios.bait``). The loader
+expands them from the sensor seed before validating, so every check below applies to the
+expanded values. Fields marked ``credential`` (account passwords, columns with
+``secret = true``) hold bait that differs per sensor; bundled packs fill them with templates.
 """
 
 from __future__ import annotations
@@ -100,9 +103,12 @@ class LoginPolicy(Strict):
         return self
 
 
+CREDENTIAL = {"credential": True}
+
+
 class Account(Strict):
     username: str = Field(min_length=1, max_length=64)
-    password: str = ""
+    password: str = Field(default="", json_schema_extra=CREDENTIAL)
 
     @field_validator("username")
     @classmethod
@@ -161,6 +167,7 @@ Scalar = Union[str, int, float, bool, None]
 class Column(Strict):
     name: str = Field(pattern=IDENT_RE)
     type: ColumnType = "text"
+    secret: bool = False   # seed_rows values in this column are credentials (templates)
 
 
 class Table(Strict):
@@ -234,7 +241,7 @@ class HttpRoute(Strict):
 
 class SipExtension(Strict):
     extension: str = Field(pattern=SIP_EXTENSION_RE)
-    password: str = ""
+    password: str = Field(default="", json_schema_extra=CREDENTIAL)
     display_name: str = Field(default="", max_length=64, pattern=SAFE_TEXT_RE)
 
     @field_validator("password")
@@ -438,10 +445,69 @@ class HoneytokenSpec(Strict):
     planted_in: list[str] = Field(min_length=1, max_length=10)  # human description of locations
 
 
+class BaitSpec(Strict):
+    """``[bait]``: pins and hints for the per-sensor identity. Values here are literal.
+
+    ``org_name`` and ``domain`` pin what ``{{org.*}}`` expands to; without them the name is
+    invented from the seed (an invented word plus one of ``org_suffixes``) and the domain is
+    built from it plus one of ``domain_words`` under a reserved TLD. ``hosts`` pins
+    ``{{host:LABEL}}`` per label and ``passwords`` pins ``{{password:LABEL}}`` (whatever its
+    style) per label, so credentials can survive a change of version or seed. A literal
+    ``identity.org_name`` or ``identity.domain`` also counts as a pin."""
+
+    org_name: Optional[str] = Field(default=None, min_length=2, max_length=80,
+                                    pattern=SAFE_TEXT_RE)
+    domain: Optional[str] = Field(default=None, min_length=4, max_length=253,
+                                  pattern=DOMAIN_RE)
+    org_suffixes: list[str] = Field(default_factory=list, max_length=20)
+    domain_words: list[str] = Field(default_factory=list, max_length=20)
+    hosts: dict[str, str] = Field(default_factory=dict)
+    passwords: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("passwords")
+    @classmethod
+    def _passwords(cls, v: dict[str, str]) -> dict[str, str]:
+        if len(v) > 100:
+            raise ValueError("max 100 pinned passwords")
+        for label, pw in v.items():
+            if not re.fullmatch(r"^[A-Za-z0-9_.-]{1,64}$", label) or not pw or \
+                    not valid_password(pw) or "{{" in pw:
+                raise ValueError(f"bad pinned password for label {label!r}")
+        return v
+
+    @field_validator("org_suffixes")
+    @classmethod
+    def _suffixes(cls, v: list[str]) -> list[str]:
+        for s in v:
+            if not (1 <= len(s) <= 40 and re.fullmatch(SAFE_TEXT_RE, s)):
+                raise ValueError(f"bad organisation suffix {s!r}")
+        return v
+
+    @field_validator("domain_words")
+    @classmethod
+    def _domain_words(cls, v: list[str]) -> list[str]:
+        for w in v:
+            if not re.fullmatch(r"^[a-z0-9][a-z0-9-]{0,19}$", w):
+                raise ValueError(f"bad domain word {w!r}")
+        return v
+
+    @field_validator("hosts")
+    @classmethod
+    def _hosts(cls, v: dict[str, str]) -> dict[str, str]:
+        if len(v) > 40:
+            raise ValueError("max 40 pinned hosts")
+        for label, host in v.items():
+            if not re.fullmatch(r"^[a-z][a-z0-9-]{0,30}$", label) or \
+                    not re.fullmatch(HOSTNAME_RE, host):
+                raise ValueError(f"bad pinned host {label!r} = {host!r}")
+        return v
+
+
 class Scenario(Strict):
     name: str = Field(pattern=SCENARIO_NAME_RE)
     title: str = Field(max_length=120)
     description: str = Field(max_length=2000)
+    bait: BaitSpec = Field(default_factory=BaitSpec)
     identity: Identity
     ssh: SshService = Field(default_factory=SshService)
     services: Services = Field(default_factory=Services)
@@ -534,3 +600,45 @@ class Overlay(Strict):
             if svc not in OVERLAY_SERVICES + ("sip",):
                 raise ValueError(f"overlay policy not allowed for {svc!r}")
         return v
+
+
+# ---- credential fields --------------------------------------------------------------------
+
+def _models_in(annotation) -> list[type[BaseModel]]:
+    from typing import get_args
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return [annotation]
+    out: list[type[BaseModel]] = []
+    for arg in get_args(annotation):
+        out += _models_in(arg)
+    return out
+
+
+def iter_credentials(raw, model: type[BaseModel] = None, path: str = ""):
+    """Yield (path, value) for every credential in a parsed, unexpanded scenario document:
+    fields marked ``credential`` in the schema and seed-row cells of ``secret`` columns."""
+    model = model or Scenario
+    if not isinstance(raw, dict):
+        return
+    for name, info in model.model_fields.items():
+        if name not in raw:
+            continue
+        value, sub = raw[name], f"{path}.{name}" if path else name
+        extra = info.json_schema_extra if isinstance(info.json_schema_extra, dict) else {}
+        if extra.get("credential"):
+            yield sub, value
+            continue
+        if model is Table and name == "seed_rows":
+            secret = [i for i, c in enumerate(raw.get("columns") or [])
+                      if isinstance(c, dict) and c.get("secret")]
+            for r, row in enumerate(value if isinstance(value, list) else []):
+                for i in secret:
+                    if isinstance(row, list) and i < len(row):
+                        yield f"{sub}[{r}][{i}]", row[i]
+            continue
+        for child in _models_in(info.annotation):
+            items = value if isinstance(value, list) else [value]
+            for i, item in enumerate(items):
+                yield from iter_credentials(item, child,
+                                            f"{sub}[{i}]" if isinstance(value, list) else sub)

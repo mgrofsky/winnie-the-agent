@@ -192,6 +192,69 @@ change them. The agents read the front-end volume read-only and do not mount the
 repository. A compromised listener therefore cannot alter what the agents produce, and a
 compromised agents process cannot change the front-ends' code or configuration.
 
+## Fingerprinting
+
+The source is public, so assume the attacker has read it. What they can and cannot use:
+
+**Not recognisable from the source.** The bait in the bundled scenarios is expanded per
+sensor from the private sensor seed: the organisation name and domain, host names, internal
+networks, people and user names, every account password, password hash, token, key and
+session id (see [per-sensor bait](scenarios.md#per-sensor-bait)). None of these values is
+in the repository, so searching for one finds nothing, and two sensors with different seeds
+do not share them. Passwords are drawn from shapes and word lists that real people use, and
+keys and tokens from plain formats with no project-specific prefix. Without the seed the
+values cannot be predicted.
+
+**Still recognisable.** Templates hide values, not structure. Someone who has read the
+scenarios can still match:
+
+- protocol behaviour: how each trap answers, its error texts, timing, which commands and
+  queries it understands, the login policy (`after_n` accepts any password after a few
+  tries), and the S3 and SQL emulation's gaps;
+- software versions in banners and headers (FreePBX 16.0.40, MariaDB 10.11.6, a given
+  Postfix, nginx or Apache version), which are the same on every sensor running a scenario;
+- the shape of the fake data: table and column names, file paths and their layout, Redis
+  key names, HTTP routes and page text, bucket name suffixes, the order and number of seed
+  rows, the generator ranges, and the fictional phone ranges and documentation addresses;
+- the story itself: one organisation of a recognisable kind with these services and these
+  files;
+- tokens issued by earlier versions, which carried fixed markers (an `AKIAFAKE` key id
+  prefix, `sk_test_hp_`, `hpt_`, `Trk`). Current versions never issue them; they are only
+  recognised when they come back;
+- the naming conventions the generators use (host name shapes, the invented halves of
+  organisation names, the person and password word lists), which narrow a guess without
+  giving a value.
+
+Planted tokens (honeytokens and per-source pairs) carry no fixed marker. Each has the length
+and alphabet of the real format and is derived from the seed; the sensor recognises one by
+looking it up in an index of every value it can have issued, not by its shape, so a reader
+of the source has nothing to search for.
+
+**AWS-style access key ids.** A planted key id is `AKIA` and 16 characters of `A-Z2-7`,
+which is the shape real key ids have. There is no shape-based guarantee that such an id was
+never issued to a real account. AWS documents no reserved range, and any rule that would
+give one (a fixed fragment, a character real ids never contain, a checksum) is a constant
+anyone who reads this source could search for, which is the fingerprint this design
+removes. The guarantee settled on is about the pair, not the id:
+
+- the secret paired with a planted key id is derived from the sensor seed (40 base64
+  characters), so it is not the secret of any real key, and AWS refuses any request signed
+  with it whatever the key id; a planted pair can never authenticate anywhere but on this
+  sensor;
+- a planted key id alone could equal a real one: there are 2^80 possible ids, so even with
+  a hundred billion keys issued the chance is below one in 10^12 per token. The only thing
+  a key id alone reveals to its holder is the owning account's id (via
+  `sts:GetAccessKeyInfo`, which needs valid credentials of the caller's own);
+- the synthetic-data checker refuses AWS-shaped key ids in a scenario unless they are the
+  sensor's own planted tokens, so a real key id cannot be pasted into a pack by mistake.
+
+The least harmful option was the real shape: it costs a vanishing collision risk with no
+access attached, against a marker that would identify every sensor.
+
+An operator who needs a sensor that survives a careful look should write their own
+scenario, or at least pin the identity and change the story, banners and data layout of a
+bundled one. The bundled scenarios are examples.
+
 ## Known limits
 
 - Docker's userland proxy hides client addresses; per-source controls are meaningless until

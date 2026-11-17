@@ -180,7 +180,7 @@ async def test_basic_bearer_and_api_key_capture():
         assert json.loads(body) == [{"id": 1, "full_name": "Avery Hartwell"},
                                     {"id": 2, "full_name": "Jordan Okonkwo"}]
         status, _, _ = await req(port, "POST", "/api/v1/notes",
-                                 {"Authorization": "Bearer hpt_abc123"}, b"{}")
+                                 {"Authorization": "Bearer opaque-abc123"}, b"{}")
         assert status == 401
         status, _, body = await req(port, "GET", "/api/v1/patients", {"X-Api-Key": "sk_live_zzz"})
         assert status == 200
@@ -193,7 +193,7 @@ async def test_basic_bearer_and_api_key_capture():
     attempts = [(a["username"], a["password"], a["success"], a["data"]["method"])
                 for a in events(ctx, "auth_attempt")]
     assert ("apiuser", "s3cret", True, "basic") in attempts
-    assert ("<bearer>", "hpt_abc123", False, "bearer") in attempts
+    assert ("<bearer>", "opaque-abc123", False, "bearer") in attempts
     assert ("<api_key>", "sk_live_zzz", True, "api_key") in attempts
 
 

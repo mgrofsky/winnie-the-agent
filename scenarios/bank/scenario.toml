@@ -1,9 +1,12 @@
-# Quillmere Savings & Trust: an invented community bank. Card numbers use the non-issued 0000
-# prefix with failing Luhn digits; IBAN-like values use the non-country code XX; account
-# numbers carry a QM- prefix. Nothing here is a real institution or customer.
+# An invented community bank. The organisation, hosts, networks, people, account numbers and
+# credentials are {{...}} templates expanded from each sensor's seed (see docs/scenarios.md),
+# so no two sensors show the same ones. Card numbers use the non-issued 0000 prefix with
+# failing Luhn digits; IBAN-like values use the non-country code XX; account numbers carry
+# the organisation's upper-case abbreviation as a prefix. Nothing here is a real institution
+# or customer.
 
 name = "bank"
-title = "Quillmere Savings & Trust online banking and core"
+title = "{{org.name}} online banking and core"
 description = """
 An invented community bank. One host fronts online banking and the back-office portal
 (nginx + Java app), exposes a REST API for accounts, cards, transfers and statements, and
@@ -12,34 +15,38 @@ inbound and outbound payment batch files. Honeytokens sit in the batch-upload sc
 SFTP/FTP partner config, the core DB API client table and a Redis config hash.
 """
 
+[bait]
+org_suffixes = ["Savings & Trust", "Community Bank", "Savings Bank", "Bank & Trust", "Federal Savings", "Trust Company"]
+domain_words = ["bank", "savings", "trust", "banking"]
+
 [identity]
-org_name = "Quillmere Savings & Trust"
-hostname = "qst-obk01"
-domain = "quillmere-bank.example"
-internal_ips = ["10.12.4.31", "10.12.20.31"]
+org_name = "{{org.name}}"
+hostname = "{{host:obk}}"
+domain = "{{org.domain}}"
+internal_ips = ["{{net:app}}.31", "{{net:data}}.31"]
 os_pretty_name = "Red Hat Enterprise Linux 9.4 (Plow)"
-kernel = "Linux qst-obk01 5.14.0-427.24.1.el9_4.x86_64 #1 SMP PREEMPT_DYNAMIC Fri Jun 21 05:23:07 EDT 2024 x86_64 x86_64 x86_64 GNU/Linux"
+kernel = "Linux {{host:obk}} 5.14.0-427.24.1.el9_4.x86_64 #1 SMP PREEMPT_DYNAMIC Fri Jun 21 05:23:07 EDT 2024 x86_64 x86_64 x86_64 GNU/Linux"
 timezone = "America/New_York"
 lures = [
-    "/opt/qst/obk/conf/application.properties",
-    "/opt/qst/batch/bin/upload-batches.sh",
-    "/opt/qst/batch/conf/partners.conf",
+    "/opt/{{org.abbr}}/obk/conf/application.properties",
+    "/opt/{{org.abbr}}/batch/bin/upload-batches.sh",
+    "/opt/{{org.abbr}}/batch/conf/partners.conf",
     "/etc/redis/redis.conf",
     "/home/svc_batch/.pgpass",
-    "/var/log/qst/obk/audit.log",
+    "/var/log/{{org.abbr}}/obk/audit.log",
 ]
 
 [[identity.users]]
-name = "qstadmin"
+name = "{{org.abbr}}admin"
 uid = 1000
 gecos = "Platform admin"
-home = "/home/qstadmin"
+home = "/home/{{org.abbr}}admin"
 
 [[identity.users]]
 name = "svc_obk"
 uid = 1201
 gecos = "Online banking service"
-home = "/opt/qst/obk"
+home = "/opt/{{org.abbr}}/obk"
 shell = "/sbin/nologin"
 
 [[identity.users]]
@@ -50,27 +57,27 @@ home = "/home/svc_batch"
 
 [ssh]
 persona_prompt = """
-This is qst-obk01 at Quillmere Savings & Trust, an invented community bank. It runs the
-online banking front end and back-office portal: a Spring Boot 3 app in /opt/qst/obk
-(systemd unit qst-obk, port 8443 behind nginx 1.26), with config in
-/opt/qst/obk/conf/application.properties. Its REST API lives at /api/v1 (accounts, cards,
-transfers, statements). PostgreSQL 16 on 10.12.20.40 holds the corebank database; Redis 7.2
+This is {{host:obk}} at {{org.name}}, an invented community bank. It runs the
+online banking front end and back-office portal: a Spring Boot 3 app in /opt/{{org.abbr}}/obk
+(systemd unit {{org.abbr}}-obk, port 8443 behind nginx 1.26), with config in
+/opt/{{org.abbr}}/obk/conf/application.properties. Its REST API lives at /api/v1 (accounts, cards,
+transfers, statements). PostgreSQL 16 on {{net:data}}.40 holds the corebank database; Redis 7.2
 on localhost:6379 caches sessions (keys sess:*) and rate limits. The payment batch service
-in /opt/qst/batch picks up files dropped by partners via vsftpd under /srv/batches/inbound,
+in /opt/{{org.abbr}}/batch picks up files dropped by partners via vsftpd under /srv/batches/inbound,
 validates them and writes acknowledgements to /srv/batches/outbound. Cron:
-/opt/qst/batch/bin/upload-batches.sh every 15 minutes (pushes settled batches to object
+/opt/{{org.abbr}}/batch/bin/upload-batches.sh every 15 minutes (pushes settled batches to object
 storage), statement generation at 04:00 on the 1st, logrotate, and an AIDE check at 05:00.
-Users: qstadmin (sudo), svc_obk and svc_batch service accounts. Keep every answer
+Users: {{org.abbr}}admin (sudo), svc_obk and svc_batch service accounts. Keep every answer
 consistent with this host.
 """
 
 [[ssh.accounts]]
-username = "qstadmin"
-password = "Quillmere!2025"
+username = "{{org.abbr}}admin"
+password = "{{password:platform_admin}}"
 
 [[ssh.accounts]]
 username = "svc_batch"
-password = "batch2024"
+password = "{{password:svc_batch:user}}"
 
 # ---- PostgreSQL core banking ------------------------------------------------------------
 
@@ -86,11 +93,15 @@ after_n_max = 6
 
 [[services.postgres.accounts]]
 username = "obk_app"
-password = "obk_app_pw"
+password = "{{ht:core_db_password}}"
 
 [[services.postgres.accounts]]
 username = "postgres"
-password = "postgres"
+password = "{{password:postgres:weak}}"
+
+[[services.postgres.accounts]]
+username = "svc_batch"
+password = "{{ht:core_db_password}}"
 
 [[services.postgres.databases]]
 name = "corebank"
@@ -139,7 +150,7 @@ count = 80
 [services.postgres.databases.tables.generator.fields]
 account_id = { kind = "seq", min = 70001 }
 customer_id = { kind = "int", min = 500001, max = 500060 }
-account_number = { kind = "account_number", prefix = "QM-" }
+account_number = { kind = "account_number", prefix = "{{org.ABBR}}-" }
 iban = { kind = "iban_like" }
 product = { kind = "choice", choices = ["everyday_checking", "high_yield_savings", "business_checking", "cd_12m"] }
 currency = { kind = "const", value = "USD" }
@@ -216,14 +227,14 @@ name = "api_clients"
 columns = [
     { name = "client_id", type = "varchar" },
     { name = "name", type = "varchar" },
-    { name = "client_secret", type = "varchar" },
+    { name = "client_secret", type = "varchar", secret = true },
     { name = "scopes", type = "varchar" },
     { name = "active", type = "bool" },
 ]
 seed_rows = [
-    ["qst-mobile-ios", "Mobile app (iOS)", "pkce-public-client", "accounts:read transfers:write", true],
-    ["qst-mobile-android", "Mobile app (Android)", "pkce-public-client", "accounts:read transfers:write", true],
-    ["qst-aggregator-feed", "Aggregator data feed", "{{ht:aggregator_api_key}}", "accounts:read statements:read", true],
+    ["{{org.abbr}}-mobile-ios", "Mobile app (iOS)", "", "accounts:read transfers:write", true],
+    ["{{org.abbr}}-mobile-android", "Mobile app (Android)", "", "accounts:read transfers:write", true],
+    ["{{org.abbr}}-aggregator-feed", "Aggregator data feed", "{{ht:aggregator_api_key}}", "accounts:read statements:read", true],
 ]
 
 [[services.postgres.databases.tables]]
@@ -236,8 +247,8 @@ columns = [
     { name = "last_login", type = "timestamp" },
 ]
 seed_rows = [
-    ["bo.pfairbanks", "Peyton Fairbanks", "ops_manager", true, "2026-11-14 08:02:51"],
-    ["bo.kduquesne", "Kendall Duquesne", "fraud_analyst", true, "2026-11-14 07:44:10"],
+    ["bo.{{person:1.username}}", "{{person:1.full_name}}", "ops_manager", true, "2026-11-14 08:02:51"],
+    ["bo.{{person:2.username}}", "{{person:2.full_name}}", "fraud_analyst", true, "2026-11-14 07:44:10"],
     ["bo.svc-recon", "Reconciliation job", "service", false, "2026-11-15 04:00:03"],
 ]
 
@@ -255,32 +266,32 @@ after_n_max = 4
 
 [[services.redis.accounts]]
 username = "default"
-password = "redis-obk-cache"
+password = "{{password:redis:service}}"
 
 [[services.redis.keys]]
-key = "sess:7f3a9c1e2b4d"
+key = "sess:{{hex:12:sess_web}}"
 type = "hash"
-value = { customer_id = "500014", channel = "web", mfa = "passed", created = "2026-11-15T07:58:12Z", ip = "10.12.4.5" }
+value = { customer_id = "500014", channel = "web", mfa = "passed", created = "2026-11-15T07:58:12Z", ip = "{{net:app}}.5" }
 
 [[services.redis.keys]]
-key = "sess:0be4d81a77c2"
+key = "sess:{{hex:12:sess_ios}}"
 type = "hash"
-value = { customer_id = "500033", channel = "ios", mfa = "passed", created = "2026-11-15T08:01:40Z", ip = "10.12.4.5" }
+value = { customer_id = "500033", channel = "ios", mfa = "passed", created = "2026-11-15T08:01:40Z", ip = "{{net:app}}.5" }
 
 [[services.redis.keys]]
-key = "sess:bo:c19e55f02a8d"
+key = "sess:bo:{{hex:12:sess_bo}}"
 type = "hash"
-value = { user = "bo.kduquesne", role = "fraud_analyst", created = "2026-11-15T07:44:10Z" }
+value = { user = "bo.{{person:2.username}}", role = "fraud_analyst", created = "2026-11-15T07:44:10Z" }
 
 [[services.redis.keys]]
-key = "ratelimit:login:10.12.4.5"
+key = "ratelimit:login:{{net:app}}.5"
 type = "string"
 value = "17"
 
 [[services.redis.keys]]
 key = "config:obk"
 type = "hash"
-value = { db_url = "jdbc:postgresql://10.12.20.40:5432/corebank", db_user = "obk_app", db_password = "{{ht:core_db_password}}", session_ttl = "900" }
+value = { db_url = "jdbc:postgresql://{{net:data}}.40:5432/corebank", db_user = "obk_app", db_password = "{{ht:core_db_password}}", session_ttl = "900" }
 
 [[services.redis.keys]]
 key = "svc:recon:token"
@@ -307,20 +318,20 @@ after_n_max = 5
 
 [[services.ftp.accounts]]
 username = "payroll-partner"
-password = "Payroll#2026"
+password = "{{password:payroll-partner:user}}"
 
 [[services.ftp.accounts]]
 username = "svc_batch"
-password = "batch2024"
+password = "{{password:svc_batch:user}}"
 
 [[services.ftp.files]]
 path = "/inbound/payroll/PAY-20261114-0001.csv"
 mtime = "2026-11-14 16:02"
 content = '''
 batch_id,effective_date,debit_account,credit_account,credit_iban,beneficiary,amount,reference
-PAY-20261114-0001,2026-11-15,QM-4401928374,QM-7712093847,XX001234567890123456789012,Harper Pemberton,2416.55,NOV PAYROLL
-PAY-20261114-0001,2026-11-15,QM-4401928374,QM-2209384756,XX009876543210987654321098,Ellis Okonkwo,1988.10,NOV PAYROLL
-PAY-20261114-0001,2026-11-15,QM-4401928374,QM-5530192837,XX005551234509876123450987,Reese Castellanos,3120.00,NOV PAYROLL
+PAY-20261114-0001,2026-11-15,{{org.ABBR}}-{{digits:6:acct_checking_head}}{{digits:4:acct_checking_tail}},{{org.ABBR}}-{{digits:10:acct_payee1}},XX001234567890123456789012,{{person:3.full_name}},2416.55,NOV PAYROLL
+PAY-20261114-0001,2026-11-15,{{org.ABBR}}-{{digits:6:acct_checking_head}}{{digits:4:acct_checking_tail}},{{org.ABBR}}-{{digits:10:acct_payee2}},XX009876543210987654321098,{{person:4.full_name}},1988.10,NOV PAYROLL
+PAY-20261114-0001,2026-11-15,{{org.ABBR}}-{{digits:6:acct_checking_head}}{{digits:4:acct_checking_tail}},{{org.ABBR}}-{{digits:10:acct_payee3}},XX005551234509876123450987,{{person:5.full_name}},3120.00,NOV PAYROLL
 '''
 
 [[services.ftp.files]]
@@ -345,10 +356,10 @@ path = "/scripts/upload-batches.sh"
 mtime = "2026-08-27 11:20"
 content = '''
 #!/bin/bash
-# Push settled payment batches to the archive bucket. Owner: qstadmin
+# Push settled payment batches to the archive bucket. Owner: {{org.abbr}}admin
 export AWS_ACCESS_KEY_ID={{ht:batch_aws_key}}
 export AWS_DEFAULT_REGION=us-east-1
-aws s3 sync /srv/batches/settled s3://qst-payment-batches-archive/ --sse aws:kms --only-show-errors
+aws s3 sync /srv/batches/settled s3://{{org.abbr}}-payment-batches-archive/ --sse aws:kms --only-show-errors
 '''
 
 [[services.ftp.files]]
@@ -358,14 +369,14 @@ content = '''
 # Partner drop accounts (vsftpd virtual users). Keep in sync with /etc/vsftpd/virtual_users.db
 [payroll-partner]
 home=/srv/batches/inbound/payroll
-notify=ops@quillmere-bank.example
+notify=ops@{{org.domain}}
 
 [vendor-payments]
 home=/srv/batches/inbound/vendor-payments
-notify=ap@quillmere-bank.example
+notify=ap@{{org.domain}}
 
 [core-db]
-host=10.12.20.40
+host={{net:data}}.40
 user=svc_batch
 password={{ht:core_db_password}}
 '''
@@ -377,8 +388,8 @@ enabled = true
 port = 8080
 server_header = "nginx/1.26.1"
 login_path = "/login"
-login_title = "Quillmere Online Banking - Sign in"
-branding = "Quillmere Savings & Trust. Member FDIC-style deposit insurance notice (sample). Secure online banking."
+login_title = "{{org.short}} Online Banking - Sign in"
+branding = "{{org.name}}. Member FDIC-style deposit insurance notice (sample). Secure online banking."
 api_prefix = "/api/v1"
 
 [services.http.policy]
@@ -387,12 +398,12 @@ after_n_min = 3
 after_n_max = 6
 
 [[services.http.accounts]]
-username = "bo.pfairbanks"
-password = "Quillmere2025!"
+username = "bo.{{person:1.username}}"
+password = "{{password:person1}}"
 
 [[services.http.accounts]]
 username = "demo.customer"
-password = "Password1"
+password = "{{password:demo_customer:weak}}"
 
 [[services.http.pages]]
 path = "/accounts"
@@ -401,8 +412,8 @@ body_html = '''
 <h1>Welcome back</h1>
 <table>
 <tr><th>Account</th><th>Number</th><th>Available balance</th></tr>
-<tr><td>Everyday Checking</td><td>QM-...8374</td><td>$4,218.77</td></tr>
-<tr><td>High Yield Savings</td><td>QM-...2290</td><td>$18,940.12</td></tr>
+<tr><td>Everyday Checking</td><td>{{org.ABBR}}-...{{digits:4:acct_checking_tail}}</td><td>$4,218.77</td></tr>
+<tr><td>High Yield Savings</td><td>{{org.ABBR}}-...{{digits:4:acct_savings_tail}}</td><td>$18,940.12</td></tr>
 </table>
 <p><a href="/transfers">Transfer money</a> | <a href="/statements">Statements</a></p>
 '''
@@ -413,7 +424,7 @@ title = "Transfers"
 body_html = '''
 <h1>Transfer money</h1>
 <form method="post" action="/api/v1/transfers">
-<label>From</label><select name="from"><option>Everyday Checking QM-...8374</option></select>
+<label>From</label><select name="from"><option>Everyday Checking {{org.ABBR}}-...{{digits:4:acct_checking_tail}}</option></select>
 <label>To account or IBAN</label><input name="to">
 <label>Amount</label><input name="amount">
 <button>Continue</button>
@@ -422,7 +433,7 @@ body_html = '''
 
 [[services.http.pages]]
 path = "/backoffice/login"
-title = "Quillmere Back Office"
+title = "{{org.short}} Back Office"
 requires_login = false
 body_html = '''
 <h1>Back Office Portal</h1>
@@ -500,7 +511,7 @@ auth = "any"
 [services.http.routes.json_body]
 transfer_id = "{transfer_id}"
 status = "pending_review"
-from_account = "QM-4401928374"
+from_account = "{{org.ABBR}}-{{digits:6:acct_checking_head}}{{digits:4:acct_checking_tail}}"
 to_iban = "XX001234567890123456789012"
 amount = 1250.0
 currency = "USD"
@@ -510,9 +521,9 @@ method = "GET"
 path = "/api/v1/partners/aggregator/config"
 auth = "basic"
 [services.http.routes.json_body]
-client_id = "qst-aggregator-feed"
+client_id = "{{org.abbr}}-aggregator-feed"
 client_secret = "{{ht:aggregator_api_key}}"
-token_url = "https://api.quillmere-bank.example/oauth/token"
+token_url = "https://api.{{org.domain}}/oauth/token"
 
 # ---- S3-compatible storage (statement archive and batch staging) ------------------------
 
@@ -520,7 +531,7 @@ token_url = "https://api.quillmere-bank.example/oauth/token"
 enabled = true
 port = 9000
 region = "us-east-1"
-owner_name = "qst-storage"
+owner_name = "{{org.abbr}}-storage"
 
 [services.s3.policy]
 accept = "after_n"
@@ -528,11 +539,11 @@ after_n_min = 3
 after_n_max = 6
 
 [[services.s3.buckets]]
-name = "qst-statement-archive"
+name = "{{org.abbr}}-statement-archive"
 created = "2022-08-01"
 
 [[services.s3.buckets.objects]]
-key = "statements/2026/10/QM-{n:06d}.pdf"
+key = "statements/2026/10/{{org.ABBR}}-{n:06d}.pdf"
 count = 1200
 size = 140000
 content_type = "application/pdf"
@@ -545,7 +556,7 @@ content_type = "text/csv"
 mtime = "2026-11-02 05:40"
 
 [[services.s3.buckets]]
-name = "qst-batch-staging"
+name = "{{org.abbr}}-batch-staging"
 created = "2022-08-01"
 
 [[services.s3.buckets.objects]]
@@ -560,14 +571,14 @@ key = "scripts/upload-batches.env"
 content_type = "text/plain"
 mtime = "2026-07-14 10:20"
 text = """
-# used by /opt/qst/batch/bin/upload-batches.sh
+# used by /opt/{{org.abbr}}/batch/bin/upload-batches.sh
 AWS_ACCESS_KEY_ID={{ht:batch_aws_key}}
-STAGING_BUCKET=qst-batch-staging
+STAGING_BUCKET={{org.abbr}}-batch-staging
 PGPASSWORD={{ht:core_db_password}}
 """
 
 [[services.s3.buckets]]
-name = "qst-db-backups"
+name = "{{org.abbr}}-db-backups"
 created = "2022-09-19"
 
 [[services.s3.buckets.objects]]
@@ -591,7 +602,7 @@ kind = "db_password"
 planted_in = [
     "Redis hash config:obk (db_password)",
     "FTP /scripts/partners.conf ([core-db] password)",
-    "S3 qst-batch-staging/scripts/upload-batches.env (PGPASSWORD)",
+    "S3 {{org.abbr}}-batch-staging/scripts/upload-batches.env (PGPASSWORD)",
 ]
 
 [[honeytokens]]
@@ -604,13 +615,13 @@ name = "batch_aws_key"
 kind = "aws_access_key"
 planted_in = [
     "FTP /scripts/upload-batches.sh (AWS_ACCESS_KEY_ID)",
-    "S3 qst-batch-staging/scripts/upload-batches.env (AWS_ACCESS_KEY_ID)",
+    "S3 {{org.abbr}}-batch-staging/scripts/upload-batches.env (AWS_ACCESS_KEY_ID)",
 ]
 
 [[honeytokens]]
 name = "aggregator_api_key"
 kind = "api_key"
 planted_in = [
-    "Postgres corebank.api_clients row qst-aggregator-feed (client_secret)",
+    "Postgres corebank.api_clients row {{org.abbr}}-aggregator-feed (client_secret)",
     "HTTP GET /api/v1/partners/aggregator/config (client_secret)",
 ]

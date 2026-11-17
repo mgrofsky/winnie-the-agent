@@ -23,7 +23,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import tempfile
 import time
 from collections import OrderedDict, deque
@@ -35,14 +34,13 @@ from typing import Awaitable, Callable, Optional, TypeVar
 from pydantic import BaseModel
 
 from agents.budget import ip_key
-from agents.source_state import MAX_TARPIT_MS, SourceEntry, SourceStateView, source_token, \
-    source_token_name
+from agents.source_state import MAX_TARPIT_MS, SourceEntry, SourceStateView, \
+    legacy_source_token, source_token, source_token_name
+from scenarios.tokens import TokenIndex
 from listeners.events import MAX_DATA_KEYS, MAX_VALUE_CHARS, EventWriter, clean, new_task_name
 from scenarios.schema import LoginPolicy
 
 T = TypeVar("T", bound=BaseModel)
-_ACCESS_KEY_RE = re.compile(r"AKIAFAKE[A-Z2-7]{12}")
-_SECRET_RUN_RE = re.compile(r"[A-Za-z0-9+/]{40,}")
 
 SERVICES = ("sip", "ftp", "telnet", "postgres", "mysql", "mssql", "redis", "smtp", "http", "mllp",
             "s3")
@@ -431,8 +429,9 @@ class ListenerContext:
         return pair
 
     def planted_tokens(self) -> dict[str, str]:
-        """{value: name} for every token currently planted for a source (key id and secret).
-        Rebuilt only when the source-state file is reloaded."""
+        """{value: name} for every token currently planted for a source (key id and secret),
+        plus the pair earlier versions planted for the same source (recognised, never
+        planted again). Rebuilt only when the source-state file is reloaded."""
         if self.source_state.path is None:
             return {}
         self.source_state._refresh()
@@ -445,36 +444,31 @@ class ListenerContext:
             for entry in state.entries.values():
                 if entry.plant_token:
                     name = source_token_name(entry.key)
+                    for value in legacy_source_token(self.seed, entry.key):
+                        out[value] = name
                     for value in self.source_token_for_key(entry.key):
                         out[value] = name
             self._planted_map, self._planted_stamp = out, stamp
+            self._token_index = None
         return self._planted_map
 
+    def token_index(self) -> TokenIndex:
+        """Scenario honeytokens and per-source tokens, indexed for lookup."""
+        planted = self.planted_tokens()
+        index = getattr(self, "_token_index", None)
+        if index is None or getattr(self, "_index_tokens", None) is not self.honeytokens:
+            index = TokenIndex(self.honeytokens)
+            index.update(planted)
+            self._token_index, self._index_tokens = index, self.honeytokens
+        return index
+
     def honeytoken_in(self, *values: Optional[str]) -> Optional[str]:
+        """The name of a token this sensor issued found in any of ``values``. Recognised by
+        lookup, one probe per position of a bounded prefix of each value."""
         values = tuple(v for v in values if v)
         if not values:
             return None
-        for v in values:
-            for token, name in self.honeytokens.items():
-                if token in v:
-                    return name
-        planted = self.planted_tokens()
-        if not planted:
-            return None
-        # Indexed lookup (cost independent of how many sources hold a planted token): the
-        # whole value, every AWS-style key id in it, and every 40-character secret window.
-        for v in values:
-            if v in planted:
-                return planted[v]
-            for m in _ACCESS_KEY_RE.finditer(v):
-                if m.group(0) in planted:
-                    return planted[m.group(0)]
-            for run in _SECRET_RUN_RE.findall(v):
-                for i in range(len(run) - 39):
-                    hit = planted.get(run[i:i + 40])
-                    if hit:
-                        return hit
-        return None
+        return self.token_index().find_any(values)
 
     def tarpit_seconds(self, ip: str) -> float:
         entry = self.source(ip)

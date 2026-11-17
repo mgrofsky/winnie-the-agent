@@ -3,10 +3,13 @@
 Backs ``python -m listeners --list-scenarios`` and ``--describe <name>``:
 
     list_text() -> str                         one line per shipped scenario
-    describe(name, seed="describe") -> str     what the scenario exposes
+    describe(name, seed="describe") -> str     what the scenario exposes for that seed
 
+Identity, hosts, people and credentials come from ``{{...}}`` templates expanded from the
+seed, so the output is specific to one sensor; ``describe`` lists every expanded template.
 Honeytoken *values* are never printed, only their names, kinds and where they are planted.
-FTP file contents, S3 object bodies and HTTP bodies are not printed either (they may embed honeytokens).
+FTP file contents, S3 object bodies and HTTP bodies are not printed either (they may embed
+honeytokens).
 """
 
 from __future__ import annotations
@@ -40,7 +43,8 @@ def list_text(scenarios_dir: Optional[str] = None) -> str:
     return "\n".join(lines)
 
 
-def describe(name: str, seed: str = "describe", scenarios_dir: Optional[str] = None) -> str:
+def describe(name: str, seed: str = "describe", scenarios_dir: Optional[str] = None,
+             seed_note: Optional[str] = None) -> str:
     loaded = load_scenario(name, seed=seed, scenarios_dir=scenarios_dir)
     sc = loaded.scenario
     ident = sc.identity
@@ -50,6 +54,13 @@ def describe(name: str, seed: str = "describe", scenarios_dir: Optional[str] = N
     w(f"Scenario: {sc.name} - {sc.title}")
     w(" ".join(sc.description.split()))
     w("")
+    if loaded.bait:
+        w("Values below are specific to this sensor: they are derived from its seed, and a "
+          "sensor with another seed shows a different organisation, hosts, people and "
+          "credentials.")
+        if seed_note:
+            w(seed_note)
+        w("")
     w("Identity")
     w(f"  organisation: {ident.org_name}")
     w(f"  host:         {ident.hostname}.{ident.domain}")
@@ -135,6 +146,12 @@ def describe(name: str, seed: str = "describe", scenarios_dir: Optional[str] = N
             if svc.openapi_path:
                 n_paths = len((svc.openapi or {}).get("paths", {}))
                 w(f"  OpenAPI document: {svc.openapi_path} ({n_paths} paths)")
+
+    if loaded.bait:
+        w("")
+        w("Per-sensor bait (template = value for this seed)")
+        for template, value in loaded.bait.items():
+            w(f"  {template} = {value}")
 
     w("")
     w("Honeytokens (values are written to reports/honeytokens.json, never printed here)")

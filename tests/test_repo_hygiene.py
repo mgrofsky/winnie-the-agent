@@ -75,7 +75,8 @@ def test_no_high_entropy_password_assignments():
         for m in PASSWORD_ASSIGNMENT.finditer(_text(path)):
             value = m.group(1)
             code = "(" in value or re.fullmatch(r"[A-Za-z_][\w.]*", value)  # an expression
-            if _entropy(value) >= 4.0 and not code and not value.startswith(("{{", "$", "<")):
+            template = value.startswith(("{{", "$", "<")) or "}}" in value  # template text
+            if _entropy(value) >= 4.0 and not code and not template:
                 hits.append(f"{path.relative_to(ROOT)}: {value[:6]}...")
     assert hits == []
 

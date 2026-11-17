@@ -44,6 +44,7 @@ from agents.sessions import (
     unverified_campaign_id,
 )
 from scenarios.loader import find_honeytoken, load_honeytoken_sources, load_honeytoken_values
+from scenarios.tokens import TokenIndex
 
 log = logging.getLogger(__name__)
 
@@ -382,10 +383,12 @@ def _ask_model(llm: JsonLLM, label: str, transcript: str) -> Optional[TriageMode
     return out
 
 
-def _honeytokens_in(texts: Iterable[str], values: dict[str, str]) -> list[str]:
+def _honeytokens_in(texts: Iterable[str], values) -> list[str]:
+    """Names of planted tokens found in ``texts``; ``values`` is a TokenIndex or a dict."""
+    index = values if isinstance(values, TokenIndex) else TokenIndex(values)
     hits = set()
     for t in texts:
-        name = find_honeytoken(t, values)
+        name = find_honeytoken(t, index)
         if name:
             hits.add(name)
     return sorted(hits)
@@ -741,7 +744,8 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
     parsed = parse_log(log_path, window_minutes=window_minutes,
                        start_offset=cursor.start_offset(log_path))
     sessions, campaigns = pending(parsed, cursor, now=now)
-    ht_values = load_honeytoken_values(reports_dir / "honeytokens.json")
+    # Built once per run: one lookup per position of each input, whatever the token count.
+    ht_values = TokenIndex(load_honeytoken_values(reports_dir / "honeytokens.json"))
     ht_sources = load_honeytoken_sources(reports_dir / "honeytokens.json")
     calls = 0
     model_ok = llm is not None

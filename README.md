@@ -173,6 +173,23 @@ checker enforces that (`uv run python -m scenarios.check`). The SSH honeypot is 
 in every scenario. See [docs/scenarios.md](docs/scenarios.md) for the schema and how to
 add one.
 
+The bait is per sensor. The organisation name and domain, host names, internal networks,
+people, passwords, password hashes, keys, tokens and session ids in the bundled scenarios
+are templates expanded from the sensor's private seed, so none of them is in this
+repository and two sensors do not share them. One sensor keeps the same values across
+restarts and across all its services: the password in a decoy config file is the one the
+database trap accepts. `uv run python -m listeners --describe <name>` shows this sensor's
+values. Upgrades that change a bundled scenario or the generators change the bait, so
+credentials attackers collected before stop working; see
+[docs/operations.md](docs/operations.md#when-the-bait-changes) for what changes and how to
+pin a password.
+
+The bundled scenarios are examples. Their story, services, banners and data layout are
+the same everywhere and are readable by anyone with the source (see
+[docs/security-model.md](docs/security-model.md#fingerprinting)). An operator who wants a
+believable target should write their own scenario, or at least pin the identity in the
+scenario's `[bait]` table and change the parts that matter to them.
+
 ## Logs
 
 Every component writes one JSON object per line to the same log (`[honeypot] log_file`,

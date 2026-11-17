@@ -103,7 +103,7 @@ def build_context(config: ConfigParser, base: Path, scenario_name: Optional[str]
         settings=resolve_settings(config, scenario),
         quarantine_dir=_resolve(base, section.get("quarantine_dir", str(REPO_ROOT / "quarantine"))),
         budget=budget, json_llm=json_llm,
-        honeytokens={t.value: t.name for t in scenario.honeytokens.values()} if scenario else {},
+        honeytokens=scenario.recognised_tokens() if scenario else {},
         bind_host=section.get("bind_host", "0.0.0.0"),
         source_state_path=str(source_state_path()),
     )
@@ -186,22 +186,38 @@ async def serve(ctx: ListenerContext, config: ConfigParser) -> None:
         reporter.cancel()
 
 
+def _describe_seed(config: ConfigParser, base: Path, args) -> tuple[str, str]:
+    """The seed --describe expands bait with, and a line saying where it came from. Reads
+    the sensor seed without creating one."""
+    if args.seed_preview:
+        return args.seed_preview, "Seed: the --seed-preview value, not this sensor's own."
+    from agents import runtime
+
+    try:
+        ddir = runtime.data_dir(config, base, args.data_dir)
+        seed = runtime.sensor_seed(config, ddir, create=False)
+    except OSError:
+        seed = None
+    if seed:
+        return seed, "Seed: this sensor's own seed."
+    return "preview", ("Seed: none found for this sensor yet (it is created on first start); "
+                       "showing a preview. The running sensor will show different values.")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m listeners", description=__doc__)
     parser.add_argument("--config", help="path to config.ini (default SSH/config.ini)")
     parser.add_argument("--scenario", help="override [scenario] active")
     parser.add_argument("--list-scenarios", action="store_true")
-    parser.add_argument("--describe", metavar="NAME")
+    parser.add_argument("--describe", metavar="NAME",
+                        help="show what a scenario exposes on this sensor (its seed's bait)")
+    parser.add_argument("--seed-preview", metavar="TEXT",
+                        help="with --describe: show the bait for this seed instead of the "
+                             "sensor's own")
     parser.add_argument("--log-file", help="override the event log path")
     parser.add_argument("--data-dir", help="writable dir for quarantine, budget state, reports")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-
-    if args.list_scenarios or args.describe:
-        from scenarios import describe as d
-
-        print(d.list_text() if args.list_scenarios else d.describe(args.describe))
-        return 0
 
     config_path = Path(args.config) if args.config else REPO_ROOT / "SSH" / "config.ini"
     config = ConfigParser()
@@ -210,6 +226,16 @@ def main(argv=None) -> int:
     elif args.config:
         print(f"config not found: {config_path}", file=sys.stderr)
         return 1
+
+    if args.list_scenarios or args.describe:
+        from scenarios import describe as d
+
+        if args.list_scenarios:
+            print(d.list_text())
+            return 0
+        seed, note = _describe_seed(config, config_path.resolve().parent, args)
+        print(d.describe(args.describe, seed=seed, seed_note=note))
+        return 0
     ctx = build_context(config, config_path.resolve().parent, args.scenario,
                         log_file=args.log_file, data_dir=args.data_dir)
     try:

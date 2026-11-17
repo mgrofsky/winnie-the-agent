@@ -1,8 +1,10 @@
-# Bellweather Voice Networks: a small hosted-PBX reseller running FreePBX 16 on Asterisk 18.
-# Everything here is invented. Phone numbers use the NANP 555-01xx fictional range.
+# A small hosted-PBX reseller running FreePBX 16 on Asterisk 18. Everything here is invented.
+# The organisation, hosts, networks, people and credentials are {{...}} templates expanded
+# from each sensor's seed (see docs/scenarios.md), so no two sensors show the same ones.
+# Phone numbers use the NANP 555-01xx fictional range.
 
 name = "sip_provider"
-title = "Bellweather Voice Networks hosted PBX (FreePBX / Asterisk)"
+title = "{{org.name}} hosted PBX (FreePBX / Asterisk)"
 description = """
 A FreePBX 16 / Asterisk 18 PBX run by an invented regional hosted-voice reseller. Exposes SIP
 registration on 5060 with numbered extension ranges, the FreePBX admin web UI, the MySQL
@@ -11,13 +13,17 @@ spool copies, and a legacy telnet console. Honeytokens sit in the trunk config b
 FreePBX DB credentials file, an offsite backup script and the REST API application listing.
 """
 
+[bait]
+org_suffixes = ["Voice Networks", "Voice", "Telecom", "Communications", "VoIP", "Telephone"]
+domain_words = ["voice", "tel", "voip", "comms"]
+
 [identity]
-org_name = "Bellweather Voice Networks"
-hostname = "pbx01"
-domain = "bellweather-voice.example"
-internal_ips = ["10.40.8.21", "172.20.1.21"]
+org_name = "{{org.name}}"
+hostname = "{{host:pbx}}"
+domain = "{{org.domain}}"
+internal_ips = ["{{net:voice}}.21", "{{net:mgmt}}.21"]
 os_pretty_name = "Debian GNU/Linux 12 (bookworm)"
-kernel = "Linux pbx01 6.1.0-26-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.112-1 (2024-10-22) x86_64 GNU/Linux"
+kernel = "Linux {{host:pbx}} 6.1.0-26-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.112-1 (2024-10-22) x86_64 GNU/Linux"
 timezone = "America/Chicago"
 lures = [
     "/etc/asterisk/pjsip.conf",
@@ -37,10 +43,10 @@ home = "/var/lib/asterisk"
 shell = "/usr/sbin/nologin"
 
 [[identity.users]]
-name = "dgallagher"
+name = "{{person:1.username}}"
 uid = 1001
-gecos = "Dakota Gallagher (voice eng)"
-home = "/home/dgallagher"
+gecos = "{{person:1.full_name}} (voice eng)"
+home = "/home/{{person:1.username}}"
 
 [[identity.users]]
 name = "voiceops"
@@ -50,28 +56,28 @@ home = "/home/voiceops"
 
 [ssh]
 persona_prompt = """
-This is pbx01, the production FreePBX 16.0.40 server for Bellweather Voice Networks, a small
+This is {{host:pbx}}, the production FreePBX 16.0.40 server for {{org.name}}, a small
 hosted-voice reseller. Asterisk 18.20.0 runs as the asterisk user (asterisk -rx works for
 root). Config lives in /etc/asterisk (pjsip.conf, extensions_custom.conf, manager.conf) and
 /etc/freepbx.conf; voicemail is under /var/spool/asterisk/voicemail/default/<ext>/INBOX;
 call recordings under /var/spool/asterisk/monitor/YYYY/MM/DD. MariaDB 10.11 serves the
 asterisk and asteriskcdrdb databases on 127.0.0.1:3306. Apache 2.4 with PHP 8.2 serves the
-admin UI at /admin. Postfix relays voicemail-to-email via smarthost.bellweather-voice.example.
-vsftpd serves /srv/ftp/backups to the backup host 10.40.8.30. Extensions are 1001-1099 for
-the main office and 2001-2049 for the Riverside branch; queue 8001 is the support line.
+admin UI at /admin. Postfix relays voicemail-to-email via smarthost.{{org.domain}}.
+vsftpd serves /srv/ftp/backups to the backup host {{net:voice}}.30. Extensions are 1001-1099 for
+the main office and 2001-2049 for the {{place:1}} branch; queue 8001 is the support line.
 Cron: fwconsole ma refreshsignatures nightly, fwconsole backup --backup=nightly at 02:15,
 /usr/local/sbin/offsite-backup.sh at 03:00 (copies backups to object storage), logrotate.
-fail2ban is installed but its asterisk jail is disabled. Users dgallagher and voiceops have
+fail2ban is installed but its asterisk jail is disabled. Users {{person:1.username}} and voiceops have
 sudo. Keep every answer consistent with this host.
 """
 
 [[ssh.accounts]]
 username = "root"
-password = "Bellweather2024!"
+password = "{{password:person1}}"
 
 [[ssh.accounts]]
 username = "voiceops"
-password = "voiceops123"
+password = "{{password:voiceops:user}}"
 
 # ---- SIP --------------------------------------------------------------------------------
 
@@ -80,11 +86,11 @@ enabled = true
 port = 5060
 udp = true
 tcp = true
-realm = "bellweather-voice.example"
+realm = "{{org.domain}}"
 server_header = "FPBX-16.0.40(18.20.0)"
 extension_ranges = ["1001-1099", "2001-2049", "8001-8009"]
 dial_plan_hints = [
-    "9 + 10 digits: outbound local and long distance via trunk bwv-carrier-a",
+    "9 + 10 digits: outbound local and long distance via trunk {{org.abbr}}-carrier-a",
     "9 + 011 + country + number: international (enabled for 1001-1010 only)",
     "*97: voicemail main menu, *98: voicemail for another mailbox",
     "8001: support ring group, 8002: sales queue",
@@ -99,33 +105,33 @@ after_n_max = 5
 
 [[services.sip.extensions]]
 extension = "1001"
-password = "Bw1001!pbx"
+password = "{{password:ext1001}}"
 display_name = "Reception"
 
 [[services.sip.extensions]]
 extension = "1002"
-password = "1002"
-display_name = "Avery Hartwell"
+password = "{{password:1002:user}}"
+display_name = "{{person:2.full_name}}"
 
 [[services.sip.extensions]]
 extension = "1004"
-password = "summer2024"
-display_name = "Jordan Okonkwo"
+password = "{{password:ext1004}}"
+display_name = "{{person:3.full_name}}"
 
 [[services.sip.extensions]]
 extension = "1010"
-password = "Bwv!1010"
+password = "{{password:ext1010}}"
 display_name = "NOC Desk"
 
 [[services.sip.extensions]]
 extension = "2001"
-password = "riverside2001"
-display_name = "Riverside Front Desk"
+password = "{{password:2001:user}}"
+display_name = "{{place:1}} Front Desk"
 
 [[services.sip.extensions]]
 extension = "2007"
-password = "2007pass"
-display_name = "Riley Lindqvist"
+password = "{{password:2007:user}}"
+display_name = "{{person:4.full_name}}"
 
 # ---- MySQL ------------------------------------------------------------------------------
 
@@ -141,11 +147,11 @@ after_n_max = 6
 
 [[services.mysql.accounts]]
 username = "freepbxuser"
-password = "fpbxdbpass2019"
+password = "{{ht:freepbx_db_password}}"
 
 [[services.mysql.accounts]]
 username = "cdrreader"
-password = "cdr-readonly"
+password = "{{password:cdrreader:service}}"
 
 [[services.mysql.databases]]
 name = "asteriskcdrdb"
@@ -167,9 +173,9 @@ columns = [
     { name = "uniqueid", type = "varchar" },
 ]
 seed_rows = [
-    ["2026-11-14 09:02:11", "\"Reception\" <1001>", "1001", "+13125550147", "from-internal", "PJSIP/1001-0000a1b2", "Dial", 182, 171, "ANSWERED", "BWV-MAIN", "1763132531.1201"],
-    ["2026-11-14 09:15:40", "\"Avery Hartwell\" <1002>", "1002", "2007", "from-internal", "PJSIP/1002-0000a1c0", "Dial", 41, 35, "ANSWERED", "BWV-MAIN", "1763133340.1207"],
-    ["2026-11-14 10:01:03", "\"Support\" <+16175550112>", "+16175550112", "8001", "from-trunk", "PJSIP/bwv-carrier-a-0000a1d4", "Queue", 305, 290, "ANSWERED", "", "1763136063.1219"],
+    ["2026-11-14 09:02:11", "\"Reception\" <1001>", "1001", "+13125550147", "from-internal", "PJSIP/1001-0000a1b2", "Dial", 182, 171, "ANSWERED", "{{org.ABBR}}-MAIN", "1763132531.1201"],
+    ["2026-11-14 09:15:40", "\"{{person:2.full_name}}\" <1002>", "1002", "2007", "from-internal", "PJSIP/1002-0000a1c0", "Dial", 41, 35, "ANSWERED", "{{org.ABBR}}-MAIN", "1763133340.1207"],
+    ["2026-11-14 10:01:03", "\"Support\" <+16175550112>", "+16175550112", "8001", "from-trunk", "PJSIP/{{org.abbr}}-carrier-a-0000a1d4", "Queue", 305, 290, "ANSWERED", "", "1763136063.1219"],
 ]
 
 [services.mysql.databases.tables.generator]
@@ -180,12 +186,12 @@ clid = { kind = "full_name" }
 src = { kind = "extension", min = 1001, max = 1030 }
 dst = { kind = "phone" }
 dcontext = { kind = "choice", choices = ["from-internal", "from-internal", "from-trunk", "ext-queues"] }
-channel = { kind = "choice", choices = ["PJSIP/1002-0000b0a1", "PJSIP/1004-0000b0c7", "PJSIP/1010-0000b113", "PJSIP/bwv-carrier-a-0000b2f0"] }
+channel = { kind = "choice", choices = ["PJSIP/1002-0000b0a1", "PJSIP/1004-0000b0c7", "PJSIP/1010-0000b113", "PJSIP/{{org.abbr}}-carrier-a-0000b2f0"] }
 lastapp = { kind = "choice", choices = ["Dial", "Dial", "Queue", "VoiceMail", "Playback"] }
 duration = { kind = "int", min = 3, max = 1800 }
 billsec = { kind = "int", min = 0, max = 1700 }
 disposition = { kind = "choice", choices = ["ANSWERED", "ANSWERED", "ANSWERED", "NO ANSWER", "BUSY", "FAILED"] }
-accountcode = { kind = "choice", choices = ["BWV-MAIN", "BWV-RIV", ""] }
+accountcode = { kind = "choice", choices = ["{{org.ABBR}}-MAIN", "{{org.ABBR}}-RIV", ""] }
 uniqueid = { kind = "int", min = 1763000000, max = 1763199999 }
 
 [[services.mysql.databases]]
@@ -195,7 +201,7 @@ name = "asterisk"
 name = "users"
 columns = [
     { name = "extension", type = "varchar" },
-    { name = "password", type = "varchar" },
+    { name = "password", type = "varchar", secret = true },
     { name = "name", type = "varchar" },
     { name = "voicemail", type = "varchar" },
     { name = "ringtimer", type = "int" },
@@ -203,12 +209,12 @@ columns = [
     { name = "mohclass", type = "varchar" },
 ]
 seed_rows = [
-    ["1001", "", "Reception", "default", 20, "\"Bellweather Voice\" <+13125550100>", "default"],
-    ["1002", "", "Avery Hartwell", "default", 20, "", "default"],
-    ["1004", "", "Jordan Okonkwo", "default", 25, "", "default"],
-    ["1010", "", "NOC Desk", "novm", 15, "\"BWV NOC\" <+13125550110>", "default"],
-    ["2001", "", "Riverside Front Desk", "default", 20, "\"BWV Riverside\" <+16175550120>", "default"],
-    ["2007", "", "Riley Lindqvist", "default", 20, "", "default"],
+    ["1001", "", "Reception", "default", 20, "\"{{org.short}}\" <+13125550100>", "default"],
+    ["1002", "", "{{person:2.full_name}}", "default", 20, "", "default"],
+    ["1004", "", "{{person:3.full_name}}", "default", 25, "", "default"],
+    ["1010", "", "NOC Desk", "novm", 15, "\"{{org.ABBR}} NOC\" <+13125550110>", "default"],
+    ["2001", "", "{{place:1}} Front Desk", "default", 20, "\"{{org.ABBR}} {{place:1}}\" <+16175550120>", "default"],
+    ["2007", "", "{{person:4.full_name}}", "default", 20, "", "default"],
 ]
 
 [services.mysql.databases.tables.generator]
@@ -235,11 +241,11 @@ columns = [
 ]
 seed_rows = [
     ["1001", "pjsip", "PJSIP/1001", "fixed", "1001", "Reception", "+13125550100"],
-    ["1002", "pjsip", "PJSIP/1002", "fixed", "1002", "Avery Hartwell", ""],
-    ["1004", "pjsip", "PJSIP/1004", "fixed", "1004", "Jordan Okonkwo", ""],
+    ["1002", "pjsip", "PJSIP/1002", "fixed", "1002", "{{person:2.full_name}}", ""],
+    ["1004", "pjsip", "PJSIP/1004", "fixed", "1004", "{{person:3.full_name}}", ""],
     ["1010", "pjsip", "PJSIP/1010", "fixed", "1010", "NOC Desk", "+13125550110"],
-    ["2001", "pjsip", "PJSIP/2001", "fixed", "2001", "Riverside Front Desk", "+16175550120"],
-    ["2007", "pjsip", "PJSIP/2007", "fixed", "2007", "Riley Lindqvist", ""],
+    ["2001", "pjsip", "PJSIP/2001", "fixed", "2001", "{{place:1}} Front Desk", "+16175550120"],
+    ["2007", "pjsip", "PJSIP/2007", "fixed", "2007", "{{person:4.full_name}}", ""],
 ]
 
 [[services.mysql.databases.tables]]
@@ -253,7 +259,7 @@ columns = [
     { name = "descr", type = "varchar" },
 ]
 seed_rows = [
-    ["outbound-allroutes", "_9NXXNXXXXXX", "1", "Macro", "dialout-trunk,1,${EXTEN:1}", "Local and LD via bwv-carrier-a"],
+    ["outbound-allroutes", "_9NXXNXXXXXX", "1", "Macro", "dialout-trunk,1,${EXTEN:1}", "Local and LD via {{org.abbr}}-carrier-a"],
     ["outbound-allroutes", "_9011.", "1", "Macro", "dialout-trunk,1,${EXTEN:1}", "International (restricted)"],
     ["ext-queues", "8001", "1", "Queue", "8001,t,,,300", "Support line"],
     ["ext-queues", "8002", "1", "Queue", "8002,t,,,300", "Sales line"],
@@ -272,21 +278,21 @@ columns = [
     { name = "disabled", type = "varchar" },
 ]
 seed_rows = [
-    [1, "bwv-carrier-a", "pjsip", "\"Bellweather Voice\" <+13125550100>", 30, "bwv-carrier-a", "off"],
-    [2, "bwv-carrier-b-backup", "pjsip", "", 10, "bwv-carrier-b", "on"],
+    [1, "{{org.abbr}}-carrier-a", "pjsip", "\"{{org.short}}\" <+13125550100>", 30, "{{org.abbr}}-carrier-a", "off"],
+    [2, "{{org.abbr}}-carrier-b-backup", "pjsip", "", 10, "{{org.abbr}}-carrier-b", "on"],
 ]
 
 [[services.mysql.databases.tables]]
 name = "ampusers"
 columns = [
     { name = "username", type = "varchar" },
-    { name = "password_sha1", type = "varchar" },
+    { name = "password_sha1", type = "varchar", secret = true },
     { name = "sections", type = "varchar" },
 ]
 seed_rows = [
-    ["admin", "4f1c0b8e2d9a7f3e6b5c4d3e2f1a0b9c8d7e6f5a", "*"],
-    ["dgallagher", "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b", "*"],
-    ["helpdesk", "0b1a2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b", "extensions;voicemail"],
+    ["admin", "{{sha1:http_admin}}", "*"],
+    ["{{person:1.username}}", "{{sha1:person1}}", "*"],
+    ["helpdesk", "{{sha1:helpdesk}}", "extensions;voicemail"],
 ]
 
 # ---- FTP --------------------------------------------------------------------------------
@@ -305,11 +311,11 @@ after_n_max = 4
 
 [[services.ftp.accounts]]
 username = "backup"
-password = "backup2023"
+password = "{{password:backup:user}}"
 
 [[services.ftp.accounts]]
 username = "voiceops"
-password = "voiceops123"
+password = "{{password:voiceops:user}}"
 
 [[services.ftp.files]]
 path = "/backups/nightly/freepbx-backup-20261114-0215.tar.gz"
@@ -336,28 +342,28 @@ protocol=udp
 bind=0.0.0.0:5060
 external_media_address=203.0.113.45
 external_signaling_address=203.0.113.45
-local_net=10.40.8.0/24
+local_net={{net:voice}}.0/24
 
-[bwv-carrier-a-reg]
+[{{org.abbr}}-carrier-a-reg]
 type=registration
-outbound_auth=bwv-carrier-a-auth
+outbound_auth={{org.abbr}}-carrier-a-auth
 server_uri=sip:sbc1.carrier-a.example:5060
-client_uri=sip:bwv-main@sbc1.carrier-a.example
+client_uri=sip:{{org.abbr}}-main@sbc1.carrier-a.example
 retry_interval=60
 
-[bwv-carrier-a-auth]
+[{{org.abbr}}-carrier-a-auth]
 type=auth
 auth_type=userpass
-username=bwv-main
+username={{org.abbr}}-main
 password={{ht:trunk_password}}
 
-[bwv-carrier-a]
+[{{org.abbr}}-carrier-a]
 type=endpoint
 context=from-trunk
 disallow=all
 allow=ulaw,alaw
-outbound_auth=bwv-carrier-a-auth
-aors=bwv-carrier-a
+outbound_auth={{org.abbr}}-carrier-a-auth
+aors={{org.abbr}}-carrier-a
 from_domain=sbc1.carrier-a.example
 '''
 
@@ -371,14 +377,14 @@ context=from-sip-external
 allowguest=no
 bindport=5061
 externip=203.0.113.45
-localnet=10.40.8.0/255.255.255.0
+localnet={{net:voice}}.0/255.255.255.0
 
-[bwv-carrier-a]
+[{{org.abbr}}-carrier-a]
 type=peer
 host=sbc1.carrier-a.example
-username=bwv-main
+username={{org.abbr}}-main
 secret={{ht:trunk_password}}
-fromuser=bwv-main
+fromuser={{org.abbr}}-main
 insecure=port,invite
 qualify=yes
 '''
@@ -404,12 +410,12 @@ path = "/backups/scripts/offsite-backup.sh"
 mtime = "2026-06-20 16:05"
 content = '''
 #!/bin/bash
-# Copy nightly FreePBX backups offsite. Owner: dgallagher
+# Copy nightly FreePBX backups offsite. Owner: {{person:1.username}}
 set -euo pipefail
 export AWS_ACCESS_KEY_ID={{ht:offsite_aws_key}}
 export AWS_DEFAULT_REGION=us-east-2
 SRC=/var/spool/asterisk/backup/nightly
-DEST=s3://bwv-pbx01-backups/nightly
+DEST=s3://{{org.abbr}}-{{host:pbx}}-backups/nightly
 find "$SRC" -name 'freepbx-backup-*.tar.gz' -mtime -1 -print0 | \
   xargs -0 -I{} aws s3 cp {} "$DEST/" --only-show-errors
 logger -t offsite-backup "uploaded $(ls $SRC | wc -l) files"
@@ -432,8 +438,8 @@ origmailbox=1001
 context=macro-vm
 macrocontext=ext-local
 exten=s-NOANSWER
-callerchan=PJSIP/bwv-carrier-a-0000a0f1
-callerid="Casey Marchetti" <+13125550163>
+callerchan=PJSIP/{{org.abbr}}-carrier-a-0000a0f1
+callerid="{{person:5.full_name}}" <+13125550163>
 origdate=Fri Nov 13 05:42:10 PM CST 2026
 origtime=1763077330
 category=
@@ -458,11 +464,11 @@ mtime = "2026-11-14 08:11"
 [[services.ftp.files]]
 path = "/README.txt"
 content = '''
-Bellweather Voice Networks - pbx01 backup drop
+{{org.name}} - {{host:pbx}} backup drop
 backups/nightly   fwconsole backup output (02:15 daily, 7 day retention)
 backups/etc-*     plain-text config snapshots
 voicemail/        spool copy for the support team, synced hourly
-Questions: voiceops@bellweather-voice.example
+Questions: voiceops@{{org.domain}}
 '''
 
 # ---- HTTP (FreePBX admin) ----------------------------------------------------------------
@@ -473,7 +479,7 @@ port = 8080
 server_header = "Apache/2.4.62 (Debian)"
 login_path = "/admin/config.php"
 login_title = "FreePBX Administration"
-branding = "Bellweather Voice Networks - pbx01 - FreePBX 16.0.40"
+branding = "{{org.name}} - {{host:pbx}} - FreePBX 16.0.40"
 api_prefix = "/admin/api"
 api_key_header = "X-API-Key"
 
@@ -484,24 +490,24 @@ after_n_max = 6
 
 [[services.http.accounts]]
 username = "admin"
-password = "admin"
+password = "{{password:http_admin:weak}}"
 
 [[services.http.accounts]]
-username = "dgallagher"
-password = "Bellweather2024!"
+username = "{{person:1.username}}"
+password = "{{password:person1}}"
 
 [[services.http.pages]]
 path = "/admin/dashboard"
 title = "FreePBX Administration - Dashboard"
 body_html = '''
 <h2>System Overview</h2>
-<p>Bellweather Voice Networks - pbx01 (10.40.8.21)</p>
+<p>{{org.name}} - {{host:pbx}} ({{net:voice}}.21)</p>
 <table class="table">
 <tr><th>FreePBX</th><td>16.0.40</td></tr>
 <tr><th>Asterisk</th><td>18.20.0</td></tr>
 <tr><th>Uptime</th><td>41 days, 3 hours</td></tr>
 <tr><th>Registered extensions</th><td>27 of 31</td></tr>
-<tr><th>Trunks</th><td>bwv-carrier-a (Registered), bwv-carrier-b-backup (Disabled)</td></tr>
+<tr><th>Trunks</th><td>{{org.abbr}}-carrier-a (Registered), {{org.abbr}}-carrier-b-backup (Disabled)</td></tr>
 </table>
 <div class="alert alert-warning">3 modules have updates available. <a href="/admin/modules">Module Admin</a></div>
 '''
@@ -514,11 +520,11 @@ body_html = '''
 <table class="table">
 <tr><th>Extension</th><th>Name</th><th>Type</th><th>Voicemail</th></tr>
 <tr><td>1001</td><td>Reception</td><td>pjsip</td><td>Enabled</td></tr>
-<tr><td>1002</td><td>Avery Hartwell</td><td>pjsip</td><td>Enabled</td></tr>
-<tr><td>1004</td><td>Jordan Okonkwo</td><td>pjsip</td><td>Enabled</td></tr>
+<tr><td>1002</td><td>{{person:2.full_name}}</td><td>pjsip</td><td>Enabled</td></tr>
+<tr><td>1004</td><td>{{person:3.full_name}}</td><td>pjsip</td><td>Enabled</td></tr>
 <tr><td>1010</td><td>NOC Desk</td><td>pjsip</td><td>Disabled</td></tr>
-<tr><td>2001</td><td>Riverside Front Desk</td><td>pjsip</td><td>Enabled</td></tr>
-<tr><td>2007</td><td>Riley Lindqvist</td><td>pjsip</td><td>Enabled</td></tr>
+<tr><td>2001</td><td>{{place:1}} Front Desk</td><td>pjsip</td><td>Enabled</td></tr>
+<tr><td>2007</td><td>{{person:4.full_name}}</td><td>pjsip</td><td>Enabled</td></tr>
 </table>
 '''
 
@@ -529,8 +535,8 @@ body_html = '''
 <h2>Trunks</h2>
 <table class="table">
 <tr><th>Name</th><th>Tech</th><th>CallerID</th><th>Status</th></tr>
-<tr><td>bwv-carrier-a</td><td>pjsip</td><td>+1 312 555 0100</td><td>Enabled</td></tr>
-<tr><td>bwv-carrier-b-backup</td><td>pjsip</td><td></td><td>Disabled</td></tr>
+<tr><td>{{org.abbr}}-carrier-a</td><td>pjsip</td><td>+1 312 555 0100</td><td>Enabled</td></tr>
+<tr><td>{{org.abbr}}-carrier-b-backup</td><td>pjsip</td><td></td><td>Disabled</td></tr>
 </table>
 <p>Secrets are hidden. Use Edit to change the outbound auth password.</p>
 '''
@@ -570,8 +576,8 @@ method = "GET"
 path = "/admin/api/applications"
 auth = "session"
 json_body = [
-    { name = "billing-sync", type = "machine-to-machine", client_id = "bwv-billing-sync", client_secret = "{{ht:freepbx_api_secret}}", scopes = "rest:cdr:read rest:extensions:read", created = "2026-04-11" },
-    { name = "noc-dashboard", type = "machine-to-machine", client_id = "bwv-noc-dash", client_secret = "********", scopes = "rest:system:read", created = "2026-07-30" },
+    { name = "billing-sync", type = "machine-to-machine", client_id = "{{org.abbr}}-billing-sync", client_secret = "{{ht:freepbx_api_secret}}", scopes = "rest:cdr:read rest:extensions:read", created = "2026-04-11" },
+    { name = "noc-dashboard", type = "machine-to-machine", client_id = "{{org.abbr}}-noc-dash", client_secret = "********", scopes = "rest:system:read", created = "2026-07-30" },
 ]
 
 [[services.http.routes]]
@@ -588,17 +594,17 @@ error_description = "Client authentication failed"
 [services.smtp]
 enabled = true
 port = 2525
-banner = "220 pbx01.bellweather-voice.example ESMTP Postfix (Debian/GNU)"
+banner = "220 {{host:pbx}}.{{org.domain}} ESMTP Postfix (Debian/GNU)"
 version = "Postfix 3.7.11"
 
 [[services.smtp.accounts]]
-username = "vm-notify@bellweather-voice.example"
-password = "vmnotify!2024"
+username = "vm-notify@{{org.domain}}"
+password = "{{password:vm-notify:service}}"
 
 [services.telnet]
 enabled = true
 port = 2323
-banner = "Debian GNU/Linux 12 pbx01"
+banner = "Debian GNU/Linux 12 {{host:pbx}}"
 
 [services.telnet.policy]
 accept = "after_n"
@@ -607,11 +613,11 @@ after_n_max = 6
 
 [[services.telnet.accounts]]
 username = "voiceops"
-password = "voiceops123"
+password = "{{password:voiceops:user}}"
 
 [[services.telnet.accounts]]
 username = "admin"
-password = "admin1234"
+password = "{{password:telnet_admin:weak}}"
 
 # ---- S3-compatible storage (MinIO on the backup host) ------------------------------------
 # Call recordings, CDR exports and config backups pushed by the nightly jobs. Any access key
@@ -621,7 +627,7 @@ password = "admin1234"
 enabled = true
 port = 9000
 region = "us-east-2"
-owner_name = "bwv-backup"
+owner_name = "{{org.abbr}}-backup"
 
 [services.s3.policy]
 accept = "after_n"
@@ -629,7 +635,7 @@ after_n_min = 2
 after_n_max = 5
 
 [[services.s3.buckets]]
-name = "bwv-call-recordings"
+name = "{{org.abbr}}-call-recordings"
 created = "2024-06-11"
 
 [[services.s3.buckets.objects]]
@@ -657,12 +663,12 @@ mtime = "2026-11-14 09:12"
 key = "README.txt"
 content_type = "text/plain"
 text = """
-Call recordings pushed nightly from pbx01 by /usr/local/sbin/offsite-backup.sh.
+Call recordings pushed nightly from {{host:pbx}} by /usr/local/sbin/offsite-backup.sh.
 Layout: YYYY/MM/DD/<queue>-<seq>.wav (8 kHz mono PCM). Retention 90 days (lifecycle rule).
 """
 
 [[services.s3.buckets]]
-name = "bwv-cdr-exports"
+name = "{{org.abbr}}-cdr-exports"
 created = "2024-06-11"
 
 [[services.s3.buckets.objects]]
@@ -686,43 +692,43 @@ content_type = "text/csv"
 mtime = "2026-11-01 04:10"
 
 [[services.s3.buckets]]
-name = "bwv-config-backups"
+name = "{{org.abbr}}-config-backups"
 created = "2024-03-02"
 
 [[services.s3.buckets.objects]]
-key = "pbx01/freepbx-backup-2026111{n}.tar.gz"
+key = "{{host:pbx}}/freepbx-backup-2026111{n}.tar.gz"
 count = 5
 size = 41000000
 content_type = "application/gzip"
 mtime = "2026-11-10 01:15"
 
 [[services.s3.buckets.objects]]
-key = "pbx01/etc-asterisk/pjsip.conf"
+key = "{{host:pbx}}/etc-asterisk/pjsip.conf"
 content_type = "text/plain"
 mtime = "2026-11-14 01:15"
 text = """
-[bwv-carrier-a-auth]
+[{{org.abbr}}-carrier-a-auth]
 type=auth
 auth_type=userpass
-username=bwv0417
+username={{org.abbr}}{{digits:4:trunk_account}}
 password={{ht:trunk_password}}
 
-[bwv-carrier-a]
+[{{org.abbr}}-carrier-a]
 type=endpoint
 context=from-trunk
-outbound_auth=bwv-carrier-a-auth
+outbound_auth={{org.abbr}}-carrier-a-auth
 """
 
 [[services.s3.buckets.objects]]
-key = "pbx01/scripts/offsite-backup.env"
+key = "{{host:pbx}}/scripts/offsite-backup.env"
 content_type = "text/plain"
 mtime = "2026-09-30 17:40"
 text = """
 # sourced by /usr/local/sbin/offsite-backup.sh
-S3_ENDPOINT=http://10.40.8.30:9000
+S3_ENDPOINT=http://{{net:voice}}.30:9000
 AWS_ACCESS_KEY_ID={{ht:offsite_aws_key}}
 AWS_DEFAULT_REGION=us-east-2
-BUCKETS="bwv-call-recordings bwv-cdr-exports bwv-config-backups"
+BUCKETS="{{org.abbr}}-call-recordings {{org.abbr}}-cdr-exports {{org.abbr}}-config-backups"
 """
 
 # ---- honeytokens ---------------------------------------------------------------------------
@@ -731,9 +737,9 @@ BUCKETS="bwv-call-recordings bwv-cdr-exports bwv-config-backups"
 name = "trunk_password"
 kind = "sip_trunk_password"
 planted_in = [
-    "FTP /backups/etc-asterisk/pjsip.conf (bwv-carrier-a-auth password)",
-    "FTP /backups/etc-asterisk/sip.conf (bwv-carrier-a secret)",
-    "S3 bwv-config-backups/pbx01/etc-asterisk/pjsip.conf",
+    "FTP /backups/etc-asterisk/pjsip.conf ({{org.abbr}}-carrier-a-auth password)",
+    "FTP /backups/etc-asterisk/sip.conf ({{org.abbr}}-carrier-a secret)",
+    "S3 {{org.abbr}}-config-backups/{{host:pbx}}/etc-asterisk/pjsip.conf",
 ]
 
 [[honeytokens]]
@@ -746,7 +752,7 @@ name = "offsite_aws_key"
 kind = "aws_access_key"
 planted_in = [
     "FTP /backups/scripts/offsite-backup.sh (AWS_ACCESS_KEY_ID)",
-    "S3 bwv-config-backups/pbx01/scripts/offsite-backup.env (AWS_ACCESS_KEY_ID)",
+    "S3 {{org.abbr}}-config-backups/{{host:pbx}}/scripts/offsite-backup.env (AWS_ACCESS_KEY_ID)",
 ]
 
 [[honeytokens]]

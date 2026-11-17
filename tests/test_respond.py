@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -313,7 +314,9 @@ def test_plant_token_registered_and_reuse_attributed(tmp_path):
     run(tmp_path, [pb(steps=[{"action": "plant_token"}])])
     access, secret = ss.source_token(SEED, "198.51.100.40")
     other, _ = ss.source_token(SEED, "198.51.100.41")
-    assert access != other and access.startswith("AKIAFAKE")
+    # The real key id shape, no fixed marker: recognised by lookup, not by prefix.
+    assert access != other and re.fullmatch(r"AKIA[A-Z2-7]{16}", access)
+    assert "FAKE" not in access[:8]
     reg = json.loads((tmp_path / "reports" / "honeytokens.json").read_text())
     assert {t["planted_for"] for t in reg["tokens"]} == {"198.51.100.40"}
     # A different source later logs in with the key planted for .40: attributed to .40.

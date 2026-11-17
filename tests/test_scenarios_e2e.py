@@ -171,4 +171,8 @@ def test_listeners_cli_list_and_describe(capsys):
         assert name in listed
     assert main(["--describe", "sip_provider"]) == 0
     out = capsys.readouterr().out
-    assert "Service sip: enabled" in out and "AKIAFAKE" not in out
+    assert "Service sip: enabled" in out
+    from scenarios.loader import load_scenario
+
+    shown = load_scenario("sip_provider", seed="preview")
+    assert not [t for t in shown.recognised_tokens() if t in out]

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import datetime
 import hashlib
-import hmac
 import ipaddress
 import json
 import logging
@@ -32,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from agents import REPO_ROOT
 from agents.budget import ip_key
+from scenarios.tokens import legacy_source_pair, source_pair
 
 SOURCE_STATE_ENV = "WINNIE_SOURCE_STATE"
 TAG_RE = r"[a-z][a-z0-9_]{1,31}"
@@ -193,16 +193,15 @@ def source_token_name(key: str) -> str:
 def source_token(seed: str, key: str) -> tuple[str, str]:
     """(access_key_id, secret) unique to one source, derived from the sensor seed.
 
-    Format-plausible AWS-style pair that can never be valid: the 'AKIAFAKE' prefix is not
-    an issued key id. Only someone who read this source's fake data can know it, so reuse
-    identifies exactly which source took it."""
-    digest = hmac.new(seed.encode(), f"plant|{key}".encode(), hashlib.sha256).digest()
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-    access = "AKIAFAKE" + "".join(alphabet[b % 32] for b in digest[:12])
-    secret_bytes = hmac.new(seed.encode(), f"secret|{key}".encode(), hashlib.sha256).digest()
-    b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    secret = "".join(b64[b % 64] for b in (secret_bytes + digest)[:40])
-    return access, secret
+    The real AWS format with no fixed marker; the seed-derived secret is what makes the pair
+    useless anywhere but here (see ``scenarios.tokens``). Only someone who read this
+    source's fake data can know it, so reuse identifies exactly which source took it."""
+    return source_pair(seed, key)
+
+
+def legacy_source_token(seed: str, key: str) -> tuple[str, str]:
+    """The pair earlier versions planted for ``key``; recognised, never planted again."""
+    return legacy_source_pair(seed, key)
 
 
 # ---- store (agents side) -------------------------------------------------------------------

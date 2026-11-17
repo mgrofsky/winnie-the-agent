@@ -1,8 +1,9 @@
-# Plinthwork: an invented multi-tenant project-tracking SaaS. Tenants are invented small
-# businesses; every email uses example domains or plinthwork.example.
+# An invented multi-tenant project-tracking SaaS. Tenants are invented small businesses.
+# The organisation, hosts, networks, people and credentials are {{...}} templates expanded
+# from each sensor's seed (see docs/scenarios.md), so no two sensors show the same ones.
 
 name = "saas"
-title = "Plinthwork multi-tenant SaaS app server"
+title = "{{org.short}} multi-tenant SaaS app server"
 description = """
 An invented multi-tenant work-tracking SaaS. One app node serves the customer web app, the
 internal admin console and a bearer-token REST API, backed by PostgreSQL (tenants, users,
@@ -11,21 +12,25 @@ notification mail. Honeytokens sit in the API token table, a Redis config hash, 
 SMTP credential that also works on the SMTP listener, and an admin API example.
 """
 
+[bait]
+org_suffixes = ["Inc", "Software", "Labs", "Technologies", "Cloud", "HQ"]
+domain_words = ["app", "hq", "work", "cloud"]
+
 [identity]
-org_name = "Plinthwork Inc"
-hostname = "app-03"
-domain = "plinthwork.example"
-internal_ips = ["10.80.1.13", "10.80.16.13"]
+org_name = "{{org.name}}"
+hostname = "{{host:app}}"
+domain = "{{org.domain}}"
+internal_ips = ["{{net:app}}.13", "{{net:data}}.13"]
 os_pretty_name = "Ubuntu 24.04.1 LTS"
-kernel = "Linux app-03 6.8.0-45-generic #45-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 30 12:02:04 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux"
+kernel = "Linux {{host:app}} 6.8.0-45-generic #45-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 30 12:02:04 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux"
 timezone = "UTC"
 lures = [
-    "/srv/plinthwork/.env.production",
-    "/srv/plinthwork/config/database.yml",
-    "/srv/plinthwork/config/storage.yml",
+    "/srv/{{org.slug}}/.env.production",
+    "/srv/{{org.slug}}/config/database.yml",
+    "/srv/{{org.slug}}/config/storage.yml",
     "/etc/postfix/sasl_passwd",
     "/home/deploy/.ssh/authorized_keys",
-    "/var/log/plinthwork/production.log",
+    "/var/log/{{org.slug}}/production.log",
 ]
 
 [[identity.users]]
@@ -35,40 +40,40 @@ gecos = "Deploy user"
 home = "/home/deploy"
 
 [[identity.users]]
-name = "plinth"
+name = "{{org.slug}}"
 uid = 1100
-gecos = "Plinthwork app"
-home = "/srv/plinthwork"
+gecos = "{{org.short}} app"
+home = "/srv/{{org.slug}}"
 shell = "/usr/sbin/nologin"
 
 [[identity.users]]
-name = "sredmond"
+name = "{{person:1.username}}"
 uid = 1001
-gecos = "Sutton Redmond SRE"
-home = "/home/sredmond"
+gecos = "{{person:1.full_name}} SRE"
+home = "/home/{{person:1.username}}"
 
 [ssh]
 persona_prompt = """
-This is app-03, one of three production app nodes for Plinthwork, an invented multi-tenant
-project-tracking SaaS. The Rails 7.1 app lives in /srv/plinthwork (current release symlink
-/srv/plinthwork/current, shared config in /srv/plinthwork/shared/config) and runs under
-Puma (systemd unit plinthwork-web, port 3000) with Sidekiq workers (plinthwork-worker)
-behind nginx 1.24. The customer app is at app.plinthwork.example, the internal admin
+This is {{host:app}}, one of three production app nodes for {{org.short}}, an invented multi-tenant
+project-tracking SaaS. The Rails 7.1 app lives in /srv/{{org.slug}} (current release symlink
+/srv/{{org.slug}}/current, shared config in /srv/{{org.slug}}/shared/config) and runs under
+Puma (systemd unit {{org.slug}}-web, port 3000) with Sidekiq workers ({{org.slug}}-worker)
+behind nginx 1.24. The customer app is at app.{{org.domain}}, the internal admin
 console at /admin, and the public REST API at /api/v1 with bearer tokens. PostgreSQL 16
-primary is db-01 (10.80.16.21), Redis 7.2 runs locally on 6379 for sessions, Sidekiq and
+primary is {{host:db}} ({{net:data}}.21), Redis 7.2 runs locally on 6379 for sessions, Sidekiq and
 cached config, and Postfix relays notification mail on port 25 through a smarthost. Cron:
 nightly tenant usage rollup at 01:00, log shipping every 5 minutes, certbot renew. Deploys
-come from CI as the deploy user via Capistrano. Users: deploy, sredmond (sudo), plinth
+come from CI as the deploy user via Capistrano. Users: deploy, {{person:1.username}} (sudo), {{org.slug}}
 (service). Keep every answer consistent with this host.
 """
 
 [[ssh.accounts]]
 username = "deploy"
-password = "deploy"
+password = "{{password:deploy:user}}"
 
 [[ssh.accounts]]
-username = "sredmond"
-password = "Plinthwork2025"
+username = "{{person:1.username}}"
+password = "{{password:person1}}"
 
 # ---- PostgreSQL -------------------------------------------------------------------------
 
@@ -83,15 +88,15 @@ after_n_min = 2
 after_n_max = 6
 
 [[services.postgres.accounts]]
-username = "plinthwork"
-password = "plinthwork_prod"
+username = "{{org.slug}}"
+password = "{{ht:prod_db_password}}"
 
 [[services.postgres.accounts]]
 username = "readonly"
-password = "readonly"
+password = "{{password:readonly:user}}"
 
 [[services.postgres.databases]]
-name = "plinthwork_production"
+name = "{{org.slug}}_production"
 
 [[services.postgres.databases.tables]]
 name = "tenants"
@@ -105,10 +110,10 @@ columns = [
     { name = "created_at", type = "timestamp" },
 ]
 seed_rows = [
-    [1, "plinthwork-internal", "Plinthwork Internal", "enterprise", 85, "finance@plinthwork.example", "2023-02-01 09:00:00"],
-    [2, "copperleaf-design", "Copperleaf Design Studio", "team", 18, "accounts@copperleaf.example", "2024-06-12 15:22:41"],
-    [3, "northgate-logistics", "Northgate Freight Co-op", "business", 62, "it@northgate.example", "2024-09-03 11:05:09"],
-    [4, "tidewater-dental", "Tidewater Family Dental", "starter", 5, "office@tidewater.example", "2025-01-20 08:47:30"],
+    [1, "{{org.slug}}-internal", "{{org.short}} Internal", "enterprise", 85, "finance@{{org.domain}}", "2023-02-01 09:00:00"],
+    [2, "{{company:1.slug}}", "{{company:1.name}}", "team", 18, "accounts@{{company:1.domain}}", "2024-06-12 15:22:41"],
+    [3, "{{company:2.slug}}", "{{company:2.name}}", "business", 62, "it@{{company:2.domain}}", "2024-09-03 11:05:09"],
+    [4, "{{company:3.slug}}", "{{company:3.name}}", "starter", 5, "office@{{company:3.domain}}", "2025-01-20 08:47:30"],
 ]
 
 [services.postgres.databases.tables.generator]
@@ -130,7 +135,7 @@ columns = [
     { name = "email", type = "varchar" },
     { name = "name", type = "varchar" },
     { name = "role", type = "varchar" },
-    { name = "encrypted_password", type = "varchar" },
+    { name = "encrypted_password", type = "varchar", secret = true },
     { name = "last_sign_in_at", type = "timestamp" },
 ]
 
@@ -142,7 +147,7 @@ tenant_id = { kind = "int", min = 1, max = 40 }
 email = { kind = "email" }
 name = { kind = "full_name" }
 role = { kind = "choice", choices = ["member", "member", "member", "admin", "owner", "guest"] }
-encrypted_password = { kind = "const", value = "$2a$12$hpRedactedBcryptPlaceholderValueNotARealHashQx" }
+encrypted_password = { kind = "choice", choices = ["$2a$12${{alnum:53:bcrypt_a}}", "$2a$12${{alnum:53:bcrypt_b}}", "$2a$12${{alnum:53:bcrypt_c}}", "$2a$12${{alnum:53:bcrypt_d}}"] }
 last_sign_in_at = { kind = "datetime", min = 280, max = 318 }
 
 [[services.postgres.databases.tables]]
@@ -170,14 +175,14 @@ columns = [
     { name = "id", type = "int" },
     { name = "tenant_id", type = "int" },
     { name = "label", type = "varchar" },
-    { name = "token", type = "varchar" },
+    { name = "token", type = "varchar", secret = true },
     { name = "scopes", type = "varchar" },
     { name = "last_used_at", type = "timestamp" },
 ]
 seed_rows = [
     [1, 1, "internal-admin-automation", "{{ht:admin_api_token}}", "admin:* tenants:read tenants:write", "2026-11-14 23:10:02"],
-    [2, 2, "copperleaf-zap", "hpt_revoked_0000000000000000000000000000", "projects:read", "2026-05-01 10:00:00"],
-    [3, 3, "northgate-reporting", "hpt_revoked_1111111111111111111111111111", "projects:read users:read", "2026-10-30 17:45:13"],
+    [2, 2, "{{company:1.slug}}-zap", "{{secret:bearer:token_company1}}", "projects:read", "2026-05-01 10:00:00"],
+    [3, 3, "{{company:2.slug}}-reporting", "{{secret:bearer:token_company2}}", "projects:read users:read", "2026-10-30 17:45:13"],
 ]
 
 # ---- Redis ------------------------------------------------------------------------------
@@ -194,27 +199,27 @@ after_n_max = 5
 
 [[services.redis.accounts]]
 username = "default"
-password = "plinth-redis"
+password = "{{password:redis:service}}"
 
 [[services.redis.keys]]
-key = "plinthwork:session:2f9d0c7ab1e4"
+key = "{{org.slug}}:session:{{hex:12:session_a}}"
 type = "string"
-value = "{\"user_id\":1004,\"tenant_id\":2,\"csrf\":\"Zx0aQ1\",\"expires\":\"2026-11-15T12:00:00Z\"}"
+value = "{\"user_id\":1004,\"tenant_id\":2,\"csrf\":\"{{alnum:6:csrf_a}}\",\"expires\":\"2026-11-15T12:00:00Z\"}"
 
 [[services.redis.keys]]
-key = "plinthwork:session:a81c44e0d9b3"
+key = "{{org.slug}}:session:{{hex:12:session_b}}"
 type = "string"
-value = "{\"user_id\":1022,\"tenant_id\":3,\"csrf\":\"Lm2bT8\",\"expires\":\"2026-11-15T12:20:00Z\"}"
+value = "{\"user_id\":1022,\"tenant_id\":3,\"csrf\":\"{{alnum:6:csrf_b}}\",\"expires\":\"2026-11-15T12:20:00Z\"}"
 
 [[services.redis.keys]]
-key = "plinthwork:config:production"
+key = "{{org.slug}}:config:production"
 type = "hash"
-value = { database_url = "postgres://plinthwork:{{ht:prod_db_password}}@10.80.16.21:5432/plinthwork_production", storage_bucket = "plinthwork-prod-uploads", storage_access_key_id = "{{ht:uploads_aws_key}}", smtp_host = "127.0.0.1", smtp_port = "25" }
+value = { database_url = "postgres://{{org.slug}}:{{url:ht:prod_db_password}}@{{net:data}}.21:5432/{{org.slug}}_production", storage_bucket = "{{org.slug}}-prod-uploads", storage_access_key_id = "{{ht:uploads_aws_key}}", smtp_host = "127.0.0.1", smtp_port = "25" }
 
 [[services.redis.keys]]
-key = "plinthwork:config:smtp"
+key = "{{org.slug}}:config:smtp"
 type = "hash"
-value = { user = "notify@plinthwork.example", password = "{{ht:smtp_password}}", from = "Plinthwork <notify@plinthwork.example>" }
+value = { user = "notify@{{org.domain}}", password = "{{ht:smtp_password}}", from = "{{org.short}} <notify@{{org.domain}}>" }
 
 [[services.redis.keys]]
 key = "queue:mailers"
@@ -222,7 +227,7 @@ type = "list"
 value = ["{\"class\":\"InviteMailer\",\"args\":[1144]}", "{\"class\":\"DigestMailer\",\"args\":[3]}"]
 
 [[services.redis.keys]]
-key = "plinthwork:feature_flags"
+key = "{{org.slug}}:feature_flags"
 type = "set"
 value = ["new_board_view", "sso_saml_beta", "usage_billing_v2"]
 
@@ -231,7 +236,7 @@ value = ["new_board_view", "sso_saml_beta", "usage_billing_v2"]
 [services.smtp]
 enabled = true
 port = 2525
-banner = "220 app-03.plinthwork.example ESMTP Postfix (Ubuntu)"
+banner = "220 {{host:app}}.{{org.domain}} ESMTP Postfix (Ubuntu)"
 version = "Postfix 3.8.6"
 
 [services.smtp.policy]
@@ -240,12 +245,12 @@ after_n_min = 3
 after_n_max = 6
 
 [[services.smtp.accounts]]
-username = "notify@plinthwork.example"
+username = "notify@{{org.domain}}"
 password = "{{ht:smtp_password}}"
 
 [[services.smtp.accounts]]
 username = "alerts"
-password = "alerts2024"
+password = "{{password:alerts:user}}"
 
 # ---- HTTP: web app, admin console, API --------------------------------------------------
 
@@ -254,8 +259,8 @@ enabled = true
 port = 8080
 server_header = "nginx/1.24.0 (Ubuntu)"
 login_path = "/users/sign_in"
-login_title = "Sign in to Plinthwork"
-branding = "Plinthwork - plan, track and ship work with your whole team"
+login_title = "Sign in to {{org.short}}"
+branding = "{{org.short}} - plan, track and ship work with your whole team"
 api_prefix = "/api/v1"
 
 [services.http.policy]
@@ -264,28 +269,28 @@ after_n_min = 2
 after_n_max = 6
 
 [[services.http.accounts]]
-username = "admin@plinthwork.example"
-password = "Plinthwork2025"
+username = "admin@{{org.domain}}"
+password = "{{password:person1}}"
 
 [[services.http.accounts]]
-username = "support@plinthwork.example"
-password = "support123"
+username = "support@{{org.domain}}"
+password = "{{password:support:user}}"
 
 [[services.http.pages]]
 path = "/dashboard"
-title = "Plinthwork - Dashboard"
+title = "{{org.short}} - Dashboard"
 body_html = '''
-<h1>Copperleaf Design Studio</h1>
+<h1>{{company:1.name}}</h1>
 <p>3 projects active - 41 open tasks - 18 seats (team plan)</p>
 <ul><li>Spring catalogue refresh (12 open)</li><li>Website rebuild (24 open)</li><li>Client onboarding kit (5 open)</li></ul>
 '''
 
 [[services.http.pages]]
 path = "/admin"
-title = "Plinthwork Admin Console"
+title = "{{org.short}} Admin Console"
 body_html = '''
 <h1>Admin Console</h1>
-<p>Environment: <b>production</b> (app-03, release 2026.11.12-3)</p>
+<p>Environment: <b>production</b> ({{host:app}}, release 2026.11.12-3)</p>
 <ul>
 <li><a href="/admin/tenants">Tenants</a> (40)</li>
 <li><a href="/admin/users">Users</a> (1,412)</li>
@@ -302,10 +307,10 @@ body_html = '''
 <h1>Tenants</h1>
 <table>
 <tr><th>ID</th><th>Name</th><th>Plan</th><th>Seats</th></tr>
-<tr><td>1</td><td>Plinthwork Internal</td><td>enterprise</td><td>85</td></tr>
-<tr><td>2</td><td>Copperleaf Design Studio</td><td>team</td><td>18</td></tr>
-<tr><td>3</td><td>Northgate Freight Co-op</td><td>business</td><td>62</td></tr>
-<tr><td>4</td><td>Tidewater Family Dental</td><td>starter</td><td>5</td></tr>
+<tr><td>1</td><td>{{org.short}} Internal</td><td>enterprise</td><td>85</td></tr>
+<tr><td>2</td><td>{{company:1.name}}</td><td>team</td><td>18</td></tr>
+<tr><td>3</td><td>{{company:2.name}}</td><td>business</td><td>62</td></tr>
+<tr><td>4</td><td>{{company:3.name}}</td><td>starter</td><td>5</td></tr>
 </table>
 '''
 
@@ -315,35 +320,35 @@ path = "/api/v1/me"
 auth = "bearer"
 [services.http.routes.json_body]
 id = 1001
-email = "admin@plinthwork.example"
-tenant = "plinthwork-internal"
+email = "admin@{{org.domain}}"
+tenant = "{{org.slug}}-internal"
 role = "owner"
 
 [[services.http.routes]]
 method = "GET"
 path = "/api/v1/tenants"
 auth = "bearer"
-list_from = "plinthwork_production.tenants"
+list_from = "{{org.slug}}_production.tenants"
 
 [[services.http.routes]]
 method = "GET"
 path = "/api/v1/tenants/{id}"
 auth = "bearer"
-item_from = "plinthwork_production.tenants"
+item_from = "{{org.slug}}_production.tenants"
 item_key = "id"
 
 [[services.http.routes]]
 method = "GET"
 path = "/api/v1/tenants/{tenant_id}/users"
 auth = "bearer"
-list_from = "plinthwork_production.users"
+list_from = "{{org.slug}}_production.users"
 list_limit = 25
 
 [[services.http.routes]]
 method = "GET"
 path = "/api/v1/tenants/{tenant_id}/projects"
 auth = "bearer"
-list_from = "plinthwork_production.projects"
+list_from = "{{org.slug}}_production.projects"
 list_limit = 25
 
 [[services.http.routes]]
@@ -361,7 +366,7 @@ path = "/api/v1/admin/automation"
 auth = "session"
 [services.http.routes.json_body]
 description = "Token used by the internal ops automation (rotate quarterly)"
-example = "curl -H 'Authorization: Bearer {{ht:admin_api_token}}' https://app.plinthwork.example/api/v1/tenants"
+example = "curl -H 'Authorization: Bearer {{ht:admin_api_token}}' https://app.{{org.domain}}/api/v1/tenants"
 
 # ---- S3-compatible storage (object store for uploads and exports) ----------------------
 
@@ -369,7 +374,7 @@ example = "curl -H 'Authorization: Bearer {{ht:admin_api_token}}' https://app.pl
 enabled = true
 port = 9000
 region = "us-east-1"
-owner_name = "plinthwork-prod"
+owner_name = "{{org.slug}}-prod"
 
 [services.s3.policy]
 accept = "after_n"
@@ -377,7 +382,7 @@ after_n_min = 3
 after_n_max = 6
 
 [[services.s3.buckets]]
-name = "plinthwork-prod-uploads"
+name = "{{org.slug}}-prod-uploads"
 created = "2023-02-14"
 
 [[services.s3.buckets.objects]]
@@ -393,11 +398,11 @@ size = 48000
 content_type = "image/png"
 
 [[services.s3.buckets]]
-name = "plinthwork-db-exports"
+name = "{{org.slug}}-db-exports"
 created = "2023-05-08"
 
 [[services.s3.buckets.objects]]
-key = "nightly/plinthwork_production-2026-11-{n:02d}.sql.gz"
+key = "nightly/{{org.slug}}_production-2026-11-{n:02d}.sql.gz"
 count = 15
 size = 380000000
 content_type = "application/gzip"
@@ -405,18 +410,18 @@ mtime = "2026-11-01 03:05"
 
 [[services.s3.buckets.objects]]
 key = "adhoc/tenants.csv"
-table = "plinthwork_production.tenants"
+table = "{{org.slug}}_production.tenants"
 content_type = "text/csv"
 mtime = "2026-11-12 16:44"
 
 [[services.s3.buckets.objects]]
 key = "adhoc/users.csv"
-table = "plinthwork_production.users"
+table = "{{org.slug}}_production.users"
 content_type = "text/csv"
 mtime = "2026-11-12 16:45"
 
 [[services.s3.buckets]]
-name = "plinthwork-public-assets"
+name = "{{org.slug}}-public-assets"
 created = "2023-02-14"
 public_list = true
 public_read = true
@@ -433,8 +438,8 @@ content_type = "text/plain"
 mtime = "2026-10-21 11:02"
 text = """
 RAILS_ENV=production
-DATABASE_URL=postgres://plinthwork:{{ht:prod_db_password}}@10.80.16.21:5432/plinthwork_production
-STORAGE_BUCKET=plinthwork-prod-uploads
+DATABASE_URL=postgres://{{org.slug}}:{{url:ht:prod_db_password}}@{{net:data}}.21:5432/{{org.slug}}_production
+STORAGE_BUCKET={{org.slug}}-prod-uploads
 STORAGE_ACCESS_KEY_ID={{ht:uploads_aws_key}}
 SMTP_HOST=127.0.0.1
 """
@@ -445,7 +450,7 @@ SMTP_HOST=127.0.0.1
 name = "admin_api_token"
 kind = "bearer_token"
 planted_in = [
-    "Postgres plinthwork_production.api_tokens row 1 (token)",
+    "Postgres {{org.slug}}_production.api_tokens row 1 (token)",
     "HTTP GET /api/v1/admin/automation (curl example)",
 ]
 
@@ -453,22 +458,22 @@ planted_in = [
 name = "prod_db_password"
 kind = "db_password"
 planted_in = [
-    "Redis hash plinthwork:config:production (database_url)",
-    "S3 plinthwork-public-assets/deploy/.env.production (DATABASE_URL)",
+    "Redis hash {{org.slug}}:config:production (database_url)",
+    "S3 {{org.slug}}-public-assets/deploy/.env.production (DATABASE_URL)",
 ]
 
 [[honeytokens]]
 name = "uploads_aws_key"
 kind = "aws_access_key"
 planted_in = [
-    "Redis hash plinthwork:config:production (storage_access_key_id)",
-    "S3 plinthwork-public-assets/deploy/.env.production (STORAGE_ACCESS_KEY_ID)",
+    "Redis hash {{org.slug}}:config:production (storage_access_key_id)",
+    "S3 {{org.slug}}-public-assets/deploy/.env.production (STORAGE_ACCESS_KEY_ID)",
 ]
 
 [[honeytokens]]
 name = "smtp_password"
 kind = "generic_password"
 planted_in = [
-    "Redis hash plinthwork:config:smtp (password)",
-    "SMTP account notify@plinthwork.example (accepted credential)",
+    "Redis hash {{org.slug}}:config:smtp (password)",
+    "SMTP account notify@{{org.domain}} (accepted credential)",
 ]

@@ -24,9 +24,13 @@ uv run python -m listeners --list-scenarios
 uv run python -m listeners --describe healthcare
 ```
 
-`--describe` prints what a scenario exposes. It prints honeytoken names, kinds and
-locations, never their values, and leaves out FTP file contents and HTTP bodies, which may
-embed honeytokens.
+`--describe` prints what a scenario exposes on this sensor: the organisation, hosts,
+people and credentials expanded from the sensor's seed (see [per-sensor bait](#per-sensor-bait)),
+with every template and its value. It reads the seed from `[scenario] seed` or the seed file
+in the data directory (`--config`, `--data-dir`) and never creates one; before the sensor
+has started once it shows a labelled preview, and `--seed-preview TEXT` shows the bait for
+any other seed. It prints honeytoken names, kinds and locations, never their values, and
+leaves out FTP file contents and HTTP bodies, which may embed honeytokens.
 
 ## Shipped scenarios
 
@@ -40,6 +44,91 @@ embed honeytokens.
 | `api_platform` | PostgreSQL, Redis, HTTP | B2B data API gateway: versioned REST endpoints with API-key auth, an OpenAPI document, consumer and key records in PostgreSQL, rate-limit counters in Redis. Unknown API routes may be answered by the budgeted model. |
 
 The SSH honeypot runs alongside any scenario and takes the scenario's host profile.
+
+The shipped scenarios are examples. Their organisation, hosts, people and credentials are
+templates, so every sensor shows its own (see below), but the story, the services and the
+shape of the data are the same on every sensor that runs them. For a target that has to
+convince a careful attacker, write your own scenario or pin the identity in `[bait]`.
+
+## Per-sensor bait
+
+The repository is public. A literal password, key or company name in a scenario would let
+anyone who sees it on a sensor search for it and learn that the host is this honeypot, and
+every sensor running the same scenario would look the same. So any string in a scenario
+(and any table key) may hold `{{...}}` templates, expanded once at load time from the
+sensor seed and the scenario name:
+
+```toml
+[identity]
+org_name = "{{org.name}}"
+hostname = "{{host:pbx}}"
+domain = "{{org.domain}}"
+internal_ips = ["{{net:voice}}.21"]
+
+[[ssh.accounts]]
+username = "root"
+password = "{{password:dba}}"
+
+[[services.ftp.files]]
+path = "/backups/etc/my.cnf"
+content = '''
+[client]
+user = root
+password = {{password:dba}}
+host = {{host:pbx}}.{{org.domain}}
+'''
+```
+
+The same template with the same label is the same value everywhere in the scenario, so the
+password in the FTP file is the one SSH accepts. The values stay the same across restarts
+of one sensor and differ between sensors with different seeds.
+
+| Template | Expands to |
+|---|---|
+| `{{org.name}}` | Organisation name: an invented word plus one of `[bait] org_suffixes` (`Hallowmere Voice Networks`). |
+| `{{org.short}}`, `{{org.slug}}` | The invented word (`Hallowmere`), and the same in lower case for names and paths (`hallowmere`). |
+| `{{org.abbr}}`, `{{org.ABBR}}` | Initials of the name in lower and upper case (`hvn`, `HVN`), for bucket prefixes, account codes and client ids. |
+| `{{org.domain}}` | The name plus one of `[bait] domain_words` under `.example` or `.test` (`hallowmere-voice.example`). |
+| `{{host:LABEL}}` | A host name for the role `LABEL` in one of several naming conventions (`pbx02`, `pbx-07`, `chi-pbx01`, `hvn-pbx03`). Different labels never collide. |
+| `{{net:LABEL}}` | The first three octets of a private /24 (`10.41.8`); write `{{net:lan}}.21` for an address. |
+| `{{person:N.FIELD}}` | Person `N` (1 to 99) from large pools of common names. `FIELD` is `first`, `last`, `full_name`, `username` (one naming convention per sensor, valid as a Unix user name) or `email` (at `{{org.domain}}`). |
+| `{{password:LABEL}}` | A password a person would choose: word, year and symbol, season and year, keyboard walks, a first name and digits, the company name and year, and other shapes common in breach corpora. |
+| `{{password:LABEL:STYLE}}` | `weak`: a default or top-of-wordlist password (`admin123`, `Welcome1`). `user`: built from the label as an account name (`voiceops`, `voiceops2023`). `service`: an application account password set once and never rotated (`crm_app_2022`). `random`: 14 to 20 generated characters. `human` is the default. |
+| `{{sha1:LABEL}}` | SHA-1 hex of `{{password:LABEL}}`, for password-hash columns that crack to a working login. |
+| `{{company:N.FIELD}}` | Another company `N` (1 to 99) for customers, tenants and partners: `name` (an invented word and a business type, `Willetwell Clinic`), `short`, `slug`, `domain` (`willetwell.example`). Never the organisation's own name. |
+| `{{place:N}}` | An invented place name `N` (1 to 99) for branches and sites. |
+| `{{secret:FORMAT:LABEL}}` | `token` (40 alphanumerics), `bearer` (43 of `A-Za-z0-9-_`, the usual opaque OAuth token), `api_key` (32 alphanumerics), `client_secret` (40 of `A-Za-z0-9-_`), `session` (26 of `0-9a-v`, the PHP session id format), `uuid` (version 4), `aws_secret` (40 base64 characters). No format carries a real provider's prefix. |
+| `{{digits:N:LABEL}}`, `{{hex:N:LABEL}}`, `{{alnum:N:LABEL}}` | `N` (1 to 128) digits, lower-case hex or alphanumerics, for session ids, account numbers and the like. |
+| `{{ht:NAME}}` | The honeytoken `NAME` (see [honeytokens](#honeytokens)). |
+| `{{url:TEMPLATE}}` | Any value template above, percent-encoded for a URL: `postgres://app:{{url:password:db}}@{{host:db}}:5432/app`. Unreserved characters stay as they are, so a value without symbols (every honeytoken password) is unchanged and still recognised. Use it wherever a password sits in a URL or a connection string. |
+| `{{open}}`, `{{close}}` | Literal `{{` and `}}`. |
+
+A `LABEL` is 1 to 64 of `A-Za-z0-9_.-` (`host` labels: lower case, starting with a letter).
+One label must always be used with the same arguments: `{{password:x}}` and
+`{{password:x:weak}}` in one scenario is an error, as are an unknown template, a bad
+argument, an undeclared honeytoken and an empty seed. Each error names the field and the
+template. Templates are expanded before validation, so the expanded values must satisfy the
+schema (a `{{person:1.username}}` in `[[identity.users]] name` is a valid user name, a
+`{{net:lan}}.5` in `internal_ips` a private address).
+
+### `[bait]`: pinning the identity
+
+```toml
+[bait]
+org_suffixes = ["Voice Networks", "Telecom", "Communications"]  # endings for {{org.name}}
+domain_words = ["voice", "tel"]                                 # words for {{org.domain}}
+org_name = "Example Voice Networks"     # optional pin for {{org.*}}
+domain = "example-voice.example"        # optional pin for {{org.domain}}
+hosts = { pbx = "pbx01" }               # optional pins for {{host:LABEL}}
+passwords = { root = "Summer2024!" }    # optional pins for {{password:LABEL}}
+```
+
+Values in `[bait]` are literal. Without pins the organisation is derived from the seed. A
+literal `identity.org_name` or `identity.domain` counts as a pin too, so a scenario written
+before templates existed, with literal values throughout, loads exactly as before. Pinning
+the identity leaves the credentials per sensor; pin a password by label in `passwords` to
+keep it across a seed change or an upgrade (see
+[operations](operations.md#when-the-bait-changes)).
 
 ## Schema
 
@@ -102,7 +191,8 @@ Service-specific keys:
   and `[[...tables]]`. A table has `name`, `columns` (`name`, `type`: `int`, `bigint`,
   `text`, `varchar`, `numeric`, `bool`, `date`, `timestamp`, `uuid`, `json`), literal
   `seed_rows`, and an optional `generator` (`count` up to 500, `fields` mapping columns to
-  generator kinds).
+  generator kinds). A column with `secret = true` holds credentials (passwords, hashes,
+  tokens); its seed-row values in shipped scenarios are templates.
 - **`redis`**: `[[services.redis.keys]]` with `key`, `type` (`string`, `hash`, `list`,
   `set`) and `value`.
 - **`http`**: `server_header`, `login_path`, `login_title`, `branding`, `[[...pages]]`
@@ -147,9 +237,21 @@ sensors show different ones. A placeholder that names an undeclared token fails
 validation. `planted_in` is a human description used by `--describe` and the digest.
 
 Kinds: `aws_access_key`, `api_key`, `bearer_token`, `db_password`, `sip_trunk_password`,
-`generic_password`, `ssh_private_key_id`. Values are format-plausible but can never be
-valid credentials anywhere: AWS-style keys use the `AKIAFAKE` prefix, API keys
-`sk_test_hp_`, bearer tokens `hpt_`.
+`generic_password`, `ssh_private_key_id`. Each value has the length and alphabet of the
+real thing and no fixed marker: AWS-style key ids are `AKIA` and 16 characters of `A-Z2-7`,
+API keys `sk_test_` and 24 alphanumerics (never a live-key prefix), bearer tokens 43
+characters of unpadded base64url, SIP trunk passwords 16 alphanumerics, SSH key ids
+`SHA256:` and 43 base64 characters, and database and generic passwords 10 alphanumerics, one
+of `-._` and two digits (no character that needs escaping in a URL or connection string).
+None of them is valid anywhere: they are derived from the sensor seed, so no real service
+issued them, and an AWS-style pair is useless because its secret is the secret of no real
+key (see [security model](security-model.md#fingerprinting)).
+
+A token is recognised by lookup, not by its shape. Every value this sensor can have issued
+(scenario honeytokens and per-source pairs) is held in an index, and each input is searched
+with one lookup per position over its first 16 KiB, whatever the number of tokens. Values
+issued by earlier versions (which did carry markers) are indexed too, so a token handed out
+before an upgrade is still recognised when it comes back; they are never issued again.
 
 The agents write every token to `reports/honeytokens.json`. When a token value appears in
 any later input (a password, a username, a command, an HTTP request) the event and the
@@ -166,7 +268,7 @@ the triage record), even when it comes from a different address.
 ## Synthetic data rules
 
 Nothing in a scenario may be, or be mistaken for, real data. `scenarios/check.py` enforces
-this over every string in a loaded scenario (after honeytoken substitution) and every
+this over every string in a loaded scenario (after template expansion) and every
 generated row:
 
 - card-like 13 to 19 digit numbers must fail the Luhn check (the generator uses the
@@ -179,7 +281,8 @@ generated row:
   `.test` or `.invalid`, or the scenario's own `identity.domain`, which must itself be
   reserved;
 - SSN-shaped values only with area 000, 666 or 9xx;
-- AWS access key IDs only with the `AKIAFAKE` prefix;
+- AWS access key IDs only when they are one of the sensor's own honeytokens (a literal key
+  id in a scenario could be someone's real key);
 - no well-known real bank, hospital, carrier or vendor names;
 - IPv4 addresses must be private, loopback, link-local, reserved or in the documentation
   ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24).
@@ -212,7 +315,8 @@ rolled back.
 1. Create `scenarios/<name>/scenario.toml`. Start from the shipped scenario closest to
    what you want; `name` must match the directory.
 2. Invent everything: organisation, people, domains (`.example`), phone numbers, account
-   formats. Use generators for bulk rows instead of hand-written data.
+   formats. Use templates for credentials, and for the identity unless you pin it, and
+   generators for bulk rows instead of hand-written data.
 3. Declare honeytokens and reference them with `{{ht:<name>}}` in places an attacker would
    look: config files on FTP, credential tables, Redis config hashes, API examples.
 4. Validate:
@@ -220,7 +324,7 @@ rolled back.
    ```bash
    uv run python -m scenarios.check <name>
    uv run python -m listeners --describe <name>
-   uv run pytest tests/test_scenarios.py tests/test_scenarios_e2e.py
+   uv run pytest tests/test_scenarios.py tests/test_scenarios_e2e.py tests/test_scenarios_bait.py
    ```
 
 5. Run it locally (`--scenario <name>`) and connect with real clients for each enabled

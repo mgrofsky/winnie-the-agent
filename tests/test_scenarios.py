@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import tomllib
+import re
 
 import pytest
 
 from scenarios.check import check_scenario, check_text, luhn_valid
 from scenarios.describe import describe, list_text
-from scenarios.loader import SCENARIOS_DIR, list_scenarios, load_scenario
+from scenarios.loader import list_scenarios, load_scenario
 from scenarios.schema import Scenario
 
 SHIPPED = ["api_platform", "bank", "contact_center", "healthcare", "saas", "sip_provider"]
@@ -20,14 +20,13 @@ def test_all_expected_scenarios_ship():
 
 @pytest.mark.parametrize("name", SHIPPED)
 def test_scenario_validates_and_loads(name):
-    with open(SCENARIOS_DIR / name / "scenario.toml", "rb") as f:
-        Scenario.model_validate(tomllib.load(f))
     loaded = load_scenario(name, seed="sensor-a")
     sc = loaded.scenario
     assert sc.name == name
     assert 3 <= len(loaded.honeytokens) <= 5
-    # every placeholder was substituted
-    assert "{{ht:" not in sc.model_dump_json()
+    # every template was expanded, and the expanded pack validates on its own
+    assert "{{" not in sc.model_dump_json()
+    Scenario.model_validate(sc.model_dump())
     # every honeytoken value actually appears somewhere in the fake data
     blob = sc.model_dump_json()
     for db_svc in ("postgres", "mysql"):
@@ -88,7 +87,6 @@ def test_checker_flags_bad_values(text, needle):
     "uk drama 01632 960123 / 07700 900456",
     "a@example.com b@x.example c@host.acme.example d@foo.test",
     "ssn 900-12-3456 666-12-3456",
-    "AKIA" + "FAKE" + "ABCDEFGH1234",
     "10.1.2.3 192.168.0.1 203.0.113.9 127.0.0.1",
     "XX001234567890123456789012",
     "MSH|20261114083015|",
@@ -133,7 +131,9 @@ def test_describe_specifics():
     assert "table cdr:" in sip and "database asteriskcdrdb" in sip
     assert "/backups/etc-asterisk/pjsip.conf" in sip
     api = describe("api_platform")
-    assert "OpenAPI document: /openapi.json" in api and "X-Corvidae-Key" in api
+    header = load_scenario("api_platform", seed="describe").scenario.services.http.api_key_header
+    assert "OpenAPI document: /openapi.json" in api and f"API key header {header}" in api
+    assert re.fullmatch(r"X-[A-Za-z0-9]+-Key", header)
     hc = describe("healthcare")
     assert "Service mllp: enabled, port 2575" in hc and "/fhir/Patient/{id}" in hc
 

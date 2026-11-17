@@ -4,17 +4,19 @@ Public API (used by listeners/, agents/ and SSH hooks):
 
     list_scenarios() -> list[str]
     load_scenario(name, seed, overlay_path=None, scenarios_dir=None) -> LoadedScenario
-    LoadedScenario.scenario          validated Scenario with honeytokens substituted
+    LoadedScenario.scenario          validated Scenario with every template expanded
     LoadedScenario.honeytokens       {name: Honeytoken(name, kind, value, planted_in)}
+    LoadedScenario.bait              {template: value} for this seed (honeytokens left out)
     LoadedScenario.table_rows(db, table) -> (columns, rows)   deterministic per seed
     LoadedScenario.accounts_for(service) -> list[(username, password)]   scenario + overlay
     LoadedScenario.policy_for(service) -> LoginPolicy                      scenario + overlay
     LoadedScenario.persona_fragment() -> str   rendered from schema-validated fields only
     write_honeytokens(loaded, path)            writes reports/honeytokens.json
-    find_honeytoken(text, honeytokens) -> Optional[str]
+    find_honeytoken(text, index_or_values) -> Optional[str]
 
 All randomness comes from ``random.Random`` seeded with sha256(seed|scenario|purpose), so
-the same sensor seed always shows the same records and the same honeytokens.
+the same sensor seed always shows the same records, honeytokens and bait (organisation,
+hosts, people and credentials expanded from ``{{...}}`` templates, see ``scenarios.bait``).
 """
 
 from __future__ import annotations
@@ -33,7 +35,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from . import bait as bait_mod
+from . import tokens as tokens_mod
+from .bait import Bait, BaitError, Pins
 from .schema import (
+    BaitSpec,
     HoneytokenSpec,
     LoginPolicy,
     Overlay,
@@ -43,14 +49,9 @@ from .schema import (
 
 SCENARIOS_DIR = Path(__file__).resolve().parent
 
-# Invented name pools. Deliberately bland; no real people are intended.
-FIRST_NAMES = ["Avery", "Jordan", "Riley", "Morgan", "Casey", "Taylor", "Quinn", "Rowan",
-               "Harper", "Emerson", "Finley", "Sawyer", "Reese", "Dakota", "Kendall", "Marlow",
-               "Peyton", "Sutton", "Teagan", "Lennox", "Ellis", "Hollis", "Arden", "Blair"]
-LAST_NAMES = ["Hartwell", "Okonkwo", "Lindqvist", "Marchetti", "Delacroix", "Brannigan",
-              "Fairbanks", "Nakashima", "Oyelaran", "Pemberton", "Quillfeather", "Rasmussen",
-              "Szymanski", "Thorncastle", "Vandermeer", "Whitlock", "Yarborough", "Zelenko",
-              "Abernathy", "Castellanos", "Duquesne", "Ferreira", "Gallagher", "Halvorsen"]
+# Name pools shared with the per-sensor bait. Common names; no real people are intended.
+FIRST_NAMES = bait_mod.FIRST_NAMES
+LAST_NAMES = bait_mod.LAST_NAMES
 WORDS = ["alpha", "bravo", "delta", "harbor", "summit", "ledger", "beacon", "cobalt",
          "meridian", "pioneer", "quartz", "sierra", "tundra", "vector", "willow", "zephyr"]
 
@@ -94,23 +95,14 @@ def fake_phone(rng: random.Random) -> str:
 
 
 def generate_honeytoken(spec: HoneytokenSpec, seed: str, scenario: str) -> str:
-    """Format-plausible, never valid. Every value carries a recognisable fake marker."""
-    rng = _rng(seed, scenario, "honeytoken", spec.name)
-    up = string.ascii_uppercase + string.digits
-    alnum = string.ascii_letters + string.digits
-    if spec.kind == "aws_access_key":
-        # Real keys start AKIA/ASIA; the 'AKIAFAKE' prefix is not a real key id.
-        return "AKIAFAKE" + "".join(rng.choice(up) for _ in range(12))
-    if spec.kind == "api_key":
-        return "sk_test_hp_" + "".join(rng.choice(alnum) for _ in range(28))
-    if spec.kind == "bearer_token":
-        return "hpt_" + "".join(rng.choice(alnum) for _ in range(36))
-    if spec.kind == "sip_trunk_password":
-        return "Trk" + "".join(rng.choice(alnum) for _ in range(13))
-    if spec.kind == "ssh_private_key_id":
-        return "SHA256:" + "".join(rng.choice(alnum) for _ in range(43))
-    # db_password / generic_password
-    return "".join(rng.choice(alnum) for _ in range(10)) + rng.choice("!#%@") + str(rng.randrange(10, 99))
+    """The value this sensor issues for ``spec``: the real format's length and alphabet, no
+    fixed marker. Recognised by lookup (``scenarios.tokens.TokenIndex``), not by shape."""
+    return tokens_mod.honeytoken_value(spec.kind, seed, scenario, spec.name)
+
+
+def legacy_honeytoken(spec: HoneytokenSpec, seed: str, scenario: str) -> str:
+    """The value earlier versions issued for ``spec``; kept for recognition only."""
+    return tokens_mod.legacy_honeytoken_value(spec.kind, seed, scenario, spec.name)
 
 
 class _Gen:
@@ -180,6 +172,15 @@ class LoadedScenario:
     overlay: Overlay = field(default_factory=Overlay)
     honeytokens: dict[str, Honeytoken] = field(default_factory=dict)
     path: Optional[Path] = None
+    bait: dict[str, str] = field(default_factory=dict)
+    legacy_honeytokens: dict[str, Honeytoken] = field(default_factory=dict)
+
+    def recognised_tokens(self) -> dict[str, str]:
+        """{value: name} for every honeytoken value this sensor may have handed out: the
+        current values and the earlier format's (detection only, never issued)."""
+        out = {t.value: t.name for t in self.legacy_honeytokens.values()}
+        out.update({t.value: t.name for t in self.honeytokens.values()})
+        return out
 
     # ---- data ----------------------------------------------------------------------------
 
@@ -324,18 +325,57 @@ def load_scenario(name: str, seed: str, overlay_path: Optional[os.PathLike | str
         raise FileNotFoundError(f"scenario {name!r} not found ({path})")
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    # Validate the raw file first (placeholders allowed), then plant honeytokens.
-    raw_scenario = Scenario.model_validate(raw)
-    if raw_scenario.name != name:
-        raise ValueError(f"scenario name mismatch: dir {name!r}, file {raw_scenario.name!r}")
-    tokens = {
-        spec.name: Honeytoken(spec.name, spec.kind,
-                              generate_honeytoken(spec, seed, name), tuple(spec.planted_in))
-        for spec in raw_scenario.honeytokens
-    }
-    scenario = Scenario.model_validate(_substitute(raw, tokens))
+    if raw.get("name") != name:
+        raise ValueError(f"scenario name mismatch: dir {name!r}, file {raw.get('name')!r}")
+    tokens, expanded, expansions = expand_scenario(raw, seed, name)
+    scenario = Scenario.model_validate(expanded)
+    legacy = {spec.name: Honeytoken(spec.name, spec.kind, legacy_honeytoken(spec, seed, name),
+                                    tokens[spec.name].planted_in)
+              for spec in scenario.honeytokens}
     return LoadedScenario(scenario=scenario, seed=seed, overlay=load_overlay(overlay_path),
-                          honeytokens=tokens, path=path)
+                          honeytokens=tokens, path=path, bait=expansions,
+                          legacy_honeytokens=legacy)
+
+
+def _pins(raw: dict) -> Pins:
+    spec = BaitSpec.model_validate(raw.get("bait") or {})
+    ident = raw.get("identity") if isinstance(raw.get("identity"), dict) else {}
+
+    def literal(value) -> Optional[str]:
+        return value if isinstance(value, str) and "{{" not in value else None
+
+    return Pins(org_name=spec.org_name or literal(ident.get("org_name")),
+                domain=spec.domain or literal(ident.get("domain")),
+                org_suffixes=list(spec.org_suffixes), domain_words=list(spec.domain_words),
+                hosts=dict(spec.hosts), passwords=dict(spec.passwords))
+
+
+def expand_scenario(raw: dict, seed: str, name: str
+                    ) -> tuple[dict[str, Honeytoken], dict, dict[str, str]]:
+    """Plant honeytokens and expand every template in a parsed pack.
+
+    Returns (honeytokens, the expanded document ready for ``Scenario`` validation,
+    {template: value}). Raises BaitError for an unknown template, a bad argument, a label
+    used with conflicting arguments or an empty seed."""
+    if not seed or not str(seed).strip():
+        raise BaitError(f"scenario {name!r}: no sensor seed; per-sensor bait needs one "
+                        "([scenario] seed or the seed file in the data directory)")
+    specs = [HoneytokenSpec.model_validate(h) for h in raw.get("honeytokens") or []]
+    tokens = {
+        spec.name: Honeytoken(spec.name, spec.kind, generate_honeytoken(spec, seed, name),
+                              tuple(spec.planted_in))
+        for spec in specs
+    }
+    engine = Bait(seed, name, _pins(raw), {n: t.value for n, t in tokens.items()})
+    body = {k: v for k, v in raw.items() if k != "bait"}
+    engine.scan(body)
+    expanded = engine.expand(body)
+    if "bait" in raw:
+        expanded["bait"] = raw["bait"]
+    tokens = {n: Honeytoken(t.name, t.kind, t.value,
+                            tuple(engine.expand_text(p, "honeytokens") for p in t.planted_in))
+              for n, t in tokens.items()}
+    return tokens, expanded, engine.expansions()
 
 
 def write_honeytokens(loaded: LoadedScenario, path: os.PathLike | str) -> None:
@@ -354,6 +394,12 @@ def write_honeytokens(loaded: LoadedScenario, path: os.PathLike | str) -> None:
         "tokens": [
             {"name": t.name, "kind": t.kind, "value": t.value, "planted_in": list(t.planted_in)}
             for t in loaded.honeytokens.values()
+        ] + [
+            # Values earlier versions handed out: recognised when they come back, never
+            # issued again.
+            {"name": t.name, "kind": t.kind, "value": t.value, "planted_in": list(t.planted_in),
+             "legacy": True}
+            for t in loaded.legacy_honeytokens.values()
         ] + planted,
     }
     path = Path(path)
@@ -386,10 +432,8 @@ def load_honeytoken_sources(path: os.PathLike | str) -> dict[str, str]:
         return {}
 
 
-def find_honeytoken(text: str, values: dict[str, str]) -> Optional[str]:
-    if not text:
-        return None
-    for value, name in values.items():
-        if value in text:
-            return name
-    return None
+def find_honeytoken(text: str, values) -> Optional[str]:
+    """The name of the planted token inside ``text``, or None. ``values`` is a
+    ``TokenIndex`` (build it once per run) or a {value: name} dict."""
+    index = values if isinstance(values, tokens_mod.TokenIndex) else tokens_mod.TokenIndex(values)
+    return index.find(text)
