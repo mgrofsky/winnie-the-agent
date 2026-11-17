@@ -6,7 +6,7 @@
 #
 # Lab ports: SSH 12222, FTP 12121 (passive 30000-30019), Telnet 12323, SMTP 12525,
 # HTTP 18080, MySQL 13306, PostgreSQL 15432, Redis 16379, SIP 15060 (udp+tcp),
-# HL7 MLLP 12575, MSSQL 11433. Set [listeners] ftp_pasv_address = 127.0.0.1 for the lab.
+# HL7 MLLP 12575, MSSQL 11433, S3 19000. Set [listeners] ftp_pasv_address = 127.0.0.1 for the lab.
 # The per-scenario listeners-* services (started with --profile) also bind 127.0.0.1 only,
 # on ports of their own: bank 21xxx, healthcare 22xxx, contact_center 23xxx, saas 24xxx,
 # api_platform 25xxx, HTTP on 8443-8447.
@@ -29,6 +29,7 @@ services:
       - "127.0.0.1:15432:5432"
       - "127.0.0.1:16379:6379"
       - "127.0.0.1:12575:2575"
+      - "127.0.0.1:19000:9000"
       - "127.0.0.1:30000-30019:30000-30019"
 
   listeners-bank:
@@ -37,6 +38,7 @@ services:
       - "127.0.0.1:21432:5432"
       - "127.0.0.1:21379:6379"
       - "127.0.0.1:21121:2121"
+      - "127.0.0.1:21900:9000"
 
   listeners-healthcare:
     ports: !override
@@ -58,6 +60,7 @@ services:
       - "127.0.0.1:24432:5432"
       - "127.0.0.1:24379:6379"
       - "127.0.0.1:24525:2525"
+      - "127.0.0.1:24900:9000"
 
   listeners-api-platform:
     ports: !override

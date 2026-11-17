@@ -138,6 +138,8 @@ SECRET_FIELDS: tuple[SecretField, ...] = (
     SecretField("http", "data.body", "form and API request bodies carry login fields"),
     SecretField("http", "data.auth_raw", "Authorization header value that could not be "
                 "parsed (undecodable basic credentials or an unknown scheme)"),
+    SecretField("s3", "data.security_token", "X-Amz-Security-Token of a temporary credential "
+                "(header or presigned URL); request signatures are never logged"),
     SecretField("ftp", "data.input", "the raw PASS command line",
                 when=lambda rec: _data_upper(rec, "cmd") == "PASS"),
     SecretField("redis", "data.input", "AUTH, HELLO ... AUTH, MIGRATE ... AUTH and CONFIG SET "

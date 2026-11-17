@@ -54,6 +54,18 @@ CASES = {
                            b"GET / HTTP/1.1\r\nX: " + b"," * 8000 + b"\r\n\r\n",
                            b"GET //[x/ HTTP/1.1\r\n\r\n", b"GET /" + b"/" * 8000 + b" HTTP/1.1\r\n\r\n"]
                  + repeats("%/?[]:;,\r", 70_000)),
+    "s3": dict(probe_request=b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+               payloads=[_line(b"GET /b/", b"%2e%2e/" * 500 + b" HTTP/1.1"),
+                         b"GET /b?" + b"&a=" * 2600 + b" HTTP/1.1\r\n\r\n",
+                         b"GET / HTTP/1.1\r\nAuthorization: AWS4-HMAC-SHA256 " + b"," * 7000
+                         + b"\r\n\r\n",
+                         b"GET / HTTP/1.1\r\nAuthorization: AWS4-HMAC-SHA256 Credential="
+                         + b"/" * 7000 + b"\r\n\r\n",
+                         b"GET /?list-type=2&continuation-token=" + b"A" * 7000
+                         + b" HTTP/1.1\r\n\r\n",
+                         b"GET /bucket.name/k HTTP/1.1\r\nHost: " + b"a." * 3500 + b"\r\n\r\n",
+                         b"PUT /b/k HTTP/1.1\r\nContent-Length: 99999999999999\r\n\r\n"]
+               + repeats("%/?[]:;,&=\r", 70_000)),
     "mllp": dict(probe_request=b"\x0bMSH|^~\\&|A|B|C|D|20260101||ADT^A01|P1|P|2.5\r\x1c\r",
                  payloads=[b"\x0b" + b"|^~\\&" * 12_000 + b"\x1c\r", b"\x0b" * 60_000,
                            b"\x0b" + b"\r" * 60_000]),

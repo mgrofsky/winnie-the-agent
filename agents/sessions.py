@@ -47,7 +47,7 @@ UTC = datetime.timezone.utc
 
 SSH_PROTOCOL = "ssh"
 TRAP_PROTOCOLS = {"sip", "ftp", "telnet", "postgres", "mysql", "mssql", "redis", "smtp",
-                  "http", "mllp"}
+                  "http", "mllp", "s3"}
 
 
 def _cap(value, limit: int = MAX_FIELD) -> str:

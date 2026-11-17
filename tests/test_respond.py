@@ -533,3 +533,18 @@ async def test_listener_entry_point_hands_source_state_to_the_telnet_persona(tmp
                                username="admin", text="ls", interactive=True, llm_config={})
     assert time.perf_counter() - start >= 0.18
     assert ss.source_token(SEED, "198.51.100.90")[0] in History.payload["decoy_profile"]
+
+
+def test_s3_upload_triggers_malware_drop_and_planted_key_honeytoken_reuse(tmp_path):
+    from agents.playbooks import derive_facts
+
+    upload = rec(rid="s3up", protocol="s3", signals={"s3_upload": 1}, ip="198.51.100.40")
+    assert derive_facts(upload)["malware_indicators"] is True
+    write(tmp_path / "reports", upload)
+    out = run(tmp_path, [_shipped()["malware_drop"]])
+    assert [r["trigger"]["record_id"] for r in out["runs"]] == ["s3up"]
+    planted = Playbook.model_validate({
+        "name": "s3_key", "description": "x", "when": {"protocols": ["s3"],
+                                                     "signals": ["s3_planted_key"]},
+        "steps": [{"action": "tag_source", "tag": "s3_key"}]})
+    assert planted.when.protocols == ["s3"]

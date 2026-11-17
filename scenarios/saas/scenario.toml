@@ -363,6 +363,82 @@ auth = "session"
 description = "Token used by the internal ops automation (rotate quarterly)"
 example = "curl -H 'Authorization: Bearer {{ht:admin_api_token}}' https://app.plinthwork.example/api/v1/tenants"
 
+# ---- S3-compatible storage (object store for uploads and exports) ----------------------
+
+[services.s3]
+enabled = true
+port = 9000
+region = "us-east-1"
+owner_name = "plinthwork-prod"
+
+[services.s3.policy]
+accept = "after_n"
+after_n_min = 3
+after_n_max = 6
+
+[[services.s3.buckets]]
+name = "plinthwork-prod-uploads"
+created = "2023-02-14"
+
+[[services.s3.buckets.objects]]
+key = "tenants/t-0001/attachments/spec-{n:03d}.pdf"
+count = 9
+size = 830000
+content_type = "application/pdf"
+
+[[services.s3.buckets.objects]]
+key = "tenants/t-0001/avatars/u-{n:04d}.png"
+count = 40
+size = 48000
+content_type = "image/png"
+
+[[services.s3.buckets]]
+name = "plinthwork-db-exports"
+created = "2023-05-08"
+
+[[services.s3.buckets.objects]]
+key = "nightly/plinthwork_production-2026-11-{n:02d}.sql.gz"
+count = 15
+size = 380000000
+content_type = "application/gzip"
+mtime = "2026-11-01 03:05"
+
+[[services.s3.buckets.objects]]
+key = "adhoc/tenants.csv"
+table = "plinthwork_production.tenants"
+content_type = "text/csv"
+mtime = "2026-11-12 16:44"
+
+[[services.s3.buckets.objects]]
+key = "adhoc/users.csv"
+table = "plinthwork_production.users"
+content_type = "text/csv"
+mtime = "2026-11-12 16:45"
+
+[[services.s3.buckets]]
+name = "plinthwork-public-assets"
+created = "2023-02-14"
+public_list = true
+public_read = true
+
+[[services.s3.buckets.objects]]
+key = "static/app-{n}.js"
+count = 6
+size = 210000
+content_type = "application/javascript"
+
+[[services.s3.buckets.objects]]
+key = "deploy/.env.production"
+content_type = "text/plain"
+mtime = "2026-10-21 11:02"
+text = """
+RAILS_ENV=production
+DATABASE_URL=postgres://plinthwork:{{ht:prod_db_password}}@10.80.16.21:5432/plinthwork_production
+STORAGE_BUCKET=plinthwork-prod-uploads
+STORAGE_ACCESS_KEY_ID={{ht:uploads_aws_key}}
+SMTP_HOST=127.0.0.1
+"""
+
 # ---- honeytokens ---------------------------------------------------------------------------
 
 [[honeytokens]]
@@ -376,12 +452,18 @@ planted_in = [
 [[honeytokens]]
 name = "prod_db_password"
 kind = "db_password"
-planted_in = ["Redis hash plinthwork:config:production (database_url)"]
+planted_in = [
+    "Redis hash plinthwork:config:production (database_url)",
+    "S3 plinthwork-public-assets/deploy/.env.production (DATABASE_URL)",
+]
 
 [[honeytokens]]
 name = "uploads_aws_key"
 kind = "aws_access_key"
-planted_in = ["Redis hash plinthwork:config:production (storage_access_key_id)"]
+planted_in = [
+    "Redis hash plinthwork:config:production (storage_access_key_id)",
+    "S3 plinthwork-public-assets/deploy/.env.production (STORAGE_ACCESS_KEY_ID)",
+]
 
 [[honeytokens]]
 name = "smtp_password"

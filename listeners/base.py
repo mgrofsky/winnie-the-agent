@@ -44,9 +44,11 @@ T = TypeVar("T", bound=BaseModel)
 _ACCESS_KEY_RE = re.compile(r"AKIAFAKE[A-Z2-7]{12}")
 _SECRET_RUN_RE = re.compile(r"[A-Za-z0-9+/]{40,}")
 
-SERVICES = ("sip", "ftp", "telnet", "postgres", "mysql", "mssql", "redis", "smtp", "http", "mllp")
+SERVICES = ("sip", "ftp", "telnet", "postgres", "mysql", "mssql", "redis", "smtp", "http", "mllp",
+            "s3")
 DEFAULT_PORTS = {"sip": 5060, "ftp": 2121, "telnet": 2323, "postgres": 5432, "mysql": 3306,
-                 "mssql": 1433, "redis": 6379, "smtp": 2525, "http": 8080, "mllp": 2575}
+                 "mssql": 1433, "redis": 6379, "smtp": 2525, "http": 8080, "mllp": 2575,
+                 "s3": 9000}
 
 
 CAPTURE_PARTS = MAX_DATA_KEYS - 1      # one key is the label

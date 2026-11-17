@@ -81,6 +81,8 @@ services:
       - "5432:5432"
       - "6379:6379"
       - "2575:2575"
+      # S3-compatible trap: plain HTTP only (no TLS), so it cannot be published as 443.
+      - "${S3_HOST_PORT:-9000}:9000"
       # FTP passive data ports: must match [listeners] ftp_pasv_ports in config.ini. Set
       # ftp_pasv_address to the sensor's public address, or clients will be told to connect
       # to the container's internal address.
@@ -128,7 +130,7 @@ services:
     command: ["python", "-m", "listeners", "--config", "/app/SSH/config.ini", "--scenario", "bank",
               "--log-file", "/data/ssh_log.log", "--data-dir", "/data"]
     environment: *frontend-env
-    ports: ["8443:8080", "15432:5432", "16379:6379", "12121:2121"]
+    ports: ["8443:8080", "15432:5432", "16379:6379", "12121:2121", "21900:9000"]
     networks: [frontend]
     volumes: [./SSH:/app/SSH:ro, frontend-bank:/data, overlay:/overlay:ro]
 
@@ -161,7 +163,7 @@ services:
     command: ["python", "-m", "listeners", "--config", "/app/SSH/config.ini", "--scenario", "saas",
               "--log-file", "/data/ssh_log.log", "--data-dir", "/data"]
     environment: *frontend-env
-    ports: ["8446:8080", "35432:5432", "36379:6379", "12525:2525"]
+    ports: ["8446:8080", "35432:5432", "36379:6379", "12525:2525", "24900:9000"]
     networks: [frontend]
     volumes: [./SSH:/app/SSH:ro, frontend-saas:/data, overlay:/overlay:ro]
 

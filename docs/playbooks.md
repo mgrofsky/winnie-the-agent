@@ -48,7 +48,7 @@ All conditions given in `[when]` must hold. List values mean "any of".
 | Condition | Type | Matches when |
 |---|---|---|
 | `kinds` | `session`, `campaign` | the record is an SSH session or a trap campaign |
-| `protocols` | `ssh`, `sip`, `ftp`, `telnet`, `postgres`, `mysql`, `mssql`, `redis`, `smtp`, `http`, `mllp` | the record's protocol is listed |
+| `protocols` | `ssh`, `sip`, `ftp`, `telnet`, `postgres`, `mysql`, `mssql`, `redis`, `smtp`, `http`, `mllp`, `s3` | the record's protocol is listed |
 | `judgement_at_least` | `BENIGN`, `SUSPICIOUS`, `MALICIOUS` | the judgement is at least this |
 | `stages` | kill-chain stages | the record's stage is listed |
 | `intents` | intents | the record's intent is listed |
@@ -59,12 +59,13 @@ All conditions given in `[when]` must hold. List values mean "any of".
 | `source_verified` | bool | the source completed a TCP handshake or a SIP nonce round trip |
 | `dialed_international_or_premium` | bool | a dialed number starts with an international (`00`, `011`, `+` other than `+1`) or premium-rate prefix |
 | `sensitive_data_access` | bool | commands or file paths touched patient or financial data (words such as `patient`, `mrn`, `fhir`, `account`, `card`, `iban`, `ledger`, `payment`) |
-| `malware_indicators` | bool | an FTP upload, or a URL or file hash among the IOCs |
+| `malware_indicators` | bool | an FTP or S3 upload, or a URL or file hash among the IOCs |
 | `nothing_novel` | bool | a campaign with no high-signal event, no honeytoken and no commands |
 | `scenarios` | scenario names | the sensor's active scenario is listed |
 
 Signals: `redis_takeover`, `sql_exec_attempt`, `sql_cred_dump`, `smtp_relay_attempt`,
-`sip_dialed_number`, `quarantine_quota`, `http_proxy_attempt`, `ftp_upload`, and the SSH
+`sip_dialed_number`, `quarantine_quota`, `http_proxy_attempt`, `ftp_upload`, `s3_upload`,
+`s3_bulk_download`, `s3_planted_key`, and the SSH
 session signals `download_execute`, `persistence`, `credential_file_read`.
 
 There are no expressions and no free-text matching. Conditions read only enum and numeric

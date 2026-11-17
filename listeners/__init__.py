@@ -1,4 +1,5 @@
-"""Login traps: SIP, FTP, Telnet, PostgreSQL, MySQL, MSSQL, Redis, SMTP, HTTP, HL7 MLLP.
+"""Login traps: SIP, FTP, Telnet, PostgreSQL, MySQL, MSSQL, Redis, SMTP, HTTP, HL7 MLLP,
+S3-compatible object storage.
 
 Each one looks real long enough to capture credentials and what follows, and writes
 ListenerEvents (see ``listeners.events``). Authentication and protocol handling never use a

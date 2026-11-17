@@ -205,6 +205,36 @@ def parse_cookies(value: Optional[str]) -> dict[str, str]:
 # ---- request parsing ----------------------------------------------------------------------
 
 async def read_request(conn: Conn) -> Optional[Request]:
+    req = await read_head(conn)
+    if req is None or req.method == "CONNECT":
+        return req
+    if req.header("transfer-encoding") is not None:
+        raise HttpError(411, "transfer_encoding")
+    n = content_length(req)
+    if n is not None:
+        if n > MAX_BODY:
+            raise HttpError(413, "body_too_large")
+        if n:
+            req.body = await conn.readexactly(n)
+    return req
+
+
+def content_length(req: Request) -> Optional[int]:
+    """The declared body length; None when absent. Raises HttpError(400) when malformed or
+    when several Content-Length headers disagree."""
+    lengths = {v for k, v in req.headers if k.lower() == "content-length"}
+    if len(lengths) > 1:
+        raise HttpError(400, "content_length")
+    if not lengths:
+        return None
+    cl = lengths.pop()
+    if not re.fullmatch(r"\d{1,19}", cl):
+        raise HttpError(400, "content_length")
+    return int(cl)
+
+
+async def read_head(conn: Conn) -> Optional[Request]:
+    """Request line and headers (no body). Shared by the HTTP and S3 traps."""
     line = b""
     for _ in range(4):
         try:
@@ -266,20 +296,6 @@ async def read_request(conn: Conn) -> Optional[Request]:
         req.query = split.query
     except ValueError:  # e.g. "//[x/": unbalanced IPv6 brackets in the authority
         raise HttpError(400, "bad_target") from None
-    if req.header("transfer-encoding") is not None:
-        raise HttpError(411, "transfer_encoding")
-    lengths = {v for k, v in headers if k.lower() == "content-length"}
-    if len(lengths) > 1:
-        raise HttpError(400, "content_length")
-    if lengths:
-        cl = lengths.pop()
-        if not re.fullmatch(r"\d{1,10}", cl):
-            raise HttpError(400, "content_length")
-        n = int(cl)
-        if n > MAX_BODY:
-            raise HttpError(413, "body_too_large")
-        if n:
-            req.body = await conn.readexactly(n)
     return req
 
 

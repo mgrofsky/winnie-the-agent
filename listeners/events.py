@@ -22,7 +22,7 @@ MAX_VALUE_CHARS = 512
 MAX_DATA_KEYS = 32
 
 Protocol = Literal["sip", "ftp", "telnet", "postgres", "mysql", "redis", "smtp", "http", "mssql",
-                   "mllp"]
+                   "mllp", "s3"]
 EventType = Literal[
     "connection",     # TCP connection accepted or first UDP datagram from a source
     "auth_attempt",   # credentials (or challenge/response material) submitted

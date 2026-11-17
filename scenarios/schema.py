@@ -323,6 +323,90 @@ class MllpService(ServiceBase):
     sending_facility: str = Field(default="EHR", max_length=40, pattern=r"^[A-Za-z0-9_ -]+$")
 
 
+S3_BUCKET_RE = r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+# Object keys in a scenario: no leading slash, no empty or ".." segments. A key may hold one
+# "{n}" or "{n:0Wd}" placeholder (W = 1..9) when the object spec describes a series.
+S3_KEY_RE = r"^[A-Za-z0-9!_.*'()=+,@ {}:-][A-Za-z0-9!_.*'()=+,@ {}:/-]{0,399}$"
+S3_SERIES_RE = r"\{n(?::0([1-9])d)?\}"
+S3_REGION_RE = r"^[a-z]{2}(-[a-z]+)+-[0-9]$"
+CONTENT_TYPE_RE = r"^[a-z]+/[A-Za-z0-9.+-]{1,80}(; ?charset=[A-Za-z0-9-]{1,20})?$"
+S3_MAX_KEYS_PER_BUCKET = 100_000
+S3_MAX_KEYS_TOTAL = 200_000
+S3_MAX_PAPER_SIZE = 5 * 1024 ** 4       # the largest object S3 accepts
+
+
+class S3Object(Strict):
+    """One object, or a series of ``count`` objects whose key holds ``{n}``.
+
+    The body is literal ``text`` (may embed ``{{ht:<name>}}``), a scenario ``table`` rendered
+    as CSV, or else deterministic filler of ``size`` bytes generated on demand. ``size`` is
+    the size on paper; downloads are capped by the service's ``get_max_bytes``."""
+
+    key: str = Field(pattern=S3_KEY_RE)
+    count: int = Field(default=1, ge=1, le=S3_MAX_KEYS_PER_BUCKET)
+    size: Optional[int] = Field(default=None, ge=0, le=S3_MAX_PAPER_SIZE)
+    content_type: str = Field(default="binary/octet-stream", pattern=CONTENT_TYPE_RE)
+    text: Optional[str] = Field(default=None, max_length=16384)
+    table: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
+    table_limit: int = Field(default=200, ge=1, le=500)
+    mtime: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?$")
+
+    @model_validator(mode="after")
+    def _shape(self) -> "S3Object":
+        segments = self.key.split("/")
+        if any(seg in ("", ".", "..") for seg in segments[:-1]) or segments[-1] in (".", ".."):
+            raise ValueError(f"bad object key {self.key!r}")
+        holes = re.findall(S3_SERIES_RE, self.key)
+        if re.sub(S3_SERIES_RE, "", self.key).count("{") or \
+                re.sub(S3_SERIES_RE, "", self.key).count("}"):
+            raise ValueError(f"object key {self.key!r}: only {{n}} placeholders are allowed")
+        if self.count > 1 and len(holes) != 1:
+            raise ValueError(f"object key {self.key!r}: a series needs exactly one {{n}}")
+        if self.count == 1 and holes:
+            raise ValueError(f"object key {self.key!r}: {{n}} needs count > 1")
+        if self.text is not None and self.table is not None:
+            raise ValueError(f"object {self.key!r}: choose text or table")
+        if (self.text is not None or self.table is not None) and \
+                (self.count > 1 or self.size is not None):
+            raise ValueError(f"object {self.key!r}: text and table objects take no size or count")
+        return self
+
+
+class S3Bucket(Strict):
+    name: str = Field(pattern=S3_BUCKET_RE)
+    region: Optional[str] = Field(default=None, pattern=S3_REGION_RE)
+    created: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    public_list: bool = False      # anonymous ListObjects (a misconfigured public bucket)
+    public_read: bool = False      # anonymous GetObject / HeadObject
+    objects: list[S3Object] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "S3Bucket":
+        if ".." in self.name or re.fullmatch(r"\d+\.\d+\.\d+\.\d+", self.name):
+            raise ValueError(f"bad bucket name {self.name!r}")
+        if sum(o.count for o in self.objects) > S3_MAX_KEYS_PER_BUCKET:
+            raise ValueError(f"bucket {self.name}: more than {S3_MAX_KEYS_PER_BUCKET} keys")
+        return self
+
+
+class S3Service(ServiceBase):
+    port: int = 9000
+    server_header: str = Field(default="AmazonS3", max_length=100, pattern=r"^[\x20-\x7e]*$")
+    region: str = Field(default="us-east-1", pattern=S3_REGION_RE)
+    owner_name: str = Field(default="ops", pattern=r"^[a-z][a-z0-9._-]{0,63}$")
+    get_max_bytes: int = Field(default=4_194_304, ge=1024, le=16_777_216)
+    buckets: list[S3Bucket] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def _buckets(self) -> "S3Service":
+        names = [b.name for b in self.buckets]
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate bucket names")
+        if sum(o.count for b in self.buckets for o in b.objects) > S3_MAX_KEYS_TOTAL:
+            raise ValueError(f"more than {S3_MAX_KEYS_TOTAL} keys across buckets")
+        return self
+
+
 class SshService(Strict):
     """SSH/Telnet persona settings consumed by agents.persona and agents.hooks."""
 
@@ -341,6 +425,7 @@ class Services(Strict):
     smtp: Optional[SmtpService] = None
     http: Optional[HttpService] = None
     mllp: Optional[MllpService] = None
+    s3: Optional[S3Service] = None
 
 
 HoneytokenKind = Literal["aws_access_key", "api_key", "bearer_token", "db_password",

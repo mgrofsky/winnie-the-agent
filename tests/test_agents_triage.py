@@ -451,3 +451,34 @@ def test_ipv6_campaigns_group_a_slash_64_and_keep_some_addresses(tmp_path):
     assert 0 < len(v6[0]["src_addresses"]) <= 20
     assert all(a.startswith("2001:db8:1:2::") for a in v6[0]["src_addresses"])
     assert [c["src_ip"] for c in camps if ":" not in c["src_ip"]] == ["203.0.113.8"]
+
+
+def _s3(ip, task, minutes, op, status=200, **data):
+    return trap_event("s3", "command", ip, task, minutes=minutes,
+                      username="AKIA" + "FAKE" + "EXAMPLE00001",
+                      data={"operation": op, "status": status,
+                            "command": f"{op} /nw-call-recordings -> {status}", **data})
+
+
+def test_s3_campaign_signals_are_deterministic(tmp_path):
+    recs = [_s3("192.0.2.50", "s3-a", 0, "ListBuckets", signal="s3_list"),
+            _s3("192.0.2.50", "s3-a", 0.1, "ListObjectsV2", signal="s3_list"),
+            _s3("192.0.2.50", "s3-a", 0.2, "GetObject", signal="s3_bulk_download",
+                high_signal=True),
+            _s3("192.0.2.50", "s3-a", 0.3, "PutObject", signal="s3_upload", high_signal=True),
+            # Refused listings from a scanner are not enumeration.
+            _s3("192.0.2.51", "s3-b", 0, "ListBuckets", status=403),
+            _s3("192.0.2.52", "s3-c", 0, "ListBuckets", signal="s3_planted_key",
+                high_signal=True, honeytoken="backup_key")]
+    llm = FakeJsonLLM(GOOD_TRIAGE)
+    _result, reports = _run(tmp_path, recs, llm, max_llm_calls=0)
+    by_ip = {r.src_ip: r for r in load_records(reports)}
+    busy = by_ip["192.0.2.50"]
+    assert busy.protocol == "s3" and busy.judgement.value == "MALICIOUS"
+    assert busy.intent.value == "DATA_THEFT"
+    assert {"T1619", "T1530", "T1105"} <= {t.id for t in busy.techniques}
+    assert busy.high_signal == {"s3_bulk_download": 1, "s3_upload": 1}
+    scanner = by_ip["192.0.2.51"]
+    assert scanner.judgement.value == "BENIGN" and not scanner.techniques
+    planted = by_ip["192.0.2.52"]
+    assert planted.judgement.value == "MALICIOUS" and planted.honeytokens == ["backup_key"]

@@ -6,7 +6,7 @@ Backs ``python -m listeners --list-scenarios`` and ``--describe <name>``:
     describe(name, seed="describe") -> str     what the scenario exposes
 
 Honeytoken *values* are never printed, only their names, kinds and where they are planted.
-FTP file contents and HTTP bodies are not printed either (they may embed honeytokens).
+FTP file contents, S3 object bodies and HTTP bodies are not printed either (they may embed honeytokens).
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import Optional
 from .loader import list_scenarios, load_scenario
 
 SERVICE_ORDER = ("sip", "ftp", "telnet", "postgres", "mysql", "mssql", "redis", "smtp",
-                 "http", "mllp")
+                 "http", "mllp", "s3")
 
 
 def _policy(p) -> str:
@@ -106,6 +106,12 @@ def describe(name: str, seed: str = "describe", scenarios_dir: Optional[str] = N
                 w(f"  key {k.key} ({k.type})")
         if svc_name == "mllp":
             w(f"  sending facility: {svc.sending_facility}")
+        if svc_name == "s3":
+            w(f"  region: {svc.region}; downloads capped at {svc.get_max_bytes} bytes")
+            for b in svc.buckets:
+                flags = [f for f in ("public_list", "public_read") if getattr(b, f)]
+                keys = sum(o.count for o in b.objects)
+                w(f"  bucket {b.name} ({keys} keys{', ' + ', '.join(flags) if flags else ''})")
         if svc_name == "http":
             w(f"  Server: {svc.server_header}")
             w(f"  login: {svc.login_path} \"{svc.login_title}\"")

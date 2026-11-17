@@ -514,6 +514,75 @@ client_id = "qst-aggregator-feed"
 client_secret = "{{ht:aggregator_api_key}}"
 token_url = "https://api.quillmere-bank.example/oauth/token"
 
+# ---- S3-compatible storage (statement archive and batch staging) ------------------------
+
+[services.s3]
+enabled = true
+port = 9000
+region = "us-east-1"
+owner_name = "qst-storage"
+
+[services.s3.policy]
+accept = "after_n"
+after_n_min = 3
+after_n_max = 6
+
+[[services.s3.buckets]]
+name = "qst-statement-archive"
+created = "2022-08-01"
+
+[[services.s3.buckets.objects]]
+key = "statements/2026/10/QM-{n:06d}.pdf"
+count = 1200
+size = 140000
+content_type = "application/pdf"
+mtime = "2026-11-02 05:00"
+
+[[services.s3.buckets.objects]]
+key = "statements/2026/10/index.csv"
+table = "corebank.statements"
+content_type = "text/csv"
+mtime = "2026-11-02 05:40"
+
+[[services.s3.buckets]]
+name = "qst-batch-staging"
+created = "2022-08-01"
+
+[[services.s3.buckets.objects]]
+key = "outbound/ach/ACH-2026111{n}.txt"
+count = 6
+size = 64000
+content_type = "text/plain"
+mtime = "2026-11-10 18:30"
+
+[[services.s3.buckets.objects]]
+key = "scripts/upload-batches.env"
+content_type = "text/plain"
+mtime = "2026-07-14 10:20"
+text = """
+# used by /opt/qst/batch/bin/upload-batches.sh
+AWS_ACCESS_KEY_ID={{ht:batch_aws_key}}
+STAGING_BUCKET=qst-batch-staging
+PGPASSWORD={{ht:core_db_password}}
+"""
+
+[[services.s3.buckets]]
+name = "qst-db-backups"
+created = "2022-09-19"
+
+[[services.s3.buckets.objects]]
+key = "corebank/corebank-2026-11-{n:02d}.dump.gz"
+count = 15
+size = 2100000000
+content_type = "application/gzip"
+mtime = "2026-11-01 01:00"
+
+[[services.s3.buckets.objects]]
+key = "corebank/customers-extract.csv"
+table = "corebank.customers"
+content_type = "text/csv"
+mtime = "2026-11-14 22:10"
+
 # ---- honeytokens ---------------------------------------------------------------------------
 
 [[honeytokens]]
@@ -522,6 +591,7 @@ kind = "db_password"
 planted_in = [
     "Redis hash config:obk (db_password)",
     "FTP /scripts/partners.conf ([core-db] password)",
+    "S3 qst-batch-staging/scripts/upload-batches.env (PGPASSWORD)",
 ]
 
 [[honeytokens]]
@@ -532,7 +602,10 @@ planted_in = ["Redis string svc:recon:token (back-office reconciliation job bear
 [[honeytokens]]
 name = "batch_aws_key"
 kind = "aws_access_key"
-planted_in = ["FTP /scripts/upload-batches.sh (AWS_ACCESS_KEY_ID)"]
+planted_in = [
+    "FTP /scripts/upload-batches.sh (AWS_ACCESS_KEY_ID)",
+    "S3 qst-batch-staging/scripts/upload-batches.env (AWS_ACCESS_KEY_ID)",
+]
 
 [[honeytokens]]
 name = "aggregator_api_key"

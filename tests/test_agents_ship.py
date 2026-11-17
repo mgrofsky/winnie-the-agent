@@ -400,7 +400,11 @@ def test_shipped_objects_never_contain_the_clear_password(tmp_path):
 # Field names that look like a secret but are not one. A new password-like field must be
 # added either to ship.SECRET_FIELDS or here, with the reason.
 KNOWN_NOT_SECRET = {
-    "auth": "PostgreSQL authentication method name",
+    "auth": "PostgreSQL authentication method name; S3 signature scheme name",
+    "auth_malformed": "S3: which part of an Authorization header failed to parse",
+    "access_key_id": "S3 access key id, the public half of a key pair (also the username)",
+    "key": "S3 object key (a file name)",
+    "max_keys": "S3 listing page size",
     "auth_plugin": "MySQL plugin name", "client_plugin": "MySQL plugin name",
     "auth_scheme": "SIP Authorization scheme name",
     "auth_switched": "bool", "auth_uri": "SIP digest URI",

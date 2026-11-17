@@ -13,7 +13,8 @@ it should pretend to be.
 On top of that SSH honeypot this project adds:
 
 - **Multi-protocol login traps**: SIP (UDP and TCP), FTP, Telnet, PostgreSQL, MySQL, MSSQL,
-  Redis, SMTP, HTTP and HL7 v2 over MLLP. Each one looks real long enough to capture
+  Redis, SMTP, HTTP, HL7 v2 over MLLP and an S3-compatible object store. Each one looks
+  real long enough to capture
   credentials and intent, then fakes a working service after a fake login.
 - **Scenarios**: one TOML file describes the whole fake target (organisation, host, users,
   services, banners, accounts, fake data, HTTP pages and APIs, honeytokens), so every
@@ -85,7 +86,7 @@ ssh -p 12222 guest@127.0.0.1
 | Telnet | 12323 | Redis | 16379 |
 | SMTP | 12525 | SIP | 15060 (UDP and TCP) |
 | HTTP | 18080 | HL7 MLLP | 12575 |
-| MSSQL | 11433 | | |
+| MSSQL | 11433 | S3 | 19000 |
 
 Only the services enabled by the active scenario answer; nothing listens behind the other ports.
 The agents container runs `python -m agents run-all` every hour. Tear down with
@@ -110,7 +111,7 @@ The SSH server listens on `[ssh] port` (8022 by default, on all addresses unless
 `[ssh] listen_host` is set) and stays in the foreground; without a model API key it prints
 one warning that sessions get canned replies. The listeners use the scenario's ports (for
 example 2121 for
-FTP, 8080 for HTTP); `[listeners] <service>_port` overrides them.
+FTP, 8080 for HTTP, 9000 for S3); `[listeners] <service>_port` overrides them.
 
 ## Configuration
 
@@ -160,11 +161,11 @@ or go into detail:
 
 | Name | Fake target |
 |---|---|
-| `sip_provider` | Hosted PBX (FreePBX / Asterisk): SIP, MySQL, FTP config backups, FreePBX web UI, SMTP, legacy telnet console. |
+| `sip_provider` | Hosted PBX (FreePBX / Asterisk): SIP, MySQL, FTP config backups, S3 buckets of call recordings, CDR exports and config backups, FreePBX web UI, SMTP, legacy telnet console. |
 | `contact_center` | Outsourced contact center on Asterisk: SIP, PostgreSQL CRM, MSSQL, FTP call recordings, agent desktop web app. |
-| `bank` | Community bank online banking and core: PostgreSQL core banking, Redis sessions, FTP payment batch drop, banking REST API. |
+| `bank` | Community bank online banking and core: PostgreSQL core banking, Redis sessions, FTP payment batch drop, S3 statement archive and database backups, banking REST API. |
 | `healthcare` | Regional health system EHR integration host: HL7 MLLP, FHIR-style REST API, PostgreSQL clinical database, FTP lab and imaging share. |
-| `saas` | Multi-tenant SaaS app server: PostgreSQL, Redis, SMTP relay, web app and bearer-token API. |
+| `saas` | Multi-tenant SaaS app server: PostgreSQL, Redis, SMTP relay, S3 uploads, database exports and a misconfigured public bucket, web app and bearer-token API. |
 | `api_platform` | B2B data API gateway: versioned REST API with API keys, OpenAPI document, PostgreSQL, Redis. |
 
 Every organisation, person, phone number, card number and domain in them is invented, and a

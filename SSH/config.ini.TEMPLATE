@@ -176,7 +176,7 @@ overlay = ../decoy/overlay.json
 # Low-interaction login traps (python -m listeners). Per-service keys override
 # the scenario: <service>_enabled, <service>_port, <service>_accept
 # (all | listed | after_n | none) and <service>_auth (only postgres uses it, see below).
-# Services: sip ftp telnet postgres mysql mssql redis smtp http mllp.
+# Services: sip ftp telnet postgres mysql mssql redis smtp http mllp s3.
 [listeners]
 bind_host = 0.0.0.0
 # Defaults to [honeypot] log_file so all protocols share one log.

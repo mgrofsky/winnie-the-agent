@@ -24,6 +24,12 @@ sensor may run and what it may reach.
   misconfigured to send to it, the log will contain real patient data and the sender will
   believe delivery succeeded. Only expose it where no real HL7 sender can reach it by
   mistake, and treat its log as potentially regulated health data.
+- **S3.** The S3 trap speaks plain HTTP only. It cannot be published as 443: clients
+  that expect `https://` fail the TLS handshake before a request is logged. Publish it on
+  9000 (the MinIO default, which scanners probe) or on 80 of a second address of the
+  sensor (80 is already the HTTP trap's port on the first). A client must be pointed at
+  it with `--endpoint-url http://...`; scanners that only try `https://<bucket>.s3...`
+  never reach it. PutObject bodies go to the quarantine like FTP uploads.
 - **Captured data.** The event log, `reports/`, the quarantine and the approval queue hold
   plain-text passwords (often real credentials reused elsewhere), attacker commands and
   uploaded files. Restrict access to the host and volumes, keep the data no longer than you
@@ -77,6 +83,7 @@ shell that runs `docker compose`, and the agents get `ANTHROPIC_API_KEY`. With
 | PostgreSQL | 5432 | 5432 | 15432 |
 | Redis | 6379 | 6379 | 16379 |
 | HL7 MLLP | 2575 | 2575 | 12575 |
+| S3 | 9000 | 9000 (`S3_HOST_PORT`) | 19000 |
 
 Only services enabled by the active scenario listen. The FTP passive range must match
 `[listeners] ftp_pasv_ports`, and `ftp_pasv_address` must be the address clients use to

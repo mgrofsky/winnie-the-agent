@@ -14,7 +14,7 @@ halves share files, never a network connection.
 | Component | Location | Role |
 |---|---|---|
 | SSH honeypot | `SSH/ssh_server.py`, `agents/hooks.py` | The upstream DECEIVE server: a model plays a Linux shell. `ssh_server.py` stays close to upstream; each addition is a small call into `agents/hooks.py`, marked with an `agent layer` comment. |
-| Listeners | `listeners/` | Low-interaction traps for SIP (UDP and TCP), FTP, Telnet, PostgreSQL, MySQL, MSSQL, Redis, SMTP, HTTP and HL7 MLLP, all in one asyncio process (`python -m listeners`). |
+| Listeners | `listeners/` | Low-interaction traps for SIP (UDP and TCP), FTP, Telnet, PostgreSQL, MySQL, MSSQL, Redis, SMTP, HTTP, HL7 MLLP and S3-compatible storage, all in one asyncio process (`python -m listeners`). |
 | Scenarios | `scenarios/` | One strict schema describing the fake target; loader, synthetic-data checker and describer. See [scenarios.md](scenarios.md). |
 | Budgets | `agents/budget.py` | Spend and concurrency limits for every model call, shared by the SSH and listener processes. |
 | Triage | `agents/triage.py`, `agents/sessions.py` | Turns the log into one validated record per SSH session or trap campaign; writes the daily digest. |
@@ -158,6 +158,26 @@ Protocol notes:
   the budgeted model when the scenario enables `llm_unknown_api_routes`; otherwise 404.
 - **HL7 MLLP**: frames are logged and answered with an `AA` acknowledgement; nothing is
   forwarded.
+- **S3**: enough of the S3 REST API (plain HTTP, path-style and virtual-hosted) for the AWS
+  CLI, boto3, s3cmd and curl: ListBuckets, HeadBucket, GetBucketLocation, GetBucketAcl and
+  GetBucketPolicy (canned), ListObjects V1 and V2 (prefix, delimiter, `max-keys` up to
+  1,000, continuation, `encoding-type=url`), HeadObject, GetObject with `Range`, PutObject,
+  DeleteObject(s) and a minimal multipart upload; everything else is a correct S3 XML
+  error. Buckets and objects come from the scenario; object bodies are text, a scenario
+  table as CSV, or deterministic filler generated per byte range, never the size on paper.
+  SigV4 (header and presigned) and SigV2 are parsed for the access key id, region and
+  signed headers; access follows the login policy keyed on the access key id, a SigV4
+  signature is verified only for a scenario account with a secret, and `public_list` /
+  `public_read` buckets answer anonymous requests. A planted access key id is accepted
+  unless the policy is `none`, and is always logged as `s3_planted_key` with the token
+  name. Upload bodies stream to the quarantine (FTP caps and truncation; `Expect:
+  100-continue` and `aws-chunked` handled; each multipart part is its own quarantine entry)
+  and the object is then listed for that source only, for an hour. Signals: `s3_list`,
+  `s3_download`, `s3_bulk_download` (25 downloads or 64 MB from one source within 10
+  minutes, high-signal), `s3_upload` (high-signal), `s3_planted_key` (high-signal).
+  Deterministic triage maps successful listings to Discovery (T1619), a bulk download to
+  data theft at Collection (T1530) and an upload to T1105; the `malware_drop` playbook
+  fires on `s3_upload` and `honeytoken_reuse` on a planted key.
 
 ### Triage
 
@@ -307,7 +327,7 @@ Listener events add:
 
 | Field | Meaning |
 |---|---|
-| `sensor_protocol` | `sip`, `ftp`, `telnet`, `postgres`, `mysql`, `mssql`, `redis`, `smtp`, `http`, `mllp` (SSH lines carry `ssh`). |
+| `sensor_protocol` | `sip`, `ftp`, `telnet`, `postgres`, `mysql`, `mssql`, `redis`, `smtp`, `http`, `mllp`, `s3` (SSH lines carry `ssh`). |
 | `event` | `connection`, `auth_attempt`, `command`, `register`, `invite`, `options`, `limit`, `error`, `close`. |
 | `transport` | `tcp` or `udp`. |
 | `username`, `password` | Submitted credentials, when the protocol reveals them. |

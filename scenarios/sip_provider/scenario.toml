@@ -613,6 +613,118 @@ password = "voiceops123"
 username = "admin"
 password = "admin1234"
 
+# ---- S3-compatible storage (MinIO on the backup host) ------------------------------------
+# Call recordings, CDR exports and config backups pushed by the nightly jobs. Any access key
+# id that is not a planted token is decided by the after_n policy.
+
+[services.s3]
+enabled = true
+port = 9000
+region = "us-east-2"
+owner_name = "bwv-backup"
+
+[services.s3.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.s3.buckets]]
+name = "bwv-call-recordings"
+created = "2024-06-11"
+
+[[services.s3.buckets.objects]]
+key = "2026/11/13/q-support-{n:05d}.wav"
+count = 180
+size = 960000
+content_type = "audio/wav"
+mtime = "2026-11-13 08:02"
+
+[[services.s3.buckets.objects]]
+key = "2026/11/14/q-support-{n:05d}.wav"
+count = 210
+size = 960000
+content_type = "audio/wav"
+mtime = "2026-11-14 08:01"
+
+[[services.s3.buckets.objects]]
+key = "2026/11/14/q-sales-{n:05d}.wav"
+count = 95
+size = 1450000
+content_type = "audio/wav"
+mtime = "2026-11-14 09:12"
+
+[[services.s3.buckets.objects]]
+key = "README.txt"
+content_type = "text/plain"
+text = """
+Call recordings pushed nightly from pbx01 by /usr/local/sbin/offsite-backup.sh.
+Layout: YYYY/MM/DD/<queue>-<seq>.wav (8 kHz mono PCM). Retention 90 days (lifecycle rule).
+"""
+
+[[services.s3.buckets]]
+name = "bwv-cdr-exports"
+created = "2024-06-11"
+
+[[services.s3.buckets.objects]]
+key = "cdr/2026/11/cdr-2026-11-{n:02d}.csv.gz"
+count = 15
+size = 2400000
+content_type = "application/gzip"
+mtime = "2026-11-01 02:30"
+
+[[services.s3.buckets.objects]]
+key = "cdr/latest/cdr-sample.csv"
+table = "asteriskcdrdb.cdr"
+table_limit = 200
+content_type = "text/csv"
+mtime = "2026-11-15 02:30"
+
+[[services.s3.buckets.objects]]
+key = "billing/rated-calls-2026-10.csv"
+size = 7800000
+content_type = "text/csv"
+mtime = "2026-11-01 04:10"
+
+[[services.s3.buckets]]
+name = "bwv-config-backups"
+created = "2024-03-02"
+
+[[services.s3.buckets.objects]]
+key = "pbx01/freepbx-backup-2026111{n}.tar.gz"
+count = 5
+size = 41000000
+content_type = "application/gzip"
+mtime = "2026-11-10 01:15"
+
+[[services.s3.buckets.objects]]
+key = "pbx01/etc-asterisk/pjsip.conf"
+content_type = "text/plain"
+mtime = "2026-11-14 01:15"
+text = """
+[bwv-carrier-a-auth]
+type=auth
+auth_type=userpass
+username=bwv0417
+password={{ht:trunk_password}}
+
+[bwv-carrier-a]
+type=endpoint
+context=from-trunk
+outbound_auth=bwv-carrier-a-auth
+"""
+
+[[services.s3.buckets.objects]]
+key = "pbx01/scripts/offsite-backup.env"
+content_type = "text/plain"
+mtime = "2026-09-30 17:40"
+text = """
+# sourced by /usr/local/sbin/offsite-backup.sh
+S3_ENDPOINT=http://10.40.8.30:9000
+AWS_ACCESS_KEY_ID={{ht:offsite_aws_key}}
+AWS_DEFAULT_REGION=us-east-2
+BUCKETS="bwv-call-recordings bwv-cdr-exports bwv-config-backups"
+"""
+
 # ---- honeytokens ---------------------------------------------------------------------------
 
 [[honeytokens]]
@@ -621,6 +733,7 @@ kind = "sip_trunk_password"
 planted_in = [
     "FTP /backups/etc-asterisk/pjsip.conf (bwv-carrier-a-auth password)",
     "FTP /backups/etc-asterisk/sip.conf (bwv-carrier-a secret)",
+    "S3 bwv-config-backups/pbx01/etc-asterisk/pjsip.conf",
 ]
 
 [[honeytokens]]
@@ -631,7 +744,10 @@ planted_in = ["FTP /backups/etc/freepbx.conf (AMPDBPASS for MySQL user freepbxus
 [[honeytokens]]
 name = "offsite_aws_key"
 kind = "aws_access_key"
-planted_in = ["FTP /backups/scripts/offsite-backup.sh (AWS_ACCESS_KEY_ID)"]
+planted_in = [
+    "FTP /backups/scripts/offsite-backup.sh (AWS_ACCESS_KEY_ID)",
+    "S3 bwv-config-backups/pbx01/scripts/offsite-backup.env (AWS_ACCESS_KEY_ID)",
+]
 
 [[honeytokens]]
 name = "freepbx_api_secret"

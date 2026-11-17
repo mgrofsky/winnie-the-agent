@@ -36,14 +36,16 @@ provider, and a malicious operator.
   executed.
 - SQL goes to an in-memory fake engine; Redis `SAVE` writes nothing and `SLAVEOF` never
   dials; SMTP accepts and discards; SIP never sends media or places a call; HL7 messages
-  are acknowledged and logged only.
-- Uploaded files go to a capped quarantine (stored once per SHA-256, mode 0600) and are
+  are acknowledged and logged only. The S3 trap serves scenario text, scenario tables and
+  generated filler; object keys are only looked up in memory and never become file paths.
+- Uploaded files (FTP `STOR`, S3 `PutObject` and `UploadPart`) go to a capped quarantine (stored once per SHA-256, mode 0600) and are
   never read back, parsed or executed.
 
 ### Front-ends do not connect out
 
 No listener opens an outbound connection: FTP active mode is refused, and passive data
-connections are accepted only from the control connection's source. The only outbound
+connections are accepted only from the control connection's source. The S3 trap refuses
+`CopyObject` and never resolves a URL, endpoint or bucket name it is given. The only outbound
 traffic a front-end originates is a model API call, when a model is configured. Enforce
 this with a host firewall as well (see [operations.md](operations.md#egress-control-in-production)).
 
@@ -70,6 +72,11 @@ line and appears in the daily digest.
 - Listeners: connection slots globally, per source, per service and per source per service;
   rate limits; read timeouts; minimum-progress checks; byte and command caps per connection;
   rate-limited logging of low-value events.
+- S3: request heads are capped like HTTP (8 KB line, 50 headers, 16 KB in all); bodies of
+  non-upload requests at 64 KB; uploads stream to the quarantine and stop at its per-file
+  cap or a quota, with `aws-chunked` framing overhead capped; a download sends at most the
+  scenario's `get_max_bytes` and a connection at most 64 MB; listings return at most 1,000
+  keys per page; per-source upload and delete state is bounded and expires after an hour.
 - No regular expression or `fnmatch` runs on attacker-supplied patterns; Redis globs and SQL
   `LIKE` use linear-time matchers. A test feeds every listener long runs of its protocol's
   special characters under a time bound.
@@ -150,8 +157,9 @@ authentication only and are never rendered into a prompt.
   - every `password` field, and the protocol fields listed in `SECRET_FIELDS` in
     `agents/ship.py` (SIP digest responses and recovered passwords, MySQL and PostgreSQL
     password responses, HTTP bodies and unparsed `Authorization` values, FTP `PASS` lines,
-    Redis `AUTH`/`HELLO`/`MIGRATE`/`CONFIG SET requirepass` command lines), plus any data
-    key whose name looks like a secret;
+    Redis `AUTH`/`HELLO`/`MIGRATE`/`CONFIG SET requirepass` command lines, S3
+    `X-Amz-Security-Token` values), plus any data key whose name looks like a secret;
+    S3 request signatures (`X-Amz-Signature`, `Signature`) are never logged at all;
   - inside every other string field: values of URL query or form parameters whose name
     contains `pass`, `pwd`, `secret`, `token`, `key`, `auth`, `cred`, `sig` or `session`;
     the password in URL userinfo (`scheme://user:secret@host`) and SIP URIs
@@ -192,5 +200,8 @@ compromised agents process cannot change the front-ends' code or configuration.
 - Token reservations are estimates; a cap can be exceeded by at most one call's estimation
   error.
 - The daily budget is shared per host, not across hosts.
+- The S3 trap speaks plain HTTP. Access key ids are logged; signatures are verified only for
+  scenario accounts that carry a secret, so any other key is accepted or refused by policy,
+  not by cryptography.
 - The captured data contains real-looking and sometimes real credentials. Protecting it is
   the operator's job.

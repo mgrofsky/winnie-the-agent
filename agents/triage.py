@@ -92,6 +92,9 @@ class Stage(str, Enum):
 
 
 STAGE_RANK = {s: i for i, s in enumerate(Stage)}
+JUDGEMENT_RANK = {j: i for i, j in enumerate(Judgement)}
+# S3 trap command lines read "<operation> /<bucket>[/<key>] -> <status>".
+S3_LISTED_RE = re.compile(r"^(ListBuckets|ListObjects|ListObjectsV2) \S* -> 200$")
 JUDGEMENT_RANK = {Judgement.BENIGN: 0, Judgement.SUSPICIOUS: 1, Judgement.MALICIOUS: 2}
 
 
@@ -415,6 +418,19 @@ def deterministic_campaign(c: Campaign, honeytokens: list[str]) -> TriageRecord:
         techniques.append(Technique(id="T1059", name="Command and Scripting Interpreter"))
     if c.high_signal.get("smtp_relay_attempt"):
         intent, judgement = Intent.SPAM_RELAY, Judgement.MALICIOUS
+    if c.protocol == "s3" and any(S3_LISTED_RE.match(cmd) for cmd in c.commands):
+        # Enumeration: bucket or object listings that succeeded (refused ones are noise).
+        stage = max(stage, Stage.DISCOVERY, key=lambda s: STAGE_RANK[s])
+        judgement = max(judgement, Judgement.SUSPICIOUS, key=lambda j: JUDGEMENT_RANK[j])
+        techniques.append(Technique(id="T1619", name="Cloud Storage Object Discovery"))
+    if c.high_signal.get("s3_bulk_download"):
+        intent, judgement = Intent.DATA_THEFT, Judgement.MALICIOUS
+        stage = max(stage, Stage.COLLECTION, key=lambda s: STAGE_RANK[s])
+        techniques.append(Technique(id="T1530", name="Data from Cloud Storage"))
+    if c.high_signal.get("s3_upload"):
+        judgement = Judgement.MALICIOUS
+        stage = max(stage, Stage.COMMAND_AND_CONTROL, key=lambda s: STAGE_RANK[s])
+        techniques.append(Technique(id="T1105", name="Ingress Tool Transfer"))
     if honeytokens:
         judgement = Judgement.MALICIOUS
         stage = max(stage, Stage.CREDENTIAL_ACCESS, key=lambda s: STAGE_RANK[s])

@@ -58,6 +58,7 @@ ACTION_TIERS: dict[str, ActionTier] = {
 
 SIGNALS = ("redis_takeover", "sql_exec_attempt", "sql_cred_dump", "smtp_relay_attempt",
            "sip_dialed_number", "quarantine_quota", "http_proxy_attempt", "ftp_upload",
+           "s3_upload", "s3_bulk_download", "s3_planted_key",
            # Deterministic SSH session signals (agents.triage.session_signals).
            "download_execute", "persistence", "credential_file_read")
 # Dialing prefixes treated as international or premium-rate (toll fraud targets).
@@ -79,7 +80,7 @@ class Conditions(Strict):
 
     kinds: list[Literal["session", "campaign"]] = Field(default_factory=list)
     protocols: list[Literal["ssh", "sip", "ftp", "telnet", "postgres", "mysql", "mssql",
-                            "redis", "smtp", "http", "mllp"]] = Field(default_factory=list)
+                            "redis", "smtp", "http", "mllp", "s3"]] = Field(default_factory=list)
     judgement_at_least: Optional[Judgement] = None
     stages: list[Stage] = Field(default_factory=list)
     intents: list[Intent] = Field(default_factory=list)
@@ -259,7 +260,8 @@ def derive_facts(record: TriageRecord, scenario_name: Optional[str] = None) -> d
             _is_international_or_premium(num) for num, _ in record.credentials.dialed_numbers),
         "sensitive_data_access": bool(words.search(sample)) or any(
             i.type == IocType.FILE_PATH and words.search(i.value) for i in iocs),
-        "malware_indicators": bool(record.high_signal.get("ftp_upload")) or any(
+        "malware_indicators": bool(record.high_signal.get("ftp_upload")
+                                   or record.high_signal.get("s3_upload")) or any(
             i.type in (IocType.URL, IocType.MD5, IocType.SHA1, IocType.SHA256) for i in iocs),
         "nothing_novel": (record.kind == "campaign" and not record.high_signal
                           and not record.honeytokens and record.commands == 0),

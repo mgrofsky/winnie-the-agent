@@ -32,11 +32,11 @@ embed honeytokens.
 
 | Name | Services | Fake target |
 |---|---|---|
-| `sip_provider` | SIP, MySQL, FTP, HTTP, SMTP, Telnet | Hosted PBX reseller on FreePBX 16 / Asterisk 18: SIP registration with extension ranges, FreePBX admin UI, CDR and configuration databases, config backups and voicemail copies on FTP, a legacy telnet console. |
+| `sip_provider` | SIP, MySQL, FTP, S3, HTTP, SMTP, Telnet | Hosted PBX reseller on FreePBX 16 / Asterisk 18: SIP registration with extension ranges, FreePBX admin UI, CDR and configuration databases, config backups and voicemail copies on FTP, call recordings, CDR exports and config backups in S3 buckets, a legacy telnet console. |
 | `contact_center` | SIP, PostgreSQL, MSSQL, FTP, HTTP | Outsourced contact center: Asterisk trunks and agent extensions, agent desktop and supervisor console with a REST API, CRM database, call recordings and CRM exports on FTP. |
-| `bank` | PostgreSQL, Redis, FTP, HTTP | Community bank: online banking and back-office portal, REST API for accounts, cards, transfers and statements, core-banking database, Redis session cache, FTP drop for payment batch files. |
+| `bank` | PostgreSQL, Redis, FTP, S3, HTTP | Community bank: online banking and back-office portal, REST API for accounts, cards, transfers and statements, core-banking database, Redis session cache, FTP drop for payment batch files, S3 statement archive, batch staging and database backups. |
 | `healthcare` | HL7 MLLP, PostgreSQL, FTP, HTTP | Regional health system integration host: patient portal and EHR admin console, FHIR R4-style API (Patient, Observation, Encounter), inbound ADT/ORU feeds over MLLP, clinical database, lab and imaging FTP share. |
-| `saas` | PostgreSQL, Redis, SMTP, HTTP | Multi-tenant work-tracking SaaS: customer web app, admin console, bearer-token API, tenants and tokens in PostgreSQL, sessions and job queues in Redis, a notification mail relay. |
+| `saas` | PostgreSQL, Redis, SMTP, S3, HTTP | Multi-tenant work-tracking SaaS: customer web app, admin console, bearer-token API, tenants and tokens in PostgreSQL, sessions and job queues in Redis, a notification mail relay, S3 uploads and database exports plus a public assets bucket that also holds a deploy `.env`. |
 | `api_platform` | PostgreSQL, Redis, HTTP | B2B data API gateway: versioned REST endpoints with API-key auth, an OpenAPI document, consumer and key records in PostgreSQL, rate-limit counters in Redis. Unknown API routes may be answered by the budgeted model. |
 
 The SSH honeypot runs alongside any scenario and takes the scenario's host profile.
@@ -83,7 +83,7 @@ Each service table shares these keys:
 | Key | Notes |
 |---|---|
 | `enabled` | Default `false`. |
-| `port` | Listening port inside the process (defaults: SIP 5060, FTP 2121, Telnet 2323, PostgreSQL 5432, MySQL 3306, MSSQL 1433, Redis 6379, SMTP 2525, HTTP 8080, MLLP 2575). |
+| `port` | Listening port inside the process (defaults: SIP 5060, FTP 2121, Telnet 2323, PostgreSQL 5432, MySQL 3306, MSSQL 1433, Redis 6379, SMTP 2525, HTTP 8080, MLLP 2575, S3 9000). |
 | `banner`, `version` | Printable ASCII. |
 | `[services.<s>.policy]` | `accept = "all" | "listed" | "after_n" | "none"`, `after_n_min`, `after_n_max` (1 to 20). |
 | `[[services.<s>.accounts]]` | Up to 50 `username` / `password` pairs. |
@@ -112,6 +112,16 @@ Service-specific keys:
   `api_key`, `any`), `status`, and exactly one source of content: `json_body`, `list_from`
   (`"db.table"`, with `list_limit`) or `item_from` (with `item_key`).
 - **`mllp`**: `sending_facility`.
+- **`s3`**: `server_header`, `region`, `owner_name`, `get_max_bytes` (bytes one download
+  sends, at most 16 MB) and `[[services.s3.buckets]]` with `name`, `region`, `created`,
+  `public_list`, `public_read` and `[[...objects]]`. An object has `key`, `content_type`,
+  `mtime` and one source of content: literal `text` (may hold `{{ht:<name>}}`), `table`
+  (`"db.table"` rendered as CSV, with `table_limit`) or neither, for deterministic filler
+  of `size` bytes generated per request (`.wav`, `.gz`, `.zip` and `.pdf` keys start with
+  that format's header). `count` turns one spec into a series whose `key` holds `{n}` or
+  `{n:05d}`; up to 100,000 keys per bucket and 200,000 per scenario. Accounts use the
+  access key id as `username`; a `password` other than `*` is the secret, and SigV4
+  requests with that key are then verified.
 - **`smtp`**, **`telnet`**: common keys only.
 
 Generator kinds: `seq`, `uuid`, `first_name`, `last_name`, `full_name`, `email`, `phone`,
