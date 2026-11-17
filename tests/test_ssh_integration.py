@@ -54,9 +54,9 @@ class ScriptedMessageHistory:
         return FakeLLMResponse(f"ran {message}\n{suffix}")
 
 
-@pytest.fixture(autouse=True)
-def quiet_asyncio_debug():
-    loop = asyncio.get_event_loop()
+@pytest_asyncio.fixture(autouse=True)
+async def quiet_asyncio_debug():
+    loop = asyncio.get_running_loop()
     loop.set_debug(False)
     loop.slow_callback_duration = 10
 

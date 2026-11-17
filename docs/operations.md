@@ -39,7 +39,7 @@ sensor may run and what it may reach.
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | One image (`python:3.11-slim`, dependencies from `uv.lock`) for all services. Runs as UID 10001. |
+| `Dockerfile` | One image (`python:3.13-slim`, dependencies from `uv.lock`) for all services. Runs as UID 10001. |
 | `docker-compose.yml` | `ssh`, `listeners` and `agents` services, plus one example sensor per scenario behind a profile. Host ports default to the real service ports. |
 | `docker-compose.lab.yml` | Override: every port bound to 127.0.0.1 on a high port, for a workstation lab. |
 | `docker-compose.isolated.yml` | Override: front-ends on an internal network with no route out and no DNS, for verifying that nothing connects outward. |
