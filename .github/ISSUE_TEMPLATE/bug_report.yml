@@ -1,0 +1,31 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Remove real credentials, addresses of your own systems and captured attacker data
+        you do not want public before posting. Report security vulnerabilities privately
+        through the Security tab, not here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what you got. Include the exact error text.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The command, the scenario name and the relevant config keys.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit hash or image tag, Python version, and how you run it (Docker or directly).
+    validations:
+      required: true

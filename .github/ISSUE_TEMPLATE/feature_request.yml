@@ -1,0 +1,17 @@
+name: Feature request
+description: A new trap, scenario, playbook or agent behaviour
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: Say how it stays within the security model (docs/security-model.md) if it touches attacker input, model calls or anything outside the honeypot.
+    validations:
+      required: true
