@@ -40,9 +40,10 @@ sensor may run and what it may reach.
 | File | Purpose |
 |---|---|
 | `Dockerfile` | One image (`python:3.13-slim`, dependencies from `uv.lock`) for all services. Runs as UID 10001. |
-| `docker-compose.yml` | `ssh`, `listeners` and `agents` services, plus one example sensor per scenario behind a profile. Host ports default to the real service ports. |
+| `docker-compose.yml` | `ssh`, `listeners` and `agents` services, plus one example sensor per scenario and the operator console (`ui`), each behind a profile. Host ports default to the real service ports. |
 | `docker-compose.lab.yml` | Override: every port bound to 127.0.0.1 on a high port, for a workstation lab. |
 | `docker-compose.isolated.yml` | Override: front-ends on an internal network with no route out and no DNS, for verifying that nothing connects outward. |
+| `docker-compose.ui-actions.yml` | Override: lets the operator console approve, reject and unblock (agent data read-write, `--actions`). See [Operator console](#operator-console). |
 
 All services run as a non-root user with a read-only root filesystem, a small `/tmp`
 tmpfs, all capabilities dropped and `no-new-privileges`.
@@ -51,9 +52,9 @@ Volumes:
 
 | Volume | Written by | Mounted read-only by | Contents |
 |---|---|---|---|
-| `frontend` | `ssh`, `listeners` | `agents` | event log, quarantine, budget state, sensor seed |
-| `overlay` | `agents` | `ssh`, `listeners` | tuner overlay, per-source state |
-| `agentdata` | `agents` | (none) | triage records, digests, response runs, approvals, tuner snapshots, honeytoken registry, detection drafts, blocklist |
+| `frontend` | `ssh`, `listeners` | `agents`, `ui` | event log, quarantine, budget state, sensor seed |
+| `overlay` | `agents` | `ssh`, `listeners`, `ui` | tuner overlay, per-source state |
+| `agentdata` | `agents` (and `ui` with actions on) | `ui` | triage records, digests, response runs, approvals, tuner snapshots, honeytoken registry, detection drafts, blocklist |
 
 `./SSH` (config, host key, prompt) is bind-mounted read-only into the front-ends, and
 `./SSH/config.ini` alone into `agents`. The agents container does not mount the
@@ -384,6 +385,112 @@ $dc exec agents python -m agents tune --rollback 3 $args
 $dc exec agents python -m agents run-all --dry-run --log /data/ssh_log.log $args
 $dc exec agents python -m agents ship --dry-run --log /data/ssh_log.log $args
 ```
+
+## Operator console
+
+`python -m agents ui` is a local web console over the same files the CLI reads. It shows:
+
+- an overview and pipeline health;
+- the response approval queue;
+- triage records, with SSH transcript replay;
+- daily digests;
+- decoy and tuner state;
+- playbooks and detections.
+
+It is read-only by default. It never calls a model and never shows configuration or
+secrets. The CLI commands keep working alongside it: the console only reads the files the
+pipeline writes, and its decisions (with actions on) go through the same functions as the
+CLI's, so you can use either at any time.
+
+### Starting it
+
+Without Docker, from the repository root (same default paths as the other commands; pass
+`--config`, `--log`, `--data-dir`, `--reports-dir`, `--state-dir` and `--detections-dir` to
+point it elsewhere):
+
+```bash
+python -m agents ui
+```
+
+With Docker, from the same directory as the rest of the stack:
+
+```bash
+docker compose --profile ui up -d ui
+```
+
+The `ui` service is off unless the profile is named. It uses the agents' image and
+directories, mounts every volume read-only, gets no model key, AWS setting or connector
+secret, and is on a network of its own, so the honeypot containers cannot reach it.
+
+Options: `--bind` (default 127.0.0.1), `--port` (default 8480), `--actions`, `--by NAME`.
+The same settings can go in `config.ini`:
+
+```ini
+[ui]
+port = 8480
+bind = 127.0.0.1
+actions = false
+operator = alice
+```
+
+The console refuses to bind anything but a loopback address unless given
+`--allow-non-loopback`. The Docker service uses it because the container binds 0.0.0.0
+while the host publishes the port on 127.0.0.1 only.
+
+### Signing in
+
+At start the console logs a sign-in link with a random token, new on every start:
+
+```bash
+docker compose logs ui          # or the terminal that runs python -m agents ui
+```
+
+Open that link once; it sets a session cookie. To keep the same token across restarts,
+set `WINNIE_UI_TOKEN` (24 characters or more) in the shell that starts it. Anyone with the
+link and access to the port can use the console, so treat the log and the token like a
+password.
+
+### Reaching it
+
+The console listens on loopback only. There is no public URL and no inbound port to open.
+
+- **On the same machine:** `http://127.0.0.1:8480`.
+- **On a remote host:** forward the port over SSH, then open `http://127.0.0.1:8480` on
+  your workstation:
+
+  ```bash
+  ssh -L 8480:127.0.0.1:8480 <host>
+  ```
+
+- **On the AWS sensor:** SSM port forwarding, see
+  [deploy/aws/README.md](../deploy/aws/README.md#operator-console-optional).
+
+Use `127.0.0.1` or `localhost` in the address bar: the console rejects requests that name
+any other host.
+
+### Turning actions on
+
+With actions on, the console can approve, reject and unblock. It calls the same functions
+as `python -m agents approve`, `reject` and `unblock`, so every gate those commands have
+still applies (source re-checks at approval time, the queue lock, expiry). Decisions are
+recorded as `ui:<operator>`, from `--by` or `[ui] operator`.
+
+```bash
+# Without Docker
+python -m agents ui --actions --by alice ...      # or [ui] actions = true
+
+# With Docker: agent data read-write and --actions, nothing else changes
+docker compose -f docker-compose.yml -f docker-compose.ui-actions.yml --profile ui up -d ui
+```
+
+Actions need write access to the agent data (the approval queue, the blocklist and the
+`response/` audit records under `reports/`). The overlay and the event log stay
+read-only. In Docker the console holds no connector secrets, so approve `open_ticket` and
+`block_webhook` items with the CLI in the `agents` container, which has them.
+
+With actions on, the console can change what the sensor blocks. Anyone who can reach its
+port and read its log can approve a block, so keep host access as tight as for the agents
+container itself.
 
 ## Upgrading and rolling back
 

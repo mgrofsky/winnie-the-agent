@@ -196,6 +196,9 @@ python -m agents reject  a-0123456789ab [--by alice]
 python -m agents unblock 203.0.113.7   # or a network, e.g. 2001:db8:1:2::/64
 ```
 
+The operator console offers the same decisions when its actions are on, through the same
+functions and gates (see [operations.md](operations.md#operator-console)).
+
 - A queued item records the action, playbook, triggering record, subject (IPv4 address or
   IPv6 /64), parameters, a structured summary and an expiry (`approval_ttl_hours`,
   default 72).

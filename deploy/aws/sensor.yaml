@@ -125,6 +125,13 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
+  UiEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Also run the read-only operator console, published on the host's 127.0.0.1:8480 only
+      and reached through SSM port forwarding. No security group, role or endpoint change.
 
 Mappings:
   # Listener services per scenario ("python -m listeners --list-scenarios"). SSH is always on.
@@ -141,6 +148,7 @@ Conditions:
   HostOn: !Equals [!Ref HostEnabled, "true"]
   TrailOn: !Equals [!Ref TrailEnabled, "true"]
   FlowLogsOn: !Equals [!Ref FlowLogsEnabled, "true"]
+  UiOn: !Equals [!Ref UiEnabled, "true"]
   SipOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Sip], "true"]
   FtpOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Ftp], "true"]
   TelnetOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Telnet], "true"]
@@ -920,6 +928,28 @@ Resources:
                     - ./config-ship.ini:/config/config.ini:ro
                     - frontend:/data:ro
                     - exportstate:/agents
+                # Operator console, read-only (no --actions), only with UiEnabled=true (the
+                # ui profile, switched in .env below). On the backend network, which may only
+                # send replies; published on the host's loopback only, for SSM port
+                # forwarding. Logs stay on the host (driver local), so the sign-in link is
+                # read with "docker compose logs ui" and never reaches CloudWatch.
+                ui:
+                  <<: *hardening
+                  profiles: [ui]
+                  logging:
+                    driver: local
+                  environment:
+                    WINNIE_DATA_DIR: /data
+                    WINNIE_OVERLAY: /overlay/overlay.json
+                    WINNIE_SOURCE_STATE: /overlay/source_state.json
+                  command: ["python", "-m", "agents", "ui", "--config", "/config/config.ini", "--log", "/data/ssh_log.log", "--data-dir", "/data", "--reports-dir", "/agents/reports", "--state-dir", "/agents/state", "--detections-dir", "/agents/detections", "--bind", "0.0.0.0", "--allow-non-loopback", "--port", "8480"]
+                  networks: [backend]
+                  ports: ["127.0.0.1:8480:8480"]
+                  volumes:
+                    - ./config.ini:/config/config.ini:ro
+                    - frontend:/data:ro
+                    - agentdata:/agents:ro
+                    - overlay:/overlay:ro
               networks:
                 frontend:
                   ipam:
@@ -933,6 +963,8 @@ Resources:
                 overlay: {}
                 exportstate: {}
               EOF
+              # Compose profiles: "ui" with UiEnabled=true, none otherwise.
+              echo "COMPOSE_PROFILES=${UiProfiles}" > .env
 
               # Public ports for the scenario's services (the security group opens the same).
               PORTS=""
@@ -992,6 +1024,7 @@ Resources:
                   - !If [RedisOn, redis, ""]
                   - !If [MllpOn, mllp, ""]
                   - !If [S3On, s3, ""]
+              UiProfiles: !If [UiOn, ui, ""]
 
   Instance:
     Type: AWS::EC2::Instance

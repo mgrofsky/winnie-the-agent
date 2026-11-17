@@ -192,6 +192,61 @@ change them. The agents read the front-end volume read-only and do not mount the
 repository. A compromised listener therefore cannot alter what the agents produce, and a
 compromised agents process cannot change the front-ends' code or configuration.
 
+## Operator console
+
+`python -m agents ui` (see [operations.md](operations.md#operator-console)) is a web
+console for the operator. It is a security component even though only the operator uses
+it: almost everything it displays was typed by attackers.
+
+**What it can read and write.**
+
+| Mode | Reads | Writes |
+|---|---|---|
+| Read-only (default) | event log, agent data (records, digests, queue, tuner and decoy state, detections), overlay, playbooks | nothing (in Docker every mount is read-only) |
+| Actions on (`--actions` or `[ui] actions = true`, plus agent data mounted read-write) | the same | approval queue, blocklist store and file, `response/` audit records, approved detections: what `approve`, `reject` and `unblock` write |
+
+With actions on it calls the same `approve`, `reject` and `unblock` functions as the CLI,
+so the same gates apply: the source is re-checked at approval time, the queue lock stops a
+double execution, expired items cannot be approved. Decisions are recorded as
+`ui:<operator>`. The overlay and the event log stay read-only in both modes. With actions
+on, the console is in the same trust zone as the agents container.
+
+**Loopback only, behind a tunnel.** The server binds a loopback address and refuses
+anything else unless told otherwise; the Docker service binds 0.0.0.0 inside its container
+and the host publishes it on 127.0.0.1 only. There is no public URL and no inbound port:
+the operator reaches it through `ssh -L` or SSM port forwarding. The console is on a
+network of its own, so the honeypot containers cannot connect to it. That network cannot
+be internal (Docker does not publish ports from internal networks), so what limits the
+container's egress is what it holds: no model key, no AWS settings, no connector secrets,
+read-only data.
+
+**Sign-in and request checks** (`agents/ui/server.py`):
+
+- At start the server logs one sign-in link with a random token (or uses
+  `WINNIE_UI_TOKEN`, at least 24 characters). `GET /?token=...` sets an HttpOnly,
+  SameSite=Strict session cookie. The cookie and the CSRF value are HMAC-SHA256
+  derivations of the token; the token itself is never stored in a cookie, returned by an
+  endpoint or logged again. Failed token attempts are throttled.
+- Every request's `Host` must name localhost, 127.0.0.1 or [::1], which defeats DNS
+  rebinding. Every POST also needs a matching `Origin`, the session cookie, the
+  `X-Winnie-CSRF` header, actions turned on, and a JSON object body of at most 16 KiB.
+- Static files come from a fixed table; no file is looked up from the request path.
+  Errors become a bare 500.
+
+**Displayed text is attacker-controlled.** Commands, usernames, passwords, HTTP requests
+and transcripts are all hostile input. The console renders them as text only, never as
+HTML: no inline script, a strict Content-Security-Policy (`default-src 'none'`, scripts
+and styles from the console itself only, `frame-ancestors 'none'`), `nosniff`, no
+referrer, no caching, and JSON with `<`, `>`, `&`, U+2028 and U+2029 escaped.
+
+**What it deliberately cannot do.** It never calls a model, so nothing it shows can steer
+one. It never displays configuration or secrets. It cannot roll back the tuner (use
+`python -m agents tune --rollback N`) or change playbooks, scenarios or the overlay.
+
+**Host access is the control.** Anyone who can reach the loopback port and read the
+container log (or knows `WINNIE_UI_TOKEN`) can use the console, and with actions on can
+approve a block. Restrict shell, Docker and SSM access on the host accordingly.
+
 ## Fingerprinting
 
 The source is public, so assume the attacker has read it. What they can and cannot use:
@@ -268,3 +323,5 @@ bundled one. The bundled scenarios are examples.
   not by cryptography.
 - The captured data contains real-looking and sometimes real credentials. Protecting it is
   the operator's job.
+- The operator console trusts anyone who can reach its loopback port and read its log.
+  Host access is the only control in front of it.

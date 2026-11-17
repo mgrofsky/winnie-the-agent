@@ -22,6 +22,7 @@ halves share files, never a network connection.
 | Tuner | `agents/tuner.py` | Adjusts fake accounts, SIP extensions, lures and login thresholds in the overlay. |
 | Detect | `agents/detect.py` | Writes Sigma rule drafts and blocklist candidates to `detections/pending/`. |
 | Event export | `agents/ship.py` | Copies new event log lines to S3 as JSON lines for a SIEM (`[connector.s3_events]`, off by default). See [operations.md](operations.md#event-export-to-s3). |
+| Operator console | `agents/ui/` | `python -m agents ui`: a local web console over the records, queue, digests, tuner state, playbooks and detections. Read-only unless actions are on; loopback only. See [operations.md](operations.md#operator-console) and [security-model.md](security-model.md#operator-console). |
 | CLI | `agents/__main__.py` | `python -m agents <command>`; `run-all` runs triage, respond, digest, tune and detect in that order, then the event export when it is enabled. |
 
 ### SSH persona
@@ -280,9 +281,9 @@ attacker --> listeners -----+--> event log --> agents     response runs, honeyto
 
 | Store | Written by | Read by | Docker volume |
 |---|---|---|---|
-| Event log, quarantine, budget state, sensor seed | SSH server, listeners | agents (read-only) | `frontend` |
-| Overlay, per-source state | agents | SSH server, listeners (read-only) | `overlay` |
-| Triage records, digests, response runs, approval queue, tuner snapshots, honeytoken registry, detection drafts, event export cursor | agents | operator | `agentdata` |
+| Event log, quarantine, budget state, sensor seed | SSH server, listeners | agents, operator console (read-only) | `frontend` |
+| Overlay, per-source state | agents | SSH server, listeners, operator console (read-only) | `overlay` |
+| Triage records, digests, response runs, approval queue, tuner snapshots, honeytoken registry, detection drafts, event export cursor | agents; operator console only with actions on (approval queue, blocklist, audit records) | operator, operator console | `agentdata` |
 | `config.ini`, host key, `prompt.txt` | operator | all (read-only) | bind mount |
 
 The sensor seed (`<data dir>/sensor_seed`, mode 0600, random on first start) drives every

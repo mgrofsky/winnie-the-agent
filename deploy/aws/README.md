@@ -166,8 +166,8 @@ Open a shell with `aws ssm start-session --target <InstanceId> $S`, then `sudo -
 `cd /opt/sensor`.
 
 - [ ] `tail /var/log/sensor-bootstrap.log` ends with `bootstrap complete`; `docker compose
-      ps` shows ssh, listeners, agents and exporter running; `systemctl is-enabled sshd`
-      prints `masked`.
+      ps` shows ssh, listeners, agents and exporter running (and ui with
+      `UiEnabled=true`); `systemctl is-enabled sshd` prints `masked`.
 - [ ] `iptables -S DOCKER-USER` shows the two 169.254.169.254 drops and the two
       `! --ctstate RELATED,ESTABLISHED` drops.
 - [ ] Containers cannot connect out. Each command must time out (not be refused, not
@@ -203,6 +203,42 @@ Open a shell with `aws ssm start-session --target <InstanceId> $S`, then `sudo -
 
 Only then widen `InboundCidr` (to `0.0.0.0/0` for an internet-facing sensor) in a new
 reviewed change set.
+
+## Operator console (optional)
+
+`UiEnabled=true` also runs the operator console (`python -m agents ui`, see
+[docs/operations.md](../../docs/operations.md#operator-console)) in read-only mode. It is off
+by default. Turning it on changes no security group, role or endpoint: the console is on
+the agents' backend network, which the host firewall already stops from opening
+connections, mounts every volume read-only, and is published on the host's
+`127.0.0.1:8480` only. You reach it through SSM.
+
+Turn it on with a reviewed change set as in step 5, adding `UiEnabled=true`. The setting
+is in the user data, so the change set replaces the instance (see Limits). The bootstrap
+writes `COMPOSE_PROFILES=ui` to `/opt/sensor/.env`; with `UiEnabled=false` that line is
+empty and the `ui` service does not start.
+
+Sign in:
+
+1. In a normal session (`aws ssm start-session --target <InstanceId> $S`, then `sudo -i`,
+   `cd /opt/sensor`), run `docker compose logs ui` and copy the sign-in link. The console
+   logs to the host only (`driver: local`), so the link never reaches CloudWatch. The link
+   changes every time the container starts.
+2. On your workstation, forward the port:
+
+       aws ssm start-session --target <instance-id> \
+           --document-name AWS-StartPortForwardingSession \
+           --parameters '{"portNumber":["8480"],"localPortNumber":["8480"]}'
+
+3. Open the link in a browser on the workstation (it starts with `http://127.0.0.1:8480/`).
+
+Not yet confirmed on a real instance. The loopback publish relies on Docker's DNAT rules
+with `"userland-proxy": false` (there is no proxy process listening on 127.0.0.1:8480), and
+the SSM agent has to connect to that address. Before relying on it, check on the instance
+that `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8480/` answers, that the port
+forward reaches it, and that `ss -tlnp` and `iptables -t nat -S DOCKER` show nothing on
+8480 beyond 127.0.0.1. If `S3Port` is ever set to 8480, the trap and the console collide;
+pick another port.
 
 ## Stop and rollback
 

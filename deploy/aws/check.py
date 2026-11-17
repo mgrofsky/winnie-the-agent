@@ -13,6 +13,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -27,6 +28,7 @@ ROLE_ACTIONS = {"ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability",
                 "logs:PutLogEvents", "s3:PutObject"}
 UNSCOPABLE = {"ecr:GetAuthorizationToken"}     # AWS offers no resource-level permission
 DOCUMENTATION_ACCOUNT_IDS = {"000000000000", "123456789012"}
+UI_PORT = 8480                                 # operator console, host loopback only
 # Literal parameter defaults: project or example names, scenario names, instance types,
 # public SSM parameter paths, addresses, numbers and switches. Nothing that could name an
 # organisation.
@@ -96,6 +98,14 @@ def is_open(cidr) -> bool:
         return False
 
 
+def opens_port(rule: dict, port: int) -> bool:
+    """Whether an ingress rule admits ``port`` (all protocols, or a literal range holding it)."""
+    if str(rule.get("IpProtocol")) == "-1":
+        return True
+    lo, hi = rule.get("FromPort"), rule.get("ToPort")
+    return isinstance(lo, int) and isinstance(hi, int) and lo <= port <= hi
+
+
 def condition_uses(doc: dict, name, target: str, seen=None) -> bool:
     """Whether condition ``name`` requires condition ``target`` (directly or through Fn::And)."""
     if name == target:
@@ -154,6 +164,8 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
         for rule in as_list(props.get("SecurityGroupIngress") or []):
             if "SourceSecurityGroupId" not in rule:
                 errors.append(f"security group {name} has inline ingress from an address range")
+            if opens_port(rule, UI_PORT):
+                errors.append(f"security group {name} ingress reaches the console port {UI_PORT}")
     for name, rule in resources(doc, "AWS::EC2::SecurityGroupEgress").items():
         props = rule.get("Properties") or {}
         if "CidrIp" in props or "CidrIpv6" in props:
@@ -166,6 +178,10 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
             errors.append(f"ingress rule {name} uses a literal open range")
         if props.get("CidrIp") != {"Ref": "InboundCidr"}:
             errors.append(f"ingress rule {name} is not limited to InboundCidr")
+        if opens_port(props, UI_PORT):
+            errors.append(f"ingress rule {name} reaches the console port {UI_PORT}")
+    if (params.get("UiEnabled") or {}).get("Default") != "false":
+        errors.append("parameter UiEnabled is not off by default")
 
     templates = resources(doc, "AWS::EC2::LaunchTemplate")
     if not templates:
@@ -217,6 +233,55 @@ def check_user_data(user_data: str) -> list[str]:
         for opt in ("--config", "--log", "--data-dir /data", "--state-dir"):
             if opt not in cmd:
                 errors.append(f"the ship command lacks {opt}")
+    errors += check_ui(embedded_compose(user_data))
+    return errors
+
+
+def embedded_compose(user_data: str) -> Optional[dict]:
+    """The docker-compose.yml the bootstrap writes, parsed; None if it cannot be found."""
+    m = re.search(r"^cat > docker-compose\.yml <<'EOF'\n(.*?)\nEOF$", user_data, re.S | re.M)
+    if not m:
+        return None
+    try:
+        doc = yaml.safe_load(m.group(1))
+    except yaml.YAMLError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def check_ui(compose: Optional[dict]) -> list[str]:
+    """The operator console in the embedded compose file: off unless its profile is on,
+    read-only, published on the host's loopback only, never on the front-end network."""
+    if compose is None:
+        return ["the embedded docker-compose.yml cannot be read"]
+    ui = (compose.get("services") or {}).get("ui")
+    if not isinstance(ui, dict):
+        return ["the embedded compose file has no ui service"]
+    errors: list[str] = []
+    if ui.get("profiles") != ["ui"]:
+        errors.append("the ui service is not behind the ui profile")
+    for port in as_list(ui.get("ports") or []):
+        if not str(port).startswith("127.0.0.1:"):
+            errors.append(f"the ui service publishes {port} beyond loopback")
+    if "network_mode" in ui:
+        errors.append(f"the ui service uses network_mode {ui['network_mode']}")
+    networks = ui.get("networks") or []
+    if "frontend" in networks:
+        errors.append("the ui service is on the front-end network")
+    if networks != ["backend"]:
+        errors.append("the ui service is not only on the backend network")
+    for volume in as_list(ui.get("volumes") or []):
+        parts = str(volume).split(":")
+        if len(parts) < 3 or parts[2] != "ro":
+            errors.append(f"the ui service mounts {parts[0]} read-write")
+    command = ui.get("command") or []
+    if "--actions" in command or "--actions" in str(command):
+        errors.append("the ui service runs with --actions")
+    for key in ui.get("environment") or {}:
+        if key.startswith(("AWS_", "ANTHROPIC", "WINNIE_WEBHOOK")) or key.endswith("_API_KEY"):
+            errors.append(f"the ui service gets {key}")
+    if (ui.get("logging") or {}).get("driver") != "local":
+        errors.append("the ui service log (with its sign-in link) leaves the host")
     return errors
 
 

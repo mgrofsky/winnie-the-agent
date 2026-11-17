@@ -9,7 +9,8 @@
 # HL7 MLLP 12575, MSSQL 11433, S3 19000. Set [listeners] ftp_pasv_address = 127.0.0.1 for the lab.
 # The per-scenario listeners-* services (started with --profile) also bind 127.0.0.1 only,
 # on ports of their own: bank 21xxx, healthcare 22xxx, contact_center 23xxx, saas 24xxx,
-# api_platform 25xxx, HTTP on 8443-8447.
+# api_platform 25xxx, HTTP on 8443-8447. The operator console (--profile ui) keeps
+# 127.0.0.1:8480.
 
 services:
   ssh:
@@ -66,3 +67,7 @@ services:
     ports: !override
       - "127.0.0.1:8447:8080"
       - "127.0.0.1:25432:5432"
+
+  ui:
+    ports: !override
+      - "127.0.0.1:8480:8480"

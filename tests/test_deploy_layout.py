@@ -32,7 +32,7 @@ def test_volume_write_boundaries():
     agents = {src: mode for src, _d, mode in _mounts(services["agents"])}
     assert agents["frontend"] == "ro" and agents["agentdata"] == "rw" and agents["overlay"] == "rw"
     for name, svc in services.items():
-        if name == "agents":
+        if name in ("agents", "ui"):     # ui: see test_ui_console_is_read_only_and_loopback
             continue
         mounts = {src: mode for src, _d, mode in _mounts(svc)}
         assert "agentdata" not in mounts, f"{name} must not see agent data"
@@ -110,7 +110,8 @@ def _override(name):
     return yaml.load((ROOT / name).read_text(), Loader=_OverrideLoader)
 
 
-FRONTENDS = [name for name in _compose()["services"] if name != "agents"]
+# Three kinds of service: agents, the operator console (ui) and the front-ends (the rest).
+FRONTENDS = [name for name in _compose()["services"] if name not in ("agents", "ui")]
 
 
 def test_every_frontend_is_only_on_the_frontend_network():
@@ -133,3 +134,67 @@ def test_isolated_and_lab_overrides_cover_every_frontend():
             assert port.startswith("127.0.0.1:"), f"{name} publishes {port} beyond loopback"
             published.append(port.rsplit(":", 1)[0] + ("/udp" if port.endswith("/udp") else ""))
     assert len(published) == len(set(published)), "lab host ports collide"
+
+
+# ---- operator console ----------------------------------------------------------------------
+
+def test_ui_console_is_read_only_and_loopback():
+    compose = _compose()
+    ui = compose["services"]["ui"]
+    assert ui.get("profiles") == ["ui"], "the console must be off unless asked for"
+    mounts = {src: mode for src, _d, mode in _mounts(ui)}
+    assert {"agentdata", "frontend", "overlay", "./SSH/config.ini"} <= set(mounts)
+    assert all(mode == "ro" for mode in mounts.values()), mounts
+    assert not any(src in (".", "./", str(ROOT)) for src in mounts), "repo must not be mounted"
+    # Its own network: front-ends must not reach it, and it does not join the default
+    # network the agents service is on.
+    networks = ui.get("networks")
+    assert networks and "frontend" not in networks and "default" not in networks, networks
+    for net in networks:
+        assert not (compose["networks"].get(net) or {}).get("internal"), "published port"
+    assert ui.get("ports"), "the console is published on loopback"
+    for port in ui["ports"]:
+        assert str(port).startswith("127.0.0.1:"), f"ui publishes {port} beyond loopback"
+    env = ui.get("environment") or {}
+    for key in env:
+        assert not key.startswith(("ANTHROPIC", "AWS_", "WINNIE_WEBHOOK")), key
+        assert not key.endswith("_API_KEY"), key
+    assert env["WINNIE_UI_TOKEN"] == "${WINNIE_UI_TOKEN:-}"
+    assert ui["read_only"] is True and ui["user"] == "10001:10001"
+    assert ui["cap_drop"] == ["ALL"] and "no-new-privileges:true" in ui["security_opt"]
+    assert "--actions" not in ui["command"]
+    assert ui["command"][:4] == ["python", "-m", "agents", "ui"]
+
+
+def test_ui_uses_the_same_directories_as_the_agents():
+    services = _compose()["services"]
+    run_all = services["agents"]["command"][-1]
+    ui = services["ui"]["command"]
+    for flag in ("--config", "--log", "--data-dir", "--reports-dir", "--state-dir",
+                 "--detections-dir"):
+        value = ui[ui.index(flag) + 1]
+        assert f"{flag} {value}" in run_all, flag
+    for key in ("WINNIE_DATA_DIR", "WINNIE_OVERLAY", "WINNIE_SOURCE_STATE"):
+        assert services["ui"]["environment"][key] == services["agents"]["environment"][key]
+
+
+def test_ui_actions_override_changes_only_the_agent_data_mode_and_the_command():
+    base = _compose()["services"]["ui"]
+    override = _override("docker-compose.ui-actions.yml")
+    assert set(override) == {"services"} and set(override["services"]) == {"ui"}
+    ui = override["services"]["ui"]
+    assert set(ui) == {"command", "volumes"}
+    assert ui["command"] == base["command"] + ["--actions"]
+    # Compose merges volumes by target, so this replaces only the /agents mount.
+    assert ui["volumes"] == ["agentdata:/agents"]
+    assert {dst for _s, dst, _m in _mounts(ui)} <= {dst for _s, dst, _m in _mounts(base)}
+
+
+def test_ui_overrides_keep_it_on_loopback():
+    lab = _override("docker-compose.lab.yml")["services"]
+    assert all(p.startswith("127.0.0.1:") for p in lab["ui"]["ports"])
+    lab_ports = {p.rsplit(":", 1)[0] for name in FRONTENDS for p in lab[name]["ports"]}
+    assert not {p.rsplit(":", 1)[0] for p in lab["ui"]["ports"]} & lab_ports
+    isolated = _override("docker-compose.isolated.yml")
+    assert "ui" not in isolated["services"]
+    assert set(isolated["networks"]) == {"frontend"}

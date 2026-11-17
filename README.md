@@ -204,6 +204,21 @@ type (`connection`, `auth_attempt`, `command`, `register`, `invite`, ...).
 **The log contains every username and password attackers submit, in plain text.** See
 [docs/architecture.md](docs/architecture.md#logging-contract) for the full format.
 
+## Operator console
+
+A local web console for the operator: pipeline health, the approval queue, triage records
+with SSH transcript replay, digests, tuner state, playbooks and detections. It is
+read-only by default, listens on 127.0.0.1:8480 only, and never calls a model.
+
+```bash
+python -m agents ui                       # without Docker
+docker compose --profile ui up -d ui      # with Docker; sign-in link: docker compose logs ui
+```
+
+On a remote host, reach it with `ssh -L 8480:127.0.0.1:8480 <host>`. Sign-in, actions
+(approve, reject, unblock) and the AWS setup are in
+[docs/operations.md](docs/operations.md#operator-console).
+
 ## Safety design
 
 - **No real system.** The SSH and Telnet shells are model output or canned text. The

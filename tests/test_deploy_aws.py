@@ -114,6 +114,54 @@ def _lifecycle_expires_tagged(d):
     props["LifecyclePolicyText"] = props["LifecyclePolicyText"].replace('"untagged"', '"any"')
 
 
+def _ui_edit(d, old, new):
+    """Replace ``old`` inside the embedded compose file's ui service only."""
+    ud = _lt(d)["UserData"]["Fn::Base64"]["Fn::Sub"]
+    head, sep, tail = ud[0].partition("\n  ui:\n")
+    assert sep and old in tail, old
+    ud[0] = head + sep + tail.replace(old, new, 1)
+
+
+def _ui_published_everywhere(d):
+    _ui_edit(d, '"127.0.0.1:8480:8480"', '"8480:8480"')
+
+
+def _ui_writes_agent_data(d):
+    _ui_edit(d, "agentdata:/agents:ro", "agentdata:/agents")
+
+
+def _ui_on_frontend(d):
+    _ui_edit(d, "networks: [backend]", "networks: [backend, frontend]")
+
+
+def _ui_actions(d):
+    _ui_edit(d, '"--port", "8480"]', '"--port", "8480", "--actions"]')
+
+
+def _ui_always_on(d):
+    _ui_edit(d, "profiles: [ui]", "profiles: []")
+
+
+def _ui_logs_to_cloudwatch(d):
+    _ui_edit(d, "driver: local", "driver: awslogs")
+
+
+def _ui_default_on(d):
+    d["Parameters"]["UiEnabled"]["Default"] = "true"
+
+
+def _ui_ingress(d):
+    d["Resources"]["InUi"] = {
+        "Type": "AWS::EC2::SecurityGroupIngress", "Condition": "InboundOn",
+        "Properties": {"GroupId": {"Ref": "InstanceSecurityGroup"}, "IpProtocol": "tcp",
+                       "FromPort": 8480, "ToPort": 8480, "CidrIp": {"Ref": "InboundCidr"}}}
+
+
+def _ui_inline_ingress_all_ports(d):
+    d["Resources"]["EndpointSecurityGroup"]["Properties"]["SecurityGroupIngress"].append(
+        {"IpProtocol": "-1", "SourceSecurityGroupId": {"Ref": "InstanceSecurityGroup"}})
+
+
 SENSOR_BREAKS = {
     "InboundCidr has a default": _set_inbound_default,
     "InSsh does not depend on InboundOn": _drop_inbound_condition,
@@ -131,6 +179,15 @@ SENSOR_BREAKS = {
     "userland proxy is not off": _userland_proxy_on,
     "containers can reach the metadata service": _no_metadata_block,
     "can expire tagged images": _lifecycle_expires_tagged,
+    "ui service publishes 8480:8480 beyond loopback": _ui_published_everywhere,
+    "ui service mounts agentdata read-write": _ui_writes_agent_data,
+    "ui service is on the front-end network": _ui_on_frontend,
+    "ui service runs with --actions": _ui_actions,
+    "ui service is not behind the ui profile": _ui_always_on,
+    "sign-in link) leaves the host": _ui_logs_to_cloudwatch,
+    "UiEnabled is not off by default": _ui_default_on,
+    "ingress rule InUi reaches the console port 8480": _ui_ingress,
+    "EndpointSecurityGroup ingress reaches the console port 8480": _ui_inline_ingress_all_ports,
 }
 
 
@@ -239,6 +296,19 @@ def test_published_ports_reach_the_listener_ports(sensor):
     rules = {r.get("Condition") for r in check.resources(sensor, "AWS::EC2::SecurityGroupIngress")
              .values()}
     assert {f"{s.capitalize()}In" for s in SERVICES} <= rules
+
+
+def test_console_is_switched_by_a_profile_and_matches_the_compose_service(sensor):
+    import yaml
+
+    ud, variables = _lt(sensor)["UserData"]["Fn::Base64"]["Fn::Sub"]
+    assert 'echo "COMPOSE_PROFILES=${UiProfiles}" > .env' in ud
+    assert variables["UiProfiles"] == {"Fn::If": ["UiOn", "ui", ""]}
+    assert sensor["Conditions"]["UiOn"] == {"Fn::Equals": [{"Ref": "UiEnabled"}, "true"]}
+    embedded = check.embedded_compose(ud)["services"]["ui"]
+    local = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]["ui"]
+    assert embedded["command"] == local["command"]
+    assert embedded["ports"] == local["ports"] == ["127.0.0.1:8480:8480"]
 
 
 def test_smtp_needs_its_own_switch(sensor):
