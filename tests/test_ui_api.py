@@ -598,3 +598,19 @@ def test_fixture_runs_as_a_script(tmp_path):
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout)["ids"]["session_a"].startswith("session-")
     assert (tmp_path / "seed" / "data" / "ssh_log.log").exists()
+
+
+def test_pending_item_expires_in_the_view_without_a_file_change(tree):
+    # The queue cache reloads only when the directory changes; time alone must still
+    # move an overdue item out of the pending list and the overview count.
+    import datetime
+
+    later = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+    api = Api(tree.api_paths(), cache_seconds=3600)
+    assert tree.ids["pending"] in [i["approval"]["id"] for i in ok(api, "/api/queue")["items"]]
+    api.now = lambda: later
+    assert ok(api, "/api/queue")["items"] == []
+    assert ok(api, "/api/overview")["approvals"]["pending"] == 0
+    closed = {i["approval"]["id"]: i for i in ok(api, "/api/queue", all=1)["items"]}
+    assert closed[tree.ids["pending"]]["approval"]["status"] == "expired"
+    assert closed[tree.ids["pending"]]["view_hash"] is None

@@ -444,6 +444,18 @@ class Api:
         items = peek_queue(self.paths.state, now=self.now(), include_closed=True)
         return sorted(items, key=lambda a: str(a.get("created_at", "")), reverse=True)
 
+    def _queue_now(self) -> list[dict]:
+        """The cached queue with expiry judged at request time: the cache only reloads when
+        the directory changes, and an item can pass its expiry without any file changing."""
+        now, out = self.now(), []
+        for a in self._queue.get():
+            if a.get("status") == "pending":
+                expires = _parse_ts(a.get("expires_at"))
+                if expires is not None and expires <= now:
+                    a = {**a, "status": "expired"}
+            out.append(a)
+        return out
+
     def _record_id(self, raw: str) -> Optional[TriageRecord]:
         if not RECORD_ID_RE.fullmatch(raw):
             return None
@@ -485,7 +497,7 @@ class Api:
             if seen is None or JUDGEMENT_RANK[r.judgement] > JUDGEMENT_RANK[seen]:
                 worst[r.src_ip] = r.judgement
         hits = [_summary(r) for r in inside if r.honeytokens][:HONEYTOKEN_HITS]
-        pending = [a for a in self._queue.get() if a.get("status") == "pending"]
+        pending = [a for a in self._queue_now() if a.get("status") == "pending"]
         expiries = sorted(str(a.get("expires_at", "")) for a in pending if a.get("expires_at"))
         return 200, {
             "window": window, "since": since.isoformat(timespec="seconds"),
@@ -606,7 +618,7 @@ class Api:
         r = self._record_id(rid)
         if r is None:
             return NOT_FOUND
-        approvals = [a.get("id") for a in self._queue.get() if a.get("record_id") == r.id]
+        approvals = [a.get("id") for a in self._queue_now() if a.get("record_id") == r.id]
         return 200, {"record": r.model_dump(mode="json"), "approvals": approvals,
                      "transcript_available": self._has_transcript(r)}
 
@@ -631,7 +643,7 @@ class Api:
         everything = query.get("all") or "0"
         if everything not in ("0", "1"):
             raise _BadQuery
-        items = self._queue.get()
+        items = self._queue_now()
         if everything == "0":
             items = [a for a in items if a.get("status") == "pending"]
         page = paginate(items, query)
