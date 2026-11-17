@@ -505,7 +505,11 @@ def test_expired_approval_does_not_requeue_immediately(tmp_path):
 
 def test_each_effect_has_its_own_expiry(tmp_path):
     real_now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
-    write(tmp_path / "reports", rec(ip="198.51.100.60"))
+    # This test runs against the wall clock (the view expires entries by real time), so the
+    # record is stamped near it too; the fixed NOW would fall out of the lookback window.
+    seen = (real_now - 3 * H).isoformat()
+    write(tmp_path / "reports",
+          rec(ip="198.51.100.60").model_copy(update={"first_seen": seen, "last_seen": seen}))
     p = pb(steps=[{"action": "tag_source", "tag": "long_tag", "hours": 168},
                   {"action": "tarpit", "delay_ms": 900, "hours": 1},
                   {"action": "deepen", "hours": 1},
