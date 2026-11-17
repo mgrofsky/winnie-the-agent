@@ -30,7 +30,7 @@ On top of that SSH honeypot this project adds:
   through opt-in connectors, and enforcement actions that run only after a person approves
   them.
 
-> This is a proof of concept. It has been exercised with real protocol clients in a lab, but
+> It has been exercised with real protocol clients in a lab, but
 > not in production, not against a real model provider and not against real notification
 > endpoints. Read the [deployment warnings](#deployment) before exposing it to anyone.
 
