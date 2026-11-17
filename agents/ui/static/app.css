@@ -1,0 +1,13 @@
+/* Placeholder styles. Replaced by the real front-end. */
+body {
+  font-family: system-ui, sans-serif;
+  margin: 2rem;
+  color: #1d1d1f;
+  background: #fafafa;
+}
+
+pre {
+  padding: 1rem;
+  background: #eee;
+  overflow-x: auto;
+}
