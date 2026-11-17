@@ -94,13 +94,14 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
 
     ui_cfg = cp["ui"] if "ui" in cp else {}
     agents_cfg = cp["agents"] if "agents" in cp else {}
+    operator = (args.by or str(ui_cfg.get("operator", ""))).strip()[:64]
     try:
         settings = UiSettings(
             bind=args.bind or str(ui_cfg.get("bind", "127.0.0.1")).strip() or "127.0.0.1",
             port=args.port if args.port is not None else int(ui_cfg.get("port", 8480)),
             actions=args.actions or str(ui_cfg.get("actions", "false")).strip().lower()
             in ("1", "true", "yes", "on"),
-            operator=(args.by or str(ui_cfg.get("operator", ""))).strip()[:64],
+            operator=operator,
             allow_non_loopback=args.allow_non_loopback,
             token=os.environ.get(UI_TOKEN_ENV, ""))
         analyst_cap = int(agents_cfg.get("max_analyst_calls_per_day", 500))
@@ -123,7 +124,12 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
                        log=Path(log_path) if log_path else None, budget_state=budget_state),
               settings=respond_settings,
               limits=ApiLimits(analyst_calls_per_day=analyst_cap,
-                               frontend_tokens_per_day=token_cap))
+                               frontend_tokens_per_day=token_cap),
+              # Decisions use what approve / reject / unblock use, re-read per decision so
+              # a bad [respond] refuses them rather than acting on the defaults above.
+              operator=operator,
+              respond_settings=lambda: runtime.respond_settings(cp),
+              connectors=lambda: runtime.respond_connectors(cp, state))
     try:
         serve(settings, api)
     except (ValueError, OSError) as exc:
@@ -210,7 +216,8 @@ def _run(argv=None) -> dict:
         return runtime.respond_connectors(cp, state)
 
     if args.command == "ui":
-        # Before anything that takes the run lock or builds a model: the console only reads.
+        # Before anything that takes the run lock or builds a model: the console reads, and
+        # its decisions take only the queue lock, as the approve / reject / unblock CLI does.
         from agents.source_state import source_state_path
 
         results["ui"] = _ui(args, cp, base, data_dir=data_dir, reports=reports, state=state,

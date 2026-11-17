@@ -1,8 +1,8 @@
-"""Read-only data API for the operator console (the ``Routes`` object ``server`` calls).
+"""Data API for the operator console (the ``Routes`` object ``server`` calls).
 
 Everything returned here was typed by attackers or derived from it. The rules:
 
-- No writes. Only loaders that are pure reads are called (``peek_queue``, ``peek_blocklist``,
+- GET never writes. Only loaders that are pure reads are called (``peek_queue``, ``peek_blocklist``,
   ``DailyCallCounter.peek``, ``EngineState``'s constructor, ...); files without such a
   loader are read directly. No lock file, directory, cursor or counter is created.
 - Ids before paths. A request path component reaches the filesystem only after matching a
@@ -16,12 +16,19 @@ Everything returned here was typed by attackers or derived from it. The rules:
   directory signature changes; the event log is indexed incrementally (``logindex``).
 - Errors are ``{"error": <fixed text>}``; request input and exception text are never
   echoed.
+- POST (approve, reject, unblock) runs only for a signed-in operator with ``[ui] actions``
+  on (the shell checks that). It calls ``respond.approve`` / ``reject`` / ``unblock`` with
+  the arguments the CLI passes, so every gate stays in one place. A decision names the
+  ``view_hash`` the operator saw; a different approval on disk is a 409 and nothing changes.
 """
 
 from __future__ import annotations
 
 import datetime
+import getpass
 import hashlib
+import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -38,12 +45,17 @@ from agents import triage
 from agents.llm import DailyCallCounter
 from agents.playbooks import PLAYBOOKS_DIR, load_playbooks, tier_of
 from agents.respond import (
+    APPROVAL_ID_RE,
     DETECTION_FILE_RE,
+    ApprovalError,
     EngineState,
     RespondSettings,
+    approve,
     peek_blocklist,
     peek_queue,
+    reject,
     size_alarm,
+    unblock,
 )
 from agents.runtime import event_log_state
 from agents.source_state import load as load_source_state
@@ -84,9 +96,23 @@ DETECTION_RE = re.compile(DETECTION_FILE_RE)
 TOKEN_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 PROTOCOL_RE = re.compile(r"[a-z0-9]{1,16}")
 TUNER_FILE_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}\.json")
+APPROVAL_RE = re.compile(APPROVAL_ID_RE)
+VIEW_HASH_RE = re.compile(r"[0-9a-f]{64}")
+DECIDE_RE = re.compile(r"queue/([^/]+)/(approve|reject)")
+MAX_TARGET = 64
+ERROR_CAP = 200
+# Approved actions that send through a connector, and the connector each one needs.
+CONNECTOR_FOR = {"open_ticket": "ticket", "block_webhook": "block_webhook"}
 
 NOT_FOUND = (404, {"error": "not found"})
 BAD_QUERY = (400, {"error": "bad query"})
+CHANGED = (409, {"error": "changed"})
+BAD_VIEW_HASH = (400, {"error": "view_hash must be the 64-character hex value from the queue"})
+BAD_TARGET = (400, {"error": "target must be an IP address or network"})
+NO_CONNECTOR = (400, {"error": "connector not available here; approve with the CLI in the "
+                               "agents container"})
+BAD_SETTINGS = (500, {"error": "[respond] settings are invalid; nothing was changed (see the "
+                               "server log)"})
 
 
 # ---- sanitising boundary -------------------------------------------------------------------
@@ -247,6 +273,11 @@ class _DirCache:
                     self.loads += 1
             return self._value
 
+    def invalidate(self) -> None:
+        """Check the signature on the next ``get`` (after this process wrote)."""
+        with self._lock:
+            self._checked = float("-inf")
+
 
 @dataclass
 class _Records:
@@ -310,7 +341,13 @@ class ApiLimits:
 
 @dataclass
 class Api:
-    """The console's read-only routes. Thread-safe; build once and share."""
+    """The console's routes. Thread-safe; build once and share.
+
+    ``respond_settings`` and ``connectors`` are what the CLI's approve / reject / unblock
+    use (``runtime.respond_settings`` and ``runtime.respond_connectors``). The settings are
+    re-read on every decision so a bad ``[respond]`` refuses it instead of falling back to
+    defaults; without the callable, ``settings`` is used. ``operator`` is the ``[ui]``
+    label; decisions are recorded as ``ui:<operator>`` (the OS user when it is empty)."""
 
     paths: ApiPaths
     settings: RespondSettings = field(default_factory=RespondSettings)
@@ -318,8 +355,14 @@ class Api:
     cache_seconds: float = CACHE_SECONDS
     clock: Callable[[], float] = time.monotonic
     now: Callable[[], datetime.datetime] = lambda: datetime.datetime.now(UTC)
+    operator: str = ""
+    respond_settings: Optional[Callable[[], RespondSettings]] = None
+    connectors: Optional[Callable[[], object]] = None
 
     def __post_init__(self) -> None:
+        self._connectors_lock = threading.Lock()
+        self._connectors_built = False
+        self._connectors_value: object = None
         p = self.paths
         self._records = _DirCache((p.reports / "sessions", p.reports / "campaigns"),
                                   self._load_records, self.cache_seconds, self.clock)
@@ -352,7 +395,23 @@ class Api:
         return status, scrub(value)
 
     def post(self, path: str, body: dict) -> tuple[int, object]:
-        return NOT_FOUND  # decisions come with a later change
+        status, value = self._dispatch_post(path, body)
+        return status, scrub(value)
+
+    def _dispatch_post(self, path: str, body: dict) -> tuple[int, object]:
+        if not path.startswith("/api/"):
+            return NOT_FOUND
+        rest = path[len("/api/"):]
+        m = DECIDE_RE.fullmatch(rest)
+        if m is None and rest != "blocklist/unblock":
+            return NOT_FOUND
+        try:
+            if m is not None:
+                return self._decide(m.group(1), m.group(2), body)
+            return self._unblock(body)
+        except Exception:  # noqa: BLE001 - details go to the log, never to the client
+            log.exception("api action failed")
+            return 500, {"error": "internal error"}
 
     def _dispatch(self, path: str, query: dict[str, str]) -> tuple[int, object]:
         if not path.startswith("/api/"):
@@ -584,6 +643,7 @@ class Api:
             # one back as an "expired" copy, which is no longer what is on disk.
             out.append({"approval": a,
                         "view_hash": view_hash(a) if a.get("status") == "pending" else None,
+                        "can_approve_here": self._can_approve_here(a),
                         "record": _summary(r) if r is not None else None})
         page["items"] = out
         return 200, page
@@ -702,3 +762,114 @@ class Api:
         for t in tokens:
             t["value"] = _mask(t["value"])
         return 200, {"scenario": registry.get("scenario"), "tokens": paginate(tokens, query)}
+
+    # -- decisions --
+
+    def _connectors(self):
+        """The ``Connectors`` object, built once (building sends nothing), or None."""
+        with self._connectors_lock:
+            if not self._connectors_built:
+                self._connectors_built = True
+                if self.connectors is not None:
+                    try:
+                        self._connectors_value = self.connectors()
+                    except Exception:  # noqa: BLE001 - no connectors is a working state
+                        log.exception("building connectors failed; connector actions are off")
+            return self._connectors_value
+
+    def _can_approve_here(self, approval: dict) -> bool:
+        """Whether approving would run the action here rather than consume the approval: a
+        connector action needs that connector enabled in this process."""
+        if approval.get("status") != "pending":
+            return False
+        name = CONNECTOR_FOR.get(str(approval.get("action", "")))
+        if name is None:
+            return True
+        conns = self._connectors()
+        return conns is not None and bool(conns.enabled(name))
+
+    def _decision_settings(self) -> Optional[RespondSettings]:
+        if self.respond_settings is None:
+            return self.settings
+        try:
+            return self.respond_settings()
+        except ValueError as exc:
+            log.error("refusing a console decision: %s", str(exc)[:200])
+            return None
+
+    def _by(self) -> str:
+        """``ui:<operator>``; never from the request. ``respond`` sanitises it as for the CLI."""
+        name = self.operator.strip()
+        if not name:
+            try:
+                name = getpass.getuser()
+            except (OSError, KeyError):   # a container user without a passwd entry
+                name = "unknown"
+        return "ui:" + name
+
+    def _decide(self, aid: str, verb: str, body: dict) -> tuple[int, object]:
+        if not APPROVAL_RE.fullmatch(aid):
+            return NOT_FOUND
+        path = self.paths.state / "approvals" / f"{aid}.json"
+        if not path.is_file():
+            return NOT_FOUND
+        given = body.get("view_hash")
+        if not isinstance(given, str) or not VIEW_HASH_RE.fullmatch(given):
+            return BAD_VIEW_HASH
+        settings = self._decision_settings()
+        if settings is None:
+            return BAD_SETTINGS
+        # The same parse the queue route hashes (peek_queue reads the file as JSON). The
+        # status and expiry are re-checked by respond under its lock; this only makes sure
+        # the operator decided on what is on disk now.
+        current = _read_json(path, {})
+        if not hmac.compare_digest(view_hash(current).encode(), given.encode()):
+            return CHANGED
+        state, reports = self.paths.state, self.paths.reports
+        try:
+            if verb == "reject":
+                result = reject(aid, state, by=self._by(),
+                                suppress_hours=settings.reject_suppress_hours,
+                                reports_dir=reports)
+            else:
+                conns = self._connectors()
+                needed = CONNECTOR_FOR.get(str(current.get("action", "")))
+                if needed is not None and (conns is None or not conns.enabled(needed)):
+                    # approve would mark it executing and then failed: refuse, keep it pending.
+                    return NO_CONNECTOR
+                result = approve(aid, state, reports, self.paths.detections, connectors=conns,
+                                 by=self._by(), blocklist_file=settings.blocklist_file,
+                                 blocklist_format=settings.blocklist_format,
+                                 blocklist_ttl_days=settings.blocklist_ttl_days,
+                                 expired_suppress_hours=settings.expired_suppress_hours,
+                                 never_act_on=settings.never_act_on)
+        except ApprovalError as exc:
+            # Fixed text from respond: the validated id and status / expiry read from disk.
+            return 400, {"error": clean_text(str(exc), ERROR_CAP)}
+        finally:
+            self._queue.invalidate()
+        return 200, {"approval": result}
+
+    def _unblock(self, body: dict) -> tuple[int, object]:
+        raw = body.get("target")
+        if not isinstance(raw, str) or len(raw) > MAX_TARGET:
+            return BAD_TARGET
+        value = raw.strip()
+        if "%" in value:   # scoped IPv6 addresses are never blocklist keys
+            return BAD_TARGET
+        try:
+            target = str(ipaddress.ip_network(value, strict=False)) if "/" in value \
+                else str(ipaddress.ip_address(value))
+        except ValueError:
+            return BAD_TARGET
+        settings = self._decision_settings()
+        if settings is None:
+            return BAD_SETTINGS
+        try:
+            result = unblock(target, self.paths.state, self.paths.reports,
+                             blocklist_file=settings.blocklist_file,
+                             blocklist_format=settings.blocklist_format,
+                             ttl_days=settings.blocklist_ttl_days, by=self._by())
+        except ValueError:
+            return BAD_TARGET
+        return 200, result
