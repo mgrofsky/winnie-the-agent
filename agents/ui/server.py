@@ -59,6 +59,7 @@ STATIC_FILES: dict[str, tuple[str, str]] = {
     "/index.html": ("index.html", HTML_TYPE),
     "/static/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/static/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/static/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
 
 CONTENT_SECURITY_POLICY = (

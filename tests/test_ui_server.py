@@ -584,6 +584,7 @@ def test_unknown_paths_are_404(console, path):
     ("/index.html", "index.html", "text/html; charset=utf-8"),
     ("/static/app.js", "app.js", "text/javascript; charset=utf-8"),
     ("/static/app.css", "app.css", "text/css; charset=utf-8"),
+    ("/static/favicon.svg", "favicon.svg", "image/svg+xml"),
 ])
 def test_static_files(console, path, name, ctype):
     resp = console.request("GET", path)
