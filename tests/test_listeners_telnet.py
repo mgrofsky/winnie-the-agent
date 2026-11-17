@@ -58,13 +58,12 @@ async def telnet_server():
 
 
 async def read_until(reader, marker: bytes, timeout: float = 3.0) -> bytes:
-    buf = b""
-    while marker not in buf:
-        chunk = await asyncio.wait_for(reader.read(4096), timeout)
-        if not chunk:
-            break
-        buf += chunk
-    return buf
+    # Stop exactly at the marker: bytes that arrive in the same segment (the next prompt
+    # after "Login incorrect", say) must stay in the stream for the next call.
+    try:
+        return await asyncio.wait_for(reader.readuntil(marker), timeout)
+    except asyncio.IncompleteReadError as exc:           # peer closed first
+        return exc.partial
 
 
 async def login(reader, w, user: bytes, password: bytes) -> bytes:
