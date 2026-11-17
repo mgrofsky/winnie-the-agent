@@ -210,6 +210,8 @@ A local web console for the operator: pipeline health, the approval queue, triag
 with SSH transcript replay, digests, tuner state, playbooks and detections. It is
 read-only by default, listens on 127.0.0.1:8480 only, and never calls a model.
 
+![The console's overview screen, shown with test data](docs/console.png)
+
 ```bash
 python -m agents ui                       # without Docker
 docker compose --profile ui up -d ui      # with Docker; sign-in link: docker compose logs ui
