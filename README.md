@@ -35,12 +35,12 @@ On top of that SSH honeypot this project adds:
 
 ## How it fits together
 
-![Data flow: attackers, front-ends, event log, agents pipeline, outputs and operator approval](docs/dataflow.svg)
+![Data flow and trust boundaries: attackers, front-ends, captured data, agents pipeline, agent outputs, operator approval, model providers and third-party services](docs/diagrams/winnie-dataflow.png)
 
 The front-ends write events; the agents read them. Each agents run triages new sessions and
 campaigns, runs the response playbooks, writes the digest, tunes the overlay, drafts
 detections and, when `[connector.s3_events]` is enabled, finally exports new log lines to
-S3 for a SIEM (`python -m agents ship`, not shown in the diagram). Agents never talk
+S3 for a SIEM (`python -m agents ship`). Agents never talk
 to attackers, and front-ends never write anything the agents produce. Details are in
 [docs/architecture.md](docs/architecture.md).
 
