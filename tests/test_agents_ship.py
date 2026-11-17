@@ -143,14 +143,14 @@ def test_the_s3_section_is_not_reported_as_an_unknown_connector(tmp_path):
 def test_wrapped_objects_use_the_documented_key_layout(tmp_path):
     write_log(tmp_path / "log.jsonl", _ftp(3))
     s3 = FakeS3()
-    res, _ = _run(tmp_path, _settings(bucket_owner="111122223333"), s3)
+    res, _ = _run(tmp_path, _settings(bucket_owner="123456789012"), s3)
     assert res["objects"] == 1 and res["events"] == 3
     (put,) = s3.puts
     epoch = int(NOW.timestamp())
     assert re.fullmatch(rf"events/2026/11/02/07-{epoch}-sensor-a-0-[0-9a-f]{{8}}\.jsonl",
                         put["Key"])
     assert put["Bucket"] == "example-honeypot-events"
-    assert put["ExpectedBucketOwner"] == "111122223333"
+    assert put["ExpectedBucketOwner"] == "123456789012"
     lines = _lines(put)
     assert [set(x) for x in lines] == [{"source", "detail"}] * 3
     assert lines[0]["source"] == "aws.honeypot"
@@ -611,3 +611,22 @@ def test_secrets_inside_free_text_fields_are_not_exported_in_clear(protocol, dat
     assert secret not in json.dumps(out)
     if mode == "hash":
         assert ship.HASH_PREFIX in json.dumps(out)
+
+
+def test_missing_log_is_nothing_to_ship_and_an_unreadable_one_is_an_error(tmp_path):
+    res = ship.run_ship(_settings(), str(tmp_path / "missing.jsonl"), tmp_path / "state",
+                        seed=SEED, sensor="s", client_factory=lambda _s: FakeS3(), now=NOW)
+    assert res == {"status": "no_log", "objects": 0, "more_pending": False}
+    (tmp_path / "dir.jsonl").mkdir()
+    res = ship.run_ship(_settings(), str(tmp_path / "dir.jsonl"), tmp_path / "state",
+                        seed=SEED, sensor="s", client_factory=lambda _s: FakeS3(), now=NOW)
+    assert "is a directory" in res["error"]
+
+
+def test_ship_command_on_a_new_sensor_reports_nothing_to_do(tmp_path, monkeypatch):
+    args, s3, _ = _cli_setup(tmp_path, monkeypatch)
+    (tmp_path / "log.jsonl").unlink()
+    summary = cli.run(["ship", *args])
+    assert summary["ship"]["status"] == "no_log" and "error" not in summary["ship"]
+    assert summary["log_rotation"]["safe"] is True and s3.puts == []
+    assert cli.main(["ship", *args]) == 0

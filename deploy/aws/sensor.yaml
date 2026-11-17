@@ -1,0 +1,1026 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Winnie the Agent sensor on one EC2 host. One VPC with one public subnet and no NAT: the
+  host reaches only AWS through VPC endpoints, containers cannot connect out or reach the
+  instance metadata service, administration is SSM only, and a separate exporter container
+  ships events to a write-only bucket in another account (events-bucket.yaml, deployed
+  first).
+
+# Lessons kept from running this on a fresh account:
+# - InboundCidr has no default. CloudFormation rejects a parameter default that fails the
+#   parameter's own AllowedPattern, and an open default would expose the host by accident.
+# - A new AWS account's first EC2 launch can be held briefly for account validation. Deploy
+#   with HostEnabled=false first; the network, repository and role do not wait for it.
+# - Amazon Linux 2023 does not package the Docker Compose plugin, and this host has no
+#   internet route to download it. The bootstrap copies the binary out of a copy of the
+#   docker/compose-bin image pushed to the same ECR repository (ComposeImageTag). The
+#   repository's lifecycle rule only expires untagged images, so that copy never expires.
+# - Docker's userland proxy is turned off, so events carry real client addresses.
+# - SMTP is off by default even in scenarios that have it: an open-looking mail relay draws
+#   abuse reports against the address. SmtpEnabled=true opens it.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: winnie-sensor
+    AllowedPattern: '^[a-z][a-z0-9-]{2,29}$'
+    Description: Prefix for every named resource (role NamePrefix-host, trail NamePrefix-trail).
+  Scenario:
+    Type: String
+    Default: sip-provider
+    AllowedValues: [sip-provider, contact-center, bank, healthcare, saas, api-platform]
+    Description: >-
+      Scenario to run, with "-" for "_" (mapping keys cannot hold underscores). Its services
+      decide which public ports open (see Mappings).
+  InboundCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: >-
+      An IPv4 CIDR. There is no default: start with your own address as a /32 and widen
+      to 0.0.0.0/0 only after the containment checklist passes.
+    Description: Source range allowed to reach the sensor's public ports.
+  InboundEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Fast stop. "false" removes every inbound rule; the host keeps running and shipping.
+  SmtpEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Open SMTP (25) when the scenario has it. Off by default to avoid abuse reports.
+  S3Port:
+    Type: Number
+    Default: 9000
+    MinValue: 1
+    MaxValue: 65535
+    Description: >-
+      Public port for the S3-compatible trap (container port 9000) when the scenario has it.
+      The trap speaks plain HTTP, so 443 is not a useful choice.
+  HostEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      "false" creates the network, repository and role only, so the image can be pushed
+      before the host boots. "true" adds the launch template, instance and address.
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedPattern: '^[a-z][a-z0-9]*\.[a-z0-9]+$'
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  VpcCidr:
+    Type: String
+    Default: 10.64.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  SubnetCidr:
+    Type: String
+    Default: 10.64.0.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  S3PrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[0-9a-f]{8,17}$'
+    Description: >-
+      Managed prefix list of S3 in this region (aws ec2 describe-managed-prefix-lists
+      --filters Name=prefix-list-name,Values=com.amazonaws.<region>.s3).
+  ImageTag:
+    Type: String
+    Default: ""
+    AllowedPattern: '^[A-Za-z0-9._-]{0,128}$'
+    Description: Immutable image tag to run, for example the git commit. Required with HostEnabled.
+  ComposeImageTag:
+    Type: String
+    Default: compose-bin
+    AllowedPattern: '^[A-Za-z0-9._-]{1,128}$'
+    Description: Tag of the docker/compose-bin copy in this stack's repository.
+  EventsBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: Bucket from events-bucket.yaml, in this region.
+  EventsBucketOwner:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: >-
+      Account that owns the events bucket. Every put carries it as ExpectedBucketOwner and
+      fails against a bucket owned by anyone else.
+  EventsPrefix:
+    Type: String
+    Default: events
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{0,30}$'
+  NeverActOn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^[0-9A-Fa-f:., /]{0,1000}$'
+    Description: Comma separated CIDRs for [respond] never_act_on (your own ranges). Empty keeps the default.
+  TrailEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Create a multi-region account trail delivering to the events bucket under cloudtrail/.
+      Needs TrailEnabled=true in events-bucket.yaml first.
+  FlowLogsEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+Mappings:
+  # Listener services per scenario ("python -m listeners --list-scenarios"). SSH is always on.
+  ScenarioServices:
+    sip-provider:   {Sip: "true",  Ftp: "true",  Telnet: "true",  Smtp: "true",  Http: "true", Mssql: "false", Mysql: "true",  Postgres: "false", Redis: "false", Mllp: "false", S3: "true"}
+    contact-center: {Sip: "true",  Ftp: "true",  Telnet: "false", Smtp: "false", Http: "true", Mssql: "true",  Mysql: "false", Postgres: "true",  Redis: "false", Mllp: "false", S3: "false"}
+    bank:           {Sip: "false", Ftp: "true",  Telnet: "false", Smtp: "false", Http: "true", Mssql: "false", Mysql: "false", Postgres: "true",  Redis: "true",  Mllp: "false", S3: "true"}
+    healthcare:     {Sip: "false", Ftp: "true",  Telnet: "false", Smtp: "false", Http: "true", Mssql: "false", Mysql: "false", Postgres: "true",  Redis: "false", Mllp: "true",  S3: "false"}
+    saas:           {Sip: "false", Ftp: "false", Telnet: "false", Smtp: "true",  Http: "true", Mssql: "false", Mysql: "false", Postgres: "true",  Redis: "true",  Mllp: "false", S3: "true"}
+    api-platform:   {Sip: "false", Ftp: "false", Telnet: "false", Smtp: "false", Http: "true", Mssql: "false", Mysql: "false", Postgres: "true",  Redis: "true",  Mllp: "false", S3: "false"}
+
+Conditions:
+  InboundOn: !Equals [!Ref InboundEnabled, "true"]
+  HostOn: !Equals [!Ref HostEnabled, "true"]
+  TrailOn: !Equals [!Ref TrailEnabled, "true"]
+  FlowLogsOn: !Equals [!Ref FlowLogsEnabled, "true"]
+  SipOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Sip], "true"]
+  FtpOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Ftp], "true"]
+  TelnetOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Telnet], "true"]
+  SmtpOn: !And
+    - !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Smtp], "true"]
+    - !Equals [!Ref SmtpEnabled, "true"]
+  HttpOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Http], "true"]
+  MssqlOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Mssql], "true"]
+  MysqlOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Mysql], "true"]
+  PostgresOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Postgres], "true"]
+  RedisOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Redis], "true"]
+  MllpOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Mllp], "true"]
+  S3On: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, S3], "true"]
+  SipIn: !And [!Condition InboundOn, !Condition SipOn]
+  FtpIn: !And [!Condition InboundOn, !Condition FtpOn]
+  TelnetIn: !And [!Condition InboundOn, !Condition TelnetOn]
+  SmtpIn: !And [!Condition InboundOn, !Condition SmtpOn]
+  HttpIn: !And [!Condition InboundOn, !Condition HttpOn]
+  MssqlIn: !And [!Condition InboundOn, !Condition MssqlOn]
+  MysqlIn: !And [!Condition InboundOn, !Condition MysqlOn]
+  PostgresIn: !And [!Condition InboundOn, !Condition PostgresOn]
+  RedisIn: !And [!Condition InboundOn, !Condition RedisOn]
+  MllpIn: !And [!Condition InboundOn, !Condition MllpOn]
+  S3In: !And [!Condition InboundOn, !Condition S3On]
+
+Rules:
+  HostNeedsImageTag:
+    RuleCondition: !Equals [!Ref HostEnabled, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ImageTag, ""]]
+        AssertDescription: ImageTag is required when HostEnabled is true.
+
+Resources:
+  # ---------------------------------------------------------------- network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref NamePrefix
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref SubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-public
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  # Needed for replies to inbound connections. New outbound connections are stopped by the
+  # instance security group's egress rules, not by routing. There is no NAT gateway.
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: FlowLogsOn
+    Properties:
+      LogGroupName: !Sub /${NamePrefix}/vpc-flow-logs
+      RetentionInDays: 90
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Condition: FlowLogsOn
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: flow-logs-delivery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !GetAtt FlowLogGroup.Arn
+                  - !Sub ${FlowLogGroup.Arn}:*
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Condition: FlowLogsOn
+    Properties:
+      ResourceId: !Ref Vpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 60
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Ref NamePrefix
+
+  # ---------------------------------------------------------------- optional account trail
+  # events-bucket.yaml must allow this trail first: CloudTrail checks the bucket policy when
+  # the trail is created.
+  AuditTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: TrailOn
+    Properties:
+      TrailName: !Sub ${NamePrefix}-trail
+      S3BucketName: !Ref EventsBucketName
+      S3KeyPrefix: cloudtrail
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+
+  # ---------------------------------------------------------------- endpoints
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface endpoints, 443 from the sensor instance only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup
+          Description: sensor instance
+      # A rule that matches nothing, so CloudFormation does not add allow-all egress.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: no egress
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref PublicRouteTable
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EventsPutOnly
+            Effect: Allow
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${EventsPrefix}/*
+          - Sid: Al2023Repositories
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::al2023-repos-${AWS::Region}-*/*
+          - Sid: EcrLayers
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*
+          - Sid: SsmAgent
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::amazon-ssm-${AWS::Region}/*
+              - !Sub arn:${AWS::Partition}:s3:::aws-ssm-${AWS::Region}/*
+              - !Sub arn:${AWS::Partition}:s3:::amazon-ssm-packages-${AWS::Region}/*
+              - !Sub arn:${AWS::Partition}:s3:::${AWS::Region}-birdwatcher-prod/*
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PublicSubnet]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PublicSubnet]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PublicSubnet]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PublicSubnet]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PublicSubnet]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PublicSubnet]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # ---------------------------------------------------------------- instance security group
+  # Egress: 443 to the S3 prefix list and to the interface endpoints, nothing else. Replies
+  # to inbound connections pass because security groups are stateful.
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Sensor instance, scenario ports in, AWS endpoints out
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref S3PrefixListId
+          Description: S3 through the gateway endpoint
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-instance
+
+  InstanceEgressToEndpoints:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref EndpointSecurityGroup
+      Description: interface endpoints
+
+  # Inbound rules: one per public port, each only with InboundEnabled=true and only when the
+  # scenario runs that service. Public port -> container port as in docker-compose.yml.
+  InSsh:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: InboundOn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref InboundCidr
+      Description: fake SSH (container 8022), not administration
+
+  InSipUdp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SipIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: udp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref InboundCidr
+      Description: SIP UDP
+
+  InSipTcp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SipIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5060
+      ToPort: 5060
+      CidrIp: !Ref InboundCidr
+      Description: SIP TCP
+
+  InFtp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: FtpIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 21
+      ToPort: 21
+      CidrIp: !Ref InboundCidr
+      Description: FTP control (container 2121)
+
+  InFtpPassive:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: FtpIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 30000
+      ToPort: 30019
+      CidrIp: !Ref InboundCidr
+      Description: FTP passive range, matches ftp_pasv_ports
+
+  InTelnet:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: TelnetIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 23
+      ToPort: 23
+      CidrIp: !Ref InboundCidr
+      Description: Telnet (container 2323)
+
+  InSmtp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: SmtpIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 25
+      ToPort: 25
+      CidrIp: !Ref InboundCidr
+      Description: SMTP (container 2525), only with SmtpEnabled
+
+  InHttp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HttpIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref InboundCidr
+      Description: HTTP (container 8080)
+
+  InMssql:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: MssqlIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1433
+      ToPort: 1433
+      CidrIp: !Ref InboundCidr
+      Description: MSSQL
+
+  InMysql:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: MysqlIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      CidrIp: !Ref InboundCidr
+      Description: MySQL
+
+  InPostgres:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: PostgresIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      CidrIp: !Ref InboundCidr
+      Description: PostgreSQL
+
+  InRedis:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: RedisIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      CidrIp: !Ref InboundCidr
+      Description: Redis
+
+  InMllp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: MllpIn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2575
+      ToPort: 2575
+      CidrIp: !Ref InboundCidr
+      Description: HL7 MLLP
+
+  InS3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: S3In
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref S3Port
+      ToPort: !Ref S3Port
+      CidrIp: !Ref InboundCidr
+      Description: S3-compatible trap, plain HTTP (container 9000)
+
+  # ---------------------------------------------------------------- image, logs, role
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref NamePrefix
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      # Untagged images only: the tagged docker/compose-bin copy must never expire.
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"expire untagged images after 14 days",
+          "selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":14},
+          "action":{"type":"expire"}}]}
+
+  HostLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${NamePrefix}/host
+      RetentionInDays: 30
+
+  # Pull this one image, write this one log group, put under the events prefix. The SSM
+  # managed policy is the only managed policy; ecr:GetAuthorizationToken cannot be scoped.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${NamePrefix}-host
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: sensor-host
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrAuthToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPullOneRepository
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt Repository.Arn
+              - Sid: WriteOneLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt HostLogGroup.Arn
+                  - !Sub ${HostLogGroup.Arn}:*
+              - Sid: PutEventsOnly
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${EventsPrefix}/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ---------------------------------------------------------------- host
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: HostOn
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        # IMDSv2 only, hop limit 1: no bridged container can obtain the role's credentials.
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: disabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            SubnetId: !Ref PublicSubnet
+            Groups:
+              - !Ref InstanceSecurityGroup
+            AssociatePublicIpAddress: false
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Ref NamePrefix
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              # Sensor bootstrap. Fails loudly; output in /var/log/sensor-bootstrap.log.
+              set -euo pipefail
+              exec > >(tee -a /var/log/sensor-bootstrap.log) 2>&1
+              REGION=${AWS::Region}
+              REGISTRY=${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}
+              IMAGE=${Repository.RepositoryUri}:${ImageTag}
+              HOME_DIR=/opt/sensor
+
+              # 1. Administration is SSM only. Free port 22 for the fake SSH service.
+              systemctl disable --now sshd.service || true
+              systemctl mask sshd.service sshd.socket
+
+              # 2. Packages from the AL2023 repositories (S3 through the gateway endpoint).
+              dnf install -y docker iptables-nft
+
+              # 3. Docker daemon: userland proxy off so events carry real client addresses.
+              mkdir -p /etc/docker
+              echo '{"userland-proxy": false, "live-restore": false}' > /etc/docker/daemon.json
+              systemctl enable --now docker.service
+
+              # 4. Firewall: no container reaches the metadata service, and the front-end and
+              #    agents networks may only send replies, never open a connection.
+              cat > /usr/local/sbin/sensor-firewall.sh <<'EOF'
+              #!/bin/bash
+              set -euo pipefail
+              add() { iptables -w -C DOCKER-USER "$@" 2>/dev/null || iptables -w -I DOCKER-USER 1 "$@"; }
+              add -i docker0 -d 169.254.169.254/32 -j DROP
+              add -i br-+ -d 169.254.169.254/32 -j DROP
+              add -s 172.30.0.0/24 -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP
+              add -s 172.30.1.0/24 -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP
+              EOF
+              chmod 0755 /usr/local/sbin/sensor-firewall.sh
+              cat > /etc/systemd/system/sensor-firewall.service <<'EOF'
+              [Unit]
+              Description=Sensor container egress and metadata rules
+              After=docker.service
+              Requires=docker.service
+              Before=sensor.service
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart=/usr/local/sbin/sensor-firewall.sh
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              systemctl daemon-reload
+              systemctl enable --now sensor-firewall.service
+
+              # 5. Images from this account's repository. Retries cover instance profile
+              #    propagation.
+              for i in 1 2 3 4 5 6 7 8 9 10; do
+                if aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"; then break; fi
+                [ "$i" = 10 ] && exit 1
+                sleep 15
+              done
+              docker pull "$IMAGE"
+
+              # 6. Docker Compose plugin. AL2023 does not package it and this host has no
+              #    internet route, so the binary is copied out of the docker/compose-bin copy
+              #    in the same repository.
+              COMPOSE_IMAGE=${Repository.RepositoryUri}:${ComposeImageTag}
+              docker pull "$COMPOSE_IMAGE"
+              cid=$(docker create "$COMPOSE_IMAGE" /docker-compose)
+              mkdir -p /usr/libexec/docker/cli-plugins
+              docker cp "$cid:/docker-compose" /usr/libexec/docker/cli-plugins/docker-compose
+              docker rm "$cid" >/dev/null
+              chmod 0755 /usr/libexec/docker/cli-plugins/docker-compose
+              docker compose version
+
+              # 7. Host files: SSH host key, config.ini from the image's template.
+              mkdir -p "$HOME_DIR"
+              cd "$HOME_DIR"
+              [ -f ssh_host_key ] || ssh-keygen -q -t rsa -b 4096 -N "" -f ssh_host_key
+              rm -f ssh_host_key.pub
+              docker run --rm --network none --entrypoint cat "$IMAGE" /app/SSH/config.ini.TEMPLATE > config.ini.TEMPLATE
+              cat > render_config.py <<'PY'
+              import configparser, re, sys
+              src, dst, name, scenario, public_ip, smtp, bucket, prefix, region, owner, never, ship = sys.argv[1:13]
+              lines = open(src, encoding="utf-8").read().splitlines()
+              want = {
+                  "honeypot": {"sensor_name": name},
+                  "scenario": {"active": scenario.replace("-", "_")},
+                  "listeners": {"ftp_pasv_ports": "30000-30019", "ftp_pasv_address": public_ip,
+                                "llm": "false"},
+                  "respond": {"queue_enforce": "true"},
+                  "connector.s3_events": {"enabled": ship, "bucket": bucket, "prefix": prefix + "/",
+                                          "region": region, "bucket_owner": owner,
+                                          "layout": "wrapped", "passwords": "hash"},
+              }
+              if smtp != "true":
+                  want["listeners"]["smtp_enabled"] = "false"
+              if never.strip():
+                  want["respond"]["never_act_on"] = never.strip()
+              if "[connector.s3_events]" not in [l.strip() for l in lines]:
+                  lines += ["", "[connector.s3_events]"]
+              def section_range(section):
+                  start = None
+                  for i, line in enumerate(lines):
+                      m = re.match(r"^\[([^\]]+)\]\s*$", line)
+                      if m and start is not None:
+                          return start, i
+                      if m and m.group(1) == section:
+                          start = i
+                  if start is None:
+                      sys.exit("config template has no [%s] section" % section)
+                  return start, len(lines)
+              for section, keys in want.items():
+                  for key, value in keys.items():
+                      start, end = section_range(section)
+                      hit = None
+                      for pattern in (r"^%s\s*=", r"^#\s*%s\s*="):
+                          for i in range(start + 1, end):
+                              if re.match(pattern % re.escape(key), lines[i]):
+                                  hit = i
+                                  break
+                          if hit is not None:
+                              break
+                      if hit is None:
+                          lines.insert(end, "%s = %s" % (key, value))
+                      else:
+                          lines[hit] = "%s = %s" % (key, value)
+              open(dst, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+              cp = configparser.ConfigParser(interpolation=None, strict=False)
+              cp.read(dst, encoding="utf-8")
+              for section, keys in want.items():
+                  for key, value in keys.items():
+                      if cp.get(section, key, fallback=None) != value:
+                          sys.exit("config.ini check failed: [%s] %s" % (section, key))
+              print("%s written" % dst)
+              PY
+              # Two files from one template. run-all also ships when the connector is enabled,
+              # and the agents container has neither credentials nor egress, so config.ini
+              # (front-ends and agents) keeps it off; config-ship.ini (exporter only) turns it on.
+              ARGS="${NamePrefix} ${Scenario} ${ElasticIp} ${SmtpEnabled} ${EventsBucketName} ${EventsPrefix} $REGION ${EventsBucketOwner}"
+              python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "${NeverActOn}" false
+              python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "${NeverActOn}" true
+              chown 10001:10001 config.ini config-ship.ini ssh_host_key
+              chmod 0400 config.ini config-ship.ini ssh_host_key
+
+              # 8. Compose files.
+              cat > docker-compose.yml <<'EOF'
+              name: sensor
+              x-hardening: &hardening
+                image: ${Repository.RepositoryUri}:${ImageTag}
+                pull_policy: never
+                user: "10001:10001"
+                read_only: true
+                tmpfs: ["/tmp:size=64m,mode=1777"]
+                cap_drop: ["ALL"]
+                security_opt: ["no-new-privileges:true"]
+                restart: unless-stopped
+                logging:
+                  driver: awslogs
+                  options:
+                    awslogs-region: ${AWS::Region}
+                    awslogs-group: ${HostLogGroup}
+                    awslogs-create-group: "false"
+                    tag: "{{.Name}}"
+              x-frontend-env: &frontend-env
+                WINNIE_DATA_DIR: /data
+                WINNIE_OVERLAY: /overlay/overlay.json
+                WINNIE_SOURCE_STATE: /overlay/source_state.json
+              x-frontend-volumes: &frontend-volumes
+                - ./config.ini:/app/SSH/config.ini:ro
+                - ./ssh_host_key:/app/SSH/ssh_host_key:ro
+                - frontend:/data
+                - overlay:/overlay:ro
+              services:
+                ssh:
+                  <<: *hardening
+                  command: ["python", "SSH/ssh_server.py", "--config", "/app/SSH/config.ini", "--log-file", "/data/ssh_log.log"]
+                  environment: *frontend-env
+                  networks: [frontend]
+                  volumes: *frontend-volumes
+                listeners:
+                  <<: *hardening
+                  depends_on: [ssh]
+                  command: ["python", "-m", "listeners", "--config", "/app/SSH/config.ini", "--log-file", "/data/ssh_log.log", "--data-dir", "/data"]
+                  environment: *frontend-env
+                  networks: [frontend]
+                  volumes: *frontend-volumes
+                agents:
+                  <<: *hardening
+                  depends_on: [ssh, listeners]
+                  environment:
+                    WINNIE_DATA_DIR: /data
+                    WINNIE_OVERLAY: /overlay/overlay.json
+                    WINNIE_SOURCE_STATE: /overlay/source_state.json
+                  command: ["/bin/sh", "-c", "while true; do python -m agents run-all --config /config/config.ini --log /data/ssh_log.log --data-dir /data --reports-dir /agents/reports --state-dir /agents/state --detections-dir /agents/detections; sleep 3600; done"]
+                  networks: [backend]
+                  volumes:
+                    - ./config.ini:/config/config.ini:ro
+                    - frontend:/data:ro
+                    - agentdata:/agents
+                    - overlay:/overlay
+                # The exporter: host network, the only container that can use the instance
+                # role (IMDS hop limit 1 and the DOCKER-USER rules stop every bridged one).
+                # It reads the log and the sensor seed (--data-dir, for passwords = hash) and
+                # keeps its cursor and run lock on its own volume (--state-dir).
+                exporter:
+                  <<: *hardening
+                  depends_on: [listeners]
+                  network_mode: host
+                  environment:
+                    AWS_REGION: ${AWS::Region}
+                    WINNIE_DATA_DIR: /data
+                  command: ["/bin/sh", "-c", "while true; do python -m agents ship --config /config/config.ini --log /data/ssh_log.log --data-dir /data --state-dir /agents/state; sleep 300; done"]
+                  volumes:
+                    - ./config-ship.ini:/config/config.ini:ro
+                    - frontend:/data:ro
+                    - exportstate:/agents
+              networks:
+                frontend:
+                  ipam:
+                    config: [{subnet: 172.30.0.0/24}]
+                backend:
+                  ipam:
+                    config: [{subnet: 172.30.1.0/24}]
+              volumes:
+                frontend: {}
+                agentdata: {}
+                overlay: {}
+                exportstate: {}
+              EOF
+
+              # Public ports for the scenario's services (the security group opens the same).
+              PORTS=""
+              for svc in ${Services}; do
+                case "$svc" in
+                  sip) PORTS="$PORTS 5060:5060/udp 5060:5060/tcp" ;;
+                  ftp) PORTS="$PORTS 21:2121 30000-30019:30000-30019" ;;
+                  telnet) PORTS="$PORTS 23:2323" ;;
+                  smtp) PORTS="$PORTS 25:2525" ;;
+                  http) PORTS="$PORTS 80:8080" ;;
+                  mssql) PORTS="$PORTS 1433:1433" ;;
+                  mysql) PORTS="$PORTS 3306:3306" ;;
+                  postgres) PORTS="$PORTS 5432:5432" ;;
+                  redis) PORTS="$PORTS 6379:6379" ;;
+                  mllp) PORTS="$PORTS 2575:2575" ;;
+                  s3) PORTS="$PORTS ${S3Port}:9000" ;;
+                esac
+              done
+              {
+                echo "services:"
+                echo "  ssh:"
+                echo "    ports: [\"22:8022\"]"
+                echo "  listeners:"
+                echo "    ports:"
+                for p in $PORTS; do echo "      - \"$p\""; done
+              } > docker-compose.override.yml
+
+              # 9. The stack as a systemd unit.
+              cat > /etc/systemd/system/sensor.service <<'EOF'
+              [Unit]
+              Description=Winnie the Agent sensor stack
+              After=docker.service sensor-firewall.service
+              Requires=docker.service sensor-firewall.service
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              WorkingDirectory=/opt/sensor
+              ExecStart=/usr/bin/docker compose up -d --remove-orphans
+              ExecStop=/usr/bin/docker compose down
+              TimeoutStartSec=600
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              systemctl daemon-reload
+              systemctl enable --now sensor.service
+              echo "bootstrap complete"
+            - Services: !Join
+                - " "
+                - - !If [SipOn, sip, ""]
+                  - !If [FtpOn, ftp, ""]
+                  - !If [TelnetOn, telnet, ""]
+                  - !If [SmtpOn, smtp, ""]
+                  - !If [HttpOn, http, ""]
+                  - !If [MssqlOn, mssql, ""]
+                  - !If [MysqlOn, mysql, ""]
+                  - !If [PostgresOn, postgres, ""]
+                  - !If [RedisOn, redis, ""]
+                  - !If [MllpOn, mllp, ""]
+                  - !If [S3On, s3, ""]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Condition: HostOn
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+  EipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: HostOn
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref Instance
+
+Outputs:
+  InstanceId:
+    Condition: HostOn
+    Value: !Ref Instance
+  PublicIp:
+    Value: !Ref ElasticIp
+  InstanceRoleArn:
+    Description: Matched by ARN in the events bucket policy (SensorRoleName there).
+    Value: !GetAtt InstanceRole.Arn
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  HostLogGroupName:
+    Value: !Ref HostLogGroup
+  TrailArn:
+    Condition: TrailOn
+    Value: !GetAtt AuditTrail.Arn

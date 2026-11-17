@@ -7,7 +7,7 @@ Runs only in the agents process (front-ends never connect out), off by default::
     bucket = example-honeypot-events
     prefix = events/
     #region = us-east-1
-    #bucket_owner = 111122223333
+    #bucket_owner = 123456789012
     source = aws.honeypot
     layout = wrapped        ; wrapped | flat
     passwords = hash        ; hash | clear | drop
@@ -427,8 +427,14 @@ def run_ship(settings: ShipSettings, log_path, state_dir, *, seed: Optional[str]
     if not settings.enabled:
         return {"status": "disabled"}
     state_dir = Path(state_dir)
-    if not log_path or not os.path.exists(log_path):
-        return {"error": f"log not found: {log_path}"}
+    from agents.runtime import event_log_state
+
+    log_state, log_error = event_log_state(log_path)
+    if log_state == "missing":
+        log.info("no event log yet at %s; nothing to export", log_path)
+        return {"status": "no_log", "objects": 0, "more_pending": False}
+    if log_error:
+        return {"error": log_error}
     key = None
     if settings.passwords == "hash":
         if not seed:

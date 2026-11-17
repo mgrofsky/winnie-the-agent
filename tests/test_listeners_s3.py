@@ -4,6 +4,7 @@ user's AWS configuration."""
 
 import asyncio
 import hashlib
+import http.client
 import os
 import socket
 import threading
@@ -15,7 +16,7 @@ import boto3
 import pytest
 from botocore import UNSIGNED
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from agents import ship
 from listeners import s3
@@ -419,15 +420,14 @@ def test_large_object_download_is_capped(server):
     url = signer.generate_presigned_url("get_object", Params={
         "Bucket": "nw-call-recordings", "Key": "archive/full-2026-10.tar.gz"}, ExpiresIn=300)
     got = 0
-    with pytest.raises(Exception):
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        assert resp.headers["Content-Length"] == "50000000"
+        try:
+            while chunk := resp.read(65536):
                 got += len(chunk)
-            if got < 50_000_000:
-                raise IOError("short read")
+        except http.client.IncompleteRead as exc:   # depends on where the close lands
+            got += len(exc.partial)
+    assert got == s3.DEFAULT_GET_MAX
     ev = server.commands("GetObject")[-1]["data"]
     assert ev["truncated"] is True and ev["bytes_out"] == s3.DEFAULT_GET_MAX
 
@@ -633,8 +633,12 @@ def test_put_over_the_cap_is_truncated_like_ftp(tmp_path):
     srv = Server(make_ctx(tmp_path, quarantine_max_file_bytes=65_536))
     try:
         data = os.urandom(200_000)
-        with pytest.raises(Exception):
+        # The trap answers RequestTimeout and closes; a client still sending may see the
+        # close first.
+        with pytest.raises((ClientError, BotoCoreError)) as caught:
             srv.client().put_object(Bucket="nw-config-backup", Key="big.bin", Body=data)
+        if isinstance(caught.value, ClientError):
+            assert error_code(caught.value) == "RequestTimeout"
         files = _quarantined(srv.ctx)
         assert len(files) == 1 and files[0].read_bytes() == data[:65_536]
         ev = srv.commands("PutObject")[-1]["data"]

@@ -141,3 +141,16 @@ def test_no_public_ip_addresses_outside_documentation_ranges():
             if ip.is_global and not ip.is_multicast and m.group(0) not in KNOWN_PUBLIC_ADDRESSES:
                 hits.append(f"{path.relative_to(ROOT)}: {m.group(0)}")
     assert hits == []
+
+
+# AWS documentation account ids; any other 12-digit run could be a real account.
+DOCUMENTATION_ACCOUNT_IDS = {"000000000000", "123456789012"}
+
+
+def test_no_aws_account_ids_outside_documentation_examples():
+    hits = []
+    for path in source_files():
+        for m in re.finditer(r"(?<![0-9A-Za-z])[0-9]{12}(?![0-9A-Za-z])", _text(path)):
+            if m.group(0) not in DOCUMENTATION_ACCOUNT_IDS:
+                hits.append(f"{path.relative_to(ROOT)}: {m.group(0)}")
+    assert hits == []

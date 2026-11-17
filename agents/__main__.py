@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 from configparser import ConfigParser, Error as ConfigParserError
 from pathlib import Path
@@ -229,15 +228,26 @@ def _run(argv=None) -> dict:
     def locked(fn) -> dict:
         """One writing run at a time: a second one exits with an error instead of
         interleaving read-modify-write updates of records, cursors and state."""
+        import contextlib
+
         from agents.respond import RunLocked, run_lock
 
-        try:
-            with run_lock(state):
-                return fn()
-        except RunLocked as exc:
-            log.error("%s", exc)
-            results["run_lock"] = {"error": str(exc)}
-            return results
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(run_lock(state))
+            except RunLocked as exc:
+                log.error("%s", exc)
+                results["run_lock"] = {"error": str(exc)}
+                return results
+            except OSError as exc:
+                # e.g. the default state directory on a read-only root filesystem
+                msg = (f"cannot create or write the state directory {state} "
+                       f"({exc.strerror or type(exc).__name__}); pass --state-dir with a "
+                       "writable directory")
+                log.error("%s", msg)
+                results["run_lock"] = {"error": msg}
+                return results
+            return fn()
 
     if args.command == "tune" and (args.history or args.rollback is not None):
         from agents.tuner import history, rollback
@@ -273,9 +283,15 @@ def _run(argv=None) -> dict:
                 log.error("%s failed: %s", name, results[name]["error"])
 
         if args.command in ("triage", "run-all"):
-            if not log_path or not os.path.exists(log_path):
-                results["triage"] = {"error": f"log not found: {log_path}"}
-                log.error("log not found: %s", log_path)
+            log_state, log_error = runtime.event_log_state(log_path)
+            if log_state == "missing":
+                # A new sensor: nothing has been logged yet.
+                results["triage"] = {"status": "no_log",
+                                     "note": f"no event log yet at {log_path}"}
+                log.info("no event log yet at %s; nothing to triage", log_path)
+            elif log_error:
+                results["triage"] = {"error": log_error}
+                log.error("%s", log_error)
             else:
                 from agents.triage import run_triage
 

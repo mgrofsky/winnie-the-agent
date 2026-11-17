@@ -376,7 +376,7 @@ size_alarm_mb = 500
 #prefix = events/
 # Optional: the bucket's region, and the bucket owner's account id (ExpectedBucketOwner).
 #region = us-east-1
-#bucket_owner = 111122223333
+#bucket_owner = 123456789012
 #source = aws.honeypot
 # layout: wrapped ({"source": ..., "detail": event} per line) | flat (the event itself)
 #layout = wrapped

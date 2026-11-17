@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import secrets
+import stat
 from configparser import ConfigParser
 from pathlib import Path
 from typing import Optional
@@ -105,3 +106,24 @@ def sensor_seed(config: Optional[ConfigParser], directory: os.PathLike | str,
     if explicit and explicit.strip():
         return explicit.strip()
     return load_or_create_seed(directory, create=create)
+
+
+def event_log_state(path: Optional[os.PathLike | str]) -> tuple[str, Optional[str]]:
+    """``("ok", None)``; ``("missing", None)`` when the configured log does not exist yet,
+    the normal state of a sensor that has not logged an event; or ``("error", message)``
+    when no log is configured or the path cannot be read (permission denied, a directory)."""
+    if not path:
+        return "error", "no event log configured ([honeypot] log_file or --log)"
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return "missing", None
+    except PermissionError:
+        return "error", f"event log not readable (permission denied): {path}"
+    except OSError as exc:
+        return "error", f"event log not readable ({exc.strerror or type(exc).__name__}): {path}"
+    if stat.S_ISDIR(st.st_mode):
+        return "error", f"event log path is a directory: {path}"
+    if not os.access(path, os.R_OK):
+        return "error", f"event log not readable (permission denied): {path}"
+    return "ok", None

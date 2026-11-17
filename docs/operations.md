@@ -145,6 +145,10 @@ layout serves no external traffic and is for testing only.
 
 ## Egress control in production
 
+[deploy/aws/README.md](../deploy/aws/README.md) applies everything in this section on AWS:
+a host with no internet route, the `DOCKER-USER` rules below, IMDSv2 with a hop limit of
+1, and the export run by its own container on the host network.
+
 The front-ends need no outbound access except the persona model API, if you use one.
 Enforce that at the host firewall. Docker evaluates the `DOCKER-USER` chain for forwarded
 container traffic before its own rules, so a rule there that drops new outbound connections
@@ -243,7 +247,7 @@ enabled = true
 bucket = example-honeypot-events
 prefix = events/                 ; default events/
 region = us-east-1               ; optional; set it to the bucket's region
-#bucket_owner = 111122223333     ; optional; sent as ExpectedBucketOwner
+#bucket_owner = 123456789012     ; optional; sent as ExpectedBucketOwner
 source = aws.honeypot            ; default aws.honeypot
 layout = wrapped                 ; wrapped (default) or flat
 passwords = hash                 ; hash (default), clear or drop
@@ -305,14 +309,14 @@ the account id, role and bucket names:
     {
       "Sid": "SensorWritesEventsOnly",
       "Effect": "Allow",
-      "Principal": {"AWS": "arn:aws:iam::111122223333:role/example-honeypot-agents"},
+      "Principal": {"AWS": "arn:aws:iam::123456789012:role/example-honeypot-agents"},
       "Action": "s3:PutObject",
       "Resource": "arn:aws:s3:::example-honeypot-events/events/*"
     },
     {
       "Sid": "SensorReadsNothing",
       "Effect": "Deny",
-      "Principal": {"AWS": "arn:aws:iam::111122223333:role/example-honeypot-agents"},
+      "Principal": {"AWS": "arn:aws:iam::123456789012:role/example-honeypot-agents"},
       "Action": ["s3:GetObject", "s3:ListBucket", "s3:DeleteObject", "s3:PutObjectAcl"],
       "Resource": ["arn:aws:s3:::example-honeypot-events",
                    "arn:aws:s3:::example-honeypot-events/*"]

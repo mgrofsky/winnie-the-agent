@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Write-only events bucket for a Winnie the Agent sensor. Deploy it in a separate account
+  from the sensor, in the sensor's region, before sensor.yaml. The sensor's instance role
+  may only PutObject under the events prefix; nothing in the sensor account can read, list
+  or delete. An optional account trail of the sensor account delivers under cloudtrail/.
+
+# Every principal here is the sensor account (which always exists) or the CloudTrail
+# service principal, so S3 accepts the policy before the sensor role or the trail exist.
+# The role and the trail are named in conditions only, by ARN, so a role recreated with the
+# same name still matches.
+#
+# The deny statements cover every principal in the sensor account. Never deploy this stack
+# in the sensor account itself: it would deny that account's administrators too.
+
+Parameters:
+  BucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: Globally unique bucket name, for example example-winnie-events.
+  SensorAccountId:
+    Type: String
+    AllowedPattern: '^\d{12}$'
+    Description: Account that runs sensor.yaml.
+  SensorRoleName:
+    Type: String
+    Default: winnie-sensor-host
+    AllowedPattern: '^[A-Za-z0-9+=,.@_-]{1,64}$'
+    Description: RoleName of the instance role in sensor.yaml (NamePrefix followed by -host).
+  EventsPrefix:
+    Type: String
+    Default: events
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{0,30}$'
+    Description: Key prefix (without slash) the sensor writes under.
+  TrailEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Allow the sensor account's trail (TrailEnabled in sensor.yaml) to deliver here.
+  TrailName:
+    Type: String
+    Default: winnie-sensor-trail
+    AllowedPattern: '^[A-Za-z0-9._-]{3,128}$'
+    Description: Trail name in sensor.yaml (NamePrefix followed by -trail).
+  ExpirationDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+  TrailExpirationDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+
+Conditions:
+  TrailOn: !Equals [!Ref TrailEnabled, "true"]
+
+Resources:
+  EventsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-events
+            Status: Enabled
+            Prefix: !Sub ${EventsPrefix}/
+            ExpirationInDays: !Ref ExpirationDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref ExpirationDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: expire-cloudtrail
+            Status: Enabled
+            Prefix: cloudtrail/
+            ExpirationInDays: !Ref TrailExpirationDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref TrailExpirationDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  EventsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EventsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SensorRolePutEventsOnly
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${SensorAccountId}:root
+            Action: s3:PutObject
+            Resource: !Sub ${EventsBucket.Arn}/${EventsPrefix}/*
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn: !Sub arn:${AWS::Partition}:iam::${SensorAccountId}:role/${SensorRoleName}
+          # Nothing in the sensor account can read, list or delete, and nothing there can
+          # write outside the events prefix. CloudTrail delivers as its service principal,
+          # which these statements do not match.
+          - Sid: DenySensorAccountEverythingElse
+            Effect: Deny
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${SensorAccountId}:root
+            NotAction: s3:PutObject
+            Resource:
+              - !GetAtt EventsBucket.Arn
+              - !Sub ${EventsBucket.Arn}/*
+          - Sid: DenySensorAccountPutOutsideEvents
+            Effect: Deny
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${SensorAccountId}:root
+            Action: s3:PutObject
+            NotResource: !Sub ${EventsBucket.Arn}/${EventsPrefix}/*
+          - !If
+            - TrailOn
+            - Sid: CloudTrailAclCheck
+              Effect: Allow
+              Principal:
+                Service: cloudtrail.amazonaws.com
+              Action: s3:GetBucketAcl
+              Resource: !GetAtt EventsBucket.Arn
+              Condition:
+                StringEquals:
+                  aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${SensorAccountId}:trail/${TrailName}
+            - !Ref AWS::NoValue
+          - !If
+            - TrailOn
+            - Sid: CloudTrailWrite
+              Effect: Allow
+              Principal:
+                Service: cloudtrail.amazonaws.com
+              Action: s3:PutObject
+              Resource: !Sub ${EventsBucket.Arn}/cloudtrail/AWSLogs/${SensorAccountId}/*
+              Condition:
+                StringEquals:
+                  s3:x-amz-acl: bucket-owner-full-control
+                  aws:SourceArn: !Sub arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${SensorAccountId}:trail/${TrailName}
+            - !Ref AWS::NoValue
+          - Sid: DenyNonTls
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt EventsBucket.Arn
+              - !Sub ${EventsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  BucketName:
+    Value: !Ref EventsBucket
+  BucketArn:
+    Value: !GetAtt EventsBucket.Arn
+  BucketOwner:
+    Description: Pass as EventsBucketOwner to sensor.yaml.
+    Value: !Ref AWS::AccountId

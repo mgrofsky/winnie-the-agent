@@ -44,11 +44,71 @@ def test_run_all_without_model_and_dry_run(tmp_path, monkeypatch):
     assert list((tmp_path / "reports" / "daily").glob("*.md"))
 
 
-def test_missing_log_is_an_error(tmp_path):
+def test_missing_log_on_a_new_sensor_is_nothing_to_do(tmp_path, caplog):
     cfg = tmp_path / "config.ini"
     cfg.write_text("[honeypot]\nlog_file = nope.jsonl\n")
-    assert cli.main(["triage", "--config", str(cfg), "--no-llm",
-                     "--reports-dir", str(tmp_path / "r")]) == 2
+    args = ["--config", str(cfg), "--no-llm", "--reports-dir", str(tmp_path / "r"),
+            "--detections-dir", str(tmp_path / "det"), "--data-dir", str(tmp_path / "data"),
+            "--overlay", str(tmp_path / "overlay.json")]
+    with caplog.at_level("INFO"):
+        assert cli.main(["triage", *args]) == 0
+        summary = cli.run(["run-all", *args])
+    assert "error" not in summary["triage"] and summary["triage"]["status"] == "no_log"
+    assert summary["log_rotation"] == {"safe": True, "pending": []}
+    assert any("no event log yet" in r.getMessage() and r.levelname == "INFO"
+               for r in caplog.records)
+    assert not any(r.levelname in ("WARNING", "ERROR") for r in caplog.records)
+
+
+def test_unreadable_log_is_still_an_error(tmp_path):
+    (tmp_path / "logdir").mkdir()
+    cfg = tmp_path / "config.ini"
+    cfg.write_text("[honeypot]\nlog_file = logdir\n")
+    args = ["triage", "--config", str(cfg), "--no-llm", "--reports-dir", str(tmp_path / "r")]
+    assert cli.main(args) == 2
+    assert "is a directory" in cli.run(args)["triage"]["error"]
+
+
+def test_log_permission_denied_is_an_error(tmp_path):
+    import os
+
+    import pytest
+
+    if os.geteuid() == 0:
+        pytest.skip("root reads any file")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "log.jsonl").write_text("{}\n")
+    locked.chmod(0o000)
+    try:
+        cfg = tmp_path / "config.ini"
+        cfg.write_text(f"[honeypot]\nlog_file = {locked / 'log.jsonl'}\n")
+        summary = cli.run(["triage", "--config", str(cfg), "--no-llm",
+                           "--reports-dir", str(tmp_path / "r")])
+        assert "permission denied" in summary["triage"]["error"]
+    finally:
+        locked.chmod(0o700)
+
+
+def test_unwritable_state_dir_is_one_clear_error(tmp_path, monkeypatch, caplog, capsys):
+    args = _setup(tmp_path, monkeypatch)
+    blocked = tmp_path / "ro"
+    blocked.mkdir()
+    blocked.chmod(0o500)
+    try:
+        state = blocked / "state"
+        for command in ("ship", "run-all", "respond", "triage"):
+            caplog.clear()
+            with caplog.at_level("ERROR"):
+                assert cli.main([command, *args, "--state-dir", str(state)]) != 0, command
+            out = json.loads(capsys.readouterr().err)
+            assert set(out) == {"run_lock"}, command
+            msg = out["run_lock"]["error"]
+            assert str(state) in msg and "--state-dir" in msg
+            errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+            assert errors == [msg] and "Traceback" not in msg
+    finally:
+        blocked.chmod(0o700)
 
 
 def test_one_failing_stage_does_not_stop_the_others(tmp_path, monkeypatch):
