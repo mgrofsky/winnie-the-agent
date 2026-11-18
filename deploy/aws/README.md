@@ -240,6 +240,12 @@ forward reaches it, and that `ss -tlnp` and `iptables -t nat -S DOCKER` show not
 8480 beyond 127.0.0.1. If `S3Port` is ever set to 8480, the trap and the console collide;
 pick another port.
 
+The console can also sit behind an HTTPS proxy on the instance and be reached over a
+private mesh VPN; see
+[Reaching it over a private network](../../docs/operations.md#reaching-it-over-a-private-network).
+This template does not set that up: it installs no VPN agent, opens no egress for one and
+writes no `external_host`. SSM stays the supported way in on AWS.
+
 ## Stop and rollback
 
 - **Fast stop:** redeploy with `InboundEnabled=false`. Every inbound rule is removed; the

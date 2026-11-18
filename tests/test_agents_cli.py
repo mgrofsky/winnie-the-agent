@@ -1,6 +1,7 @@
 import datetime
 import json
 
+import pytest
 from agent_fakes import ssh_session, trap_event, write_log
 
 import agents.__main__ as cli
@@ -307,6 +308,40 @@ def test_ui_logs_the_sign_in_link_exactly_once(tmp_path, monkeypatch, caplog):
     links = [r for r in caplog.records if "t" * 40 in r.getMessage()]
     assert len(links) == 1 and links[0].name == "agents.ui" and links[0].levelname == "INFO"
     assert "sign in at http://127.0.0.1:" in links[0].getMessage()
+
+
+def test_ui_external_host_from_config_and_the_flag_wins(tmp_path, monkeypatch):
+    args = _ui_setup(tmp_path, monkeypatch, "[ui]\nexternal_host = cfg.example-tailnet.ts.net\n")
+    seen = _capture_serve(monkeypatch)
+    cli.run(["ui", *args])
+    assert seen["settings"].external_host == "cfg.example-tailnet.ts.net"
+    cli.run(["ui", "--external-host", "flag.example-tailnet.ts.net", *args])
+    assert seen["settings"].external_host == "flag.example-tailnet.ts.net"
+    cli.run(["ui", "--external-host", "", *args])  # an empty flag turns it off
+    assert seen["settings"].external_host == ""
+    args = _ui_setup(tmp_path, monkeypatch)
+    cli.run(["ui", *args])
+    assert seen["settings"].external_host == ""
+
+
+@pytest.mark.parametrize("value", ["localhost", "198.51.100.7", "https://sensor.example.net",
+                                   "sensor.example.net/", "*.example.net", "sensor.example.net.",
+                                   "sensor.example.net:0", "sensor"])
+def test_ui_refuses_to_start_on_a_bad_external_host(tmp_path, monkeypatch, value):
+    args = _ui_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("WINNIE_UI_TOKEN", "t" * 40)
+    result = cli.run(["ui", "--port", "0", "--external-host", value, *args])
+    assert "external_host" in result["ui"]["error"] and "t" * 40 not in result["ui"]["error"]
+    args = _ui_setup(tmp_path, monkeypatch, f"[ui]\nexternal_host = {value}\n")
+    monkeypatch.setenv("WINNIE_UI_TOKEN", "t" * 40)
+    assert "external_host" in cli.run(["ui", "--port", "0", *args])["ui"]["error"]
+    assert cli.main(["ui", "--port", "0", *args]) == 2
+
+
+def test_ui_external_host_does_not_relax_the_bind_guard(tmp_path, monkeypatch):
+    args = _ui_setup(tmp_path, monkeypatch, "[ui]\nexternal_host = sensor.example.net\n")
+    result = cli.run(["ui", "--bind", "0.0.0.0", "--port", "0", *args])
+    assert "non-loopback" in result["ui"]["error"]
 
 
 def test_ui_refuses_bad_settings_with_an_error(tmp_path, monkeypatch):

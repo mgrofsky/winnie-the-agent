@@ -12,8 +12,9 @@ Directories:
 runs it as its last step.
 
 ``ui`` serves the operator console on loopback (``[ui]``; ``--bind``, ``--port``,
-``--actions``, ``--by``). It reads the same directories, takes no run lock and never calls
-a model. The sign-in token comes from ``WINNIE_UI_TOKEN`` or is generated at start.
+``--actions``, ``--by``, ``--external-host``). It reads the same directories, takes no run
+lock and never calls a model. The sign-in token comes from ``WINNIE_UI_TOKEN`` or is
+generated at start.
 """
 
 from __future__ import annotations
@@ -103,7 +104,10 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
             in ("1", "true", "yes", "on"),
             operator=operator,
             allow_non_loopback=args.allow_non_loopback,
-            token=os.environ.get(UI_TOKEN_ENV, ""))
+            token=os.environ.get(UI_TOKEN_ENV, ""),
+            # Validated by build_server; an empty --external-host turns the config value off.
+            external_host=args.external_host if args.external_host is not None
+            else str(ui_cfg.get("external_host", "")).strip())
         analyst_cap = int(agents_cfg.get("max_analyst_calls_per_day", 500))
     except ValueError:
         return {"error": "[ui] port or [agents] max_analyst_calls_per_day is not a number"}
@@ -133,8 +137,8 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     try:
         serve(settings, api)
     except (ValueError, OSError) as exc:
-        # build_server refuses a non-loopback bind, a bad port or a short token; the
-        # message names only settings, never the token.
+        # build_server refuses a non-loopback bind, a bad port, a bad external name or a
+        # short token; the message names only settings, never the token.
         reason = getattr(exc, "strerror", None) or type(exc).__name__
         msg = str(exc)[:300] if isinstance(exc, ValueError) else \
             f"cannot listen on {settings.bind}:{settings.port} ({reason})"
@@ -180,6 +184,9 @@ def _run(argv=None) -> dict:
     parser.add_argument("--allow-non-loopback", action="store_true",
                         help="ui: allow a non-loopback bind (only inside a container whose port "
                              "is published on loopback)")
+    parser.add_argument("--external-host", default=None, metavar="NAME",
+                        help="ui: also accept this HTTPS name, served by a reverse proxy on the "
+                             "same host (default [ui] external_host, none)")
     parser.add_argument("--list", action="store_true", help="playbooks: list them")
     parser.add_argument("--validate", action="store_true", help="playbooks: validate all files")
     parser.add_argument("--all", action="store_true", help="queue: include decided/expired items")

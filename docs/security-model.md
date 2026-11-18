@@ -227,6 +227,27 @@ be internal (Docker does not publish ports from internal networks), so what limi
 container's egress is what it holds: no model key, no AWS settings, no connector secrets,
 read-only data.
 
+**Optional external name, behind a same-host proxy.** With `[ui] external_host` (or
+`--external-host`) set, the console also answers to that one HTTPS name, served by a
+TLS-terminating reverse proxy on the same host that forwards to the loopback port (see
+[operations.md](operations.md#reaching-it-over-a-private-network)). It still binds
+loopback, and the bind guard is unchanged. What changes:
+
+- Who can reach the console is then decided by the VPN's access rules, not by host
+  access. Allow only the operator's devices, to that one port, and nothing initiated from
+  the sensor towards them.
+- The token and session checks are unchanged. Under the external name a POST needs an
+  `https://` `Origin` equal to that name, the cookie is `Secure`, and responses carry
+  HSTS. A session is bound to the kind of name it was issued under (loopback or external),
+  so a cookie from one is refused on the other.
+- The console never reads `X-Forwarded-*`, `Forwarded` or identity headers. It cannot tell
+  a proxied request from a direct one, so nothing the proxy adds can sign anyone in or
+  change a check.
+- A name a public CA issues a certificate for appears in certificate transparency logs.
+  Give the node a neutral name that does not say it is a sensor or a honeypot.
+- This is for a private network. A public reverse proxy or tunnel would put the sign-in
+  page on the internet with only the token in front of it; do not use one.
+
 **Sign-in and request checks** (`agents/ui/server.py`):
 
 - At start the server logs one sign-in link with a random token (or uses
@@ -270,7 +291,9 @@ one. It never displays configuration or secrets. It cannot roll back the tuner (
 
 **Host access is the control.** Anyone who can reach the loopback port and read the
 container log (or knows `WINNIE_UI_TOKEN`) can use the console, and with actions on can
-approve a block. Restrict shell, Docker and SSM access on the host accordingly.
+approve a block. Restrict shell, Docker and SSM access on the host accordingly. With an
+external name set, add the VPN's access rules to that list: anyone they let reach the
+proxy needs only the token.
 
 ## Fingerprinting
 
@@ -349,4 +372,5 @@ bundled one. The bundled scenarios are examples.
 - The captured data contains real-looking and sometimes real credentials. Protecting it is
   the operator's job.
 - The operator console trusts anyone who can reach its loopback port and read its log.
-  Host access is the only control in front of it.
+  Host access is the only control in front of it. With `external_host` set, the VPN's
+  access rules and the token are.
