@@ -336,7 +336,7 @@ class DailyCallCounter:
             if isinstance(data, dict) and data.get("day") == today and \
                     isinstance(data.get("calls"), int) and data["calls"] >= 0:
                 calls = data["calls"]
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             pass
         return {"day": today, "calls": calls, "limit": self.limit}
 

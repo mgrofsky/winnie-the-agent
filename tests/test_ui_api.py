@@ -107,9 +107,10 @@ def test_clean_text_removes_controls_and_bidi_but_keeps_markup_newlines_and_tabs
 
 
 def test_scrub_walks_everything_keys_included():
-    out = scrub({"k\x1b": ["‮x", ("t", 1, 2.5, math.nan, None, True)],
+    out = scrub({"k": ["‮x", ("t", 1, 2.5, math.nan, None, True)], "k\x1b": "dropped",
                  "long": LongText("z" * 300_000), "short": "z" * 300_000, "obj": object()})
     assert out["k"] == ["x", ["t", 1, 2.5, None, None, True]]
+    assert "k\x1b" not in out and "dropped" not in out.values()
     assert len(out["long"]) == api_mod.LONG_TEXT_CAP and len(out["short"]) == api_mod.TEXT_CAP
     assert isinstance(out["obj"], str)
     deep = current = []
@@ -307,9 +308,15 @@ def test_queue_pending_with_view_hash(api, tree):
     item = body["items"][0]
     assert item["approval"]["id"] == tree.ids["pending"]
     on_disk = json.loads((tree.state / "approvals" / f"{tree.ids['pending']}.json").read_text())
-    canonical = json.dumps(on_disk, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    # The hash covers the raw file, the served approval and the served record summary.
+    canonical = json.dumps({"raw": on_disk, "approval": item["approval"],
+                            "record": item["record"], "files": {}},
+                           sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     assert item["view_hash"] == hashlib.sha256(canonical.encode()).hexdigest() \
-        == view_hash(on_disk)
+        == view_hash(on_disk, item["approval"], item["record"]) \
+        == api.view_of(tree.ids["pending"]).digest
+    assert item["id"] == tree.ids["pending"] and item["can_decide_here"] is True
+    assert item["undecidable_reason"] is None
     assert item["record"]["id"] == tree.ids["redis"]
     assert SCRIPT in item["approval"]["summary"]
 

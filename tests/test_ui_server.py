@@ -7,7 +7,9 @@ import json
 import logging
 import re
 import secrets
+import socket
 import threading
+import time
 import urllib.parse
 from dataclasses import dataclass
 
@@ -288,20 +290,46 @@ def test_post_requires_local_origin(active):
         resp = active.post("/api/decide", {"id": "x"}, Origin=origin)
         assert resp.status == 403, origin
         assert_hardened(resp)
-    assert active.post("/api/decide", {}, Origin=f"http://localhost:{active.port}").status == 201
+    assert active.post("/api/decide", {}, Origin=active.origin.upper()).status == 201
+    assert len(active.routes.posts) == 1
+
+
+def test_origin_must_equal_host(active):
+    port = active.port
+    for origin in (f"http://localhost:{port}", f"http://[::1]:{port}",
+                   f"http://127.0.0.1:{port + 1 if port < 65535 else port - 1}",
+                   "http://127.0.0.1", f"http://127.0.0.1:0{port}"):
+        resp = active.post("/api/decide", {}, Origin=origin)
+        assert resp.status == 403 and resp.json() == {"error": "origin not allowed"}, origin
+    assert active.routes.posts == []
+    # The same check with the browser on the localhost name: Host and Origin agree.
+    host = f"localhost:{port}"
+    headers = {"Origin": f"http://{host}", "X-Winnie-CSRF": active.csrf(),
+               "Content-Type": "application/json"}
+    assert active.request("POST", "/api/decide", headers=headers, body=b"{}",
+                          host=host).status == 201
+    headers["Origin"] = active.origin
+    assert active.request("POST", "/api/decide", headers=headers, body=b"{}",
+                          host=host).status == 403
     assert len(active.routes.posts) == 1
 
 
 # ---- sign-in ---------------------------------------------------------------------------------
 
-def test_sign_in_sets_derived_cookie_and_redirects(start):
+def test_sign_in_sets_session_cookie_and_redirects(start):
     c = start()
+    c.srv.wall_clock = lambda: 1_700_000_000.5
     resp = c.sign_in()
     assert resp.header("Location") == "/"
     cookie = resp.header("Set-Cookie")
-    expected = hmac.new(c.srv.token.encode(), b"winnie-ui session v1", hashlib.sha256).hexdigest()
-    assert cookie == f"winnie_ui={expected}; HttpOnly; SameSite=Strict; Path=/"
-    assert "Secure" not in cookie and c.srv.token not in cookie
+    value = cookie.split(";")[0].split("=", 1)[1]
+    issued, mac = value.split(".")
+    assert issued == "1700000000" and re.fullmatch(r"[0-9a-f]{64}", mac)
+    assert cookie == f"winnie_ui={value}; HttpOnly; SameSite=Strict; Path=/"
+    assert "Secure" not in cookie and "Max-Age" not in cookie and c.srv.token not in cookie
+    # Not derivable from the token: the old token-only derivation does not match.
+    for label in (b"winnie-ui session v1", b"winnie-ui session v2 1700000000"):
+        assert mac != hmac.new(c.srv.token.encode(), label, hashlib.sha256).hexdigest()
     page = c.request("GET", "/")
     assert page.status == 200 and page.header("Content-Type") == "text/html; charset=utf-8"
     assert page.body == (STATIC_DIR / "index.html").read_bytes()
@@ -315,7 +343,7 @@ def test_wrong_token_is_403_without_cookie(start):
         assert resp.header("Set-Cookie") is None
 
 
-def test_token_attempts_throttled_globally(start):
+def test_failed_token_attempts_throttled_globally(start):
     c = start()
     now = [1000.0]
     c.srv.clock = lambda: now[0]
@@ -323,9 +351,95 @@ def test_token_attempts_throttled_globally(start):
         assert c.request("GET", "/?token=wrong").status == 403
     assert c.request("GET", "/?token=wrong").status == 429
     good = "/?token=" + urllib.parse.quote(c.srv.token, safe="")
-    assert c.request("GET", good).status == 429  # even the right token waits
+    assert c.request("GET", good).status == 303  # a correct token is never held back
+    assert c.request("GET", "/?token=wrong").status == 429
     now[0] += ui.THROTTLE_WINDOW + 1
-    assert c.request("GET", good).status == 303
+    assert c.request("GET", "/?token=wrong").status == 403
+
+
+def test_correct_token_signs_in_after_many_failures(start):
+    c = start()
+    c.srv.clock = lambda: 5.0  # every failure inside one window
+    statuses = {c.request("GET", "/?token=" + "w" * 40).status for _ in range(50)}
+    assert statuses == {403, 429}
+    resp = c.sign_in()
+    assert resp.status == 303
+    assert c.request("GET", "/api/session").status == 200
+
+
+# ---- session lifetime and binding ------------------------------------------------------------
+
+def test_session_rejected_after_restart_with_the_same_token(start):
+    token = secrets.token_urlsafe(32)
+    first = start(token=token)
+    first.sign_in()
+    assert first.request("GET", "/api/session").status == 200
+    second = start(token=token)
+    second.cookie = first.cookie
+    resp = second.request("GET", "/api/session")
+    assert resp.status == 401 and resp.json() == {"error": "not signed in"}
+    assert second.request("GET", "/").status == 401
+    second.sign_in()  # the same token still works as a sign-in link
+    assert second.cookie != first.cookie
+    assert second.request("GET", "/api/session").status == 200
+
+
+def test_session_expires_after_its_lifetime(start):
+    c = start(actions=True)
+    now = [1_800_000_000.0]
+    c.srv.wall_clock = lambda: now[0]
+    c.sign_in()
+    csrf = c.csrf()
+    now[0] += ui.SESSION_LIFETIME - 1
+    assert c.request("GET", "/api/session").status == 200
+    now[0] += 1
+    assert c.request("GET", "/api/session").status == 401
+    assert c.request("GET", "/static/app.js").status == 401
+    headers = {"Origin": c.origin, "X-Winnie-CSRF": csrf, "Content-Type": "application/json"}
+    assert c.request("POST", "/api/decide", headers=headers, body=b"{}").status == 401
+    assert c.routes.posts == []
+    c.sign_in()  # the token link is reusable after expiry
+    assert c.request("GET", "/api/session").status == 200
+
+
+def test_tampered_or_future_issue_time_rejected(start):
+    c = start()
+    now = [1_800_000_000.0]
+    c.srv.wall_clock = lambda: now[0]
+    c.sign_in()
+    good = c.cookie
+    issued, mac = good.split(".")
+    for forged in (f"{int(issued) + 3600}.{mac}", f"{int(issued) - 1}.{mac}", f"0{issued}.{mac}",
+                   f"{issued}.{mac[:-1]}", f"{issued}.{mac.upper()}", f"{issued}{mac}",
+                   f"{issued}.{mac}.1", mac, issued):
+        c.cookie = forged
+        assert c.request("GET", "/api/session").status == 401, forged
+    # A genuine value issued "later" than now (clock went back) is refused too.
+    c.cookie = good
+    now[0] -= 10
+    assert c.request("GET", "/api/session").status == 401
+    now[0] += 10
+    assert c.request("GET", "/api/session").status == 200
+
+
+def test_csrf_is_bound_to_its_session(start):
+    c = start(actions=True)
+    now = [1_800_000_000.0]
+    c.srv.wall_clock = lambda: now[0]
+    c.sign_in()
+    first_cookie, first_csrf = c.cookie, c.csrf()
+    now[0] += 5
+    c.sign_in()
+    second_csrf = c.csrf()
+    assert c.cookie != first_cookie and second_csrf != first_csrf
+    resp = c.post("/api/decide", {}, **{"X-Winnie-CSRF": first_csrf})
+    assert resp.status == 403 and resp.json() == {"error": "bad csrf token"}
+    assert c.routes.posts == []
+    assert c.post("/api/decide", {}, **{"X-Winnie-CSRF": second_csrf}).status == 201
+    c.cookie = first_cookie
+    assert c.post("/api/decide", {}, **{"X-Winnie-CSRF": second_csrf}).status == 403
+    assert c.post("/api/decide", {}, **{"X-Winnie-CSRF": first_csrf}).status == 201
+    assert len(c.routes.posts) == 2
 
 
 def test_signed_out_root_page_has_no_form_or_script(start):
@@ -354,9 +468,10 @@ def test_cookie_required_for_static_and_api(start, path):
 def test_session_endpoint(active):
     data = active.request("GET", "/api/session").json()
     assert data == {"csrf": data["csrf"], "actions": True, "operator": "night shift"}
-    expected = hmac.new(active.srv.token.encode(), b"winnie-ui csrf v1", hashlib.sha256)
-    assert data["csrf"] == expected.hexdigest()
+    assert re.fullmatch(r"[0-9a-f]{64}", data["csrf"])
+    assert data["csrf"] == active.srv.csrf_for(active.cookie)
     assert data["csrf"] not in (active.srv.token, active.cookie)
+    assert data["csrf"] not in active.cookie
     assert active.routes.gets == []  # answered by the shell
 
 
@@ -377,7 +492,7 @@ def test_token_never_leaves_the_process(start, caplog):
     c.request("POST", "/?token=" + token, headers={"Origin": c.origin}, body=b"{}")
     routes.error = RuntimeError("route exploded")
     c.request("GET", "/api/x")
-    csrf = hmac.new(token.encode(), b"winnie-ui csrf v1", hashlib.sha256).hexdigest()
+    csrf = c.srv.csrf_for(c.cookie)
     for resp in c.seen:
         blob = resp.body.decode("latin-1") + repr(resp.headers)
         assert token not in blob
@@ -503,6 +618,130 @@ def test_actions_mode_calls_routes_post(active):
 def test_post_outside_api_is_404(active):
     assert active.post("/index.html", {}).status == 404
     assert active.routes.posts == []
+
+
+# ---- slow bodies, connection cap, HTTP/0.9 ---------------------------------------------------
+
+def raw_post_head(c, length, origin=DEFAULT, csrf=None, cookie=True):
+    lines = ["POST /api/decide HTTP/1.0", f"Host: {c.host}", "Content-Type: application/json",
+             f"Content-Length: {length}"]
+    if origin is not None:
+        lines.append(f"Origin: {c.origin if origin is DEFAULT else origin}")
+    if cookie and c.cookie:
+        lines.append(f"Cookie: winnie_ui={c.cookie}")
+    if csrf:
+        lines.append(f"X-Winnie-CSRF: {csrf}")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+
+def read_all(sock) -> bytes:
+    data = b""
+    try:
+        while chunk := sock.recv(4096):
+            data += chunk
+    except ConnectionResetError:
+        pass
+    return data
+
+
+@pytest.mark.parametrize("case", ["no session", "bad origin", "bad csrf", "read-only",
+                                  "bad host"])
+def test_refused_post_answered_without_waiting_for_the_body(start, case):
+    c = start(actions=case != "read-only")
+    c.sign_in()
+    csrf = c.csrf()
+    if case == "no session":
+        head = raw_post_head(c, 4000, csrf=csrf, cookie=False)
+    elif case == "bad origin":
+        head = raw_post_head(c, 4000, origin="http://evil.example", csrf=csrf)
+    elif case == "bad csrf":
+        head = raw_post_head(c, 4000, csrf="0" * 64)
+    elif case == "bad host":
+        head = raw_post_head(c, 4000, csrf=csrf).replace(c.host.encode(), b"evil.example")
+    else:
+        head = raw_post_head(c, 4000, csrf=csrf)
+    started = time.monotonic()
+    with socket.create_connection(("127.0.0.1", c.port), timeout=2) as sock:
+        sock.sendall(head)  # the declared 4000-byte body never comes
+        data = read_all(sock)
+    assert time.monotonic() - started < 1.5
+    assert re.match(rb"HTTP/1\.0 (401|403|421) ", data), data[:80]
+    assert c.routes.posts == []
+
+
+def test_dribbled_body_cut_at_the_deadline(start):
+    c = start(actions=True)
+    c.sign_in()
+    c.srv.body_deadline = 0.4
+    body = b"{" + b" " * 98 + b"}"
+    stop = threading.Event()
+    with socket.create_connection(("127.0.0.1", c.port), timeout=3) as sock:
+        sock.sendall(raw_post_head(c, len(body), csrf=c.csrf()))
+
+        def dribble():
+            for byte in body:
+                if stop.wait(0.05):
+                    return
+                try:
+                    sock.send(bytes([byte]))
+                except OSError:
+                    return
+
+        sender = threading.Thread(target=dribble, daemon=True)
+        started = time.monotonic()
+        sender.start()
+        data = read_all(sock)
+        elapsed = time.monotonic() - started
+        stop.set()
+        sender.join(2)
+    assert data.startswith(b"HTTP/1.0 408 "), data[:80]
+    assert 0.3 < elapsed < 1.9
+    assert c.routes.posts == []
+    # A body that arrives in time is still accepted.
+    assert c.post("/api/decide", {"id": "x"}).status == 201
+
+
+def test_connection_cap(start, monkeypatch):
+    monkeypatch.setattr(ui, "MAX_CONNECTIONS", 2)
+    c = start()
+    held = [socket.create_connection(("127.0.0.1", c.port), timeout=3) for _ in range(2)]
+    try:
+        # Each held connection sends half a request line, so its thread stays busy.
+        for sock in held:
+            sock.sendall(b"GET /api/x")
+        deadline = time.monotonic() + 3
+        while True:
+            with socket.create_connection(("127.0.0.1", c.port), timeout=3) as extra:
+                data = read_all(extra)
+            if data or time.monotonic() > deadline:
+                break
+        assert data.startswith(b"HTTP/1.0 503 "), data[:80]
+        head, _, body = data.partition(b"\r\n\r\n")
+        assert json.loads(body) == {"error": "busy"}
+        assert b"Content-Security-Policy: " in head and b"X-Frame-Options: DENY" in head
+    finally:
+        for sock in held:
+            sock.close()
+    # Slots come back once the held connections end.
+    deadline = time.monotonic() + 3
+    while c.request("GET", "/api/session").status != 401:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    assert all(c.request("GET", "/api/session").status == 401 for _ in range(5))
+
+
+def test_http09_request_gets_no_bare_body(console):
+    # A two-word GET would be answered HTTP/0.9 style (a body, no status line or headers).
+    for line in (b"GET /\r\n", b"GET /api/session\r\n", b"GET /api/x\r\n"):
+        with socket.create_connection(("127.0.0.1", console.port), timeout=3) as sock:
+            sock.sendall(line)
+            assert read_all(sock) == b"", line
+    # Other unparseable lines get a normal error with a status line and headers.
+    with socket.create_connection(("127.0.0.1", console.port), timeout=3) as sock:
+        sock.sendall(b"POST /api/x\r\n")
+        data = read_all(sock)
+    assert data.startswith(b"HTTP/1.0 400 ") and b"Content-Security-Policy: " in data
+    assert console.routes.gets == []
 
 
 # ---- routes ----------------------------------------------------------------------------------

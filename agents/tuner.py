@@ -334,7 +334,7 @@ def history(state_dir: os.PathLike | str) -> list[dict]:
             data = json.loads(p.read_text(encoding="utf-8"))
             out.append({"n": int(data["n"]), "timestamp": data.get("timestamp"),
                         "action": data.get("action", "tune"), "changes": data.get("changes", [])})
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError):
             continue
     return out
 

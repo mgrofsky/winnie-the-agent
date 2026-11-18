@@ -153,6 +153,62 @@ def test_index_loads_only_the_static_table():
         assert ref in STATIC_FILES, ref
 
 
+def _function(text: str, name: str) -> str:
+    """The source of one top-level ``function name(...)`` in app.js, up to the next one."""
+    start = re.search(rf"\n  (?:async )?function {name}\(", text).start() + 1
+    nxt = re.search(r"\n  (?:async )?function \w+\(", text[start + 1:])
+    return text[start:start + 1 + nxt.start()] if nxt else text[start:]
+
+
+def test_approval_card_acts_on_the_file_id_and_only_on_decidable_items():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    card = _function(text, "approvalCard")
+    # Decisions go to the approval file's own name, checked against the id pattern, and only
+    # for items the server marked decidable whose served id is that same name.
+    assert "APPROVAL_ID_RE.test(item.id) ? item.id : null" in card
+    assert "item.can_decide_here === true && a.id === id" in card
+    assert 'decide("approve", id, viewHash, ctx)' in card
+    assert 'decide("reject", id, viewHash, ctx)' in card
+    assert "item.undecidable_reason" in card
+
+
+def test_publish_detection_names_its_files_as_the_target():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    card = _function(text, "approvalCard")
+    assert 'a.action === "publish_detection"' in card
+    # The card title, the card's rows and the confirmation rows name the files; the source
+    # is shown as context.
+    assert '[" of ", fileNames(files)' in card
+    assert '["Files", fileNames(files)], ["Source", mono(target)]' in card
+    assert '"Approve and publish "' in card and "names.join" in card
+    # File names come from the server's list and are re-checked against its pattern, and
+    # are rendered as text nodes (mono / el with text), never as attributes.
+    files = _function(text, "detectionFiles")
+    assert "DETECTION_RE.test(f.name)" in files
+    names = _function(text, "fileNames")
+    assert "mono(f.name)" in names and "attrs" not in names
+
+
+def test_confirmation_panel_label_is_fixed_text():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    panel = _function(text, "openConfirm")
+    assert '"aria-label": "Confirmation"' in panel
+    assert not re.search(r"attrs:\s*\{[^}]*opts\.", panel), "data in an attribute"
+
+
+def test_withheld_transcript_is_said_up_front():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    record = _function(text, "drawRecord")
+    assert 'typeof data.transcript_withheld === "string"' in record
+    assert record.index("transcript_withheld") < record.index("transcriptView(id)")
+    assert 'text: data.transcript_withheld' in record
+
+
+def test_capped_answers_are_flagged_on_screen():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "d.truncated === true" in _function(text, "fill")
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
 @pytest.mark.parametrize("path", JS_FILES, ids=lambda p: p.name)
 def test_js_parses(path):

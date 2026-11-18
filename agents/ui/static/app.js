@@ -385,6 +385,13 @@
       clearTimeout(timer);
       const out = draw(data);
       target.replaceChildren();
+      // The server caps list and dict sizes and drops keys with hidden characters, and says
+      // so with a top-level flag (a digest or detection uses the same flag for its text and
+      // shows its own note).
+      const d = obj(data);
+      if (d.truncated === true && typeof d.text !== "string") {
+        append(target, [el("p", { cls: "muted", text: "Part of this answer was cut at the server's size limits." })]);
+      }
       append(target, [out]);
       filled.set(target, "ok");
       return true;
@@ -537,8 +544,9 @@
     const status = el("div", { cls: "muted", attrs: { "aria-live": "polite" } });
     const go = button(opts.confirmLabel, () => run(), opts.danger ? "btn-danger-solid" : "btn-primary");
     const cancel = button("Cancel", () => close());
+    // The title can name a target, so it is text only; the group gets a fixed label.
     const panel = el("div", { cls: opts.danger ? "confirm confirm-danger" : "confirm",
-      attrs: { role: "group", "aria-label": opts.title } },
+      attrs: { role: "group", "aria-label": "Confirmation" } },
     el("div", { cls: "confirm-title", text: opts.title }),
     kv(opts.rows),
     opts.note ? el("p", { cls: "muted", text: opts.note }) : null,
@@ -1074,18 +1082,42 @@
     return [more, el("div", "cards", items.map((it) => approvalCard(obj(it), ctx)))];
   }
 
+  // The detection files a publish_detection approval names, as the server listed them
+  // (names it checked against DETECTION_FILE_RE; checked here again). Text nodes only.
+  function detectionFiles(item) {
+    return arr(item.detection_files).map((f) => obj(f))
+      .filter((f) => typeof f.name === "string" && DETECTION_RE.test(f.name));
+  }
+
+  function fileNames(files) {
+    if (!files.length) return el("span", { cls: "muted", text: "(no files listed)" });
+    return el("span", "wrap", files.map((f, i) => [i ? ", " : null, mono(f.name),
+      f.present === false ? el("span", { cls: "muted", text: " (no longer pending)" }) : null]));
+  }
+
   function approvalCard(item, ctx) {
     const a = obj(item.approval);
-    const id = typeof a.id === "string" && APPROVAL_ID_RE.test(a.id) ? a.id : null;
+    // Decisions go to the approval file's own name (item.id). The server marks an item
+    // decidable only when the id inside the file is the same and every value it acts on
+    // is shown exactly; this checks the id again.
+    const id = typeof item.id === "string" && APPROVAL_ID_RE.test(item.id) ? item.id : null;
     const record = item.record && typeof item.record === "object" ? item.record : null;
+    // publish_detection acts on files, not on the source: the files are its target, and the
+    // source is context.
+    const publish = a.action === "publish_detection";
+    const files = publish ? detectionFiles(item) : [];
 
-    const head = el("div", "card-head",
-      el("div", "card-title", mono(a.action), " on ", mono(a.subject)),
+    const head = el("div", "card-title", mono(a.action),
+      publish ? [" of ", fileNames(files), el("span", { cls: "muted", text: " from " }), mono(a.subject)]
+        : [" on ", mono(a.subject)]);
+    const headRow = el("div", "card-head", head,
       statusBadge(a.status), tierBadge(a.tier),
       a.unverified_source === true ? badge("source may be forged", "st-bad") : null);
 
     const params = obj(a.params);
-    const paramPairs = Object.keys(params).map((k) => [k, el("span", { cls: "mono wrap", text: fmtValue(params[k]) })]);
+    const paramPairs = publish
+      ? [["Files", fileNames(files)], ["Source", mono(a.subject)]]
+      : Object.keys(params).map((k) => [k, el("span", { cls: "mono wrap", text: fmtValue(params[k]) })]);
     const expires = parseTime(a.expires_at);
     const soon = expires && expires.getTime() - Date.now() < 6 * 3600000;
     const why = el("div", "stack",
@@ -1118,16 +1150,30 @@
     const body = el("div", "card-body", why,
       el("div", null, el("div", { cls: "label", text: "Triggering record" }), facts));
 
-    const foot = el("div", "card-foot", el("span", { cls: "muted", text: "Id " }), mono(a.id), el("span", "spacer"));
-    const card = el("article", "card", head, body, foot);
+    const foot = el("div", "card-foot", el("span", { cls: "muted", text: "Id " }), mono(id || a.id), el("span", "spacer"));
+    const card = el("article", "card", headRow, body, foot);
     if (id) ctx.cards.set(id, card);
 
+    if (a.status === "pending" && item.can_decide_here !== true && typeof item.undecidable_reason === "string") {
+      // Not decidable here: say why (a fixed server text) and where to decide it.
+      foot.append(el("span", { cls: "muted",
+        text: "Cannot be decided in the console: " + item.undecidable_reason + ". Check the file and use the CLI. " }));
+    }
+
     const viewHash = typeof item.view_hash === "string" ? item.view_hash : null;
-    if (ctx.actions && id && viewHash && a.status === "pending") {
+    if (ctx.actions && id && viewHash && a.status === "pending" && item.can_decide_here === true && a.id === id) {
       const target = str(a.subject);
       const action = str(a.action);
-      const rows = [["Action", mono(action)], ["Target", mono(target)], ["Approval", mono(id)],
-        ["Playbook", mono(a.playbook)]];
+      const names = files.map((f) => f.name);
+      // Built per panel: a node can sit in one panel only.
+      const rows = () => publish
+        ? [["Action", mono(action)], ["Files", fileNames(files)], ["Source", mono(target)],
+          ["Approval", mono(id)], ["Playbook", mono(a.playbook)]]
+        : [["Action", mono(action)], ["Target", mono(target)], ["Approval", mono(id)],
+          ["Playbook", mono(a.playbook)]];
+      const approveTitle = publish
+        ? "Approve and publish " + plural(names.length, "detection file", "detection files") + ": " + names.join(", ") + "?"
+        : "Approve and run " + action + " on " + target + "?";
       // Reject works for every pending item. Approve only when this process can run the
       // action (open_ticket and block_webhook need a connector the console usually lacks).
       if (item.can_approve_here !== true) {
@@ -1137,7 +1183,7 @@
       foot.append(
         button("Reject", () => openConfirm(foot, {
           title: "Reject " + id + "?",
-          rows: rows,
+          rows: rows(),
           note: "Nothing is executed. The item is closed as rejected.",
           confirmLabel: "Reject",
           danger: false,
@@ -1145,8 +1191,8 @@
         })));
       if (item.can_approve_here === true) {
         foot.append(button("Approve", () => openConfirm(foot, {
-          title: "Approve and run " + action + " on " + target + "?",
-          rows: rows,
+          title: approveTitle,
+          rows: rows(),
           note: "Approving runs the action now. It can take as long as the action does.",
           confirmLabel: "Approve and run",
           danger: true,
@@ -1198,7 +1244,7 @@
       return {
         cells: [statusBadge(a.status), mono(a.action), clip(a.subject), mono(a.playbook),
           timeNode(decidedAt), clip(by), clip(result),
-          a.record_id ? recordLink(a.record_id, clip(a.record_id)) : "-", mono(a.id)],
+          a.record_id ? recordLink(a.record_id, clip(a.record_id)) : "-", mono(it.id)],
       };
     });
     const wrap = items.length ? table([
@@ -1206,7 +1252,7 @@
       { label: "Decided" }, { label: "By" }, { label: "Result" }, { label: "Record" }, { label: "Id" },
     ], rows) : empty("No closed items on this page.");
     for (const [i, it] of items.entries()) {
-      const id = obj(it.approval).id;
+      const id = it.id;   // the approval file's name
       if (typeof id === "string" && APPROVAL_ID_RE.test(id) && !ctx.cards.has(id)) {
         ctx.cards.set(id, wrap.querySelectorAll("tbody tr")[i]);
       }
@@ -1467,9 +1513,13 @@
 
     if (r.kind === "session" && r.protocol === "ssh") {
       const transcript = section("Transcript");
-      transcript.body.append(data.transcript_available === true
-        ? transcriptView(id)
-        : empty("Transcript not available: the session's lines are no longer in the current event log."));
+      // A session too large to replay is said up front, with the server's fixed text naming
+      // the command that reads it from the log, instead of a transcript that answers 422.
+      transcript.body.append(typeof data.transcript_withheld === "string"
+        ? notice("warn", el("span", { cls: "wrap", text: data.transcript_withheld }))
+        : data.transcript_available === true
+          ? transcriptView(id)
+          : empty("Transcript not available: the session's lines are no longer in the current event log."));
       out.push(transcript.node);
     }
     return out;

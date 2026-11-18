@@ -128,7 +128,7 @@ def _read_json(path: Path, default):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, type(default)) else default
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return default
 
 

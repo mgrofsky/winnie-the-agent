@@ -656,11 +656,13 @@ def sensor_limit_totals(reports_dir: Path, day: str) -> Counter:
     totals: Counter = Counter()
     try:
         known = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return totals
     for value in (known.values() if isinstance(known, dict) else []):
         if isinstance(value, list) and len(value) == 4 and isinstance(value[3], int):
-            totals[(str(value[0]), str(value[1]), value[2])] += value[3]
+            # pool is a string or None as written; anything else (a list) is unhashable.
+            pool = value[2] if isinstance(value[2], str) else None
+            totals[(str(value[0]), str(value[1]), pool)] += value[3]
     return totals
 
 
@@ -847,7 +849,7 @@ def load_records(reports_dir: os.PathLike | str) -> list[TriageRecord]:
         for p in sorted((Path(reports_dir) / sub).glob("*.json")):
             try:
                 out.append(TriageRecord.model_validate_json(p.read_text(encoding="utf-8")))
-            except (OSError, ValidationError, ValueError):
+            except (OSError, ValidationError, ValueError, RecursionError):
                 log.warning("skipping invalid record %s", p.name)
     return out
 
