@@ -4,15 +4,24 @@ Everything the console displays was typed by attackers, so this layer is a secur
 component even though it only listens on loopback (reached through an SSH or SSM tunnel):
 
 - Binding: loopback only, unless ``allow_non_loopback`` (a container binds 0.0.0.0 while
-  the host publishes the port on loopback).
+  the host publishes the port on loopback). ``external_host`` does not relax this.
 - Host: every request's ``Host`` must name localhost, 127.0.0.1 or [::1] (any port); this
   is the DNS-rebinding defence. Every POST also needs an ``Origin`` equal to
   ``"http://" + Host`` (lower-cased), so another local port or name cannot post.
+- External name: ``external_host`` (empty by default) adds exactly one more accepted
+  ``Host``, for a TLS-terminating reverse proxy on the same host that forwards to the
+  loopback port. It is HTTPS only: a POST under it needs ``Origin`` equal to
+  ``"https://" + Host``, its session cookie is ``Secure`` and its responses carry HSTS.
+  Sessions are bound to the kind of name (loopback or external) they were issued for.
+- No proxy trust: ``X-Forwarded-*``, ``Forwarded`` and any identity header a proxy adds
+  are never read. The console cannot tell a proxied request from a direct one, so the
+  token and session checks are the same for both; reach through the proxy is decided by
+  whatever controls who can connect to the proxy.
 - Sign-in: ``GET /?token=<token>`` sets an HttpOnly, SameSite=Strict session cookie. The
-  cookie is ``<issued>.<HMAC(process key, issued)>`` with a per-process random key, so it
-  dies on restart and after ``SESSION_LIFETIME``; nothing is stored server-side. The CSRF
+  cookie is ``<issued>.<HMAC(process key, kind, issued)>`` with a per-process random key, so
+  it dies on restart and after ``SESSION_LIFETIME``; nothing is stored server-side. The CSRF
   value is an HMAC of the cookie value, so it belongs to one session. The token itself is
-  never stored in a cookie, returned by an endpoint or logged (except the one sign-in URL
+  never stored in a cookie, returned by an endpoint or logged (except the one sign-in line
   ``serve`` prints at start). The token is compared first, so a correct one always signs
   in; only failures are throttled (globally).
 - POST: cookie, ``X-Winnie-CSRF``, ``[ui] actions`` on, JSON object body of at most 16 KiB
@@ -42,7 +51,7 @@ import threading
 import time
 import urllib.parse
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
@@ -87,6 +96,13 @@ SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
     ("Cross-Origin-Resource-Policy", "same-origin"),
     ("Content-Security-Policy", CONTENT_SECURITY_POLICY),
 )
+# Added only for requests under the external name, which the browser reaches over HTTPS.
+# On loopback (plain HTTP) browsers ignore it, and it would pin nothing useful.
+HSTS_HEADER = ("Strict-Transport-Security", "max-age=31536000")
+
+# The kind of name a request arrived under; sessions are bound to it.
+LOCAL = "local"
+EXTERNAL = "external"
 
 # Shown at / without a session. No form and no script: the only way in is the logged link.
 SIGNED_OUT_PAGE = (
@@ -100,6 +116,8 @@ _HOST_RE = re.compile(_LOCAL_NAME + r"(?::(\d{1,5}))?", re.ASCII)
 _ORIGIN_RE = re.compile(r"http://" + _LOCAL_NAME + r"(?::(\d{1,5}))?", re.ASCII)
 _LENGTH_RE = re.compile(r"\d{1,9}", re.ASCII)
 _SESSION_RE = re.compile(r"(\d{1,11})\.([0-9a-f]{64})", re.ASCII)
+_DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.ASCII)
+_PORT_RE = re.compile(r"[1-9]\d{0,4}", re.ASCII)
 # Checked on the raw path, lower-cased. Any encoded dot, slash, backslash or NUL is refused
 # outright rather than decoded and re-checked.
 _BAD_PATH_PARTS = ("..", "//", "\\", "\x00", "%2e", "%2f", "%5c", "%00")
@@ -113,6 +131,7 @@ class UiSettings:
     operator: str = ""             # label recorded with decisions
     allow_non_loopback: bool = False
     token: str = ""                # empty: generate one at start
+    external_host: str = ""        # name[:port] a same-host HTTPS proxy is reached by
 
 
 class Routes(Protocol):
@@ -140,11 +159,61 @@ def _port_ok(match: Optional[re.Match]) -> bool:
     return match is not None and (match.group(1) is None or int(match.group(1)) <= 65535)
 
 
-def host_allowed(values: Optional[list[str]]) -> bool:
-    """Exactly one Host header naming a loopback name (lower-casing is the only leniency)."""
+def normalize_external_host(value: str) -> str:
+    """The ``external_host`` setting, lower-cased; ``""`` when unset. ValueError if invalid.
+
+    One DNS name of two or more labels, optionally ``:port``. Anything that could widen
+    what the Host check accepts is refused: IP literals, localhost, wildcards, a scheme, a
+    path, a trailing dot. ``:443`` is dropped, since browsers leave the default port out of
+    Host and Origin and the bare name already accepts ``name:443``."""
+    text = value.strip()
+    if not text:
+        return ""
+    shown = repr(text[:100])
+    if not text.isascii():  # checked before lower(): some non-ASCII letters lower to ASCII
+        raise ValueError(f"ui external_host {shown}: must be ASCII (use the punycode name)")
+    host = text.lower()
+    name, sep, port = host.partition(":")
+    if sep and not _PORT_RE.fullmatch(port):
+        raise ValueError(f"ui external_host {shown}: the port must be a number from 1 to 65535 "
+                         "and nothing may follow it (no scheme, path or IPv6 literal)")
+    if sep and int(port) > 65535:
+        raise ValueError(f"ui external_host {shown}: port out of range")
+    if len(name) > 253 or name.endswith("."):
+        raise ValueError(f"ui external_host {shown}: must be a DNS name of at most 253 "
+                         "characters with no trailing dot")
+    labels = name.split(".")
+    if len(labels) < 2 or not all(_DNS_LABEL_RE.fullmatch(label) for label in labels):
+        raise ValueError(f"ui external_host {shown}: must be one DNS name such as "
+                         "sensor.example-tailnet.ts.net (letters, digits and hyphens, at least "
+                         "two labels; no scheme, path or wildcard)")
+    if labels[-1].isdigit():
+        raise ValueError(f"ui external_host {shown}: IP addresses are not allowed; use the "
+                         "name the proxy's certificate is issued for")
+    if labels[-1] == "localhost":
+        raise ValueError(f"ui external_host {shown}: localhost names are already accepted")
+    return name if port in ("", "443") else f"{name}:{port}"
+
+
+def host_kind(values: Optional[list[str]], external_host: str = "") -> Optional[str]:
+    """``LOCAL``, ``EXTERNAL`` or None for a request's Host headers.
+
+    Exactly one Host header, naming a loopback name or exactly ``external_host`` (already
+    normalized); lower-casing is the only leniency. With no port configured, ``name:443``
+    is the same origin as ``name`` and is accepted too."""
     if not values or len(values) != 1:
-        return False
-    return _port_ok(_HOST_RE.fullmatch(values[0].strip(" \t").lower()))
+        return None
+    host = values[0].strip(" \t").lower()
+    if _port_ok(_HOST_RE.fullmatch(host)):
+        return LOCAL
+    if external_host and (host == external_host or
+                          (":" not in external_host and host == external_host + ":443")):
+        return EXTERNAL
+    return None
+
+
+def host_allowed(values: Optional[list[str]], external_host: str = "") -> bool:
+    return host_kind(values, external_host) is not None
 
 
 def origin_allowed(values: Optional[list[str]], host: str) -> bool:
@@ -158,6 +227,20 @@ def origin_allowed(values: Optional[list[str]], host: str) -> bool:
     if not _port_ok(_ORIGIN_RE.fullmatch(origin)):
         return False
     return hmac.compare_digest(origin.encode(), ("http://" + host.strip(" \t").lower()).encode())
+
+
+def external_origin_allowed(values: Optional[list[str]], host: str, external_host: str) -> bool:
+    """For a request under the external name: exactly one Origin equal to ``"https://" +
+    host``, or ``https://<name>`` when Host was ``<name>:443`` (browsers omit the default
+    port). There is no plain-HTTP external origin."""
+    if not values or len(values) != 1:
+        return False
+    origin = values[0].strip(" \t").lower()
+    host = host.strip(" \t").lower()
+    allowed = ["https://" + host]
+    if ":" not in external_host and host == external_host + ":443":
+        allowed.append("https://" + external_host)
+    return origin in allowed
 
 
 def parse_target(target: str) -> Optional[tuple[str, dict[str, str]]]:
@@ -311,18 +394,22 @@ class UiServer(http.server.ThreadingHTTPServer):
         message = f"winnie-ui {label} v2 {value}".encode()
         return hmac.new(self._key, message, hashlib.sha256).hexdigest()
 
-    def new_session(self) -> str:
-        """A cookie value: issue time (whole seconds) and its HMAC under the process key."""
+    def new_session(self, kind: str = LOCAL) -> str:
+        """A cookie value: issue time (whole seconds) and an HMAC under the process key of
+        that time and the kind of name it was issued under. The kind is not written out:
+        the request's Host supplies it when the cookie comes back, so a loopback session
+        cannot be replayed under the external name, or the reverse."""
         issued = str(int(self.wall_clock()))
-        return f"{issued}.{self._mac('session', issued)}"
+        return f"{issued}.{self._mac('session', f'{kind} {issued}')}"
 
-    def session_ok(self, value: str) -> bool:
-        """Issued by this process, unaltered, not from the future and not past its life."""
+    def session_ok(self, value: str, kind: str = LOCAL) -> bool:
+        """Issued by this process for this kind of name, unaltered, not from the future and
+        not past its life."""
         match = _SESSION_RE.fullmatch(value)
         if match is None:
             return False
         issued, mac = match.groups()
-        if not hmac.compare_digest(mac, self._mac("session", issued)):
+        if not hmac.compare_digest(mac, self._mac("session", f"{kind} {issued}")):
             return False
         age = self.wall_clock() - int(issued)
         return 0 <= age < SESSION_LIFETIME
@@ -343,6 +430,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     _headers_sent = False
     _body_read = False
+    _kind: Optional[str] = None
+    _kind_known = False
 
     # -- stdlib hooks --
 
@@ -376,6 +465,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def end_headers(self) -> None:
         for name, value in SECURITY_HEADERS:
             self.send_header(name, value)
+        if self._host_kind() == EXTERNAL:
+            self.send_header(*HSTS_HEADER)
         super().end_headers()
 
     def log_request(self, code: object = "-", size: object = "-") -> None:
@@ -487,8 +578,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._body_read = True
         return b"".join(chunks)
 
+    def _host_kind(self) -> Optional[str]:
+        """``LOCAL``, ``EXTERNAL`` or None, from the Host header alone (never a forwarded
+        header). None until the headers are parsed, e.g. for a bad request line."""
+        if not self._kind_known:
+            headers = getattr(self, "headers", None)
+            if headers is None:
+                return None
+            self._kind = host_kind(headers.get_all("Host"), self.server.settings.external_host)
+            self._kind_known = True
+        return self._kind
+
     def _target(self) -> tuple[str, dict[str, str]]:
-        if not host_allowed(self.headers.get_all("Host")):
+        if self._host_kind() is None:
             raise _Reject(421, "host not allowed")
         parsed = parse_target(self.path)
         if parsed is None:
@@ -500,7 +602,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         for header in self.headers.get_all("Cookie") or []:
             for part in header.split(";"):
                 name, sep, value = part.strip().partition("=")
-                if sep and name == COOKIE_NAME and self.server.session_ok(value):
+                if sep and name == COOKIE_NAME \
+                        and self.server.session_ok(value, self._host_kind() or LOCAL):
                     return value
         return None
 
@@ -561,9 +664,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             raise _Reject(429, "too many sign-in attempts")
         if result != "ok":
             raise _Reject(403, "bad token")
-        # No Secure attribute: plain HTTP on loopback.
+        # Secure only under the external name (HTTPS at the proxy); loopback is plain HTTP.
         # No Max-Age: the browser drops it at exit, and the server enforces SESSION_LIFETIME.
-        cookie = f"{COOKIE_NAME}={self.server.new_session()}; HttpOnly; SameSite=Strict; Path=/"
+        kind = self._host_kind() or LOCAL
+        secure = "Secure; " if kind == EXTERNAL else ""
+        cookie = (f"{COOKIE_NAME}={self.server.new_session(kind)}; {secure}HttpOnly; "
+                  "SameSite=Strict; Path=/")
         self._send(303, b"", None, (("Location", "/"), ("Set-Cookie", cookie)))
 
     def _send_static(self, path: str) -> None:
@@ -581,7 +687,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # Every refusal below happens before the body is read; _dispatch then answers at once
         # and closes, so a refused client cannot hold the thread by sending its body slowly.
         path, _ = self._target()
-        if not origin_allowed(self.headers.get_all("Origin"), self.headers["Host"]):
+        origins, host = self.headers.get_all("Origin"), self.headers["Host"]
+        if self._host_kind() == EXTERNAL:
+            allowed = external_origin_allowed(origins, host, self.server.settings.external_host)
+        else:
+            allowed = origin_allowed(origins, host)
+        if not allowed:
             raise _Reject(403, "origin not allowed")
         session = self._session()
         if session is None:
@@ -622,6 +733,9 @@ def build_server(settings: UiSettings, routes: Routes) -> UiServer:
             f"refusing to bind the operator console to non-loopback address {settings.bind!r}; "
             "bind 127.0.0.1 and reach it through an SSH or SSM tunnel, or set "
             "allow_non_loopback (only inside a container whose port is published on loopback)")
+    external = normalize_external_host(settings.external_host)
+    if external != settings.external_host:
+        settings = replace(settings, external_host=external)
     if settings.token:
         if len(settings.token) < MIN_TOKEN_LENGTH:
             raise ValueError(f"ui token must be at least {MIN_TOKEN_LENGTH} characters")
@@ -646,11 +760,26 @@ def sign_in_url(server: UiServer) -> str:
     return f"http://{host}:{port}/?token={urllib.parse.quote(server.token, safe='')}"
 
 
+def external_sign_in_url(server: UiServer) -> str:
+    """The link through the same-host HTTPS proxy, or ``""`` when no external name is set."""
+    if not server.settings.external_host:
+        return ""
+    token = urllib.parse.quote(server.token, safe="")
+    return f"https://{server.settings.external_host}/?token={token}"
+
+
 def serve(settings: UiSettings, routes: Routes) -> None:
-    """Run the console until interrupted. Logs the sign-in URL once at start."""
+    """Run the console until interrupted. Logs the sign-in URL(s) once at start."""
     server = build_server(settings, routes)
-    # The only place the token is ever written anywhere.
-    log.info("operator console ready; sign in at %s", sign_in_url(server))
+    # The only place the token is ever written anywhere: one line, both links.
+    external = external_sign_in_url(server)
+    if external:
+        log.info("operator console ready; sign in at %s or %s", sign_in_url(server), external)
+        log.warning("operator console is also reachable through a proxy as https://%s; whoever "
+                    "can reach that proxy is held back only by the sign-in token",
+                    server.settings.external_host)
+    else:
+        log.info("operator console ready; sign in at %s", sign_in_url(server))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

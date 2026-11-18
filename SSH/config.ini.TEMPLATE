@@ -338,6 +338,9 @@ bind = 127.0.0.1
 actions = false
 # Name recorded with decisions made in the console (--by overrides it).
 #operator = oncall
+# HTTPS name of a reverse proxy on this host that forwards to the port above (--external-host
+# overrides it). Empty: loopback names only. See docs/operations.md, "Reaching it".
+#external_host = sensor.example-tailnet.ts.net
 
 # Outbound connectors. All disabled by default. Destinations must be https and public
 # (allow_private = true to permit internal ones). Secrets are environment variable NAMES.

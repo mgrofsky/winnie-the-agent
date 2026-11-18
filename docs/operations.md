@@ -478,8 +478,9 @@ The `ui` service is off unless the profile is named. It uses the agents' image a
 directories, mounts every volume read-only, gets no model key, AWS setting or connector
 secret, and is on a network of its own, so the honeypot containers cannot reach it.
 
-Options: `--bind` (default 127.0.0.1), `--port` (default 8480), `--actions`, `--by NAME`.
-The same settings can go in `config.ini`:
+Options: `--bind` (default 127.0.0.1), `--port` (default 8480), `--actions`, `--by NAME`,
+`--external-host NAME` (see [below](#reaching-it-over-a-private-network)). The same settings
+can go in `config.ini`:
 
 ```ini
 [ui]
@@ -513,6 +514,7 @@ Wrong tokens are slowed down (429 after ten a minute) but never block the right 
 ### Reaching it
 
 The console listens on loopback only. There is no public URL and no inbound port to open.
+To reach it from another machine without a tunnel, see the next section.
 
 - **On the same machine:** `http://127.0.0.1:8480`.
 - **On a remote host:** forward the port over SSH, then open `http://127.0.0.1:8480` on
@@ -529,6 +531,45 @@ Use `127.0.0.1` or `localhost` in the address bar: the console rejects requests 
 any other host. Actions must come from the page under the same name and port they are
 sent to, so stay on one address (do not sign in on `localhost` and act from a tab opened
 on `127.0.0.1`).
+
+### Reaching it over a private network
+
+To open the console from another machine without logging in to the host, put an HTTPS
+reverse proxy on the same host, in front of the loopback port, and reach it over a private
+mesh VPN. The console keeps listening on 127.0.0.1; it only accepts one more name. With
+Tailscale, for example:
+
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:8480
+```
+
+That serves the node's own HTTPS name, for example `sensor.example-tailnet.ts.net`, to
+devices on the tailnet only. Then tell the console that name:
+
+```ini
+[ui]
+external_host = sensor.example-tailnet.ts.net
+```
+
+or start it with `--external-host sensor.example-tailnet.ts.net` (the flag wins; with
+Docker, use `config.ini`, and set `WINNIE_UI_TOKEN` in the shell that runs compose). Use the
+exact name the browser will show, with `:port` only if the proxy is not on 443. It must be
+a plain DNS name: no `https://`, no path, no IP address. The console refuses to start on
+anything else.
+
+Under that name the console is HTTPS only: the session cookie is `Secure`, responses
+carry `Strict-Transport-Security`, and actions must come from an `https://` page on that
+name. A session started on `127.0.0.1` does not work under the external name, and the
+reverse; sign in on the one you use. The console ignores `X-Forwarded-*` and identity
+headers the proxy adds; it trusts only the token.
+
+- Set a fixed `WINNIE_UI_TOKEN` (24 characters or more, kept in your password manager), so
+  signing in does not need the container log. At start the console logs both links and a
+  warning that it is reachable through a proxy.
+- Start read-only. Add the actions override only when you mean to act from the console,
+  and take it off again after.
+- Limit the VPN's access rules to your own devices and this one port. See
+  [security-model.md](security-model.md#operator-console).
 
 ### Turning actions on
 

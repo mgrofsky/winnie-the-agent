@@ -858,3 +858,276 @@ def test_unknown_method_is_405(console, method):
     assert resp.header("Allow") == "GET, HEAD, POST"
     assert_hardened(resp)
     assert console.routes.gets == [] and console.routes.posts == []
+
+
+# ---- external name (same-host HTTPS proxy) ---------------------------------------------------
+
+EXT = "sensor.example-tailnet.ts.net"
+HSTS = "max-age=31536000"
+
+
+def ext_sign_in(c, host=EXT):
+    resp = c.request("GET", "/?token=" + urllib.parse.quote(c.srv.token, safe=""), host=host)
+    assert resp.status == 303, resp.body
+    return resp, resp.header("Set-Cookie").split(";")[0].split("=", 1)[1]
+
+
+def ext_post(c, cookie, origin, host=EXT, csrf=None):
+    c.cookie = cookie
+    if csrf is None:
+        csrf = c.request("GET", "/api/session", host=host).json()["csrf"]
+    headers = {"Origin": origin, "X-Winnie-CSRF": csrf, "Content-Type": "application/json"}
+    return c.request("POST", "/api/decide", headers=headers, body=b"{}", host=host)
+
+
+@pytest.mark.parametrize("host", [EXT, EXT + ":443", "sensor.example-tailnet.ts.net:8443"])
+def test_external_looking_host_is_421_when_the_setting_is_empty(start, host):
+    c = start()
+    resp = c.request("GET", "/?token=" + urllib.parse.quote(c.srv.token, safe=""), host=host)
+    assert resp.status == 421 and resp.header("Set-Cookie") is None
+    assert resp.header("Strict-Transport-Security") is None
+
+
+def test_external_sign_in_sets_secure_cookie_and_hsts(start):
+    c = start(external_host=EXT)
+    resp, cookie = ext_sign_in(c)
+    assert resp.header("Set-Cookie") == \
+        f"winnie_ui={cookie}; Secure; HttpOnly; SameSite=Strict; Path=/"
+    assert resp.header("Strict-Transport-Security") == HSTS
+    assert_hardened(resp)
+    c.cookie = cookie
+    page = c.request("GET", "/", host=EXT)
+    assert page.status == 200 and page.header("Strict-Transport-Security") == HSTS
+    # Every external answer carries it, errors included.
+    for resp in (c.request("GET", "/nope", host=EXT), c.request("PUT", "/", host=EXT),
+                 c.request("GET", "/api/session", host=EXT, cookie=False)):
+        assert resp.status in (404, 405, 401)
+        assert resp.header("Strict-Transport-Security") == HSTS, resp.status
+
+
+def test_loopback_sign_in_has_no_secure_or_hsts_with_the_setting_on(start):
+    c = start(external_host=EXT)
+    resp = c.sign_in()
+    cookie = resp.header("Set-Cookie")
+    assert cookie == f"winnie_ui={c.cookie}; HttpOnly; SameSite=Strict; Path=/"
+    assert resp.header("Strict-Transport-Security") is None
+    for resp in c.seen + [c.request("GET", "/api/session"), c.request("GET", "/nope"),
+                          c.request("GET", "/", host="evil.example")]:
+        assert resp.header("Strict-Transport-Security") is None
+
+
+def test_external_post_needs_its_https_origin(start):
+    c = start(external_host=EXT, actions=True)
+    _, cookie = ext_sign_in(c)
+    for origin in (f"http://{EXT}", f"https://{EXT}:443", f"https://{EXT}:8443",
+                   f"https://{EXT}.", f"https://x.{EXT}", f"https://{EXT}/", "null", None,
+                   f"http://127.0.0.1:{c.port}", f"https://127.0.0.1:{c.port}",
+                   "https://example-tailnet.ts.net"):
+        resp = ext_post(c, cookie, origin)
+        assert resp.status == 403 and resp.json() == {"error": "origin not allowed"}, origin
+        assert resp.header("Strict-Transport-Security") == HSTS
+    assert c.routes.posts == []
+    assert ext_post(c, cookie, f"https://{EXT}").status == 201
+    assert ext_post(c, cookie, f"HTTPS://{EXT.upper()}").status == 201
+    assert len(c.routes.posts) == 2
+
+
+def test_external_origin_on_a_loopback_host_is_refused(start):
+    c = start(external_host=EXT, actions=True)
+    c.sign_in()
+    for origin in (f"https://{EXT}", f"http://{EXT}"):
+        resp = c.post("/api/decide", {}, Origin=origin)
+        assert resp.status == 403 and resp.json() == {"error": "origin not allowed"}, origin
+    assert c.post("/api/decide", {}).status == 201  # the loopback rule is unchanged
+    assert len(c.routes.posts) == 1
+
+
+def test_external_name_with_port_443(start):
+    c = start(external_host=EXT, actions=True)
+    _, cookie = ext_sign_in(c, host=EXT + ":443")
+    host = EXT + ":443"
+    assert ext_post(c, cookie, f"https://{EXT}", host=host).status == 201       # browsers
+    assert ext_post(c, cookie, f"https://{EXT}:443", host=host).status == 201   # Host as sent
+    assert ext_post(c, cookie, f"http://{EXT}", host=host).status == 403
+    # The session belongs to the name, not to the spelling of its port.
+    assert ext_post(c, cookie, f"https://{EXT}").status == 201
+    assert c.request("GET", "/api/session", host=EXT + ":8443").status == 421
+
+
+def test_configured_port_is_required_and_443_is_the_bare_name(start):
+    c = start(external_host=EXT + ":8443", actions=True)
+    assert c.srv.settings.external_host == EXT + ":8443"
+    for host in (EXT, EXT + ":443", EXT + ":8444"):
+        assert c.request("GET", "/api/session", host=host).status == 421, host
+    _, cookie = ext_sign_in(c, host=EXT + ":8443")
+    host = EXT + ":8443"
+    assert ext_post(c, cookie, f"https://{EXT}", host=host).status == 403
+    assert ext_post(c, cookie, f"https://{EXT}:8443", host=host).status == 201
+    d = start(external_host=EXT.upper() + ":443")
+    assert d.srv.settings.external_host == EXT
+    assert d.request("GET", "/api/session", host=EXT).status == 401
+
+
+@pytest.mark.parametrize("host", [
+    "other.example-tailnet.ts.net", "example-tailnet.ts.net", "ts.net", "x." + EXT,
+    EXT + ".evil.example", EXT[1:], EXT[:-1], "x" + EXT, EXT + "x", EXT + ".", EXT + ":",
+    EXT + ":80", EXT + ":0443", EXT + ":443:443", "user@" + EXT, f"{EXT} {EXT}",
+    [EXT, EXT], [EXT, "localhost"], ["localhost", EXT],
+])
+def test_other_names_are_421_with_the_setting_on(start, host):
+    c = start(external_host=EXT)
+    resp = c.request("GET", "/?token=" + urllib.parse.quote(c.srv.token, safe=""), host=host)
+    assert resp.status == 421 and resp.header("Set-Cookie") is None, host
+    assert resp.header("Strict-Transport-Security") is None
+
+
+def test_external_host_header_is_case_insensitive(start):
+    c = start(external_host=EXT)
+    resp, cookie = ext_sign_in(c, host=EXT.upper())
+    assert "Secure" in resp.header("Set-Cookie")
+    c.cookie = cookie
+    assert c.request("GET", "/api/session", host=EXT).status == 200
+    assert c.request("GET", "/api/session", host="Sensor.Example-Tailnet.TS.net").status == 200
+
+
+def test_sessions_are_bound_to_the_kind_of_name(start):
+    c = start(external_host=EXT, actions=True)
+    c.sign_in()
+    local_cookie, local_csrf = c.cookie, c.csrf()
+    _, ext_cookie = ext_sign_in(c)
+    c.cookie = ext_cookie
+    ext_csrf = c.request("GET", "/api/session", host=EXT).json()["csrf"]
+    # A loopback cookie is not a session under the external name ...
+    c.cookie = local_cookie
+    assert c.request("GET", "/api/session", host=EXT).status == 401
+    assert c.request("GET", "/", host=EXT).status == 401
+    assert ext_post(c, local_cookie, f"https://{EXT}", csrf=local_csrf).status == 401
+    # ... and an external cookie is not one on loopback.
+    c.cookie = ext_cookie
+    assert c.request("GET", "/api/session").status == 401
+    headers = {"Origin": c.origin, "X-Winnie-CSRF": ext_csrf, "Content-Type": "application/json"}
+    assert c.request("POST", "/api/decide", headers=headers, body=b"{}").status == 401
+    assert c.routes.posts == []
+    # Each still works where it was issued.
+    assert c.request("GET", "/api/session", host=EXT).status == 200
+    c.cookie = local_cookie
+    assert c.request("GET", "/api/session").status == 200
+
+
+FORWARDED_HEADERS = {
+    "X-Forwarded-For": "127.0.0.1",
+    "X-Forwarded-Host": "localhost",
+    "X-Forwarded-Proto": "http",
+    "X-Forwarded-Port": "80",
+    "X-Real-IP": "127.0.0.1",
+    "Forwarded": "for=127.0.0.1;host=localhost;proto=http",
+    "Tailscale-User-Login": "operator@example.com",
+    "Tailscale-User-Name": "Operator",
+    "Remote-User": "admin",
+    "X-Remote-User": "admin",
+    "X-Authenticated-User": "admin",
+}
+
+
+def test_forwarded_and_identity_headers_are_ignored(start):
+    c = start(external_host=EXT, actions=True)
+    token_target = "/?token=" + urllib.parse.quote(c.srv.token, safe="")
+    # They do not make an unknown Host acceptable or stand in for one.
+    for host in ("evil.example", None):
+        assert c.request("GET", token_target, headers=FORWARDED_HEADERS,
+                         host=host).status == 421
+    # They do not sign anyone in or open the API without a cookie.
+    assert c.request("GET", "/api/session", headers=FORWARDED_HEADERS, host=EXT).status == 401
+    assert c.request("GET", "/api/session", headers=FORWARDED_HEADERS).status == 401
+    # They do not turn an external sign-in into a loopback one, or the reverse.
+    resp = c.request("GET", token_target, headers=FORWARDED_HEADERS, host=EXT)
+    assert "Secure" in resp.header("Set-Cookie")
+    assert resp.header("Strict-Transport-Security") == HSTS
+    https_hint = {**FORWARDED_HEADERS, "X-Forwarded-Proto": "https",
+                  "X-Forwarded-Host": EXT, "Forwarded": f"proto=https;host={EXT}"}
+    resp = c.request("GET", token_target, headers=https_hint)
+    assert "Secure" not in resp.header("Set-Cookie")
+    assert resp.header("Strict-Transport-Security") is None
+    # They do not change which Origin a POST needs.
+    _, cookie = ext_sign_in(c)
+    c.cookie = cookie
+    csrf = c.request("GET", "/api/session", host=EXT).json()["csrf"]
+    headers = {**FORWARDED_HEADERS, "Origin": f"http://127.0.0.1:{c.port}", "X-Winnie-CSRF": csrf,
+               "Content-Type": "application/json"}
+    assert c.request("POST", "/api/decide", headers=headers, body=b"{}", host=EXT).status == 403
+    headers["Origin"] = f"https://{EXT}"
+    assert c.request("POST", "/api/decide", headers=headers, body=b"{}", host=EXT).status == 201
+    assert len(c.routes.posts) == 1
+
+
+def test_server_never_reads_proxy_headers():
+    """No string the server code uses (docstrings aside) names a proxy-added header."""
+    import ast
+
+    tree = ast.parse((STATIC_DIR.parent / "server.py").read_text())
+    docstrings = {id(node.value) for node in ast.walk(tree)
+                  if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)}
+    strings = [node.value.lower() for node in ast.walk(tree)
+               if isinstance(node, ast.Constant) and isinstance(node.value, str)
+               and id(node) not in docstrings]
+    assert "host" in strings  # the scan sees header names
+    for name in ("forwarded", "x-real-ip", "tailscale", "remote-user", "x-user", "-user"):
+        assert not [s for s in strings if name in s], name
+
+
+@pytest.mark.parametrize("value", [
+    "localhost", "LOCALHOST", "sensor.localhost", "127.0.0.1", "198.51.100.7", "[::1]", "::1",
+    "[2001:db8::1]", "2001:db8::1", "0x7f.1", "sensor", "*.example-tailnet.ts.net",
+    "sensor.*.ts.net", "https://" + EXT, "http://" + EXT, EXT + "/", EXT + "/console",
+    EXT + "/?x=1", EXT + ".", EXT + ":", EXT + ":0", EXT + ":65536", EXT + ":99999",
+    EXT + ":08443", EXT + ":http", EXT + ":443:443", "-sensor.example.net", "sensor-.example.net",
+    "sensor..example.net", ".example.net", "sensor_one.example.net", "sens or.example.net",
+    "sensör.example.net", "user@" + EXT, "x" * 64 + ".example.net",
+    ".".join(["a" * 63] * 3 + ["a" * 62]), EXT + "#frag", EXT + "\\x",  # 254 characters
+])
+def test_invalid_external_host_refuses_to_start(value):
+    with pytest.raises(ValueError, match="external_host"):
+        build_server(UiSettings(port=0, token="t" * 32, external_host=value), FakeRoutes())
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("", ""), ("  ", ""), (EXT, EXT), (" " + EXT.upper() + " ", EXT), (EXT + ":443", EXT),
+    (EXT + ":8443", EXT + ":8443"), (EXT + ":1", EXT + ":1"), (EXT + ":65535", EXT + ":65535"),
+    ("a.b", "a.b"), ("x" * 63 + ".example.net", "x" * 63 + ".example.net"),
+    ("console-1.sensor-2.example.org", "console-1.sensor-2.example.org"),
+    ("xn--snsor-cua.example.net", "xn--snsor-cua.example.net"),
+    (".".join(["a" * 63] * 3 + ["a" * 61]), ".".join(["a" * 63] * 3 + ["a" * 61])),  # 253
+])
+def test_valid_external_host_is_normalized(value, expected):
+    assert ui.normalize_external_host(value) == expected
+
+
+def test_external_host_does_not_relax_the_bind_guard():
+    for bind in ("0.0.0.0", "198.51.100.7", "::"):
+        with pytest.raises(ValueError, match="non-loopback"):
+            build_server(UiSettings(bind=bind, port=0, token="t" * 32, external_host=EXT),
+                         FakeRoutes())
+
+
+def test_serve_logs_both_links_once_and_a_warning(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="agents.ui")
+    monkeypatch.setattr(ui.UiServer, "serve_forever", lambda self, *a, **k: None)
+    token = "q" * 32
+    ui.serve(UiSettings(port=0, token=token, external_host=EXT.upper()), FakeRoutes())
+    hits = [r for r in caplog.records if token in r.getMessage()]
+    assert len(hits) == 1 and hits[0].levelname == "INFO"
+    line = hits[0].getMessage()
+    assert re.search(r"http://127\.0\.0\.1:\d+/\?token=" + token, line)
+    assert f"https://{EXT}/?token={token}" in line
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and EXT in warnings[0] and "proxy" in warnings[0]
+    assert "token=" not in warnings[0]
+
+
+def test_serve_logs_no_external_link_when_unset(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="agents.ui")
+    monkeypatch.setattr(ui.UiServer, "serve_forever", lambda self, *a, **k: None)
+    ui.serve(UiSettings(port=0, token="q" * 32), FakeRoutes())
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "https://" not in text and "proxy" not in text
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
