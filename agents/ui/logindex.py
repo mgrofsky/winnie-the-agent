@@ -9,19 +9,22 @@ newline just before the offset). It never writes anything: no cursor file, no lo
 
 Replay reads only a session's range and runs it through ``sessions.parse_log``, so the
 turns shown are exactly what triage saw. Memory is capped (the most recently active
-``max_sessions`` sessions are kept) and so is the work done by one refresh.
+``max_sessions`` sessions are kept) and so is the work done by one refresh. Lines are read
+with a length limit (``MAX_LINE_BYTES``): a longer line is skipped in chunks, never held
+whole, and like a malformed line it is passed over with the offset moving past it.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from agents import sessions
 
@@ -35,10 +38,57 @@ MAX_BYTES_PER_REFRESH = 64 * 1024 * 1024
 # be read whole, interleaved with every other connection of that period).
 MAX_RANGE_BYTES = 32 * 1024 * 1024
 HEAD_BYTES = sessions.Cursor.HEAD_BYTES
+# A log line longer than this (newline excluded) is skipped by the index without being
+# read into memory whole. Real event-log lines are a few KiB at most.
+MAX_LINE_BYTES = 1024 * 1024
+SKIP_CHUNK = 64 * 1024
 
 
 class RangeTooLarge(Exception):
     """The session's lines span more of the log than ``MAX_RANGE_BYTES``."""
+
+
+def _parse_line(raw: bytes) -> Optional[dict]:
+    """A line as ``sessions.iter_records`` parses it: {} when blank, None when malformed
+    (bad JSON, nesting too deep for the parser, not an object)."""
+    if not raw.strip():
+        return {}
+    try:
+        obj = json.loads(raw.decode("utf-8", errors="replace"))
+    except (ValueError, RecursionError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def iter_lines(path: os.PathLike | str, start_offset: int = 0,
+               max_line: Optional[int] = None) -> Iterator[tuple[int, int, Optional[dict]]]:
+    """Yield (start, end, record) for complete lines from ``start_offset``, as
+    ``sessions.iter_records`` does, except that a line longer than ``max_line`` (default
+    ``MAX_LINE_BYTES``) is read past in ``SKIP_CHUNK`` pieces and yielded as malformed
+    (None). A trailing partial line (still being written) is not consumed."""
+    limit = MAX_LINE_BYTES if max_line is None else max_line
+    with open(path, "rb") as f:
+        f.seek(start_offset)
+        pos = start_offset
+        while True:
+            raw = f.readline(limit + 1)
+            if not raw:
+                return
+            start, pos = pos, pos + len(raw)
+            if raw.endswith(b"\n"):
+                yield start, pos, _parse_line(raw)
+                continue
+            if len(raw) <= limit:
+                return   # a partial last line: wait for the rest
+            del raw
+            while True:
+                chunk = f.readline(SKIP_CHUNK)
+                if not chunk:
+                    return   # an oversize line still being written: not consumed yet
+                pos += len(chunk)
+                if chunk.endswith(b"\n"):
+                    break
+            yield start, pos, None
 
 
 def _head(f) -> Optional[str]:
@@ -51,7 +101,10 @@ def _session_task(rec: Optional[dict]) -> Optional[str]:
     """The task name of an SSH session line, cut as ``parse_log`` cuts it; else None."""
     if not rec:
         return None
-    if sessions._cap(rec.get("sensor_protocol", ""), 16).lower() != sessions.SSH_PROTOCOL:
+    # parse_log compares str(value)[:16]; no non-string JSON value prints as "ssh", so
+    # only strings need the comparison (and a large nested value is never printed).
+    protocol = rec.get("sensor_protocol")
+    if not isinstance(protocol, str) or protocol[:16].lower() != sessions.SSH_PROTOCOL:
         return None
     task = rec.get("task_name")
     if not isinstance(task, str) or not task.startswith("session-"):
@@ -128,7 +181,7 @@ class SessionIndex:
         limit = self._offset + self.max_bytes_per_refresh
         offset = self._offset
         self.caught_up = True  # unless the loop stops at the limit; a partial line waits
-        for start, end, rec in sessions.iter_records(self.path, self._offset):
+        for start, end, rec in iter_lines(self.path, self._offset):
             if start >= limit:
                 self.caught_up = False
                 break

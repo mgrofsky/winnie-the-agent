@@ -6,15 +6,23 @@ component even though it only listens on loopback (reached through an SSH or SSM
 - Binding: loopback only, unless ``allow_non_loopback`` (a container binds 0.0.0.0 while
   the host publishes the port on loopback).
 - Host: every request's ``Host`` must name localhost, 127.0.0.1 or [::1] (any port); this
-  is the DNS-rebinding defence. Every POST also needs a matching ``http://`` ``Origin``.
+  is the DNS-rebinding defence. Every POST also needs an ``Origin`` equal to
+  ``"http://" + Host`` (lower-cased), so another local port or name cannot post.
 - Sign-in: ``GET /?token=<token>`` sets an HttpOnly, SameSite=Strict session cookie. The
-  cookie and the CSRF value are HMAC-SHA256 derivations of the token; the token itself is
+  cookie is ``<issued>.<HMAC(process key, issued)>`` with a per-process random key, so it
+  dies on restart and after ``SESSION_LIFETIME``; nothing is stored server-side. The CSRF
+  value is an HMAC of the cookie value, so it belongs to one session. The token itself is
   never stored in a cookie, returned by an endpoint or logged (except the one sign-in URL
-  ``serve`` prints at start). Failed token attempts are throttled globally.
-- POST: cookie, ``X-Winnie-CSRF``, ``[ui] actions`` on, JSON object body of at most 16 KiB.
+  ``serve`` prints at start). The token is compared first, so a correct one always signs
+  in; only failures are throttled (globally).
+- POST: cookie, ``X-Winnie-CSRF``, ``[ui] actions`` on, JSON object body of at most 16 KiB
+  read within ``BODY_DEADLINE``. A POST refused before its body is read is answered at once
+  and the connection closed, so an unauthenticated client cannot hold a thread with a slow
+  body. At most ``MAX_CONNECTIONS`` connections are served at once; the rest get a 503.
 - Responses: strict CSP and related headers on every response, JSON with ``<``, ``>``,
   ``&``, U+2028 and U+2029 escaped, static files from a fixed table (no filesystem lookup
-  from the request path). Exceptions from ``routes`` become a bare 500.
+  from the request path). Exceptions from ``routes`` become a bare 500. HTTP/0.9 requests
+  (which would get a body without headers) are closed without an answer.
 """
 
 from __future__ import annotations
@@ -49,6 +57,10 @@ MAX_QUERY_VALUE = 512
 SOCKET_TIMEOUT = 15
 THROTTLE_FAILURES = 10
 THROTTLE_WINDOW = 60.0
+SESSION_LIFETIME = 12 * 3600     # seconds; the logged sign-in link works again after it
+BODY_DEADLINE = 10.0             # seconds to receive a whole accepted POST body
+LINGER_SECONDS = 0.5             # after refusing an unread POST, see linger() below
+MAX_CONNECTIONS = 32             # connections served at once; more get a fixed 503
 
 JSON_TYPE = "application/json; charset=utf-8"
 HTML_TYPE = "text/html; charset=utf-8"
@@ -87,6 +99,7 @@ _LOCAL_NAME = r"(?:localhost|127\.0\.0\.1|\[::1\])"
 _HOST_RE = re.compile(_LOCAL_NAME + r"(?::(\d{1,5}))?", re.ASCII)
 _ORIGIN_RE = re.compile(r"http://" + _LOCAL_NAME + r"(?::(\d{1,5}))?", re.ASCII)
 _LENGTH_RE = re.compile(r"\d{1,9}", re.ASCII)
+_SESSION_RE = re.compile(r"(\d{1,11})\.([0-9a-f]{64})", re.ASCII)
 # Checked on the raw path, lower-cased. Any encoded dot, slash, backslash or NUL is refused
 # outright rather than decoded and re-checked.
 _BAD_PATH_PARTS = ("..", "//", "\\", "\x00", "%2e", "%2f", "%5c", "%00")
@@ -134,10 +147,17 @@ def host_allowed(values: Optional[list[str]]) -> bool:
     return _port_ok(_HOST_RE.fullmatch(values[0].strip(" \t").lower()))
 
 
-def origin_allowed(values: Optional[list[str]]) -> bool:
+def origin_allowed(values: Optional[list[str]], host: str) -> bool:
+    """Exactly one loopback ``http://`` Origin, equal to ``"http://" + host`` (lower-cased).
+
+    The allowlist alone would let a page on another loopback port or name (some other local
+    service) post here; requiring the exact Host ties the request to this console's page."""
     if not values or len(values) != 1:
         return False
-    return _port_ok(_ORIGIN_RE.fullmatch(values[0].strip(" \t").lower()))
+    origin = values[0].strip(" \t").lower()
+    if not _port_ok(_ORIGIN_RE.fullmatch(origin)):
+        return False
+    return hmac.compare_digest(origin.encode(), ("http://" + host.strip(" \t").lower()).encode())
 
 
 def parse_target(target: str) -> Optional[tuple[str, dict[str, str]]]:
@@ -172,10 +192,6 @@ def is_loopback(bind: str) -> bool:
         return False
 
 
-def _derive(token: str, label: str) -> str:
-    return hmac.new(token.encode(), f"winnie-ui {label} v1".encode(), hashlib.sha256).hexdigest()
-
-
 def _phrase(code: int) -> str:
     try:
         return http.HTTPStatus(code).phrase.lower()
@@ -197,6 +213,18 @@ class _Reject(Exception):
         self.headers = headers
 
 
+def _busy_response() -> bytes:
+    body = encode_json({"error": "busy"})
+    head = ["HTTP/1.0 503 Service Unavailable", "Server: winnie-ui",
+            "Content-Type: " + JSON_TYPE, f"Content-Length: {len(body)}", "Connection: close"]
+    head += [f"{name}: {value}" for name, value in SECURITY_HEADERS]
+    return ("\r\n".join(head) + "\r\n\r\n").encode("ascii") + body
+
+
+# Sent by the accept loop itself when every connection slot is taken: fixed bytes, no parsing.
+BUSY_RESPONSE = _busy_response()
+
+
 # ---- server ----------------------------------------------------------------------------------
 
 class UiServer(http.server.ThreadingHTTPServer):
@@ -210,11 +238,16 @@ class UiServer(http.server.ThreadingHTTPServer):
         self.settings = settings
         self.routes = routes
         self._token = token
-        self._session = _derive(token, "session")
-        self._csrf = _derive(token, "csrf")
+        # Session and CSRF values come from this key, never from the token: a fixed
+        # WINNIE_UI_TOKEN must not give a cookie that survives a restart.
+        self._key = secrets.token_bytes(32)
         self._failures: deque[float] = deque()
         self._lock = threading.Lock()
-        self.clock: Callable[[], float] = time.monotonic  # replaceable in tests
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        # Replaceable in tests: the throttle clock, the session clock and the body deadline.
+        self.clock: Callable[[], float] = time.monotonic
+        self.wall_clock: Callable[[], float] = time.time
+        self.body_deadline = BODY_DEADLINE
         if ":" in settings.bind:
             self.address_family = socket.AF_INET6
         super().__init__((settings.bind.strip("[]"), settings.port), _Handler)
@@ -234,24 +267,71 @@ class UiServer(http.server.ThreadingHTTPServer):
         # The default prints a traceback to stderr; keep it in the module's log instead.
         log.warning("connection error", exc_info=True)
 
+    def process_request(self, request, client_address) -> None:
+        # Runs on the accept loop. Over the cap, answer from fixed bytes and close rather
+        # than start a thread, so a flood of idle connections cannot exhaust threads.
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.settimeout(1.0)
+                request.sendall(BUSY_RESPONSE)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
     def check_token(self, given: str) -> str:
-        """``ok``, ``bad`` or ``throttled``. Failures are counted globally over a window."""
+        """``ok``, ``bad`` or ``throttled``.
+
+        The compare comes first, so a correct token always signs in; a global throttle
+        that ran first would let anyone lock the operator out. Only failures are counted
+        (globally, over a window), and failures past the limit get ``throttled``."""
+        if hmac.compare_digest(given.encode(), self._token.encode()):
+            return "ok"
         with self._lock:
             now = self.clock()
             while self._failures and now - self._failures[0] >= THROTTLE_WINDOW:
                 self._failures.popleft()
             if len(self._failures) >= THROTTLE_FAILURES:
                 return "throttled"
-            if hmac.compare_digest(given.encode(), self._token.encode()):
-                return "ok"
             self._failures.append(now)
             return "bad"
 
-    def session_ok(self, value: str) -> bool:
-        return hmac.compare_digest(value.encode(), self._session.encode())
+    def _mac(self, label: str, value: str) -> str:
+        message = f"winnie-ui {label} v2 {value}".encode()
+        return hmac.new(self._key, message, hashlib.sha256).hexdigest()
 
-    def csrf_ok(self, value: str) -> bool:
-        return hmac.compare_digest(value.encode(), self._csrf.encode())
+    def new_session(self) -> str:
+        """A cookie value: issue time (whole seconds) and its HMAC under the process key."""
+        issued = str(int(self.wall_clock()))
+        return f"{issued}.{self._mac('session', issued)}"
+
+    def session_ok(self, value: str) -> bool:
+        """Issued by this process, unaltered, not from the future and not past its life."""
+        match = _SESSION_RE.fullmatch(value)
+        if match is None:
+            return False
+        issued, mac = match.groups()
+        if not hmac.compare_digest(mac, self._mac("session", issued)):
+            return False
+        age = self.wall_clock() - int(issued)
+        return 0 <= age < SESSION_LIFETIME
+
+    def csrf_for(self, session: str) -> str:
+        return self._mac("csrf", session)
+
+    def csrf_ok(self, session: str, value: str) -> bool:
+        return hmac.compare_digest(value.encode(), self.csrf_for(session).encode())
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -272,6 +352,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def parse_request(self) -> bool:
         if not super().parse_request():
             return False
+        if self.request_version == "HTTP/0.9":
+            # A two-word request line parses as HTTP/0.9, whose answer is a bare body with
+            # no status line or security headers. Close without sending anything.
+            self.close_connection = True
+            return False
         if self.command not in ("GET", "HEAD", "POST"):
             self.close_connection = True
             self._send_json(405, {"error": "method not allowed"},
@@ -284,6 +369,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # The stdlib version echoes the request line (which can hold the token) into the
         # body and the log; answer with the status phrase only.
         self.close_connection = True
+        if self.request_version == "HTTP/0.9":
+            return  # would be a body without headers (see parse_request)
         self._send_json(code, {"error": _phrase(code)})
 
     def end_headers(self) -> None:
@@ -337,27 +424,68 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             handler()
         except _Reject as reject:
-            if self.command == "POST" and not self._body_read:
-                self._drain()
+            unread = self.command == "POST" and not self._body_read
+            if unread:
+                self.close_connection = True
             self._send_json(reject.status, {"error": reject.error}, reject.headers)
+            if unread:
+                self._linger()
         except Exception:
             log.exception("unhandled error on %s %s", self.command, self._log_path())
             if not self._headers_sent:
                 self.close_connection = True
                 self._send_json(500, {"error": "internal error"})
 
-    def _drain(self) -> None:
-        """Read a small refused body so closing the socket does not reset the connection
-        before the client reads the answer. Bodies over the limit are never read."""
-        self._body_read = True
+    def _linger(self) -> None:
+        """After answering a POST whose body was never read: half-close, then discard what
+        the client already sent for at most ``LINGER_SECONDS`` and ``MAX_BODY`` bytes.
+
+        The answer is already on the wire, so a client that never sends its body is not
+        waited on for it. Closing with unread bytes queued makes the kernel send a reset,
+        which can make the client drop the answer before reading it; this short, bounded
+        discard lets a well-behaved client read the answer and close first."""
+        sock = self.connection
         try:
-            length = self._content_length()
-        except _Reject:
-            return
-        try:
-            self.rfile.read(length)
-        except OSError:
+            self.wfile.flush()
+            sock.shutdown(socket.SHUT_WR)
+            deadline = time.monotonic() + LINGER_SECONDS
+            budget = MAX_BODY
+            while budget > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                data = sock.recv(min(4096, budget))
+                if not data:
+                    break
+                budget -= len(data)
+        except OSError:  # includes the timeout
             pass
+
+    def _read_body(self, length: int) -> bytes:
+        """Read ``length`` bytes within the server's body deadline (the socket timeout alone
+        restarts on every byte, so a dribbled body could hold a thread for hours)."""
+        deadline = time.monotonic() + self.server.body_deadline
+        chunks: list[bytes] = []
+        got = 0
+        try:
+            while got < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _Reject(408, "request body too slow")
+                self.connection.settimeout(min(remaining, SOCKET_TIMEOUT))
+                try:
+                    chunk = self.rfile.read1(length - got)
+                except TimeoutError:
+                    raise _Reject(408, "request body too slow")
+                if not chunk:
+                    break  # client closed early; reported as a short body
+                chunks.append(chunk)
+                got += len(chunk)
+        finally:
+            self.connection.settimeout(SOCKET_TIMEOUT)
+        self._body_read = True
+        return b"".join(chunks)
 
     def _target(self) -> tuple[str, dict[str, str]]:
         if not host_allowed(self.headers.get_all("Host")):
@@ -367,13 +495,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             raise _Reject(400, "bad request path")
         return parsed
 
-    def _cookie_ok(self) -> bool:
+    def _session(self) -> Optional[str]:
+        """The first valid session cookie value, or None (expired and forged look the same)."""
         for header in self.headers.get_all("Cookie") or []:
             for part in header.split(";"):
                 name, sep, value = part.strip().partition("=")
                 if sep and name == COOKIE_NAME and self.server.session_ok(value):
-                    return True
-        return False
+                    return value
+        return None
 
     def _content_length(self) -> int:
         if self.headers.get_all("Transfer-Encoding"):
@@ -408,7 +537,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if path == "/" and "token" in query:
             self._sign_in(query["token"])
             return
-        if not self._cookie_ok():
+        session = self._session()
+        if session is None:
             if path == "/":
                 self._send(401, SIGNED_OUT_PAGE, HTML_TYPE)
                 return
@@ -417,8 +547,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send_static(path)
         elif path == "/api/session":
             settings = self.server.settings
-            self._send_json(200, {"csrf": self.server._csrf, "actions": settings.actions,
-                                  "operator": settings.operator})
+            self._send_json(200, {"csrf": self.server.csrf_for(session),
+                                  "actions": settings.actions, "operator": settings.operator})
         elif path.startswith("/api/"):
             routes = self.server.routes
             self._call_route(path, lambda: routes.get(path, query))
@@ -432,7 +562,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if result != "ok":
             raise _Reject(403, "bad token")
         # No Secure attribute: plain HTTP on loopback.
-        cookie = f"{COOKIE_NAME}={self.server._session}; HttpOnly; SameSite=Strict; Path=/"
+        # No Max-Age: the browser drops it at exit, and the server enforces SESSION_LIFETIME.
+        cookie = f"{COOKIE_NAME}={self.server.new_session()}; HttpOnly; SameSite=Strict; Path=/"
         self._send(303, b"", None, (("Location", "/"), ("Set-Cookie", cookie)))
 
     def _send_static(self, path: str) -> None:
@@ -447,13 +578,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     # -- POST --
 
     def _handle_post(self) -> None:
+        # Every refusal below happens before the body is read; _dispatch then answers at once
+        # and closes, so a refused client cannot hold the thread by sending its body slowly.
         path, _ = self._target()
-        if not origin_allowed(self.headers.get_all("Origin")):
+        if not origin_allowed(self.headers.get_all("Origin"), self.headers["Host"]):
             raise _Reject(403, "origin not allowed")
-        if not self._cookie_ok():
+        session = self._session()
+        if session is None:
             raise _Reject(401, "not signed in")
         csrf = self.headers.get_all(CSRF_HEADER) or []
-        if len(csrf) != 1 or not self.server.csrf_ok(csrf[0].strip()):
+        if len(csrf) != 1 or not self.server.csrf_ok(session, csrf[0].strip()):
             raise _Reject(403, "bad csrf token")
         if not self.server.settings.actions:
             raise _Reject(403, "read-only")
@@ -464,8 +598,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 or content_types[0].split(";", 1)[0].strip().lower() != "application/json":
             raise _Reject(415, "content-type must be application/json")
         length = self._content_length()
-        raw = self.rfile.read(length)
-        self._body_read = True
+        raw = self._read_body(length)
         if len(raw) != length:
             raise _Reject(400, "short body")
         try:

@@ -2,15 +2,20 @@
 
 Everything returned here was typed by attackers or derived from it. The rules:
 
-- GET never writes. Only loaders that are pure reads are called (``peek_queue``, ``peek_blocklist``,
+- GET never writes. Only loaders that are pure reads are called (``peek_blocklist``,
   ``DailyCallCounter.peek``, ``EngineState``'s constructor, ...); files without such a
-  loader are read directly. No lock file, directory, cursor or counter is created.
+  loader (approvals, tuner runs) are read directly. No lock file, directory, cursor or
+  counter is created.
 - Ids before paths. A request path component reaches the filesystem only after matching a
   strict pattern, and the final path must resolve inside its base directory. Record ids
   are looked up in the parsed record set and never become a path. Anything else is a 404.
 - One sanitising boundary. ``Api.get`` passes its whole answer through ``scrub``, which
-  removes control and bidi characters from every string (keys included) and caps lengths,
-  so a field added later cannot skip it.
+  removes control, format and other invisible characters from every string, drops any key
+  that cleaning would change, and caps string, list and dict sizes, so a field added later
+  cannot skip it.
+- What is shown is what is acted on. An approval is served as a projection of named fields
+  read by exact key, and is decidable here only when every value the engine acts on is
+  already in its exact, clean form (``undecidable_reason``).
 - Missing or corrupt data is normal: a fresh deployment answers with empty lists.
 - Bounded work: the record set and the queue are cached and re-read only when a cheap
   directory signature changes; the event log is indexed incrementally (``logindex``).
@@ -19,7 +24,9 @@ Everything returned here was typed by attackers or derived from it. The rules:
 - POST (approve, reject, unblock) runs only for a signed-in operator with ``[ui] actions``
   on (the shell checks that). It calls ``respond.approve`` / ``reject`` / ``unblock`` with
   the arguments the CLI passes, so every gate stays in one place. A decision names the
-  ``view_hash`` the operator saw; a different approval on disk is a 409 and nothing changes.
+  ``view_hash`` the operator saw (the raw approval, what the card showed and, for
+  ``publish_detection``, the files it names); any difference now is a 409 and nothing
+  changes.
 """
 
 from __future__ import annotations
@@ -34,12 +41,17 @@ import logging
 import math
 import os
 import re
+import stat
+import sys
 import threading
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+
+from pydantic import ValidationError
 
 from agents import triage
 from agents.llm import DailyCallCounter
@@ -52,15 +64,16 @@ from agents.respond import (
     RespondSettings,
     approve,
     peek_blocklist,
-    peek_queue,
     reject,
     size_alarm,
     unblock,
 )
 from agents.runtime import event_log_state
 from agents.source_state import load as load_source_state
-from agents.triage import JUDGEMENT_RANK, Judgement, TriageRecord, load_records, rank
+from agents.source_state import valid_source_key
+from agents.triage import JUDGEMENT_RANK, Judgement, TriageRecord, rank
 from agents.tuner import history as tuner_history
+from agents.ui import logindex
 from agents.ui.logindex import DEFAULT_MAX_SESSIONS, RangeTooLarge, SessionIndex
 from scenarios.loader import load_overlay
 
@@ -84,11 +97,40 @@ TUNER_RECORDS = 20
 MAX_TUNER_FILE = 1024 * 1024
 MAX_JSON_FILE = 16 * 1024 * 1024
 WINDOWS = {"24h": datetime.timedelta(hours=24), "7d": datetime.timedelta(days=7)}
+# Size caps of the response boundary: a hostile file cannot make any route's body unbounded.
+LIST_CAP = 2_000
+DICT_CAP = 500
 
-# Every C0 control except \t and \n, DEL, C1 controls, and the bidi/direction marks
-# (ALM, LRM, RLM, LRE..RLO, LRI..PDI) that can make text render other than it reads.
-_STRIP_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f؜‎‏‪-‮"
-                       "⁦-⁩]")
+
+def _strip_pattern() -> re.Pattern:
+    """Characters that make text render other than it reads, or not at all: every C0
+    control except \\t and \\n, DEL, C1 controls, every format character (category Cf:
+    bidi marks and overrides, zero-width characters, soft hyphen, tag characters, ...),
+    the line and paragraph separators, variation selectors, the whole tag block and the
+    Hangul fillers that render as blank space. Built from ``unicodedata`` once at import
+    (about 1.1M lookups, a few tens of milliseconds)."""
+    points = set(range(0x00, 0x09)) | set(range(0x0B, 0x20)) | set(range(0x7F, 0xA0))
+    points |= {c for c in range(sys.maxunicode + 1) if unicodedata.category(chr(c)) == "Cf"}
+    points |= {0x2028, 0x2029, 0x115F, 0x1160, 0x3164, 0xFFA0}
+    points |= set(range(0x180B, 0x1810))      # Mongolian free variation selectors
+    points |= set(range(0xFE00, 0xFE10))      # variation selectors 1-16
+    points |= set(range(0xE0100, 0xE01F0))    # variation selectors 17-256
+    points |= set(range(0xE0000, 0xE0080))    # tag block, unassigned code points included
+    ranges, start, prev = [], None, None
+    for c in sorted(points):
+        if start is None:
+            start = prev = c
+        elif c == prev + 1:
+            prev = c
+        else:
+            ranges.append((start, prev))
+            start = prev = c
+    ranges.append((start, prev))
+    body = "".join(f"\\U{a:08x}" if a == b else f"\\U{a:08x}-\\U{b:08x}" for a, b in ranges)
+    return re.compile(f"[{body}]")
+
+
+_STRIP_RE = _strip_pattern()
 # The record id shape triage.write_record produces (its _safe_filename alphabet).
 RECORD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -97,12 +139,26 @@ TOKEN_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 PROTOCOL_RE = re.compile(r"[a-z0-9]{1,16}")
 TUNER_FILE_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}\.json")
 APPROVAL_RE = re.compile(APPROVAL_ID_RE)
+APPROVAL_FILE_RE = re.compile(APPROVAL_ID_RE + r"\.json")
+RECORD_FILE_RE = re.compile(r"[^.].*\.json")   # what triage.load_records globs (*.json)
 VIEW_HASH_RE = re.compile(r"[0-9a-f]{64}")
 DECIDE_RE = re.compile(r"queue/([^/]+)/(approve|reject)")
 MAX_TARGET = 64
 ERROR_CAP = 200
 # Approved actions that send through a connector, and the connector each one needs.
 CONNECTOR_FOR = {"open_ticket": "ticket", "block_webhook": "block_webhook"}
+# Actions respond.approve executes, and the params keys each one reads.
+PARAMS_USED: dict[str, tuple[str, ...]] = {"export_blocklist": (), "publish_detection": ("files",),
+                                           "open_ticket": ("priority",), "block_webhook": ()}
+TICKET_PRIORITIES = ("low", "medium", "high")
+MAX_DETECTION_FILES = 50
+# Approval fields served, each read by exact key from the file as parsed.
+APPROVAL_FIELDS = ("id", "status", "action", "tier", "playbook", "record_id", "subject",
+                   "unverified_source", "created_at", "expires_at", "summary", "approved_by",
+                   "approved_at", "rejected_by", "rejected_at", "expired_at")
+RESULT_FIELDS = ("ok", "status", "files", "entries")
+# Stand-in digest of a detection file named by an approval that is not in pending/.
+MISSING_FILE = "missing"
 
 NOT_FOUND = (404, {"error": "not found"})
 BAD_QUERY = (400, {"error": "bad query"})
@@ -113,6 +169,18 @@ NO_CONNECTOR = (400, {"error": "connector not available here; approve with the C
                                "agents container"})
 BAD_SETTINGS = (500, {"error": "[respond] settings are invalid; nothing was changed (see the "
                                "server log)"})
+UNDECIDABLE = (400, {"error": "this item cannot be decided in the console; nothing was "
+                              "changed. Decide it with the CLI (python -m agents approve or "
+                              "reject <id>) after checking the file"})
+# Why an approval is not decidable here (fixed texts; never built from the file).
+WHY_ID = "its id does not match its file name"
+WHY_ACTION = "its action is not one the engine runs"
+WHY_SUBJECT = "its target is not an address or /64 in the exact form the engine acts on"
+WHY_PLAYBOOK = "its playbook name is missing or contains hidden characters"
+WHY_PARAMS = "its parameters are not in the exact form the engine acts on"
+WHY_EXPIRY = "its expiry time is missing or malformed"
+WHY_FILES = "a detection file it names is not a regular file inside detections/pending"
+WHY_UNREADABLE = "the file cannot be read in full"
 
 
 # ---- sanitising boundary -------------------------------------------------------------------
@@ -122,35 +190,172 @@ class LongText(str):
 
 
 def clean_text(value: str, cap: int = TEXT_CAP) -> str:
-    """Control and bidi characters removed (``\\n`` and ``\\t`` kept), then capped. The
-    input is cut first so a huge string costs no more than a capped one."""
+    """Invisible and control characters removed (``\\n`` and ``\\t`` kept), then capped.
+    The input is cut first so a huge string costs no more than a capped one."""
     return _STRIP_RE.sub("", value[:cap * 2])[:cap]
 
 
-def scrub(value: object, depth: int = 0) -> object:
-    """The response boundary: every string cleaned, numbers made JSON-safe, any other type
-    turned into cleaned text. Applied to the whole answer, so no field can skip it."""
-    if depth > MAX_DEPTH:
-        return None
-    if value is None or isinstance(value, bool) or isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, str):
-        return clean_text(value, LONG_TEXT_CAP if isinstance(value, LongText) else TEXT_CAP)
-    if isinstance(value, dict):
-        return {clean_text(str(k), KEY_CAP): scrub(v, depth + 1) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [scrub(v, depth + 1) for v in value]
-    return clean_text(str(value))
+class _Scrubber:
+    """One pass of ``scrub``; ``cut`` records whether anything was dropped or capped."""
+
+    def __init__(self) -> None:
+        self.cut = False
+
+    def __call__(self, value: object, depth: int = 0) -> object:
+        if depth > MAX_DEPTH:
+            self.cut = True
+            return None
+        if value is None or isinstance(value, bool) or isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, str):
+            return clean_text(value, LONG_TEXT_CAP if isinstance(value, LongText) else TEXT_CAP)
+        if isinstance(value, dict):
+            return self._dict(value, depth)
+        if isinstance(value, (list, tuple)):
+            if len(value) > LIST_CAP:
+                self.cut = True
+            return [self(v, depth + 1) for v in value[:LIST_CAP]]
+        return clean_text(str(value))
+
+    def _dict(self, value: dict, depth: int) -> dict:
+        # A key that cleaning would change is dropped, never renamed: renaming could make
+        # "subject‎" replace "subject", so the page would show one value while the
+        # engine reads the other. Dropping also means no two keys can become one.
+        out: dict = {}
+        for k, v in value.items():
+            if len(out) >= DICT_CAP:
+                self.cut = True
+                break
+            key = k if isinstance(k, str) else str(k)
+            if key in out or clean_text(key, KEY_CAP) != key:
+                self.cut = True
+                continue
+            out[key] = self(v, depth + 1)
+        return out
 
 
-def view_hash(approval: dict) -> str:
-    """SHA-256 over the canonical JSON of an approval as read from disk. The approve and
-    reject calls send it back, so a decision is only made on what the operator saw."""
-    text = json.dumps(approval, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+def scrub_flagged(value: object) -> tuple[object, bool]:
+    """``scrub`` and whether it dropped a key or cut a list, dict or nesting level."""
+    s = _Scrubber()
+    out = s(value)
+    return out, s.cut
+
+
+def scrub(value: object) -> object:
+    """The response boundary: every string cleaned and capped, numbers made JSON-safe, any
+    other type turned into cleaned text, keys that cleaning would change dropped, lists
+    and dicts capped (``LIST_CAP``, ``DICT_CAP``). Applied to the whole answer, so no field
+    can skip it."""
+    return _Scrubber()(value)
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
                       default=str)
+
+
+def view_hash(raw: dict, approval: dict, record: Optional[dict],
+              files: Optional[dict[str, str]] = None) -> str:
+    """SHA-256 over what a decision depends on: the approval as parsed from disk, the
+    approval and record summary as served (after ``scrub``) and, for ``publish_detection``,
+    the SHA-256 of each named pending file. The approve and reject calls send it back, so a
+    decision is only made on what the operator saw. Raises ValueError or RecursionError
+    when ``raw`` cannot be serialised (such an item is not decidable here)."""
+    text = _canonical({"raw": raw, "approval": approval, "record": record,
+                       "files": files or {}})
     return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def project_approval(raw: dict) -> dict:
+    """The served approval: named fields read by exact key, never the whole object, so a
+    look-alike key cannot stand in for one the engine reads. Only the params the action
+    uses are served (all of them are what it acts on)."""
+    out = {k: raw[k] for k in APPROVAL_FIELDS if k in raw}
+    params = raw.get("params")
+    if isinstance(params, dict):
+        used = PARAMS_USED.get(raw.get("action"), ()) if isinstance(raw.get("action"), str) \
+            else ()
+        out["params"] = {k: params[k] for k in used if k in params}
+    result = raw.get("result")
+    if isinstance(result, dict):
+        out["result"] = {k: result[k] for k in RESULT_FIELDS if k in result}
+    return out
+
+
+def _clean_same(value: object, cap: int = TEXT_CAP) -> bool:
+    """A string that the response boundary would serve unchanged."""
+    return isinstance(value, str) and clean_text(value, cap) == value
+
+
+def _exact_source_key(value: object) -> bool:
+    """``value`` is a source key (IPv4 address or IPv6 /64) in the exact canonical text
+    ``ip_key`` writes, so the target shown is byte for byte the target acted on."""
+    if not isinstance(value, str) or not _clean_same(value, MAX_TARGET) \
+            or not valid_source_key(value):
+        return False
+    try:
+        canon = str(ipaddress.ip_network(value, strict=True)) if "/" in value \
+            else str(ipaddress.ip_address(value))
+    except ValueError:
+        return False
+    return canon == value
+
+
+def undecidable_reason(stem: str, raw: dict) -> Optional[str]:
+    """None when every value ``respond.approve`` / ``reject`` act on is in its exact clean
+    form, so the card shows what would be acted on; else a fixed reason. ``stem`` is the
+    file name without ``.json``: the id a decision is sent to."""
+    aid = raw.get("id")
+    if not isinstance(aid, str) or aid != stem or not APPROVAL_RE.fullmatch(aid):
+        return WHY_ID
+    action = raw.get("action")
+    if not isinstance(action, str) or action not in PARAMS_USED:
+        return WHY_ACTION
+    if not _exact_source_key(raw.get("subject")):
+        return WHY_SUBJECT
+    playbook = raw.get("playbook")
+    if not _clean_same(playbook, KEY_CAP) or not playbook:
+        return WHY_PLAYBOOK
+    if _parse_ts(raw.get("expires_at")) is None:
+        return WHY_EXPIRY
+    params = raw.get("params", {})
+    if not isinstance(params, dict):
+        return WHY_PARAMS
+    if action == "publish_detection":
+        files = params.get("files")
+        if not isinstance(files, list) or not 0 < len(files) <= MAX_DETECTION_FILES \
+                or not all(isinstance(n, str) and DETECTION_RE.fullmatch(n) for n in files):
+            return WHY_PARAMS
+    if action == "open_ticket" and params.get("priority", "medium") not in TICKET_PRIORITIES:
+        return WHY_PARAMS
+    return None
+
+
+def _file_digest(base: Path, name: str) -> Optional[str]:
+    """SHA-256 of ``base/name`` read in chunks, ``MISSING_FILE`` when it does not exist,
+    or None when it is not a regular file directly inside ``base`` (a symlink out, a
+    directory): the engine would move such an entry without the console seeing it."""
+    path = _inside(base, name)
+    if path is None:
+        return None
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return MISSING_FILE
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
 
 
 # ---- small helpers -------------------------------------------------------------------------
@@ -214,7 +419,7 @@ def _read_json(path: Path, default):
         if path.stat().st_size > MAX_JSON_FILE:
             return default
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return default
     return data if isinstance(data, type(default)) else default
 
@@ -287,6 +492,42 @@ class _Records:
     stamps: dict[str, Optional[datetime.datetime]]
 
 
+@dataclass(frozen=True)
+class _Approval:
+    """One approval file: its name without ``.json`` (the id a decision is sent to, already
+    matching ``APPROVAL_ID_RE``) and its content as parsed."""
+
+    stem: str
+    raw: dict
+
+    def status_at(self, now: datetime.datetime) -> object:
+        """The status, with an overdue pending item judged expired (as ``peek_queue``)."""
+        status = self.raw.get("status")
+        if status == "pending":
+            expires = _parse_ts(self.raw.get("expires_at"))
+            if expires is not None and expires <= now:
+                return "expired"
+        return status
+
+
+@dataclass(frozen=True)
+class _View:
+    shown: dict                      # the served approval projection (status as on disk)
+    record: Optional[dict]           # the served record summary, or None
+    reason: Optional[str]            # why it is not decidable here, or None
+    files: dict[str, str]            # publish_detection: name -> SHA-256 or MISSING_FILE
+    digest: Optional[str]            # the view_hash, when decidable
+
+
+def _bounded(value: object) -> object:
+    """``scrub``, with ``"truncated": true`` added to a dict answer when a list, dict or
+    nesting level was cut or a key dropped (as routes flag a cut string)."""
+    out, cut = scrub_flagged(value)
+    if cut and isinstance(out, dict):
+        out["truncated"] = True
+    return out
+
+
 def _stamp(r: TriageRecord) -> Optional[datetime.datetime]:
     return _parse_ts(r.last_seen) or _parse_ts(r.first_seen)
 
@@ -309,8 +550,14 @@ def _haystack(r: TriageRecord) -> str:
     return "\n".join(parts).lower()
 
 
+MASK = "......"
+MASK_PREFIX_MIN = 8   # shorter values show nothing: two characters would be most of them
+
+
 def _mask(value: str) -> str:
-    return value[:2] + "......"
+    """A honeytoken value hidden: its first two characters only when it is long enough
+    that they give little away, otherwise nothing at all."""
+    return value[:2] + MASK if len(value) >= MASK_PREFIX_MIN else MASK
 
 
 # ---- the API -------------------------------------------------------------------------------
@@ -392,11 +639,11 @@ class Api:
 
     def get(self, path: str, query: dict[str, str]) -> tuple[int, object]:
         status, value = self._dispatch(path, query)
-        return status, scrub(value)
+        return status, _bounded(value)
 
     def post(self, path: str, body: dict) -> tuple[int, object]:
         status, value = self._dispatch_post(path, body)
-        return status, scrub(value)
+        return status, _bounded(value)
 
     def _dispatch_post(self, path: str, body: dict) -> tuple[int, object]:
         if not path.startswith("/api/"):
@@ -433,27 +680,95 @@ class Api:
     # -- loaders --
 
     def _load_records(self) -> _Records:
-        records = load_records(self.paths.reports)
+        records = []
+        # triage.load_records' files, each kept inside its directory as the digest and
+        # detection routes are (a symlink out of reports/sessions is not followed).
+        for sub in ("sessions", "campaigns"):
+            base = self.paths.reports / sub
+            for name in _list_names(base, RECORD_FILE_RE):
+                path = _inside(base, name)
+                try:
+                    if path is None or path.stat().st_size > MAX_JSON_FILE:
+                        continue
+                    records.append(TriageRecord.model_validate_json(
+                        path.read_text(encoding="utf-8")))
+                except (OSError, ValidationError, ValueError, RecursionError):
+                    log.warning("skipping invalid record %s", name[:80])
         stamps = {r.id: _stamp(r) for r in records}
         floor = datetime.datetime.min.replace(tzinfo=UTC)
         newest = sorted(records, key=lambda r: stamps[r.id] or floor, reverse=True)
         return _Records(newest=newest, ranked=rank(records), by_id={r.id: r for r in records},
                         stamps=stamps)
 
-    def _load_queue(self) -> list[dict]:
-        items = peek_queue(self.paths.state, now=self.now(), include_closed=True)
-        return sorted(items, key=lambda a: str(a.get("created_at", "")), reverse=True)
+    def _load_queue(self) -> list[_Approval]:
+        """Every approval file, as ``peek_queue`` lists them (a pure read; a file without a
+        parseable ``expires_at`` is skipped), keeping each file's name for decisions."""
+        adir = self.paths.state / "approvals"
+        items = []
+        for name in _list_names(adir, APPROVAL_FILE_RE):
+            raw = _read_json(adir / name, {})
+            if _parse_ts(raw.get("expires_at")) is not None:
+                items.append(_Approval(name[:-len(".json")], raw))
+        return sorted(items, key=lambda a: str(a.raw.get("created_at", "")), reverse=True)
 
-    def _queue_now(self) -> list[dict]:
-        """The cached queue with expiry judged at request time: the cache only reloads when
-        the directory changes, and an item can pass its expiry without any file changing."""
-        now, out = self.now(), []
-        for a in self._queue.get():
-            if a.get("status") == "pending":
-                expires = _parse_ts(a.get("expires_at"))
-                if expires is not None and expires <= now:
-                    a = {**a, "status": "expired"}
-            out.append(a)
+    def _queue_now(self) -> list[_Approval]:
+        """The cached queue; callers judge expiry at request time (``status_at``): the cache
+        only reloads when the directory changes, and an item can pass its expiry without
+        any file changing."""
+        return self._queue.get()
+
+    def _view(self, item: _Approval, by_id: dict[str, TriageRecord]) -> _View:
+        """What the queue serves for ``item`` and its ``view_hash``, from the file as it is
+        on disk. The queue route and a decision both call this, so they hash alike."""
+        raw = item.raw
+        shown = scrub(project_approval(raw))
+        rid = raw.get("record_id")
+        r = by_id.get(rid) if isinstance(rid, str) else None
+        record = scrub(_summary(r)) if r is not None else None
+        reason = undecidable_reason(item.stem, raw)
+        files = self._detection_files(raw) if reason is None else {}
+        if files is None:
+            reason, files = WHY_FILES, {}
+        digest = None
+        if reason is None:
+            try:
+                digest = view_hash(raw, shown, record, files)
+            except (ValueError, TypeError, RecursionError):
+                reason = WHY_UNREADABLE
+        return _View(shown, record, reason, files, digest)
+
+    def _card(self, item: _Approval, now: datetime.datetime,
+              by_id: dict[str, TriageRecord]) -> dict:
+        """One queue entry: the served approval, the record summary shown beside it, the
+        detection files it names, and a ``view_hash`` when it can be decided here now."""
+        v = self._view(item, by_id)
+        status = item.status_at(now)
+        # Only an untouched pending item can be decided; one past its expiry is shown as
+        # expired (it is still pending on disk, and respond would refuse it).
+        decidable = v.reason is None and status == "pending"
+        out = {"id": item.stem, "approval": {**v.shown, "status": scrub(status)},
+               "view_hash": v.digest if decidable else None,
+               "can_decide_here": decidable,
+               "can_approve_here": decidable and self._connector_ready(item.raw),
+               "undecidable_reason": v.reason,
+               "record": v.record}
+        if item.raw.get("action") == "publish_detection" and v.reason is None:
+            out["detection_files"] = [{"name": n, "present": d != MISSING_FILE}
+                                      for n, d in v.files.items()]
+        return out
+
+    def _detection_files(self, raw: dict) -> Optional[dict[str, str]]:
+        """{name: SHA-256 or MISSING_FILE} for the pending files a ``publish_detection``
+        approval names ({} for other actions), or None when one is not a regular file
+        inside detections/pending. Names were checked by ``undecidable_reason``."""
+        if raw.get("action") != "publish_detection":
+            return {}
+        out = {}
+        for name in raw["params"]["files"]:
+            digest = _file_digest(self.paths.detections / "pending", name)
+            if digest is None:
+                return None
+            out[name] = digest
         return out
 
     def _record_id(self, raw: str) -> Optional[TriageRecord]:
@@ -497,7 +812,7 @@ class Api:
             if seen is None or JUDGEMENT_RANK[r.judgement] > JUDGEMENT_RANK[seen]:
                 worst[r.src_ip] = r.judgement
         hits = [_summary(r) for r in inside if r.honeytokens][:HONEYTOKEN_HITS]
-        pending = [a for a in self._queue_now() if a.get("status") == "pending"]
+        pending = [a.raw for a in self._queue_now() if a.status_at(now) == "pending"]
         expiries = sorted(str(a.get("expires_at", "")) for a in pending if a.get("expires_at"))
         return 200, {
             "window": window, "since": since.isoformat(timespec="seconds"),
@@ -564,7 +879,7 @@ class Api:
         for line in reversed(lines):
             try:
                 ev = json.loads(line.decode("utf-8", errors="replace"))
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if isinstance(ev, dict):
                 # Whitelisted fields: the object key carries the configured bucket prefix.
@@ -618,12 +933,22 @@ class Api:
         r = self._record_id(rid)
         if r is None:
             return NOT_FOUND
-        approvals = [a.get("id") for a in self._queue_now() if a.get("record_id") == r.id]
-        return 200, {"record": r.model_dump(mode="json"), "approvals": approvals,
-                     "transcript_available": self._has_transcript(r)}
-
-    def _has_transcript(self, r: TriageRecord) -> bool:
-        return r.kind == "session" and r.protocol == "ssh" and self.index.range_of(r.id) is not None
+        approvals = [a.stem for a in self._queue_now() if a.raw.get("record_id") == r.id]
+        out = {"record": r.model_dump(mode="json"), "approvals": approvals,
+               "transcript_available": False, "transcript_withheld": None}
+        span = self.index.range_of(r.id) if r.kind == "session" and r.protocol == "ssh" \
+            else None
+        if span is not None and span[1] - span[0] > logindex.MAX_RANGE_BYTES:
+            # Said up front, rather than offering a transcript that then answers 422. The id
+            # matched RECORD_ID_RE, so it is safe to quote in the command.
+            out["transcript_withheld"] = (
+                f"This session's lines span more than "
+                f"{logindex.MAX_RANGE_BYTES // (1024 * 1024)} MiB of the event log, so the "
+                f"console does not replay it. Read it on the host with: "
+                f"grep -F '\"{r.id}\"' <event log>")
+        else:
+            out["transcript_available"] = span is not None
+        return 200, out
 
     def transcript(self, query: dict[str, str], rid: str) -> tuple[int, object]:
         r = self._record_id(rid)
@@ -643,21 +968,13 @@ class Api:
         everything = query.get("all") or "0"
         if everything not in ("0", "1"):
             raise _BadQuery
+        now = self.now()
         items = self._queue_now()
         if everything == "0":
-            items = [a for a in items if a.get("status") == "pending"]
+            items = [a for a in items if a.status_at(now) == "pending"]
         page = paginate(items, query)
         by_id = self._records.get().by_id
-        out = []
-        for a in page["items"]:
-            r = by_id.get(str(a.get("record_id", "")))
-            # Only an untouched pending item can be decided; peek_queue hands an overdue
-            # one back as an "expired" copy, which is no longer what is on disk.
-            out.append({"approval": a,
-                        "view_hash": view_hash(a) if a.get("status") == "pending" else None,
-                        "can_approve_here": self._can_approve_here(a),
-                        "record": _summary(r) if r is not None else None})
-        page["items"] = out
+        page["items"] = [self._card(a, now, by_id) for a in page["items"]]
         return 200, page
 
     def blocklist(self, query: dict[str, str]) -> tuple[int, object]:
@@ -704,9 +1021,9 @@ class Api:
             overlay, overlay_error = None, "overlay file is not valid"
         tuner_runs = []
         for name in reversed(_list_names(p.reports / "tuner", TUNER_FILE_RE)[-TUNER_RECORDS:]):
-            path = p.reports / "tuner" / name
+            path = _inside(p.reports / "tuner", name)   # no symlink out of the directory
             try:
-                if path.stat().st_size > MAX_TUNER_FILE:
+                if path is None or path.stat().st_size > MAX_TUNER_FILE:
                     continue
             except OSError:
                 continue
@@ -789,11 +1106,9 @@ class Api:
                         log.exception("building connectors failed; connector actions are off")
             return self._connectors_value
 
-    def _can_approve_here(self, approval: dict) -> bool:
+    def _connector_ready(self, approval: dict) -> bool:
         """Whether approving would run the action here rather than consume the approval: a
         connector action needs that connector enabled in this process."""
-        if approval.get("status") != "pending":
-            return False
         name = CONNECTOR_FOR.get(str(approval.get("action", "")))
         if name is None:
             return True
@@ -831,11 +1146,13 @@ class Api:
         settings = self._decision_settings()
         if settings is None:
             return BAD_SETTINGS
-        # The same parse the queue route hashes (peek_queue reads the file as JSON). The
-        # status and expiry are re-checked by respond under its lock; this only makes sure
-        # the operator decided on what is on disk now.
-        current = _read_json(path, {})
-        if not hmac.compare_digest(view_hash(current).encode(), given.encode()):
+        current = self.view_of(aid)
+        if current.reason is not None:
+            # Approve and reject alike: reject also acts on the raw subject, playbook and
+            # action (its suppression key), so it could be misdirected the same way.
+            return UNDECIDABLE
+        if current.digest is None or \
+                not hmac.compare_digest(current.digest.encode(), given.encode()):
             return CHANGED
         state, reports = self.paths.state, self.paths.reports
         try:
@@ -845,7 +1162,7 @@ class Api:
                                 reports_dir=reports)
             else:
                 conns = self._connectors()
-                needed = CONNECTOR_FOR.get(str(current.get("action", "")))
+                needed = CONNECTOR_FOR.get(str(current.shown.get("action", "")))
                 if needed is not None and (conns is None or not conns.enabled(needed)):
                     # approve would mark it executing and then failed: refuse, keep it pending.
                     return NO_CONNECTOR
@@ -860,28 +1177,57 @@ class Api:
             return 400, {"error": clean_text(str(exc), ERROR_CAP)}
         finally:
             self._queue.invalidate()
-        return 200, {"approval": result}
+        return 200, {"approval": project_approval(result) if isinstance(result, dict) else None}
+
+    def view_of(self, aid: str) -> _View:
+        """The view of approval ``aid`` as the queue would serve it now, read fresh from disk
+        (the record set's signature is re-checked first, so a record re-triaged since the
+        page loaded changes the hash). ``aid`` must already match ``APPROVAL_ID_RE``. The
+        status and expiry are re-checked by respond under its lock; this makes sure the
+        operator decided on what is on disk now."""
+        raw = _read_json(self.paths.state / "approvals" / f"{aid}.json", {})
+        self._records.invalidate()
+        return self._view(_Approval(aid, raw), self._records.get().by_id)
+
+    # One fixed answer for every refused unblock: the console removes single listed entries,
+    # and a range (which can empty the whole list in one click) is a CLI decision.
+    UNBLOCK_REFUSED = (400, {"error": "target must be one blocklist entry exactly as listed; "
+                                      "unblock a range with the CLI (python -m agents unblock)"})
 
     def _unblock(self, body: dict) -> tuple[int, object]:
+        """Remove exactly one listed entry. ``target`` must parse (``ipaddress``) to a value
+        equal to an existing key; covering networks such as 0.0.0.0/0 are refused here."""
         raw = body.get("target")
         if not isinstance(raw, str) or len(raw) > MAX_TARGET:
-            return BAD_TARGET
-        value = raw.strip()
-        if "%" in value:   # scoped IPv6 addresses are never blocklist keys
-            return BAD_TARGET
-        try:
-            target = str(ipaddress.ip_network(value, strict=False)) if "/" in value \
-                else str(ipaddress.ip_address(value))
-        except ValueError:
-            return BAD_TARGET
+            return self.UNBLOCK_REFUSED
+        wanted = self._unblock_network(raw.strip())
+        if wanted is None:
+            return self.UNBLOCK_REFUSED
         settings = self._decision_settings()
         if settings is None:
             return BAD_SETTINGS
+        entries = peek_blocklist(self.paths.state, self.now(), settings.blocklist_ttl_days)
+        key = next((k for k in entries if self._unblock_network(k) == wanted), None)
+        if key is None:
+            return self.UNBLOCK_REFUSED
         try:
-            result = unblock(target, self.paths.state, self.paths.reports,
+            # respond.unblock also removes entries inside the given network; keys are single
+            # addresses or IPv6 /64s, so for an exact key that is only the key itself.
+            result = unblock(key, self.paths.state, self.paths.reports,
                              blocklist_file=settings.blocklist_file,
                              blocklist_format=settings.blocklist_format,
                              ttl_days=settings.blocklist_ttl_days, by=self._by())
         except ValueError:
-            return BAD_TARGET
+            return self.UNBLOCK_REFUSED
         return 200, result
+
+    @staticmethod
+    def _unblock_network(value: str):
+        """``value`` as an ``ip_network`` (an address is its /32 or /128), or None. Host bits
+        set under a prefix are refused rather than masked, so 198.51.100.7/24 is no key."""
+        if "%" in value:   # scoped IPv6 addresses are never blocklist keys
+            return None
+        try:
+            return ipaddress.ip_network(value, strict=True)
+        except ValueError:
+            return None

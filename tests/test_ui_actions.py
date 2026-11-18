@@ -23,7 +23,7 @@ from agents.playbooks import Playbook
 from agents.respond import approve as respond_approve
 from agents.respond import queue_enforce_action, reject as respond_reject
 from agents.ui import api as api_mod
-from agents.ui.api import Api, view_hash
+from agents.ui.api import Api
 from agents.ui.server import UiSettings, build_server
 
 pytestmark = pytest.mark.usefixtures("public_test_net")
@@ -169,7 +169,7 @@ def test_expired_item_is_refused(tree):
     item = queue_items(api)[aid]
     assert item["approval"]["status"] == "expired" and item["view_hash"] is None
     # An operator who loaded the page before it expired holds the hash of the file as is.
-    status, body = decide(api, aid, "approve", view_hash(on_disk(tree, aid)))
+    status, body = decide(api, aid, "approve", api.view_of(aid).digest)
     assert status == 400 and body["error"].startswith(f"{aid} expired at ")
     assert on_disk(tree, aid)["status"] == "expired"
     assert not (tree.detections / "approved" / "0a1b2c3d-ssh-download-execute.yml").exists()
@@ -223,8 +223,13 @@ def test_unblock_removes_the_entry_and_writes_an_audit_record(tree):
     record = json.loads(path.read_text())["unblock"]
     assert record == {"target": "198.51.100.7", "removed": ["198.51.100.7"],
                       "by": "ui:" + OPERATOR}
-    status, body = api.post("/api/blocklist/unblock", {"target": "198.51.100.0/24"})
-    assert status == 200 and body["removed"] == ["198.51.100.8"]
+    # A /32 spelling of the remaining entry is the same key.
+    status, body = api.post("/api/blocklist/unblock", {"target": "198.51.100.8/32"})
+    assert status == 200 and body["removed"] == ["198.51.100.8"] and body["entries"] == 0
+
+
+UNBLOCK_REFUSED = (400, {"error": "target must be one blocklist entry exactly as listed; "
+                                  "unblock a range with the CLI (python -m agents unblock)"})
 
 
 @pytest.mark.parametrize("target", [None, 7, ["198.51.100.7"], "", "198.51.100.300",
@@ -233,9 +238,34 @@ def test_unblock_refuses_a_bad_target_with_fixed_text(tree, target):
     api = make_api(tree)
     before = snapshot(tree.root)
     body = {} if target is None else {"target": target}
-    assert api.post("/api/blocklist/unblock", body) == \
-        (400, {"error": "target must be an IP address or network"})
+    assert api.post("/api/blocklist/unblock", body) == UNBLOCK_REFUSED
     assert snapshot(tree.root) == before
+
+
+@pytest.mark.parametrize("target", ["0.0.0.0/0", "::/0", "198.51.100.0/24", "198.51.100.0/25",
+                                    "198.51.100.7/24", "198.51.100.9", "2001:db8::/64",
+                                    "::ffff:198.51.100.7"])
+def test_unblock_takes_only_an_exact_entry(tree, target):
+    api = make_api(tree)
+    before = snapshot(tree.root)
+    assert api.post("/api/blocklist/unblock", {"target": target}) == UNBLOCK_REFUSED
+    assert snapshot(tree.root) == before
+    assert {e["target"] for e in api.get("/api/blocklist", {})[1]["items"]} == \
+        {"198.51.100.7", "198.51.100.8"}
+
+
+def test_unblock_exact_ipv6_key(tree):
+    from agents.respond import _blocklist_store
+
+    store = _blocklist_store(tree.state)
+    entries = json.loads(store.read_text())
+    entries["2001:db8:1:2::/64"] = dict(entries["198.51.100.7"])
+    store.write_text(json.dumps(entries))
+    api = make_api(tree)
+    for wrong in ("2001:db8:1:2::1", "2001:db8:1::/48", "2001:db8:1:2::/96"):
+        assert api.post("/api/blocklist/unblock", {"target": wrong}) == UNBLOCK_REFUSED
+    status, body = api.post("/api/blocklist/unblock", {"target": "2001:DB8:1:2:0::/64"})
+    assert status == 200 and body["removed"] == ["2001:db8:1:2::/64"] and body["entries"] == 2
 
 
 # ---- refusals that change nothing ----------------------------------------------------------
@@ -310,7 +340,7 @@ def test_request_input_never_appears_in_an_error_body(tree):
             assert value not in text and json.dumps(value)[1:-1] not in text
     # An ApprovalError carries only the validated id and what respond read from disk.
     respond_reject(aid, tree.state, by="cli")
-    status, body = decide(api, aid, "approve", view_hash(on_disk(tree, aid)))
+    status, body = decide(api, aid, "approve", api.view_of(aid).digest)
     assert (status, body) == (400, {"error": f"{aid} is rejected, not pending"})
 
 

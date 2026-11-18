@@ -501,10 +501,14 @@ At start the console logs a sign-in link with a random token, new on every start
 docker compose logs ui          # or the terminal that runs python -m agents ui
 ```
 
-Open that link once; it sets a session cookie. To keep the same token across restarts,
-set `WINNIE_UI_TOKEN` (24 characters or more) in the shell that starts it. Anyone with the
-link and access to the port can use the console, so treat the log and the token like a
-password.
+Open that link; it sets a session cookie. The session ends after 12 hours and whenever
+the console restarts; the page then shows "not signed in". The link itself stays valid
+for as long as that console process runs, so open it again to get a new session. To keep
+the same token (and link) across restarts, set `WINNIE_UI_TOKEN` (24 characters or more)
+in the shell that starts it; sessions still end at each restart. Anyone with the link and
+access to the port can use the console, so treat the log and the token like a password.
+
+Wrong tokens are slowed down (429 after ten a minute) but never block the right one.
 
 ### Reaching it
 
@@ -522,7 +526,9 @@ The console listens on loopback only. There is no public URL and no inbound port
   [deploy/aws/README.md](../deploy/aws/README.md#operator-console-optional).
 
 Use `127.0.0.1` or `localhost` in the address bar: the console rejects requests that name
-any other host.
+any other host. Actions must come from the page under the same name and port they are
+sent to, so stay on one address (do not sign in on `localhost` and act from a tab opened
+on `127.0.0.1`).
 
 ### Turning actions on
 
@@ -543,6 +549,9 @@ Actions need write access to the agent data (the approval queue, the blocklist a
 `response/` audit records under `reports/`). The overlay and the event log stay
 read-only. In Docker the console holds no connector secrets, so approve `open_ticket` and
 `block_webhook` items with the CLI in the `agents` container, which has them.
+
+The console's unblock takes one blocklist entry exactly as listed. To remove a range
+(every entry inside a network), use `python -m agents unblock <network>`.
 
 With actions on, the console can change what the sensor blocks. Anyone who can reach its
 port and read its log can approve a block, so keep host access as tight as for the agents

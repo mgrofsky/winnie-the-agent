@@ -231,14 +231,32 @@ read-only data.
 
 - At start the server logs one sign-in link with a random token (or uses
   `WINNIE_UI_TOKEN`, at least 24 characters). `GET /?token=...` sets an HttpOnly,
-  SameSite=Strict session cookie. The cookie and the CSRF value are HMAC-SHA256
-  derivations of the token; the token itself is never stored in a cookie, returned by an
-  endpoint or logged again. Failed token attempts are throttled.
+  SameSite=Strict session cookie. The cookie holds its issue time and an HMAC-SHA256 of
+  it under a random key made fresh at every start, never derived from the token: a
+  session ends when the server restarts (even with a fixed `WINNIE_UI_TOKEN`) and after 12
+  hours, both enforced by the server, with nothing stored server-side. An altered,
+  expired or future-dated cookie gets the same 401 as no cookie. The CSRF value is an
+  HMAC of the cookie value, so one session's value is refused with another's cookie. The
+  token itself is never stored in a cookie, returned by an endpoint or logged again.
+- The sign-in token is not used up: after a restart or expiry the operator opens the same
+  logged link again (with a fixed `WINNIE_UI_TOKEN`, the same link across restarts). The
+  token is compared first, so the correct one always signs in; failed attempts are
+  counted and answered 429 once over 10 a minute, which slows guessing but cannot lock the
+  operator out.
 - Every request's `Host` must name localhost, 127.0.0.1 or [::1], which defeats DNS
-  rebinding. Every POST also needs a matching `Origin`, the session cookie, the
-  `X-Winnie-CSRF` header, actions turned on, and a JSON object body of at most 16 KiB.
+  rebinding. Every POST also needs an `Origin` exactly equal to `http://` plus that
+  `Host` (so a page on another local port or under another loopback name cannot post),
+  the session cookie, the `X-Winnie-CSRF` header, actions turned on, and a JSON object
+  body of at most 16 KiB.
+- A POST refused by any of those checks is answered before its body is read and the
+  connection closed, so an unauthenticated client cannot hold a worker with a slow body.
+  An accepted body must arrive within 10 seconds in total. At most 32 connections are
+  served at once; the rest get a fixed 503. HTTP/0.9 requests are closed unanswered.
 - Static files come from a fixed table; no file is looked up from the request path.
   Errors become a bare 500.
+- The console's unblock removes exactly one listed entry: the target must parse to a key
+  already on the blocklist. A network covering several entries (or everything, such as
+  `0.0.0.0/0`) is refused; ranges are unblocked with `python -m agents unblock`.
 
 **Displayed text is attacker-controlled.** Commands, usernames, passwords, HTTP requests
 and transcripts are all hostile input. The console renders them as text only, never as

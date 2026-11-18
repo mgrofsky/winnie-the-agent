@@ -310,7 +310,7 @@ def iter_records(path: os.PathLike | str, start_offset: int = 0
                 continue
             try:
                 obj = json.loads(raw.decode("utf-8", errors="replace"))
-            except ValueError:
+            except (ValueError, RecursionError):
                 yield start, pos, None
                 continue
             yield start, pos, obj if isinstance(obj, dict) else None

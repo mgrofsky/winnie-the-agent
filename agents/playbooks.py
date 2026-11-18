@@ -220,7 +220,7 @@ def load_playbook(path: Path) -> Playbook:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
         pb = Playbook.model_validate(raw)
-    except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, ValidationError, RecursionError) as exc:
         raise PlaybookError(f"{path.name}: {exc}") from exc
     if pb.name != path.stem:
         raise PlaybookError(f"{path.name}: name {pb.name!r} must match the file name")
