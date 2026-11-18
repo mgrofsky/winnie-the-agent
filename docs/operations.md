@@ -215,6 +215,7 @@ Everything runs without any model configured:
 | Per-source state | `overlay` | entries expire; at most 10,000 |
 | Approved blocklist | `agentdata`: `/agents/reports/blocklist/` | entries expire after `blocklist_ttl_days` (30) |
 | Detection drafts | `agentdata`: `/agents/detections/pending/` | no |
+| Blocklist candidates | `agentdata`: `/agents/detections/pending/blocklist-candidates.csv` | rewritten each detect run; rows past `expires` (`[agents] blocklist_expiry_days`, 14, or `blocklist_access_expiry_days`, 30) are left out |
 | Event export cursor and failure events | `agentdata`: `/agents/state/ship_cursor.json`, `ship_events.jsonl` | the failure file is kept under 1 MB |
 
 Rotate the event log yourself, and only when nothing is pending. The summary of every
@@ -367,6 +368,61 @@ breaches, or a person who reached the trap by mistake and typed their own passwo
 hash keeps the correlation value without copying those secrets into another system. Anyone
 holding the sensor seed can still test guesses against the hashes, so the seed stays on the
 front-end volume.
+
+## Using the intelligence outside the sensor
+
+The sensor produces addresses and indicators: `detections/pending/blocklist-candidates.csv`,
+Sigma drafts, the approved blocklist file (`[respond] blocklist_file`) and, with export on,
+the raw events. Feeding any of them into a firewall, a WAF, a session border controller, a
+SIEM or a paging system happens outside the sensor's fences, and a mistake there blocks or
+wakes up the wrong people. The guidance below applies to all of them, including the
+approved blocklist: a person approving an entry does not make the entry's source more
+trustworthy.
+
+- **Act only on proven sources.** Use candidate rows with `source_proven` set to `yes`, and
+  events that pass the [source proof](architecture.md#source-proof) filter (`transport`
+  is `tcp`, or `data.source_verified` or `data.nonce_verified` is `true`). A UDP source
+  address is whatever the sender wrote, so an unproven address may belong to a bystander
+  the attacker picked. Acting on it lets anyone choose whom you block.
+- **Expire entries.** Honour `expires` in the candidate file, and give anything you derive
+  from raw events an expiry of its own. Attack traffic comes mostly from rented servers,
+  residential proxies and compromised devices whose addresses change hands. A permanent
+  entry ends up blocking whoever holds the address next, and nobody remembers why it is
+  there.
+- **Keep an allow-list and check it before listing.** List your carriers and SIP trunks,
+  offices and VPN egress, monitoring and uptime checks, the scanners you pay for, and your
+  customers' known addresses. Check it before an address goes onto any list, not after a
+  complaint. The sensor is on the internet and sees some of your own traffic, and an
+  attacker can provoke it into listing an address you depend on. A block on a carrier or a
+  monitor is an outage you caused.
+- **Check whether the address was already a successful caller.** Before acting, look the
+  address up in the logs of your real services: authenticated logins, completed calls,
+  normal API use, from before it first appeared on the sensor. If it was, never page or
+  block on it automatically; send it to a person. It may be a customer behind shared NAT,
+  a customer's compromised device, or a forged source aimed at you. Each of those needs a
+  different response, and none of them is an automatic block.
+- **Cap list size.** Give every list a maximum number of entries, and when it is full,
+  stop adding and alert instead of evicting older entries. An attacker with many proven
+  addresses (a botnet is enough) can generate entries faster than you review them. If new
+  entries push out old ones, a flood evicts the real entries you meant to keep; if nothing
+  is capped, the list can exhaust a firewall's rule table or slow every lookup.
+- **Start any block in count or review mode.** A new rule or list should first log or count
+  what it would have dropped, for long enough to see real traffic against it, before it
+  drops anything. A wrong entry in count mode costs a log line; in block mode it costs a
+  customer, often silently.
+- **Prefer detection to blocking for services you do not expose.** If the sensor emulates a
+  service you do not run on the internet (Redis, S3, a database port), blocking listed
+  addresses on that service protects nothing. Alert instead when a listed address appears
+  in your real logs on any service. That match is rare and worth a look, and it costs
+  nothing when the entry is wrong.
+- **Treat the sensor as possibly compromised.** The sensor exchanges data with attackers
+  all day, so plan for the day its output is wrong or written by someone else. A list
+  derived from its events is evidence for a person or a correlating system to weigh, not
+  an authority your enforcement trusts directly. In practice: have the receiving side pull
+  from the sensor rather than letting the sensor push into enforcement; give the sensor no
+  credentials for your firewalls, WAF or SIEM rules; validate every entry on the receiving
+  side (address syntax, not on the allow-list, within the size cap, has an expiry); and
+  keep a way to remove everything that came from the sensor in one step.
 
 ## Running agent commands in Docker
 

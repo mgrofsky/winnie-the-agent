@@ -265,6 +265,11 @@ max_tuner_changes_per_run = 3
 # removes session and campaign records older than record_retention_days (0 keeps them).
 max_records_per_run = 1000
 record_retention_days = 90
+# Detect: each row of detections/pending/blocklist-candidates.csv expires this many days
+# after the source was last seen, and the next run leaves it out. Sources that got past a
+# login or used a planted credential keep the longer period.
+blocklist_expiry_days = 14
+blocklist_access_expiry_days = 30
 
 # Response playbooks (playbooks/*.toml; python -m agents respond / queue / approve / reject).
 # Local steps (tarpit, deepen, shallow, plant_token, tag_source, capture_more) change only

@@ -435,7 +435,10 @@ def _run(argv=None) -> dict:
         if args.command in ("detect", "run-all"):
             from agents.detect import run_detect
 
-            stage("detect", lambda: run_detect(reports, detections, llm, dry_run=args.dry_run))
+            stage("detect", lambda: run_detect(
+                reports, detections, llm, dry_run=args.dry_run,
+                expiry_days=agents_cfg.get("blocklist_expiry_days", 14),
+                access_expiry_days=agents_cfg.get("blocklist_access_expiry_days", 30)))
         if args.command == "run-all":
             _ship_stage(always=False)
 

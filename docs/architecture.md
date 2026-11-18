@@ -263,7 +263,11 @@ accounts.
   description, which are length-capped and limited to a safe character set. Each draft
   lists the triage records it was built from.
 - `blocklist-candidates.csv`, one row per source across all protocols. Private, reserved
-  and documentation addresses and unverified sources are skipped.
+  and documentation addresses and unverified sources (see [Source proof](#source-proof))
+  are skipped. Each row carries `source_proven`, a `reason` from a fixed vocabulary and an
+  `expires` time; rows past their expiry are left out of the next run's file. See
+  [Using the intelligence outside the sensor](operations.md#using-the-intelligence-outside-the-sensor)
+  before acting on it.
 
 See [detections/README.md](../detections/README.md).
 
@@ -339,6 +343,39 @@ Listener events add:
 Every attacker-supplied value is length-capped (512 characters) and has control characters
 escaped before it is written. Listener writes use `O_APPEND`, so lines from the SSH and
 listener processes never interleave.
+
+### Source proof
+
+A UDP datagram's source address is whatever the sender wrote, so a SIP event over UDP may
+name an address that never sent anything. Two flags say when the address is proven:
+
+| Field | On | Meaning |
+|---|---|---|
+| `data.source_verified` | every SIP request event over UDP (not `error` or `limit` lines); SIP `invite` over either transport | `true` when the address has completed a nonce round trip with this listener: it was sent a challenge nonce and came back with it, so it can receive packets at that address. `false` otherwise. |
+| `data.nonce_verified` | SIP `auth_attempt` (a REGISTER with credentials) and an answered `invite` | `true` when this request carries a nonce the trap issued to this same address. This is the round trip itself; it is what turns `source_verified` on for the address's later events. |
+
+When they are set:
+
+- An address becomes verified the first time a request from it carries a nonce issued to
+  it. From then on its UDP events carry `source_verified: true`, including the event that
+  proved it.
+- The listener remembers the 10,000 most recently verified addresses, in memory only. An
+  address that falls out of that list, or any address after a listener restart, is
+  unverified again until it completes another round trip.
+- Events from unverified UDP sources go through the low-value gate: the first of each kind
+  per source, then periodic lines with a `suppressed` count. A missing line does not mean
+  nothing arrived.
+- TCP events (every other listener, SIP over TCP, and SSH) do not need the flag. A completed
+  TCP handshake proves the address, so `transport: tcp` (or an SSH line) is proof on its
+  own, and `source_verified` may be absent there.
+
+A consumer that decides anything per address (blocking, alerting, reputation, counting
+distinct attackers) should keep only events where `transport` is `tcp`, or
+`data.source_verified` is `true`, or `data.nonce_verified` is `true`, and treat the rest
+as unattributed volume. Without that filter a forged-source flood can put any address,
+including a victim's or your own, into the result. Triage applies the same rule: campaigns
+seen only over UDP without a round trip are marked `unverified_source`, never raise
+severity, and never reach the blocklist candidates or Sigma drafts.
 
 ## Budgets
 

@@ -142,6 +142,13 @@ authentication only and are never rendered into a prompt.
   addresses and `never_act_on` ranges get no per-source action of any tier. This prevents
   an attacker from spoofing a victim's address into a blocklist or a tarpit. Gates are
   checked again at approval time.
+- **Output used elsewhere.** Addresses reach enforcement only through an approved enforce
+  action. Everything the sensor writes (blocklist candidates, the approved blocklist, Sigma
+  drafts, exported events) is evidence from a host that talks to attackers, and a system
+  that consumes it should act
+  only on proven sources, expire entries, check an allow-list first and treat the sensor as
+  possibly compromised. See
+  [Using the intelligence outside the sensor](operations.md#using-the-intelligence-outside-the-sensor).
 - **Proxy guard.** If one non-global address accounts for most records, per-source actions
   are refused for the run, since every client would otherwise share one identity.
 - **Connectors.** `https` only (SMTP requires STARTTLS before credentials); no private or

@@ -6,7 +6,11 @@
   records its provenance in ``related_records`` (the triage record ids it was built from);
   the response engine publishes a draft for a record only when that list includes it.
 - ``blocklist-candidates.csv``: per source IP across all protocols. Private and reserved
-  addresses are skipped.
+  addresses are skipped, and so are UDP-only sources that never completed a nonce round
+  trip (their address may be forged). Each row says whether the source address was proven,
+  the highest thing the source did (``reason``, a fixed vocabulary) and when the row stops
+  being valid (``expires``); rows past their expiry are left out. Every cell is built from
+  validated values, never from text the attacker sent.
 
 Every draft needs human approval (see detections/README.md).
 """
@@ -16,6 +20,7 @@ from __future__ import annotations
 import csv
 import datetime
 import io
+import ipaddress
 import logging
 import os
 import re
@@ -33,6 +38,7 @@ from agents.addresses import is_public
 from agents.llm import JsonLLM, LLMOutputError, LLMRequestError, LLMUnavailable, untrusted_block
 from agents.triage import (
     JUDGEMENT_RANK,
+    S3_LISTED_RE,
     IocType,
     Judgement,
     TriageRecord,
@@ -199,39 +205,171 @@ def build_rules(records: list[TriageRecord], llm: Optional[JsonLLM] = None,
     return rules
 
 
-def blocklist_rows(records: list[TriageRecord]) -> list[dict]:
+# Blocklist candidates ---------------------------------------------------------------------
+
+BLOCKLIST_FIELDS = ["ip", "sessions", "attempts", "first_seen", "last_seen", "judgement",
+                    "protocols", "source_proven", "reason", "expires"]
+# What a source did, lowest first. A row carries the highest reason across its records.
+BLOCKLIST_REASONS = ("probe", "login_attempt", "object_list", "register", "login",
+                     "object_read", "command", "relay", "dial", "upload", "honeytoken")
+REASON_RANK = {name: i for i, name in enumerate(BLOCKLIST_REASONS)}
+DEFAULT_EXPIRY_DAYS = 14.0          # sources that never got past a login
+DEFAULT_ACCESS_EXPIRY_DAYS = 30.0   # sources that logged in or used a planted credential
+UPLOAD_SIGNALS = {"s3_upload", "ftp_upload", "quarantine_quota"}
+RELAY_SIGNALS = {"smtp_relay_attempt", "http_proxy_attempt"}
+COMMAND_SIGNALS = {"redis_takeover", "sql_exec_attempt", "sql_cred_dump", "download_execute",
+                   "persistence", "credential_file_read"}
+S3_READ_RE = re.compile(r"^GetObject /\S+ -> 20[06]$")
+SAFE_PROTOCOL_RE = re.compile(r"^[a-z0-9_]{1,16}$")
+CSV_UNSAFE_FIRST = tuple("=+-@\t\r\n'")
+
+
+def record_reasons(r: TriageRecord) -> set[str]:
+    """Every reason one record supports, derived from counts and code-set signal names."""
+    signals = set(r.high_signal)
+    out = {"probe"}
+    if r.auth_attempts:
+        out.add("login_attempt")
+    if r.protocol == "s3" and any(S3_LISTED_RE.match(c) for c in r.command_sample):
+        out.add("object_list")
+    if r.auth_successes:
+        out.add("register" if r.protocol == "sip" else "login")
+    if "s3_bulk_download" in signals or any(S3_READ_RE.match(c) for c in r.command_sample):
+        out.add("object_read")
+    if signals & COMMAND_SIGNALS or (r.commands and (
+            r.kind == "session" or (r.auth_successes and r.protocol not in ("sip", "s3")))):
+        out.add("command")
+    if signals & RELAY_SIGNALS:
+        out.add("relay")
+    if "sip_dialed_number" in signals:
+        out.add("dial")
+    if signals & UPLOAD_SIGNALS:
+        out.add("upload")
+    if r.honeytokens:
+        out.add("honeytoken")
+    return out
+
+
+def _canonical_ip(value: str) -> Optional[str]:
+    try:
+        return str(ipaddress.ip_address(str(value).split("%", 1)[0]))
+    except ValueError:
+        return None
+
+
+def _parse_ts(value: Optional[str]) -> Optional[datetime.datetime]:
+    if not value or not isinstance(value, str) or not value[:1].isdigit():
+        return None
+    try:
+        ts = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=datetime.timezone.utc)
+    return ts.astimezone(datetime.timezone.utc)
+
+
+def _fmt_ts(ts: Optional[datetime.datetime]) -> str:
+    return ts.isoformat(timespec="seconds") if ts else ""
+
+
+def _expiry_days(value, default: float) -> float:
+    try:
+        days = float(value)
+    except (TypeError, ValueError):
+        return default
+    return days if days > 0 else default
+
+
+def blocklist_rows(records: list[TriageRecord], now: Optional[datetime.datetime] = None,
+                   expiry_days: float = DEFAULT_EXPIRY_DAYS,
+                   access_expiry_days: float = DEFAULT_ACCESS_EXPIRY_DAYS,
+                   expired: Optional[list[str]] = None) -> list[dict]:
+    """One row per proven public source. Rows whose expiry is not after ``now`` are left
+    out (their addresses are appended to ``expired`` when a list is given)."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    expiry_days = _expiry_days(expiry_days, DEFAULT_EXPIRY_DAYS)
+    access_expiry_days = _expiry_days(access_expiry_days, DEFAULT_ACCESS_EXPIRY_DAYS)
     by_ip: dict[str, dict] = {}
     for r in records:
         if r.unverified_source or not is_public_ip(r.src_ip):
             continue  # spoofable UDP-only sources never reach the blocklist
-        row = by_ip.setdefault(r.src_ip, {"ip": r.src_ip, "sessions": 0, "attempts": 0,
-                                          "first_seen": r.first_seen, "last_seen": r.last_seen,
-                                          "judgement": r.judgement, "protocols": set()})
+        ip = _canonical_ip(r.src_ip)
+        if ip is None:
+            continue
+        row = by_ip.setdefault(ip, {"ip": ip, "sessions": 0, "attempts": 0, "first_seen": None,
+                                    "last_seen": None, "judgement": r.judgement,
+                                    "protocols": set(), "reason": "probe", "access": False})
         row["sessions"] += r.connections if r.kind == "campaign" else 1
         row["attempts"] += r.auth_attempts
-        row["protocols"].add(r.protocol)
-        if r.first_seen and (not row["first_seen"] or r.first_seen < row["first_seen"]):
-            row["first_seen"] = r.first_seen
-        if r.last_seen and (not row["last_seen"] or r.last_seen > row["last_seen"]):
-            row["last_seen"] = r.last_seen
+        if SAFE_PROTOCOL_RE.match(r.protocol):
+            row["protocols"].add(r.protocol)
+        first, last = _parse_ts(r.first_seen), _parse_ts(r.last_seen)
+        if first and (row["first_seen"] is None or first < row["first_seen"]):
+            row["first_seen"] = first
+        if last and (row["last_seen"] is None or last > row["last_seen"]):
+            row["last_seen"] = last
         if JUDGEMENT_RANK[r.judgement] > JUDGEMENT_RANK[row["judgement"]]:
             row["judgement"] = r.judgement
+        row["reason"] = max(record_reasons(r) | {row["reason"]}, key=REASON_RANK.__getitem__)
+        row["access"] = row["access"] or bool(r.auth_successes or r.honeytokens)
     out = []
     for row in by_ip.values():
         if row["judgement"] == Judgement.BENIGN:
             continue
+        base = row["last_seen"] or row["first_seen"] or now
+        expires = base + datetime.timedelta(
+            days=access_expiry_days if row.pop("access") else expiry_days)
+        if expires <= now:
+            if expired is not None:
+                expired.append(row["ip"])
+            continue
         row["judgement"] = row["judgement"].value
         row["protocols"] = ";".join(sorted(row["protocols"]))
+        row["first_seen"] = _fmt_ts(row["first_seen"])
+        row["last_seen"] = _fmt_ts(row["last_seen"])
+        row["source_proven"] = "yes"   # unverified sources were skipped above
+        row["expires"] = _fmt_ts(expires)
         out.append(row)
     out.sort(key=lambda x: (-JUDGEMENT_RANK[Judgement(x["judgement"])], -x["attempts"], x["ip"]))
     return out
 
 
+def _csv_cell(value):
+    """Integers pass; text that a spreadsheet could read as a formula, or that carries a
+    control character, is written empty. Every value here is already validated, so this
+    is a backstop."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return ""
+    if isinstance(value, int):
+        return value
+    if value.startswith(CSV_UNSAFE_FIRST) or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return ""
+    return value
+
+
+def blocklist_csv(rows: list[dict]) -> str:
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=BLOCKLIST_FIELDS, extrasaction="ignore",
+                       quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+    w.writeheader()
+    for row in rows:
+        w.writerow({k: _csv_cell(row.get(k, "")) for k in BLOCKLIST_FIELDS})
+    return buf.getvalue()
+
+
 def run_detect(reports_dir: os.PathLike | str, detections_dir: os.PathLike | str,
-               llm: Optional[JsonLLM] = None, dry_run: bool = False) -> dict:
+               llm: Optional[JsonLLM] = None, dry_run: bool = False,
+               now: Optional[datetime.datetime] = None,
+               expiry_days: float = DEFAULT_EXPIRY_DAYS,
+               access_expiry_days: float = DEFAULT_ACCESS_EXPIRY_DAYS) -> dict:
     records = load_records(reports_dir)
     rules = build_rules(records, llm)
-    rows = blocklist_rows(records)
+    expired: list[str] = []
+    rows = blocklist_rows(records, now=now, expiry_days=expiry_days,
+                          access_expiry_days=access_expiry_days, expired=expired)
     pending = Path(detections_dir) / "pending"
     written = []
     if not dry_run:
@@ -240,12 +378,7 @@ def run_detect(reports_dir: os.PathLike | str, detections_dir: os.PathLike | str
             path = pending / f"{rule['id'][:8]}-{name}.yml"
             _atomic_write(path, yaml.safe_dump(rule, sort_keys=False, allow_unicode=False))
             written.append(path.name)
-        buf = io.StringIO()
-        fields = ["ip", "sessions", "attempts", "first_seen", "last_seen", "judgement", "protocols"]
-        w = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        for row in rows:
-            # Values are IPs, ints, timestamps and enums; still guard against CSV formula injection.
-            w.writerow({k: (str(v).lstrip("=+-@") if isinstance(v, str) else v) for k, v in row.items()})
-        _atomic_write(pending / "blocklist-candidates.csv", buf.getvalue())
-    return {"rules": len(rules), "rule_files": written, "blocklist_rows": len(rows)}
+        # Rewritten in full each run, so rows past their expiry disappear.
+        _atomic_write(pending / "blocklist-candidates.csv", blocklist_csv(rows))
+    return {"rules": len(rules), "rule_files": written, "blocklist_rows": len(rows),
+            "blocklist_expired": len(expired)}
