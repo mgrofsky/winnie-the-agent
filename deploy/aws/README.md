@@ -327,6 +327,26 @@ What it adds:
   reaches no S3 address and the export waits. Nothing in this path fails open: the chain
   is rebuilt behind a `REJECT`, and a failure to install the rules stops the bootstrap
   before the stack starts.
+- **The rules at every boot, before any container.** iptables rules do not survive a
+  reboot, and Docker restarts the containers itself, before anything ordered after
+  `docker.service` runs. So `sensor-egress-boot.service` runs before `docker.service`, and
+  Docker requires it (`RequiredBy=docker.service`). It runs `sensor-egress.sh deny` first:
+  the two `REJECT`s for uid 10001, which need no settings. If even that fails, Docker does
+  not start, and the sensor is down until it is fixed. Then it rebuilds the full rules from
+  the saved list. If that step fails (a bad settings file, say), Docker still starts, but
+  the exporter has no egress at all until `sensor-firewall.sh` or the timer rebuilds them.
+  Holding all of Docker back for that case would stop the honeypot without making the
+  exporter any safer. On the first boot the bootstrap applies the rules itself before the
+  stack starts; the only containers before that are `docker run --network none` copies.
+  Do not `systemctl stop` or `restart` this unit: Docker requires it, so stopping it stops
+  Docker. Rerun `/usr/local/sbin/sensor-egress.sh` instead.
+- **Docker restarts and flushes.** `systemctl restart docker`, or a Docker package upgrade
+  that restarts the daemon, leaves the rules alone: they are in the filter table's
+  `OUTPUT` chain and in `SENSOR-UID`, which Docker does not manage. A manual `iptables -F`
+  removes them (and Docker's own rules, and `DOCKER-USER`'s). The timer puts back the
+  `OUTPUT` jump, the `REJECT` and `SENSOR-UID` within 15 minutes, but not `DOCKER-USER`:
+  after a flush, run `/usr/local/sbin/sensor-firewall.sh` and restart Docker, or reboot.
+  `ip6tables` is not touched by `iptables -F`.
 - **One role policy**, `ssm:GetParameter` and `ssm:PutParameter` on
   `/<NamePrefix>/tailscale-state` (the node state, the only parameter the role can write),
   `ssm:GetParameter` on `/<NamePrefix>/tailscale-authkey` and `/<NamePrefix>/ui-token`,
@@ -431,6 +451,13 @@ Then check, on the host (`sudo -i`):
       `--uid-owner 10001 -j REJECT` right after it; `iptables -S SENSOR-UID` lists the S3
       CIDRs from `cat /var/lib/sensor-egress/s3-cidrs`; `ip6tables -S OUTPUT` rejects uid
       10001; `systemctl list-timers sensor-egress.timer` shows the next refresh.
+- [ ] After a reboot, the rules were in place before the exporter started:
+      `systemctl is-active sensor-egress-boot.service` is `active`,
+      `systemctl show -p Requires docker.service` lists it, and the unit finished before the
+      exporter's container started (compare
+      `systemctl show -p ExecMainExitTimestamp sensor-egress-boot.service` with
+      `docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q exporter)"`, in UTC).
+      Then repeat the next check.
 - [ ] The exporter cannot reach the internet or the tailnet; each must be refused at once:
 
       cd /opt/sensor
@@ -524,7 +551,8 @@ tailnet and from `/go` before and after a reboot, tailscaled added no firewall c
   prefix-list ARN form `arn:aws:ec2:<region>:aws:prefix-list/<id>` that the IAM statement
   and the endpoint policy name (if AWS evaluates another form, the lookup is refused and
   the export waits, it does not open), the exporter's DNS going to `127.0.0.53` or the VPC
-  resolver, and the export still reaching S3 through the gateway endpoint under the rules.
+  resolver, the export still reaching S3 through the gateway endpoint under the rules, and
+  `sensor-egress-boot.service` running before Docker restarts the containers at a reboot.
   `tests/test_deploy_aws.py` runs `sensor-egress.sh` against a fake `iptables`, which
   proves the order and the fail-closed paths of the script, not the kernel's behaviour;
 - a first join with the state in Parameter Store from the start: that deployment moved

@@ -1,0 +1,14 @@
+[Unit]
+Description=Exporter egress rules before Docker starts any container (sensor-egress.sh)
+After=local-fs.target
+Before=docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The deny may not fail: docker.service requires this unit, so Docker stays down without
+# it. The full rules may: the deny then keeps uid 10001 off the network until
+# sensor-firewall.sh or sensor-egress.timer rebuilds them.
+ExecStart=/usr/local/sbin/sensor-egress.sh deny
+ExecStart=-/usr/local/sbin/sensor-egress.sh
+[Install]
+RequiredBy=docker.service

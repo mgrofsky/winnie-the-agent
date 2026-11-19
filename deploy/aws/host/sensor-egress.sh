@@ -11,9 +11,17 @@
 # DNS (the local stub and the VPC resolver). uid 10001 gets no IPv6 (tailscale0 carries
 # IPv6). Root (tailscaled, dockerd, the SSM agent) is not matched.
 #
-#   sensor-egress.sh            rebuild the rules from the saved prefix list (at boot, from
-#                               sensor-firewall.sh, before the stack starts)
+#   sensor-egress.sh deny       only the two REJECTs below, which need no settings
+#                               (sensor-egress-boot.service, before Docker starts)
+#   sensor-egress.sh            rebuild the rules from the saved prefix list (at boot, right
+#                               after the deny, and from sensor-firewall.sh)
 #   sensor-egress.sh refresh    look the prefix list up first (sensor-egress.timer)
+#
+# iptables rules do not survive a reboot, and Docker starts the containers itself. So
+# sensor-egress-boot.service runs this script before docker.service at every boot, and
+# Docker requires it: if even the deny cannot be installed, Docker does not start. The
+# REJECTs go in first, before the settings are read, so a bad or missing settings file
+# leaves uid 10001 with no egress at all rather than with the open path.
 #
 # The lookup is ec2:GetManagedPrefixListEntries through the stack's ec2 interface endpoint.
 # A failed or malformed answer keeps the last saved list; with none saved, uid 10001 reaches
@@ -21,6 +29,11 @@
 # REJECT after its jump in OUTPUT refuses a packet that arrives mid-rebuild: this never
 # fails open.
 set -euo pipefail
+w="iptables -w"
+u="-m owner --uid-owner 10001"
+$w -C OUTPUT $u -j REJECT 2>/dev/null || $w -I OUTPUT 1 $u -j REJECT
+ip6tables -w -C OUTPUT $u -j REJECT 2>/dev/null || ip6tables -w -I OUTPUT 1 $u -j REJECT
+[ "${1:-}" != deny ] || exit 0
 . "${SENSOR_EGRESS_ENV:-/etc/sensor-egress.env}"
 C=${SENSOR_EGRESS_DIR:-/var/lib/sensor-egress}/s3-cidrs
 ip4="^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$"
@@ -45,9 +58,6 @@ if [ "${1:-}" = refresh ]; then
     echo "s3 prefix list: lookup failed, keeping the last list" >&2
   fi
 fi
-w="iptables -w"
-u="-m owner --uid-owner 10001"
-$w -C OUTPUT $u -j REJECT 2>/dev/null || $w -I OUTPUT 1 $u -j REJECT
 $w -N SENSOR-UID 2>/dev/null || $w -F SENSOR-UID
 $w -C OUTPUT $u -j SENSOR-UID 2>/dev/null || $w -I OUTPUT 1 $u -j SENSOR-UID
 $w -A SENSOR-UID -o tailscale0 -j REJECT
@@ -58,4 +68,3 @@ $w -A SENSOR-UID -d 169.254.169.253 -p udp --dport 53 -j ACCEPT
 $w -A SENSOR-UID -d "$VPC_CIDR" -p udp --dport 53 -j ACCEPT
 $w -A SENSOR-UID -d "$VPC_CIDR" -p tcp --dport 443 -j ACCEPT
 for c in $(cat "$C" 2>/dev/null || :); do if good "$c"; then $w -A SENSOR-UID -d "$c" -p tcp --dport 443 -j ACCEPT; fi; done
-ip6tables -w -C OUTPUT $u -j REJECT 2>/dev/null || ip6tables -w -I OUTPUT 1 $u -j REJECT

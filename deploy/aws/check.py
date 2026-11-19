@@ -538,6 +538,8 @@ EGRESS_RULES = [
     'w="iptables -w"',
     'u="-m owner --uid-owner 10001"',
     "$w -C OUTPUT $u -j REJECT 2>/dev/null || $w -I OUTPUT 1 $u -j REJECT",
+    "ip6tables -w -C OUTPUT $u -j REJECT 2>/dev/null || ip6tables -w -I OUTPUT 1 $u -j REJECT",
+    '[ "${1:-}" != deny ] || exit 0',
     "$w -N SENSOR-UID 2>/dev/null || $w -F SENSOR-UID",
     "$w -C OUTPUT $u -j SENSOR-UID 2>/dev/null || $w -I OUTPUT 1 $u -j SENSOR-UID",
     "$w -A SENSOR-UID -o tailscale0 -j REJECT",
@@ -549,8 +551,10 @@ EGRESS_RULES = [
     '$w -A SENSOR-UID -d "$VPC_CIDR" -p tcp --dport 443 -j ACCEPT',
     'for c in $(cat "$C" 2>/dev/null || :); do if good "$c"; then $w -A SENSOR-UID '
     '-d "$c" -p tcp --dport 443 -j ACCEPT; fi; done',
-    "ip6tables -w -C OUTPUT $u -j REJECT 2>/dev/null || ip6tables -w -I OUTPUT 1 $u -j REJECT",
 ]
+# The deny comes before the settings are read, so a bad or missing settings file leaves
+# uid 10001 with no egress at all.
+EGRESS_SETTINGS = '. "${SENSOR_EGRESS_ENV:-/etc/sensor-egress.env}"'
 EGRESS_IP4 = 'ip4="^[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}$"'
 EGRESS_GOOD = 'good() { [[ $1 =~ $ip4 ]] && [ "${1#*/}" -ge 8 ] && [ "${1#*/}" -le 32 ]; }'
 # The step that installs it: its settings, the hooks into the boot-time firewall (including
@@ -561,7 +565,7 @@ EGRESS_STEP_LINES = [
     "H=/app/deploy/aws/host",
     'docker run --rm --network none --entrypoint cat "$IMAGE" $H/sensor-egress.sh | install '
     "-m 0700 /dev/stdin /usr/local/sbin/sensor-egress.sh",
-    "for u in sensor-egress.service sensor-egress.timer; do docker run --rm --network none "
+    "for u in sensor-egress.service sensor-egress.timer sensor-egress-boot.service; do docker run --rm --network none "
     '--entrypoint cat "$IMAGE" $H/$u > /etc/systemd/system/$u; done',
     "F=/usr/local/sbin/sensor-firewall.sh",
     "grep -q tailscale0 $F || echo 'add -i tailscale0 -j DROP' >> $F",
@@ -569,12 +573,22 @@ EGRESS_STEP_LINES = [
     "/usr/local/sbin/sensor-egress.sh refresh",
     "$F",
     "systemctl daemon-reload",
-    "systemctl enable --now sensor-egress.timer",
+    "systemctl enable --now sensor-egress-boot.service sensor-egress.timer",
 ]
 EGRESS_UNITS = {
     "sensor-egress.service": ["Type=oneshot", "ExecStart=/usr/local/sbin/sensor-egress.sh refresh"],
     "sensor-egress.timer": ["OnBootSec=2min", "OnUnitActiveSec=15min", "WantedBy=timers.target"],
 }
+# The rules at every boot, before Docker restarts the containers: Docker requires the unit,
+# whose first step (the deny) may not fail and whose second (the full rules) may. Exactly
+# these ExecStart lines, in this order, and nothing that loosens the hold on Docker.
+EGRESS_BOOT_UNIT = "sensor-egress-boot.service"
+EGRESS_BOOT_LINES = ["Before=docker.service", "Type=oneshot", "RemainAfterExit=yes",
+                     "ExecStart=/usr/local/sbin/sensor-egress.sh deny",
+                     "ExecStart=-/usr/local/sbin/sensor-egress.sh", "RequiredBy=docker.service"]
+EGRESS_BOOT_EXEC = ["ExecStart=/usr/local/sbin/sensor-egress.sh deny", "ExecStart=-/usr/local/sbin/sensor-egress.sh"]
+EGRESS_BOOT_FORBIDDEN = ("After=docker", "Wants=docker", "WantedBy=", "DefaultDependencies=no", "ExecStartPre=",
+                         "ExecStartPost=", "SuccessExitStatus=", "Condition", "Assert")
 # The node's unit (host/tailscaled.service) and what the node step writes for it.
 TAILSCALED_LINES = [
     "EnvironmentFile=/etc/sensor-tailscale.env",
@@ -593,8 +607,22 @@ NODE_STEP_LINES = [
 ]
 
 
+def check_boot_unit(unit: str) -> list[str]:
+    """sensor-egress-boot.service: the uid 10001 rules before Docker, and Docker held without them."""
+    lines = [line.strip() for line in unit.splitlines()]
+    errors = [f"{EGRESS_BOOT_UNIT} lacks {n}" for n in EGRESS_BOOT_LINES if n not in lines]
+    if [line for line in lines if line.startswith("ExecStart")] != EGRESS_BOOT_EXEC:
+        errors.append(f"{EGRESS_BOOT_UNIT} does not run exactly the deny (may not fail) and then the "
+                      "full rules")
+    for line in lines:
+        if not line.startswith("#") and line.startswith(EGRESS_BOOT_FORBIDDEN):
+            errors.append(f"{EGRESS_BOOT_UNIT} weakens its hold on Docker: {line[:60]}")
+    return errors
+
+
 def check_host_files(egress: Optional[str] = None, units: Optional[dict] = None,
-                     tailscaled: Optional[str] = None, dockerfile: Optional[str] = None) -> list[str]:
+                     tailscaled: Optional[str] = None, dockerfile: Optional[str] = None,
+                     boot: Optional[str] = None) -> list[str]:
     """The files under deploy/aws/host that the image carries for the tailnet option."""
     egress = (HOST_DIR / "sensor-egress.sh").read_text(encoding="utf-8") if egress is None \
         else egress
@@ -602,6 +630,7 @@ def check_host_files(egress: Optional[str] = None, units: Optional[dict] = None,
         n: (HOST_DIR / n).read_text(encoding="utf-8") for n in EGRESS_UNITS}
     tailscaled = (HOST_DIR / "tailscaled.service").read_text(encoding="utf-8") \
         if tailscaled is None else tailscaled
+    boot = (HOST_DIR / EGRESS_BOOT_UNIT).read_text(encoding="utf-8") if boot is None else boot
     dockerfile = DOCKERFILE.read_text(encoding="utf-8") if dockerfile is None else dockerfile
     errors: list[str] = []
     if HOST_IN_IMAGE not in dockerfile.splitlines():
@@ -620,6 +649,10 @@ def check_host_files(egress: Optional[str] = None, units: Optional[dict] = None,
         errors.append("the egress script does not validate CIDRs")
     if "set -euo pipefail" not in script:
         errors.append("the egress script does not stop on errors")
+    deny = [script.index(r) if r in script else -1 for r in EGRESS_RULES[2:5]]
+    if EGRESS_SETTINGS not in script or -1 in deny or max(deny) > script.index(EGRESS_SETTINGS):
+        errors.append("the egress script does not install the deny before it reads its settings")
+    errors += check_boot_unit(boot)
     for name, needed in EGRESS_UNITS.items():
         lines = units.get(name, "").splitlines()
         if any(n not in lines for n in needed):

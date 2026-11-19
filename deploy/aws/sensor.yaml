@@ -1170,9 +1170,11 @@ Resources:
               # error here stops the bootstrap, so the stack never runs without these rules.
               # sensor-egress.sh (deploy/aws/host in the image; its header explains the rules)
               # limits the exporter, uid 10001, to what it reached before InstanceEgressTailscale
-              # existed, and its timer refreshes the S3 prefix list every 15 minutes.
-              # sensor-firewall.sh, which runs before the stack at every boot, calls it and also
-              # drops tailscale0 traffic in DOCKER-USER, so no tailnet device reaches the
+              # existed, and its timer refreshes the S3 prefix list every 15 minutes. At every
+              # later boot sensor-egress-boot.service applies the rules before Docker starts
+              # (Docker restarts the containers itself), and Docker requires it.
+              # sensor-firewall.sh, which runs before the stack at every boot, calls it again and
+              # also drops tailscale0 traffic in DOCKER-USER, so no tailnet device reaches the
               # honeypot ports.
               EgressStep: !If
                 - TailscaleOn
@@ -1180,14 +1182,14 @@ Resources:
                   printf 'REGION=%s\nPREFIX_LIST=%s\nVPC_CIDR=%s\n' ${AWS::Region} ${S3PrefixListId} ${VpcCidr} > /etc/sensor-egress.env
                   H=/app/deploy/aws/host
                   docker run --rm --network none --entrypoint cat "$IMAGE" $H/sensor-egress.sh | install -m 0700 /dev/stdin /usr/local/sbin/sensor-egress.sh
-                  for u in sensor-egress.service sensor-egress.timer; do docker run --rm --network none --entrypoint cat "$IMAGE" $H/$u > /etc/systemd/system/$u; done
+                  for u in sensor-egress.service sensor-egress.timer sensor-egress-boot.service; do docker run --rm --network none --entrypoint cat "$IMAGE" $H/$u > /etc/systemd/system/$u; done
                   F=/usr/local/sbin/sensor-firewall.sh
                   grep -q tailscale0 $F || echo 'add -i tailscale0 -j DROP' >> $F
                   grep -q sensor-egress $F || echo /usr/local/sbin/sensor-egress.sh >> $F
                   /usr/local/sbin/sensor-egress.sh refresh
                   $F
                   systemctl daemon-reload
-                  systemctl enable --now sensor-egress.timer
+                  systemctl enable --now sensor-egress-boot.service sensor-egress.timer
                 - ""
               # TailscaleEnabled or UiActions, before the stack starts; nothing here touches
               # the front-ends, agents or exporter. With TailscaleEnabled: the fixed sign-in

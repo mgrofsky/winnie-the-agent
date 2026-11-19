@@ -486,6 +486,16 @@ def _egress_step_tolerated(d):
                "/usr/local/sbin/sensor-egress.sh refresh || echo \"egress: FAILED\"\n")
 
 
+def _boot_unit_not_enabled(d):
+    _step_edit(d, "EgressStep", "systemctl enable --now sensor-egress-boot.service sensor-egress.timer\n",
+               "systemctl enable --now sensor-egress.timer\n")
+
+
+def _boot_unit_not_copied(d):
+    _step_edit(d, "EgressStep", "sensor-egress.timer sensor-egress-boot.service; do",
+               "sensor-egress.timer; do")
+
+
 def _egress_step_skipped(d):
     _steps(d)["EgressStep"]["Fn::If"][0] = "UiActionsOn"
 
@@ -572,6 +582,10 @@ TAILNET_BREAKS = {
     "the egress step lacks the line: /usr/local/sbin/sensor-egress.sh refresh":
         _egress_step_tolerated,
     "step EgressStep is not empty unless TailscaleOn": _egress_step_skipped,
+    "the egress step lacks the line: systemctl enable --now sensor-egress-boot.service":
+        _boot_unit_not_enabled,
+    "the egress step lacks the line: for u in sensor-egress.service sensor-egress.timer sensor-egress-b":
+        _boot_unit_not_copied,
     "the egress and console steps do not run right before the stack is started":
         _egress_after_stack,
     "the node's name is not compared with the expected one": _no_name_check,
@@ -1046,7 +1060,7 @@ exit 0
 
 
 def _run_egress(tmp_path, answer, *, saved=None, vpc="10.64.0.0/16", aws_fails=False,
-                refresh=True):
+                refresh=True, args=None, env_file_present=True):
     """Run host/sensor-egress.sh with fake iptables, ip6tables and aws on PATH. Returns
     (exit code, stderr, the OUTPUT order, the SENSOR-UID rules, the saved list or None)."""
     bin_ = tmp_path / "bin"
@@ -1063,14 +1077,16 @@ def _run_egress(tmp_path, answer, *, saved=None, vpc="10.64.0.0/16", aws_fails=F
     if saved is not None:
         (state / "s3-cidrs").write_text(saved)
     env_file = tmp_path / "egress.env"
-    env_file.write_text(f"REGION=us-east-1\nPREFIX_LIST=pl-0123456789abcdef0\nVPC_CIDR={vpc}\n")
+    if env_file_present:
+        env_file.write_text(f"REGION=us-east-1\nPREFIX_LIST=pl-0123456789abcdef0\nVPC_CIDR={vpc}\n")
     log = tmp_path / "log"
     log.write_text("")
     import os
     env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", LOG=str(log),
                SENSOR_EGRESS_ENV=str(env_file), SENSOR_EGRESS_DIR=str(state),
                SENSOR_EGRESS_RETRY_SECONDS="0")
-    args = ["bash", str(AWS / "host" / "sensor-egress.sh")] + (["refresh"] if refresh else [])
+    args = ["bash", str(AWS / "host" / "sensor-egress.sh")] + (
+        args if args is not None else ["refresh"] if refresh else [])
     result = subprocess.run(args, env=env, capture_output=True, text=True)
     tables, chain = {"iptables": [], "ip6tables": []}, []
     for line in log.read_text().splitlines():
@@ -1129,10 +1145,37 @@ def test_a_wide_or_bad_saved_entry_is_skipped(tmp_path):
 
 
 @pytest.mark.parametrize("vpc", ["0.0.0.0/0", "10.64.0.0", "10.64.0.0/16 -j ACCEPT"])
-def test_bad_settings_stop_before_any_rule(tmp_path, vpc):
+def test_bad_settings_leave_only_the_deny(tmp_path, vpc):
     code, err, output, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", vpc=vpc)
     assert code != 0
-    assert output == chain == []
+    assert output == [f"iptables {UID} -j REJECT", f"ip6tables {UID} -j REJECT"]
+    assert chain == []
+
+
+def test_missing_settings_leave_only_the_deny(tmp_path):
+    code, _, output, chain, _ = _run_egress(tmp_path, "", refresh=False, env_file_present=False)
+    assert code != 0
+    assert output == [f"iptables {UID} -j REJECT", f"ip6tables {UID} -j REJECT"]
+    assert chain == []
+
+
+def test_deny_needs_no_settings_and_stops_there(tmp_path):
+    # sensor-egress-boot.service's first step, before Docker starts
+    code, err, output, chain, cache = _run_egress(tmp_path, "198.51.100.0/24", args=["deny"],
+                                                  env_file_present=False)
+    assert code == 0, err
+    assert output == [f"iptables {UID} -j REJECT", f"ip6tables {UID} -j REJECT"]
+    assert chain == [] and cache is None
+
+
+def test_boot_order_deny_then_saved_list(tmp_path):
+    # the boot unit's two steps in order, from a saved list, with no lookup
+    _run_egress(tmp_path, "", args=["deny"], saved="198.51.100.0/24\n")
+    code, err, output, chain, _ = _run_egress(tmp_path, "", args=[], saved="198.51.100.0/24\n",
+                                              aws_fails=True)
+    assert code == 0, err
+    assert output[:2] == [f"iptables {UID} -j SENSOR-UID", f"iptables {UID} -j REJECT"]
+    assert _s3_accepts(chain) == ["198.51.100.0/24"]
 
 
 def test_host_files_are_valid_and_reach_the_image():
@@ -1166,6 +1209,26 @@ HOST_BREAKS = {
         dict(tailscaled=("tailscaled.service", "ProtectSystem=strict\n", "")),
     "tailscaled.service has more than one ExecStart":
         dict(tailscaled=("tailscaled.service", "ExecStopPost=", "ExecStart=\nExecStopPost=")),
+    "the egress script does not install the deny before it reads its settings":
+        dict(egress=("sensor-egress.sh", '[ "${1:-}" != deny ] || exit 0\n. "${SENSOR_EGRESS_ENV:-/etc/sensor-egress.env}"\n',
+                     '. "${SENSOR_EGRESS_ENV:-/etc/sensor-egress.env}"\n[ "${1:-}" != deny ] || exit 0\n')),
+    "sensor-egress-boot.service lacks Before=docker.service":
+        dict(boot=("sensor-egress-boot.service", "Before=docker.service\n", "")),
+    "sensor-egress-boot.service lacks RequiredBy=docker.service":
+        dict(boot=("sensor-egress-boot.service", "RequiredBy=docker.service", "WantedBy=multi-user.target")),
+    "sensor-egress-boot.service weakens its hold on Docker: WantedBy=multi-user.target":
+        dict(boot=("sensor-egress-boot.service", "RequiredBy=docker.service", "WantedBy=multi-user.target")),
+    "sensor-egress-boot.service weakens its hold on Docker: After=docker.service":
+        dict(boot=("sensor-egress-boot.service", "Before=docker.service", "Before=docker.service\nAfter=docker.service")),
+    "sensor-egress-boot.service does not run exactly the deny (may not fail)":
+        dict(boot=("sensor-egress-boot.service", "ExecStart=/usr/local/sbin/sensor-egress.sh deny",
+                   "ExecStart=-/usr/local/sbin/sensor-egress.sh deny")),
+    "sensor-egress-boot.service lacks ExecStart=/usr/local/sbin/sensor-egress.sh deny":
+        dict(boot=("sensor-egress-boot.service", "ExecStart=/usr/local/sbin/sensor-egress.sh deny\n", "")),
+    "sensor-egress-boot.service weakens its hold on Docker: ConditionPathExists":
+        dict(boot=("sensor-egress-boot.service", "[Service]", "ConditionPathExists=/etc/sensor-egress.env\n[Service]")),
+    "sensor-egress-boot.service lacks RemainAfterExit=yes":
+        dict(boot=("sensor-egress-boot.service", "RemainAfterExit=yes\n", "")),
     "tailscaled.service lacks ExecStart=/usr/local/sbin/tailscaled --statedir":
         dict(tailscaled=("tailscaled.service", "--state=${TS_STATE}", "")),
 }

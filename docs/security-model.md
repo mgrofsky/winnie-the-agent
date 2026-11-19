@@ -288,7 +288,9 @@ loopback, and the bind guard is unchanged. What changes:
   10001) with host `OUTPUT` rules to what it reached before the option (its endpoints, the
   S3 prefix list's CIDRs, the metadata service, DNS) and nothing over the tunnel, and
   rejects the rest. Those rules fail closed: a missing or stale prefix list stops the
-  export, it never widens the reach. They depend on the exporter running as uid 10001 and
+  export, it never widens the reach. They are applied before Docker starts at every boot,
+  because Docker restarts the containers itself, and Docker does not start without at
+  least the exporter's `REJECT`. They depend on the exporter running as uid 10001 and
   on nothing else unprivileged running on the host network.
 - If the node's state is kept outside the host (the AWS template keeps it in a Parameter
   Store SecureString so a rebuilt host is the same node), that parameter is a credential

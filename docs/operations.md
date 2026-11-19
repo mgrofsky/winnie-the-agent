@@ -854,7 +854,9 @@ rules, which live in the tailnet's admin console):
   the host itself, by owner: the AWS template sends every packet of the exporter's user
   (uid 10001) through an `OUTPUT` chain that accepts only what it needed before (its
   endpoints, the S3 prefix list's CIDRs, the metadata service, DNS) and nothing out
-  `tailscale0`, and rejects the rest; see
+  `tailscale0`, and rejects the rest, and applies those rules before Docker starts at every
+  boot, since host firewall rules do not survive a reboot and Docker restarts the
+  containers on its own; see
   [Console over a tailnet](../deploy/aws/README.md#console-over-a-tailnet-optional).
   Bridged containers are not affected by the 443 rule: the `DOCKER-USER` rules stop every
   new connection from them. No inbound rule is needed: the node reaches out, and relays
