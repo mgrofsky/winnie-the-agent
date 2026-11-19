@@ -9,6 +9,7 @@ them before deploying, and run the checks below after every change.
 | `events-bucket.yaml` | a separate account (for example your security or log archive account), in the sensor's region | the events bucket and its policy |
 | `sensor.yaml` | a dedicated account for the sensor | VPC, endpoints, ECR repository, instance role, log groups, optional trail, launch template, instance, Elastic IP |
 | `check.py` | nowhere: run locally | offline checks of both templates (`tests/test_deploy_aws.py` runs them too) |
+| `strip_comments.py` | nowhere: run locally | writes the copy of `sensor.yaml` you deploy, without its comments (see [Template size](#facts-learned-from-deploying-it)) |
 
 ## What gets created
 
@@ -48,13 +49,18 @@ them before deploying, and run the checks below after every change.
   delete. Requests without TLS are denied. With `TrailEnabled=true` in both stacks, the
   sensor account's own multi-region trail delivers under `cloudtrail/`.
 
+Optional, all off by default: the operator console (`UiEnabled`, with `UiActions` to let
+it act), and reaching that console over a Tailscale tailnet (`TailscaleEnabled`, see
+[Console over a tailnet](#console-over-a-tailnet-optional)), which adds one egress rule
+and one scoped role policy and opens nothing inbound.
+
 No model calls: the host has no route to a model API, so `[listeners] llm = false`, the
 SSH persona gives canned replies and triage is deterministic.
 
 ### Cost
 
 Roughly 70 to 90 USD a month in a typical region on demand, most of it the six interface
-endpoints. A `t3.small`, its volume and the Elastic IP add up to roughly 20 USD; S3, logs,
+endpoints (seven, about 7 USD more, with `TailscaleEnabled=true`). A `t3.small`, its volume and the Elastic IP add up to roughly 20 USD; S3, logs,
 flow logs and the first trail's management events are usually a few dollars, but log
 ingestion grows with attack traffic. Watch the host and flow log groups during the first
 weeks. Check current prices for your region; these are orders of magnitude, not a quote.
@@ -79,6 +85,24 @@ weeks. Check current prices for your region; these are orders of magnitude, not 
   the sensor's address. To run it in a scenario that has SMTP (`sip-provider`, `saas`),
   redeploy with `SmtpEnabled=true`: it opens port 25 and stops setting
   `[listeners] smtp_enabled = false` in the generated config.
+- **Template size.** `aws cloudformation deploy --template-file` (and `--template-body`)
+  refuses a template over 51,200 bytes, and `sensor.yaml` with its comments is larger.
+  Deploy the copy that `strip_comments.py` writes: it drops whole comment lines only, keeps
+  the scripts byte for byte, and writes nothing unless the copy parses to the same document
+  and fits. `check.py` runs the same two checks, so a change that would break the deploy
+  fails locally first. The other way round the limit, an S3 template URL, needs a bucket
+  in the sensor account that the deploying principal can write; this example avoids it.
+- **User data size.** EC2 refuses user data over 16,384 bytes. The bootstrap's comments are
+  YAML comments above `UserData`, and its static files live in the image (below).
+  `check.py` measures the script at the longest value every parameter allows, with every
+  optional step on (about 14,300 bytes today).
+- **Template and image.** The bootstrap copies `deploy/aws/render_config.py` (which writes
+  `config.ini` and `config-ship.ini`) and, with `TailscaleEnabled`, the files under
+  `deploy/aws/host/` out of the image it runs, instead of carrying them in the user data.
+  **Rebuild and push the image whenever you take a new `sensor.yaml`**: an image built
+  before these files existed makes the bootstrap stop at the copy, before the stack
+  starts. `check.py` checks that the `Dockerfile` puts them where the bootstrap reads them,
+  and runs `render_config.py` and `sensor-egress.sh`'s rules from the repository.
 
 ## Deploy
 
@@ -96,7 +120,12 @@ S="--profile <sensor-account-profile> --region us-east-1"
 uv run python deploy/aws/check.py                 # prints ok
 uv run pytest tests/test_deploy_aws.py
 uvx cfn-lint deploy/aws/sensor.yaml deploy/aws/events-bucket.yaml   # optional
+mkdir -p build
+uv run python deploy/aws/strip_comments.py deploy/aws/sensor.yaml build/sensor.deploy.yaml
 ```
+
+The last line writes the copy of `sensor.yaml` that steps 3 and 5 deploy (`build/` is
+ignored by git). Write it again after every change to `sensor.yaml`.
 
 ### 2. Events bucket (bucket account)
 
@@ -123,7 +152,7 @@ principal of that account.
 aws ec2 describe-managed-prefix-lists $S \
   --filters Name=prefix-list-name,Values=com.amazonaws.us-east-1.s3 --query "PrefixLists[0].PrefixListId"
 aws cloudformation deploy --stack-name winnie-sensor \
-  --template-file deploy/aws/sensor.yaml --capabilities CAPABILITY_NAMED_IAM $S \
+  --template-file build/sensor.deploy.yaml --capabilities CAPABILITY_NAMED_IAM $S \
   --parameter-overrides InboundCidr=<your address>/32 HostEnabled=false \
     Scenario=sip-provider S3PrefixListId=<pl-...> \
     EventsBucketName=example-winnie-events EventsBucketOwner=<bucket account id> \
@@ -154,6 +183,9 @@ aws ecr describe-image-scan-findings --repository-name winnie-sensor --image-id 
 
 Tags are immutable. A newer Compose binary goes under a new tag, passed as
 `ComposeImageTag`.
+
+The image carries files the bootstrap copies onto the host (`deploy/aws/render_config.py`
+and `deploy/aws/host/`), so build it from the same commit as the `sensor.yaml` you deploy.
 
 ### 5. Turn the host on
 
@@ -219,6 +251,16 @@ is in the user data, so the change set replaces the instance (see Limits). The b
 writes `COMPOSE_PROFILES=ui` to `/opt/sensor/.env`; with `UiEnabled=false` that line is
 empty and the `ui` service does not start.
 
+`UiActions=true` (needs `UiEnabled=true`) lets the console approve, reject, unblock and
+enforce, recorded as `ui:<UiOperator>` (default `ui:console`). The bootstrap sets `[ui]
+actions` and `operator` in `config.ini` and adds `docker-compose.actions.yml`, which mounts
+the agent data and `blocklist` volumes read-write for the `ui` service only (approvals
+write the queue, the blocklist file and `tracked.json`); the event log and overlay stay
+read-only. Anyone who can sign in can then change what the sensor blocks. A failure is
+logged as `console: FAILED` and the console stays read-only. `AgentsIntervalSeconds`
+(default 3600) sets how often the agents run `run-all`; records cover closed hours, so a
+shorter interval only shortens the wait after each hour.
+
 Sign in:
 
 1. In a normal session (`aws ssm start-session --target <InstanceId> $S`, then `sudo -i`,
@@ -244,11 +286,288 @@ the console before relying on it, and repeat the four checks above after any cha
 the Docker or compose setup. If `S3Port` is ever set to 8480, the trap and the console
 collide; pick another port.
 
-The console can also sit behind an HTTPS proxy on the instance and be reached over a
-private mesh VPN; see
-[Reaching it over a private network](../../docs/operations.md#reaching-it-over-a-private-network).
-This template does not set that up: it installs no VPN agent, opens no egress for one and
-writes no `external_host`. SSM stays the supported way in on AWS.
+The console can also be reached over a private mesh VPN through an HTTPS proxy on the
+instance; see
+[Reaching it over a private network](../../docs/operations.md#reaching-it-over-a-private-network)
+for how that works in general. The next section sets it up with Tailscale. SSM port
+forwarding keeps working either way.
+
+## Console over a tailnet (optional)
+
+`TailscaleEnabled=true` joins the host to a Tailscale tailnet and serves the console on the
+node's tailnet HTTPS name, for example `https://sensor-1.example-tailnet.ts.net/`, to the
+devices the tailnet's access rules let in. Nothing new is reachable from the internet. It
+needs `UiEnabled=true`, `TailscaleImageTag`, `TailscaleHostname` and `TailnetSuffix`; the
+stack's rules refuse a deploy without them. With `TailscaleEnabled=false` (the default)
+none of what follows exists and the bootstrap is as before.
+
+What it adds:
+
+- **One egress rule**, tcp 443 to anywhere, for the coordination server, the DERP relays and
+  the certificate service. No UDP, so the node always relays through DERP over HTTPS,
+  which is plenty for the console. No inbound rule: tailscaled's WireGuard port listens on
+  the host, but the security group admits nothing to it.
+- **Host rules that keep the exporter where it was.** A security group cannot tell one
+  process from another, so that rule alone would let the exporter (uid 10001 on the host
+  network, holding the instance role, parsing data attackers wrote) send the role's
+  credentials to any HTTPS server, or anything out `tailscale0`. `sensor-egress.sh` (in
+  the image, `deploy/aws/host/`) sends every uid 10001 packet through an `OUTPUT` chain
+  that accepts only what the security group allowed before the option: tcp 443 into the
+  VPC (the interface endpoints) and to the CIDRs of the S3 prefix list (the gateway
+  endpoint), the metadata service, and DNS. Everything else, including anything out
+  `tailscale0` and all IPv6, is rejected. Root processes (tailscaled, dockerd, the SSM
+  agent) are not matched. Bridged containers are unaffected either way: the `DOCKER-USER`
+  rules still drop every new connection from them, whatever the port.
+- **The S3 prefix list's CIDRs** come from `ec2:GetManagedPrefixListEntries`, looked up
+  through a new `ec2` interface endpoint (`Ec2Endpoint`, about 7 USD a month, with a
+  policy that allows that one call on that one list) at boot and every 15 minutes
+  (`sensor-egress.timer`). AWS changes that list rarely; a new CIDR is picked up within 15
+  minutes, and exports to it fail and are retried until then. A failed or malformed lookup
+  (or a CIDR wider than a /8) keeps the last saved list; with none saved the exporter
+  reaches no S3 address and the export waits. Nothing in this path fails open: the chain
+  is rebuilt behind a `REJECT`, and a failure to install the rules stops the bootstrap
+  before the stack starts.
+- **The rules at every boot, before any container.** iptables rules do not survive a
+  reboot, and Docker restarts the containers itself, before anything ordered after
+  `docker.service` runs. So `sensor-egress-boot.service` runs before `docker.service`, and
+  Docker requires it (`RequiredBy=docker.service`). It runs `sensor-egress.sh deny` first:
+  the two `REJECT`s for uid 10001, which need no settings. If even that fails, Docker does
+  not start, and the sensor is down until it is fixed. Then it rebuilds the full rules from
+  the saved list. If that step fails (a bad settings file, say), Docker still starts, but
+  the exporter has no egress at all until `sensor-firewall.sh` or the timer rebuilds them.
+  Holding all of Docker back for that case would stop the honeypot without making the
+  exporter any safer. On the first boot the bootstrap applies the rules itself before the
+  stack starts; the only containers before that are `docker run --network none` copies.
+  Do not `systemctl stop` or `restart` this unit: Docker requires it, so stopping it stops
+  Docker. Rerun `/usr/local/sbin/sensor-egress.sh` instead.
+- **Docker restarts and flushes.** `systemctl restart docker`, or a Docker package upgrade
+  that restarts the daemon, leaves the rules alone: they are in the filter table's
+  `OUTPUT` chain and in `SENSOR-UID`, which Docker does not manage. A manual `iptables -F`
+  removes them (and Docker's own rules, and `DOCKER-USER`'s). The timer puts back the
+  `OUTPUT` jump, the `REJECT` and `SENSOR-UID` within 15 minutes, but not `DOCKER-USER`:
+  after a flush, run `/usr/local/sbin/sensor-firewall.sh` and restart Docker, or reboot.
+  `ip6tables` is not touched by `iptables -F`.
+- **One role policy**, `ssm:GetParameter` and `ssm:PutParameter` on
+  `/<NamePrefix>/tailscale-state` (the node state, the only parameter the role can write),
+  `ssm:GetParameter` on `/<NamePrefix>/tailscale-authkey` and `/<NamePrefix>/ui-token`,
+  and `ec2:GetManagedPrefixListEntries` on the S3 prefix list. `check.py` fails on any
+  other action, name or wildcard, and on any other policy resource in the template.
+- **Bootstrap steps.** Before the stack starts, the egress rules above (with the
+  `DOCKER-USER` drop of anything forwarded in from `tailscale0`, so no tailnet device
+  reaches the honeypot ports), then `/usr/local/sbin/sensor-console.sh`, which reads the
+  console token into `/opt/sensor/ui-token.env` (root only, given to the `ui` service
+  alone) and sets `[ui] external_host` to the tailnet name. After the stack is up,
+  `/usr/local/sbin/sensor-tailscale.sh` copies `tailscale` and `tailscaled` out of the
+  image copy, runs tailscaled as a hardened unit (`deploy/aws/host/tailscaled.service`) in
+  kernel (TUN) mode with `--netfilter-mode=off`, joins with no SSH, routes, DNS or exit
+  node, checks that the node got exactly the expected name, and runs `tailscale serve
+  --https=443 http://127.0.0.1:8480`. A failure in the console or node step is one
+  `FAILED` line in `/var/log/sensor-bootstrap.log`; the sensor starts anyway. Both scripts
+  can be run again by hand: they rewrite what they wrote before, and the node script
+  replaces the binaries and restarts tailscaled, so it also upgrades a running node.
+
+The node state (machine and node keys, the serve config) lives in the
+`/<NamePrefix>/tailscale-state` SecureString, through tailscaled's own AWS store
+(`--state=arn:...`), not on the instance. So a rebuilt host comes back as the same node,
+with the same name and address, without a join key or a person. The join key is only a
+fallback for when that parameter holds no logged-in node.
+
+`UiTailnetSignIn=true` also serves `/go` on the tailnet name: a page that signs the visitor
+in with the console token, so nobody has to handle the token. Then the tailnet's access
+rules are the only gate in front of the console (and, with `UiActions=true`, in front of
+approving blocks). Leave it off unless those rules name only the people who should sign in.
+
+### One-time setup
+
+In the tailnet's admin console, by a person:
+
+- [ ] MagicDNS and HTTPS certificates are on (`tailscale serve` needs both).
+- [ ] A tag for the sensor, for example `tag:sensor`, owned by the admins.
+- [ ] Access rules: the operators' devices may reach `tag:sensor` on tcp 443 only;
+      `tag:sensor` may reach nothing. No SSH rule for the tag.
+- [ ] A pre-approved, tagged (`tag:sensor`), single-use, non-ephemeral auth key with a short
+      expiry. A key without a tag joins the host as the person who made it, with that
+      person's access to the whole tailnet; see
+      [Joining the sensor to the VPN](../../docs/operations.md#joining-the-sensor-to-the-vpn).
+- [ ] A console token: 24 to 128 characters of `A-Z a-z 0-9 _ -` (for example
+      `openssl rand -hex 32`), kept in your password manager.
+
+`TailscaleHostname` with `TailnetSuffix` gets a public certificate, so the name is listed
+in certificate transparency logs. Pick a neutral name that does not say what the host is.
+
+In the sensor account, the two secrets as SecureStrings under the default `aws/ssm` key,
+read into variables without echo and sent on stdin, so they are never on a command line
+or in shell history:
+
+```bash
+read -rs TS_AUTHKEY; echo
+read -rs UI_TOKEN; echo
+printf '{"Name":"/winnie-sensor/tailscale-authkey","Type":"SecureString","Value":"%s"}' "$TS_AUTHKEY" \
+  | aws ssm put-parameter --cli-input-json file:///dev/stdin $S
+printf '{"Name":"/winnie-sensor/ui-token","Type":"SecureString","Value":"%s"}' "$UI_TOKEN" \
+  | aws ssm put-parameter --cli-input-json file:///dev/stdin $S
+unset TS_AUTHKEY UI_TOKEN
+```
+
+(`winnie-sensor` is the default `NamePrefix`.) Do not create `/winnie-sensor/tailscale-state`:
+tailscaled writes it on first start. The host has no route to Docker Hub, so copy the
+official image into the stack's repository, as for Compose:
+
+```bash
+docker pull --platform linux/amd64 tailscale/tailscale:v<version>
+docker tag tailscale/tailscale:v<version> "$R:tailscale-v<version>"
+docker push "$R:tailscale-v<version>"
+```
+
+The bootstrap expects static `tailscale` and `tailscaled` binaries at `/usr/local/bin` in
+the image, as in the official one. The `--state=arn:` store must be compiled in; it is in
+the official linux/amd64 builds this was tried with.
+
+### Turning it on
+
+A reviewed change set as in step 5, adding `TailscaleEnabled=true
+TailscaleImageTag=tailscale-v<version> TailscaleHostname=<neutral name>
+TailnetSuffix=<tailnet>.ts.net` (and `UiTailnetSignIn=true` or `UiActions=true` if wanted).
+Expect `Add` of `InstanceEgressTailscale`, `Ec2Endpoint` and `InstanceTailscaleParameters`, `Modify` of
+`LaunchTemplate`, and the instance and its address association replaced. Anything under
+an inbound rule, the other endpoints, the bucket or the repository means something is wrong.
+The image must be one built from this commit or later (see
+[Template and image](#facts-learned-from-deploying-it)).
+The `TailnetConsoleUrl` output is the address to open.
+
+Then check, on the host (`sudo -i`):
+
+- [ ] `grep -E 'FAILED|tailscale: ' /var/log/sensor-bootstrap.log` shows a state line and no
+      `FAILED`. On the first start the state is `NeedsLogin` and the join key is used.
+- [ ] `tailscale status` lists the node under its name, tagged, with no user. Confirm the
+      tag in the admin console too.
+- [ ] `tailscale serve status` shows the tailnet name proxying to `http://127.0.0.1:8480`,
+      tailnet only (no Funnel), and `/go` only with `UiTailnetSignIn=true`.
+- [ ] `tailscale debug prefs | grep -E '"(RunSSH|RouteAll|CorpDNS|AdvertiseRoutes|ExitNodeID|NetfilterMode)"'`
+      shows `false`, `false`, `false`, `null`, `""` and `0`.
+- [ ] `iptables -S DOCKER-USER` includes `-i tailscale0 -j DROP`, and `iptables -S | grep -c ts-`
+      is 0 (tailscaled added no chains of its own).
+- [ ] `iptables -S OUTPUT` starts with the `--uid-owner 10001 -j SENSOR-UID` jump and the
+      `--uid-owner 10001 -j REJECT` right after it; `iptables -S SENSOR-UID` lists the S3
+      CIDRs from `cat /var/lib/sensor-egress/s3-cidrs`; `ip6tables -S OUTPUT` rejects uid
+      10001; `systemctl list-timers sensor-egress.timer` shows the next refresh.
+- [ ] After a reboot, the rules were in place before the exporter started:
+      `systemctl is-active sensor-egress-boot.service` is `active`,
+      `systemctl show -p Requires docker.service` lists it, and the unit finished before the
+      exporter's container started (compare
+      `systemctl show -p ExecMainExitTimestamp sensor-egress-boot.service` with
+      `docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q exporter)"`, in UTC).
+      Then repeat the next check.
+- [ ] The exporter cannot reach the internet or the tailnet; each must be refused at once:
+
+      cd /opt/sensor
+      docker compose exec -T exporter python -c "import socket; socket.create_connection(('192.0.2.1', 443), timeout=5)"
+      docker compose exec -T exporter python -c "import socket; socket.create_connection(('<an operator device 100.x>', 443), timeout=5)"
+
+- [ ] The export still works: within about five minutes of a connection to a honeypot
+      port, a new object is listed under `events/` (as in the containment checklist), and
+      `docker compose logs exporter` shows no connection errors.
+- [ ] `systemctl cat tailscaled | grep -- --state=arn:`, and `ls /var/lib/tailscale` has no
+      `tailscaled.state`.
+- [ ] `grep -c tskey /var/log/sensor-bootstrap.log` is 0 and `/run/ts-key` does not exist.
+- [ ] From a device the access rules let in, the `TailnetConsoleUrl` with `?token=<token>`
+      signs in (or `/go`), and the response carries `Strict-Transport-Security`.
+- [ ] From outside the tailnet, `nc -vz -w 5 <PublicIp> 443` and `8480` time out, and the
+      containment checklist above still passes.
+
+After the first join, the auth key is not needed. Delete the parameter, then revoke the
+key in the admin console:
+
+```bash
+aws ssm delete-parameter --name /winnie-sensor/tailscale-authkey $S
+```
+
+A key left in Parameter Store stays readable by the instance role (and so by anything that
+takes over the exporter) for as long as it is valid. Put a new single-use key there only
+when a rebuild needs one (see below), and delete it again after the join.
+
+### What a rebuild does
+
+Every change that replaces the instance (any user data or AMI change) builds a new host.
+With the state in Parameter Store:
+
+- The new tailscaled reads the state and the node logs in as before: same name, same
+  tailnet address, same tag, no join key. Only if that fails (the state is gone, or the
+  node was removed from the tailnet) is the join key read; if there is none, the log says
+  `tailscale: not logged in and no join key; running without the tailnet` and the console
+  is reachable through SSM only. Put a new tagged key in `/<NamePrefix>/tailscale-authkey`
+  and run `/usr/local/sbin/sensor-tailscale.sh` on the host.
+- If the state was lost while the old device is still in the tailnet, a join key registers
+  the node as `<name>-1`, whose certificate the console would refuse. The node step checks
+  the name and logs `tailscale: joined as <name>-1..., not <name> (remove the old device)`
+  followed by `tailscale: FAILED`. Remove both devices in the admin console, put a new key
+  in the parameter and run `/usr/local/sbin/sensor-tailscale.sh` again.
+- The old and new hosts should not run the node at the same time: both would hold the same
+  keys and write the same parameter. CloudFormation starts the new instance before it
+  terminates the old one, so just before executing the change set, stop the node on the
+  old host (`systemctl stop tailscaled`). The tailnet console is then down until the new
+  host has joined; SSM port forwarding still works.
+- **Certificates are requested again.** The certificate lives on the instance's disk, not
+  in the state, so each rebuild asks Let's Encrypt for a new one for the same name. Let's
+  Encrypt issues at most five certificates for the same name in a week. A sixth rebuild
+  within seven days leaves the console without a certificate until the week has passed;
+  SSM port forwarding still works. Batch changes, or use a new `TailscaleHostname` if you
+  must rebuild more often.
+- Every state change is a new parameter version and a CloudTrail `PutParameter` event from
+  the instance role. Parameter Store keeps 100 versions; do not label any of them.
+
+The state parameter is a credential: whoever can read it can run a copy of the node on the
+tailnet. The instance role can read every parameter anyway (`AmazonSSMManagedInstanceCore`
+grants `ssm:GetParameter` on `*`), so keep the sensor in its own account, as this example
+assumes, and limit who else there can decrypt parameters.
+
+### Rollback of the tailnet option
+
+- **Cut it off now, no rebuild:** remove the device in the tailnet admin console, or on the
+  host `tailscale down && systemctl disable --now tailscaled`. The sensor and the loopback
+  console keep running.
+- **Sign-in page only:** on the host, `tailscale serve --https=443 --set-path /go off` and
+  `rm /var/lib/tailscale/go.html`; then redeploy with `UiTailnetSignIn=false`.
+- **Remove it:** a change set with `TailscaleEnabled=false` (and `UiTailnetSignIn=false`).
+  Expect `Remove` of the egress rule, the `ec2` endpoint and the role policy, and the
+  instance replaced (the new host has none of the `uid 10001` rules). Then
+  remove the device from the tailnet and delete the three parameters
+  (`aws ssm delete-parameters --names /winnie-sensor/tailscale-state /winnie-sensor/tailscale-authkey /winnie-sensor/ui-token $S`):
+  a stale copy of a node's keys should not stay around.
+
+### What has and has not been run
+
+The design (node state in Parameter Store, the egress rule, the role policy, the firewall
+rule, `--netfilter-mode=off`, `tailscale serve`, `/go`, console actions) has run on a real
+AWS account in a private deployment built from a fork of this template: a rebuilt
+instance came back as the same node without a join key, the console answered over the
+tailnet and from `/go` before and after a reboot, tailscaled added no firewall chains, and
+443 and 8480 stayed closed from the internet.
+
+The exporter's host rules have run there too, from the host files in this repository
+copied out of an image built from it: the prefix-list lookup through the `ec2` endpoint
+succeeded (the ARN form `arn:aws:ec2:<region>:aws:prefix-list/<id>` is accepted by IAM and
+by the endpoint policy); as the exporter's user on the host network, connections to a
+public address, out `tailscale0` and over IPv6 were refused, while the metadata service,
+S3 through the gateway endpoint and an interface endpoint connected; root still reached
+the internet; a bridged container reached neither the internet nor the metadata service.
+After a reboot `sensor-egress-boot.service` had finished before Docker started and before
+the exporter's container did, the same probes gave the same answers, and
+`systemctl restart docker` left the rules unchanged. `tests/test_deploy_aws.py` also runs
+`sensor-egress.sh` against a fake `iptables` for the order and the fail-closed paths.
+
+These are not yet run as written here:
+
+- this template's own version of the steps (the combined console step, `[ui] actions` set
+  in `config.ini` rather than a command line, the read-write `blocklist` mount, the
+  parameter names derived from `NamePrefix`, the name check, files copied out of the image);
+- a first join with the state in Parameter Store from the start: that deployment moved
+  an existing node's state into the parameter. tailscaled's AWS store writes `{}` when
+  the parameter does not exist and then starts logged out (read in its source, not
+  observed), and the join key does the rest;
+- a replacement without stopping the old node first (two hosts with the same keys for a
+  few minutes);
+- a partition other than `aws`.
 
 ## Tracked blocklist export (optional)
 
@@ -313,6 +632,8 @@ Not proven without a real deploy:
   stop-instances --instance-ids <InstanceId> $S` (`start-instances` resumes; the systemd
   units start the stack again).
 - **Host off, network kept:** redeploy with `HostEnabled=false`.
+- **Tailnet only:** see [Rollback](#rollback-of-the-tailnet-option) under Console over a
+  tailnet.
 - **Remove the sensor:** `aws cloudformation delete-stack --stack-name winnie-sensor $S`.
   The ECR repository is retained on purpose; delete it by hand when done. The bucket stack
   is not touched, and the bucket itself is retained even if its stack is deleted.

@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Winnie the Agent sensor on one EC2 host. One VPC with one public subnet and no NAT: the
-  host reaches only AWS through VPC endpoints, containers cannot connect out or reach the
+  host reaches only AWS through VPC endpoints (TailscaleEnabled adds tcp 443 out for a
+  tailnet), containers cannot connect out or reach the
   instance metadata service, administration is SSM only, and a separate exporter container
   ships events to a write-only bucket in another account (events-bucket.yaml, deployed
   first).
@@ -150,6 +151,67 @@ Parameters:
       no "..". It starts with a letter, so it never lands among the events, which are
       written under EventsPrefix/YYYY/MM/DD/.
     Description: Key of the tracked list, relative to EventsPrefix (the object is EventsPrefix/TrackedKey).
+  AgentsIntervalSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 60
+    MaxValue: 86400
+    Description: >-
+      Seconds between analysis passes (run-all) in the agents container. Records are written
+      per closed hour, so a shorter interval only shortens the wait after each hour ends.
+  UiActions:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Let the console approve, reject, unblock and enforce ([ui] actions), with the agent
+      data and blocklist volumes mounted read-write for it. Needs UiEnabled=true.
+  UiOperator:
+    Type: String
+    Default: console
+    MaxLength: 40
+    AllowedPattern: '^[a-z0-9][a-z0-9._-]{0,39}$'
+    Description: Name recorded with console decisions (as ui:<name>) when UiActions is true.
+  # Mesh VPN (Tailscale): everything below is off unless TailscaleEnabled is "true". See the
+  # README, "Console over a tailnet".
+  TailscaleEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Join the host to a tailnet and serve the console on its tailnet HTTPS name, nothing
+      else. Needs UiEnabled, TailscaleImageTag, TailscaleHostname and TailnetSuffix. Adds tcp
+      443 out, Get/Put on one SSM parameter (the node state) and the bootstrap steps; no
+      inbound rule.
+  TailscaleImageTag:
+    Type: String
+    Default: ""
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9._-]{0,64}$'
+    Description: >-
+      Tag of a copy of the official tailscale/tailscale image (linux/amd64) in this stack's
+      repository, the source of tailscale and tailscaled on the host.
+  TailscaleHostname:
+    Type: String
+    Default: ""
+    AllowedPattern: '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$'
+    ConstraintDescription: One lower-case DNS label, 1 to 63 characters.
+    Description: >-
+      Tailnet machine name. Keep it neutral: with TailnetSuffix it is the console's HTTPS name
+      and is published in certificate transparency logs.
+  TailnetSuffix:
+    Type: String
+    Default: ""
+    MaxLength: 63
+    AllowedPattern: '^([a-z0-9-]+\.ts\.net)?$'
+    Description: The tailnet's DNS name, for example example-tailnet.ts.net.
+  UiTailnetSignIn:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Also serve /go on the tailnet name, a page that signs the visitor in with the console
+      token. The tailnet's access rules are then the only gate. Needs TailscaleEnabled=true.
 
 Mappings:
   # Listener services per scenario ("python -m listeners --list-scenarios"). SSH is always on.
@@ -167,6 +229,9 @@ Conditions:
   TrailOn: !Equals [!Ref TrailEnabled, "true"]
   FlowLogsOn: !Equals [!Ref FlowLogsEnabled, "true"]
   UiOn: !Equals [!Ref UiEnabled, "true"]
+  UiActionsOn: !Equals [!Ref UiActions, "true"]
+  TailscaleOn: !Equals [!Ref TailscaleEnabled, "true"]
+  ConsoleStepOn: !Or [!Condition TailscaleOn, !Condition UiActionsOn]
   SipOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Sip], "true"]
   FtpOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Ftp], "true"]
   TelnetOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Telnet], "true"]
@@ -198,6 +263,27 @@ Rules:
     Assertions:
       - Assert: !Not [!Equals [!Ref ImageTag, ""]]
         AssertDescription: ImageTag is required when HostEnabled is true.
+  TailscaleNeedsItsSettings:
+    RuleCondition: !Equals [!Ref TailscaleEnabled, "true"]
+    Assertions:
+      - Assert: !Equals [!Ref UiEnabled, "true"]
+        AssertDescription: TailscaleEnabled=true needs UiEnabled=true (it serves the console).
+      - Assert: !Not [!Equals [!Ref TailscaleImageTag, ""]]
+        AssertDescription: TailscaleImageTag is required when TailscaleEnabled is true.
+      - Assert: !Not [!Equals [!Ref TailscaleHostname, ""]]
+        AssertDescription: TailscaleHostname is required when TailscaleEnabled is true.
+      - Assert: !Not [!Equals [!Ref TailnetSuffix, ""]]
+        AssertDescription: TailnetSuffix is required when TailscaleEnabled is true.
+  UiSignInNeedsTailscale:
+    RuleCondition: !Equals [!Ref UiTailnetSignIn, "true"]
+    Assertions:
+      - Assert: !Equals [!Ref TailscaleEnabled, "true"]
+        AssertDescription: UiTailnetSignIn=true needs TailscaleEnabled=true (it is a tailnet page).
+  UiActionsNeedUi:
+    RuleCondition: !Equals [!Ref UiActions, "true"]
+    Assertions:
+      - Assert: !Equals [!Ref UiEnabled, "true"]
+        AssertDescription: UiActions=true needs UiEnabled=true.
 
 Resources:
   # ---------------------------------------------------------------- network
@@ -466,6 +552,46 @@ Resources:
       DestinationSecurityGroupId: !Ref EndpointSecurityGroup
       Description: interface endpoints
 
+  # TailscaleEnabled only. The coordination server, the DERP relays and the certificate
+  # service all answer on tcp 443; with no UDP out the node always relays through DERP over
+  # HTTPS, which is enough for the console. A separate rule, so the group itself is untouched.
+  # Host-network processes can use it (tailscaled, the exporter); bridged containers cannot,
+  # because the DOCKER-USER rules drop their new connections whatever the destination.
+  InstanceEgressTailscale:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: TailscaleOn
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: Tailscale coordination, DERP relays and certificates over 443
+
+  # TailscaleEnabled only: the EC2 API, for one call. The host firewall limits the exporter
+  # (uid 10001) to the S3 prefix list's CIDRs once the 443 rule above exists, and reads
+  # them with ec2:GetManagedPrefixListEntries. The endpoint policy allows that one call on
+  # that one list; the role allows nothing else on EC2. About 7 USD a month in a typical
+  # region, like each of the other interface endpoints.
+  Ec2Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: TailscaleOn
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PublicSubnet]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: S3PrefixListOnly
+            Effect: Allow
+            Principal: "*"
+            Action: ec2:GetManagedPrefixListEntries
+            Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:aws:prefix-list/${S3PrefixListId}
+
   # Inbound rules: one per public port, each only with InboundEnabled=true and only when the
   # scenario runs that service. Public port -> container port as in docker-compose.yml.
   InSsh:
@@ -697,6 +823,42 @@ Resources:
       Roles:
         - !Ref InstanceRole
 
+  # TailscaleEnabled only. tailscaled keeps its node state (machine and node keys, serve
+  # config) in one SecureString through its built-in AWS store (--state=arn:...): GetParameter
+  # with decryption at start, PutParameter on every change, "{}" on first start if the
+  # parameter does not exist. That is the only write this role gets. The join key and the
+  # console token are read at boot; AmazonSSMManagedInstanceCore already allows
+  # ssm:GetParameter on "*", so ReadJoinKeyAndToken records intent rather than widening
+  # anything. All three use the default aws/ssm key, whose key policy lets this account's
+  # principals decrypt through SSM, so no kms: grant is needed.
+  InstanceTailscaleParameters:
+    Type: AWS::IAM::RolePolicy
+    Condition: TailscaleOn
+    Properties:
+      RoleName: !Ref InstanceRole
+      PolicyName: sensor-host-tailscale
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: KeepNodeState
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:PutParameter
+            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/tailscale-state
+          - Sid: ReadJoinKeyAndToken
+            Effect: Allow
+            Action: ssm:GetParameter
+            Resource:
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/tailscale-authkey
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/ui-token
+          # The host firewall's allow-list for the exporter (see EgressStep). AWS-managed
+          # prefix lists are owned by "aws", hence that account field.
+          - Sid: ReadS3PrefixList
+            Effect: Allow
+            Action: ec2:GetManagedPrefixListEntries
+            Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:aws:prefix-list/${S3PrefixListId}
+
   # ---------------------------------------------------------------- host
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
@@ -731,11 +893,53 @@ Resources:
             Tags:
               - Key: Name
                 Value: !Ref NamePrefix
+        # The bootstrap. EC2 caps user data at 16,384 bytes, so its comments live here
+        # (deploy/aws/check.py measures it at the longest allowed parameter values). It fails
+        # loudly; output in /var/log/sensor-bootstrap.log.
+        # 1. Administration is SSM only. Free port 22 for the fake SSH service.
+        # 2. Packages from the AL2023 repositories (S3 through the gateway endpoint).
+        # 3. Docker daemon: userland proxy off so events carry real client addresses.
+        # 4. Firewall: no container reaches the metadata service, and the front-end and
+        #    agents networks may only send replies, never open a connection.
+        # 5. Images from this account's repository. Retries cover instance profile
+        #    propagation.
+        # 6. Docker Compose plugin. AL2023 does not package it and this host has no internet
+        #    route, so the binary is copied out of the docker/compose-bin copy in the same
+        #    repository.
+        # 7. Host files: SSH host key, config.ini from the image's template. Sections the
+        #    template has only commented out ("#[connector.s3_events]") get a real header at
+        #    the end. Two files from one template: run-all also ships when a connector is
+        #    enabled, and the agents container has neither credentials nor egress, so
+        #    config.ini (front-ends and agents) keeps s3_events and tracked_export off;
+        #    config-ship.ini (exporter only) turns them on. Both get the same
+        #    track_before_enforce.
+        # 8. Compose files.
+        #    - The exporter: host network, the only container that can use the instance role
+        #      (IMDS hop limit 1 and the DOCKER-USER rules stop every bridged one). It reads
+        #      the log and the sensor seed (--data-dir, for passwords = hash) and keeps its
+        #      cursor and run lock on its own volume (--state-dir). Of the agents' data it
+        #      sees only the blocklist volume, the directory holding tracked.json, read-only,
+        #      never agentdata (approvals, state, reports).
+        #    - Operator console, read-only (no actions; UiActions below changes that), only
+        #      with UiEnabled=true (the ui profile, switched in .env). On the backend network,
+        #      which may only send replies; published on the host's loopback only, for SSM
+        #      port forwarding. Logs stay on the host (driver local), so the sign-in link is
+        #      read with "docker compose logs ui" and never reaches CloudWatch. It starts
+        #      after the agents, whose read-write mounts create the blocklist mount point
+        #      inside agentdata that this read-only mount needs.
+        #    - The blocklist volume (approved.txt, tracked.json): written by the agents,
+        #      read-only for everyone else, so the exporter needs no part of agentdata.
+        #    - Compose profiles: "ui" with UiEnabled=true, none otherwise. Public ports for
+        #      the scenario's services (the security group opens the same).
+        # 9. The stack as a systemd unit.
+        # The optional steps below render to "" when their switch is off, so with every
+        # switch off the script is exactly steps 1 to 9. Each is a root-only script under
+        # /usr/local/sbin that can be run again by hand; a failure is logged as "FAILED" and
+        # the sensor starts anyway.
         UserData:
           Fn::Base64: !Sub
             - |
               #!/bin/bash
-              # Sensor bootstrap. Fails loudly; output in /var/log/sensor-bootstrap.log.
               set -euo pipefail
               exec > >(tee -a /var/log/sensor-bootstrap.log) 2>&1
               REGION=${AWS::Region}
@@ -743,20 +947,15 @@ Resources:
               IMAGE=${Repository.RepositoryUri}:${ImageTag}
               HOME_DIR=/opt/sensor
 
-              # 1. Administration is SSM only. Free port 22 for the fake SSH service.
               systemctl disable --now sshd.service || true
               systemctl mask sshd.service sshd.socket
 
-              # 2. Packages from the AL2023 repositories (S3 through the gateway endpoint).
               dnf install -y docker iptables-nft
 
-              # 3. Docker daemon: userland proxy off so events carry real client addresses.
               mkdir -p /etc/docker
               echo '{"userland-proxy": false, "live-restore": false}' > /etc/docker/daemon.json
               systemctl enable --now docker.service
 
-              # 4. Firewall: no container reaches the metadata service, and the front-end and
-              #    agents networks may only send replies, never open a connection.
               cat > /usr/local/sbin/sensor-firewall.sh <<'EOF'
               #!/bin/bash
               set -euo pipefail
@@ -783,8 +982,6 @@ Resources:
               systemctl daemon-reload
               systemctl enable --now sensor-firewall.service
 
-              # 5. Images from this account's repository. Retries cover instance profile
-              #    propagation.
               for i in 1 2 3 4 5 6 7 8 9 10; do
                 if aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"; then break; fi
                 [ "$i" = 10 ] && exit 1
@@ -792,9 +989,6 @@ Resources:
               done
               docker pull "$IMAGE"
 
-              # 6. Docker Compose plugin. AL2023 does not package it and this host has no
-              #    internet route, so the binary is copied out of the docker/compose-bin copy
-              #    in the same repository.
               COMPOSE_IMAGE=${Repository.RepositoryUri}:${ComposeImageTag}
               docker pull "$COMPOSE_IMAGE"
               cid=$(docker create "$COMPOSE_IMAGE" /docker-compose)
@@ -804,88 +998,19 @@ Resources:
               chmod 0755 /usr/libexec/docker/cli-plugins/docker-compose
               docker compose version
 
-              # 7. Host files: SSH host key, config.ini from the image's template.
               mkdir -p "$HOME_DIR"
               cd "$HOME_DIR"
               [ -f ssh_host_key ] || ssh-keygen -q -t rsa -b 4096 -N "" -f ssh_host_key
               rm -f ssh_host_key.pub
               docker run --rm --network none --entrypoint cat "$IMAGE" /app/SSH/config.ini.TEMPLATE > config.ini.TEMPLATE
-              cat > render_config.py <<'PY'
-              import configparser, re, sys
-              (src, dst, name, scenario, public_ip, smtp, bucket, prefix, region, owner, tracked,
-               tracked_key, never, ship) = sys.argv[1:15]
-              lines = open(src, encoding="utf-8").read().splitlines()
-              want = {
-                  "honeypot": {"sensor_name": name},
-                  "scenario": {"active": scenario.replace("-", "_")},
-                  "listeners": {"ftp_pasv_ports": "30000-30019", "ftp_pasv_address": public_ip,
-                                "llm": "false"},
-                  "respond": {"queue_enforce": "true", "track_before_enforce": tracked},
-                  "connector.s3_events": {"enabled": ship, "bucket": bucket, "prefix": prefix + "/",
-                                          "region": region, "bucket_owner": owner,
-                                          "layout": "wrapped", "passwords": "hash"},
-                  "connector.tracked_export": {
-                      "enabled": "true" if ship == "true" and tracked == "true" else "false",
-                      "kind": "s3", "file": "/blocklist/tracked.json", "bucket": bucket,
-                      "key": tracked_key, "region": region, "bucket_owner": owner},
-              }
-              if smtp != "true":
-                  want["listeners"]["smtp_enabled"] = "false"
-              if never.strip():
-                  want["respond"]["never_act_on"] = never.strip()
-              # Sections the template has only commented out ("#[connector.s3_events]") get
-              # a real header at the end.
-              for section in want:
-                  if "[%s]" % section not in [l.strip() for l in lines]:
-                      lines += ["", "[%s]" % section]
-              def section_range(section):
-                  start = None
-                  for i, line in enumerate(lines):
-                      m = re.match(r"^\[([^\]]+)\]\s*$", line)
-                      if m and start is not None:
-                          return start, i
-                      if m and m.group(1) == section:
-                          start = i
-                  if start is None:
-                      sys.exit("config template has no [%s] section" % section)
-                  return start, len(lines)
-              for section, keys in want.items():
-                  for key, value in keys.items():
-                      start, end = section_range(section)
-                      hit = None
-                      for pattern in (r"^%s\s*=", r"^#\s*%s\s*="):
-                          for i in range(start + 1, end):
-                              if re.match(pattern % re.escape(key), lines[i]):
-                                  hit = i
-                                  break
-                          if hit is not None:
-                              break
-                      if hit is None:
-                          while end > start + 1 and not lines[end - 1].strip():
-                              end -= 1
-                          lines.insert(end, "%s = %s" % (key, value))
-                      else:
-                          lines[hit] = "%s = %s" % (key, value)
-              open(dst, "w", encoding="utf-8").write("\n".join(lines) + "\n")
-              cp = configparser.ConfigParser(interpolation=None, strict=False)
-              cp.read(dst, encoding="utf-8")
-              for section, keys in want.items():
-                  for key, value in keys.items():
-                      if cp.get(section, key, fallback=None) != value:
-                          sys.exit("config.ini check failed: [%s] %s" % (section, key))
-              print("%s written" % dst)
-              PY
-              # Two files from one template. run-all also ships when a connector is enabled,
-              # and the agents container has neither credentials nor egress, so config.ini
-              # (front-ends and agents) keeps s3_events and tracked_export off; config-ship.ini
-              # (exporter only) turns them on. Both get the same track_before_enforce.
+              docker run --rm --network none --entrypoint cat "$IMAGE" /app/deploy/aws/render_config.py > render_config.py
               ARGS="${NamePrefix} ${Scenario} ${ElasticIp} ${SmtpEnabled} ${EventsBucketName} ${EventsPrefix} $REGION ${EventsBucketOwner} ${TrackedExport} ${EventsPrefix}/${TrackedKey}"
-              python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "${NeverActOn}" false
-              python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "${NeverActOn}" true
+              NEVER="${NeverActOn}"
+              python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "$NEVER" false
+              python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "$NEVER" true
               chown 10001:10001 config.ini config-ship.ini ssh_host_key
               chmod 0400 config.ini config-ship.ini ssh_host_key
 
-              # 8. Compose files.
               cat > docker-compose.yml <<'EOF'
               name: sensor
               x-hardening: &hardening
@@ -930,11 +1055,8 @@ Resources:
                 agents:
                   <<: *hardening
                   depends_on: [ssh, listeners]
-                  environment:
-                    WINNIE_DATA_DIR: /data
-                    WINNIE_OVERLAY: /overlay/overlay.json
-                    WINNIE_SOURCE_STATE: /overlay/source_state.json
-                  command: ["/bin/sh", "-c", "while true; do python -m agents run-all --config /config/config.ini --log /data/ssh_log.log --data-dir /data --reports-dir /agents/reports --state-dir /agents/state --detections-dir /agents/detections; sleep 3600; done"]
+                  environment: *frontend-env
+                  command: ["/bin/sh", "-c", "while true; do python -m agents run-all --config /config/config.ini --log /data/ssh_log.log --data-dir /data --reports-dir /agents/reports --state-dir /agents/state --detections-dir /agents/detections; sleep ${AgentsIntervalSeconds}; done"]
                   networks: [backend]
                   volumes:
                     - ./config.ini:/config/config.ini:ro
@@ -942,12 +1064,6 @@ Resources:
                     - agentdata:/agents
                     - blocklist:/agents/reports/blocklist
                     - overlay:/overlay
-                # The exporter: host network, the only container that can use the instance
-                # role (IMDS hop limit 1 and the DOCKER-USER rules stop every bridged one).
-                # It reads the log and the sensor seed (--data-dir, for passwords = hash) and
-                # keeps its cursor and run lock on its own volume (--state-dir). Of the agents'
-                # data it sees only the blocklist volume, the directory holding tracked.json,
-                # read-only, never agentdata (approvals, state, reports).
                 exporter:
                   <<: *hardening
                   depends_on: [listeners]
@@ -961,23 +1077,13 @@ Resources:
                     - frontend:/data:ro
                     - exportstate:/agents
                     - blocklist:/blocklist:ro
-                # Operator console, read-only (no --actions), only with UiEnabled=true (the
-                # ui profile, switched in .env below). On the backend network, which may only
-                # send replies; published on the host's loopback only, for SSM port
-                # forwarding. Logs stay on the host (driver local), so the sign-in link is
-                # read with "docker compose logs ui" and never reaches CloudWatch. It starts
-                # after the agents, whose read-write mounts create the blocklist mount point
-                # inside agentdata that this read-only mount needs.
                 ui:
                   <<: *hardening
                   profiles: [ui]
                   depends_on: [agents]
                   logging:
                     driver: local
-                  environment:
-                    WINNIE_DATA_DIR: /data
-                    WINNIE_OVERLAY: /overlay/overlay.json
-                    WINNIE_SOURCE_STATE: /overlay/source_state.json
+                  environment: *frontend-env
                   command: ["python", "-m", "agents", "ui", "--config", "/config/config.ini", "--log", "/data/ssh_log.log", "--data-dir", "/data", "--reports-dir", "/agents/reports", "--state-dir", "/agents/state", "--detections-dir", "/agents/detections", "--bind", "0.0.0.0", "--allow-non-loopback", "--port", "8480"]
                   networks: [backend]
                   ports: ["127.0.0.1:8480:8480"]
@@ -997,16 +1103,12 @@ Resources:
               volumes:
                 frontend: {}
                 agentdata: {}
-                # The blocklist directory (approved.txt, tracked.json): written by the agents,
-                # read-only for everyone else, so the exporter needs no part of agentdata.
                 blocklist: {}
                 overlay: {}
                 exportstate: {}
               EOF
-              # Compose profiles: "ui" with UiEnabled=true, none otherwise.
               echo "COMPOSE_PROFILES=${UiProfiles}" > .env
 
-              # Public ports for the scenario's services (the security group opens the same).
               PORTS=""
               for svc in ${Services}; do
                 case "$svc" in
@@ -1032,8 +1134,7 @@ Resources:
                 for p in $PORTS; do echo "      - \"$p\""; done
               } > docker-compose.override.yml
 
-              # 9. The stack as a systemd unit.
-              cat > /etc/systemd/system/sensor.service <<'EOF'
+              ${EgressStep}${ConsoleStep}cat > /etc/systemd/system/sensor.service <<'EOF'
               [Unit]
               Description=Winnie the Agent sensor stack
               After=docker.service sensor-firewall.service
@@ -1050,7 +1151,7 @@ Resources:
               EOF
               systemctl daemon-reload
               systemctl enable --now sensor.service
-              echo "bootstrap complete"
+              ${TailscaleNodeStep}echo "bootstrap complete"
             - Services: !Join
                 - " "
                 - - !If [SipOn, sip, ""]
@@ -1065,6 +1166,155 @@ Resources:
                   - !If [MllpOn, mllp, ""]
                   - !If [S3On, s3, ""]
               UiProfiles: !If [UiOn, ui, ""]
+              # TailscaleEnabled only, before the stack starts, and not allowed to fail: an
+              # error here stops the bootstrap, so the stack never runs without these rules.
+              # sensor-egress.sh (deploy/aws/host in the image; its header explains the rules)
+              # limits the exporter, uid 10001, to what it reached before InstanceEgressTailscale
+              # existed, and its timer refreshes the S3 prefix list every 15 minutes. At every
+              # later boot sensor-egress-boot.service applies the rules before Docker starts
+              # (Docker restarts the containers itself), and Docker requires it.
+              # sensor-firewall.sh, which runs before the stack at every boot, calls it again and
+              # also drops tailscale0 traffic in DOCKER-USER, so no tailnet device reaches the
+              # honeypot ports.
+              EgressStep: !If
+                - TailscaleOn
+                - !Sub |
+                  printf 'REGION=%s\nPREFIX_LIST=%s\nVPC_CIDR=%s\n' ${AWS::Region} ${S3PrefixListId} ${VpcCidr} > /etc/sensor-egress.env
+                  H=/app/deploy/aws/host
+                  docker run --rm --network none --entrypoint cat "$IMAGE" $H/sensor-egress.sh | install -m 0700 /dev/stdin /usr/local/sbin/sensor-egress.sh
+                  for u in sensor-egress.service sensor-egress.timer sensor-egress-boot.service; do docker run --rm --network none --entrypoint cat "$IMAGE" $H/$u > /etc/systemd/system/$u; done
+                  F=/usr/local/sbin/sensor-firewall.sh
+                  grep -q tailscale0 $F || echo 'add -i tailscale0 -j DROP' >> $F
+                  grep -q sensor-egress $F || echo /usr/local/sbin/sensor-egress.sh >> $F
+                  /usr/local/sbin/sensor-egress.sh refresh
+                  $F
+                  systemctl daemon-reload
+                  systemctl enable --now sensor-egress-boot.service sensor-egress.timer
+                - ""
+              # TailscaleEnabled or UiActions, before the stack starts; nothing here touches
+              # the front-ends, agents or exporter. With TailscaleEnabled: the fixed sign-in
+              # token from /NamePrefix/ui-token into ui-token.env (root only, never echoed),
+              # given to the ui service alone by docker-compose.tailnet.yml, and [ui]
+              # external_host set to the node's tailnet name. With UiActions:
+              # docker-compose.actions.yml mounts the agent data and blocklist volumes
+              # read-write for the ui service (compose merges volumes by target, replacing the
+              # :ro mounts), and [ui] actions and operator are set. COMPOSE_FILE goes into .env
+              # only after "docker compose config" accepts the files, and config.ini changes
+              # only after that, so a failure leaves the console as it was without the step.
+              ConsoleStep: !If
+                - ConsoleStepOn
+                - !Sub |
+                  install -m 0700 /dev/stdin /usr/local/sbin/sensor-console.sh <<'EOF'
+                  #!/bin/bash
+                  set -euo pipefail
+                  cd /opt/sensor
+                  f=docker-compose.yml:docker-compose.override.yml
+                  e=()
+                  if [ ${TailscaleEnabled} = true ]; then
+                  umask 077
+                  t=$(aws ssm get-parameter --region ${AWS::Region} --name /${NamePrefix}/ui-token --with-decryption --query Parameter.Value --output text)
+                  [[ $t =~ ^[A-Za-z0-9_-]{24,128}$ ]] || { echo "ui token: missing or bad format" >&2; exit 1; }
+                  printf 'WINNIE_UI_TOKEN=%s\n' "$t" > ui-token.env
+                  unset t
+                  printf 'services:\n  ui:\n    env_file: [./ui-token.env]\n' > docker-compose.tailnet.yml
+                  f=$f:docker-compose.tailnet.yml
+                  e+=(-e "s/^#?external_host *=.*/external_host = ${TailscaleHostname}.${TailnetSuffix}/")
+                  fi
+                  if [ ${UiActions} = true ]; then
+                  printf 'services:\n  ui:\n    volumes:\n      - agentdata:/agents\n      - blocklist:/agents/reports/blocklist\n' > docker-compose.actions.yml
+                  f=$f:docker-compose.actions.yml
+                  e+=(-e 's/^actions *=.*/actions = true/' -e 's/^#?operator *=.*/operator = ${UiOperator}/')
+                  fi
+                  COMPOSE_FILE=$f docker compose config --quiet
+                  sed -i '/^COMPOSE_FILE=/d' .env
+                  echo "COMPOSE_FILE=$f" >> .env
+                  sed -i -E "${!e[@]}" config.ini
+                  chown 10001:10001 config.ini
+                  chmod 0400 config.ini
+                  EOF
+                  /usr/local/sbin/sensor-console.sh || echo "console: FAILED ($?)"
+                - ""
+              # TailscaleEnabled only, after the stack is up so it cannot hold it back.
+              # a. --netfilter-mode=off keeps tailscaled's own chains out: it would insert them
+              #    at FORWARD rule 1, ahead of DOCKER-USER (the egress step adds the tailscale0
+              #    drop instead).
+              # b. tailscale and tailscaled from the copy of tailscale/tailscale in this stack's
+              #    repository (static binaries at /usr/local/bin in the official image).
+              # c. tailscaled as a hardened unit (deploy/aws/host/tailscaled.service in the
+              #    image), kernel (TUN) mode. Node state in the /NamePrefix/tailscale-state
+              #    SecureString (TS_STATE in /etc/sensor-tailscale.env), so a replaced instance
+              #    comes back as the same node; certificates stay under --statedir and are
+              #    requested again after a rebuild. The binaries are replaced by rename and tailscaled restarted,
+              #    so running the script again upgrades a running node.
+              # d. If the restored state holds a node: tailscale up, same flags, no key. Only if
+              #    still not logged in: the join key from /NamePrefix/tailscale-authkey into a
+              #    root-only file on tmpfs, passed as file: (never on a command line or in the
+              #    log), deleted after. No key is one log line, not a failure. No SSH, routes,
+              #    DNS or exit node.
+              #    Then the node's own DNS name must be TailscaleHostname.TailnetSuffix: a join
+              #    key used while the old device is still in the tailnet registers <name>-1,
+              #    whose certificate the console would refuse.
+              # e. tailscale serve: the console on the node's tailnet HTTPS name, tailnet only
+              #    (no Funnel). A /go restored from the node state is removed first.
+              # f. UiTailnetSignIn only: /var/lib/tailscale/go.html (root, 0600) redirects to
+              #    /?token=<console token> and sends no Referer, and tailscale serve maps /go to
+              #    it. Anyone the tailnet's access rules admit to the node is then signed in.
+              #    The file is on the instance's disk, so it survives a reboot; a rebuild
+              #    writes it again.
+              TailscaleNodeStep: !If
+                - TailscaleOn
+                - !Sub |
+                  install -m 0700 /dev/stdin /usr/local/sbin/sensor-tailscale.sh <<'EOF'
+                  #!/bin/bash
+                  set -euo pipefail
+                  T=/usr/local/bin/tailscale
+                  D=/usr/local/sbin/tailscaled
+                  K=/run/ts-key
+                  trap 'rm -f $K' EXIT
+                  cid=$(docker create --entrypoint $T ${Repository.RepositoryUri}:${TailscaleImageTag})
+                  docker cp -L "$cid:$T" $T.new
+                  docker cp -L "$cid:/usr/local/bin/tailscaled" $D.new
+                  docker rm "$cid" >/dev/null
+                  chown root:root $T.new $D.new
+                  chmod 0755 $T.new $D.new
+                  mv -f $T.new $T
+                  mv -f $D.new $D
+                  $T version
+                  echo tun > /etc/modules-load.d/tailscale.conf
+                  modprobe tun
+                  systemctl daemon-reload
+                  systemctl enable tailscaled.service
+                  systemctl restart tailscaled.service
+                  up() { timeout 200 $T up --reset --hostname=${TailscaleHostname} --ssh=false --accept-routes=false --accept-dns=false --netfilter-mode=off --advertise-routes= --advertise-exit-node=false --exit-node= "$@"; }
+                  for i in {1..30}; do s=$($T status --json 2>/dev/null | sed -n 's/^  "BackendState": "\(.*\)",$/\1/p' || :); [[ $s && $s != NoState ]] && break; sleep 2; done
+                  echo "tailscale: state $s"
+                  [ "$s" = NeedsLogin ] || up --timeout=60s || :
+                  if ! $T status >/dev/null 2>&1; then
+                  umask 077
+                  if ! aws ssm get-parameter --region ${AWS::Region} --name /${NamePrefix}/tailscale-authkey --with-decryption --query Parameter.Value --output text 2>/dev/null | tr -d '\r\n' > $K || [ ! -s $K ]; then
+                  echo "tailscale: not logged in and no join key; running without the tailnet"
+                  exit 0
+                  fi
+                  up --auth-key=file:$K --timeout=180s
+                  fi
+                  n=$($T status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"])')
+                  [ "$n" = ${TailscaleHostname}.${TailnetSuffix}. ] || { echo "tailscale: joined as $n, not ${TailscaleHostname}.${TailnetSuffix} (remove the old device); the console would refuse that name" >&2; exit 1; }
+                  $T ip -4
+                  timeout 120 $T serve --bg --https=443 http://127.0.0.1:8480
+                  timeout 60 $T serve --https=443 --set-path /go off >/dev/null 2>&1 || :
+                  if [ ${UiTailnetSignIn} = true ]; then
+                  umask 077
+                  t=$(sed -n 's/^WINNIE_UI_TOKEN=//p' /opt/sensor/ui-token.env)
+                  [[ $t =~ ^[A-Za-z0-9_-]{24,128}$ ]] || { echo "go page: no ui token" >&2; exit 1; }
+                  printf '<!doctype html><meta name=referrer content=no-referrer><meta http-equiv=refresh content="0;url=/?token=%s"><title>Console</title>' "$t" > /var/lib/tailscale/go.html
+                  unset t
+                  timeout 60 $T serve --bg --https=443 --set-path /go /var/lib/tailscale/go.html
+                  fi
+                  $T serve status
+                  EOF
+                  printf 'TS_STATE=arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/tailscale-state\n' > /etc/sensor-tailscale.env
+                  docker run --rm --network none --entrypoint cat "$IMAGE" /app/deploy/aws/host/tailscaled.service > /etc/systemd/system/tailscaled.service && /usr/local/sbin/sensor-tailscale.sh || echo "tailscale: FAILED ($?)"
+                - ""
 
   Instance:
     Type: AWS::EC2::Instance
@@ -1097,3 +1347,7 @@ Outputs:
   TrailArn:
     Condition: TrailOn
     Value: !GetAtt AuditTrail.Arn
+  TailnetConsoleUrl:
+    Condition: TailscaleOn
+    Description: The console over the tailnet (sign in with the token in /NamePrefix/ui-token, or /go).
+    Value: !Sub https://${TailscaleHostname}.${TailnetSuffix}/
