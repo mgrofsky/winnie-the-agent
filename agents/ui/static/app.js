@@ -2051,19 +2051,21 @@
     }
     const tbody = el("tbody");
     for (const it of items) addActivityRows(tbody, it);
-    if (items.length) {
-      const head = el("tr", null, ["", "Time", "Source", "Service", "Event", "User", "Outcome", "Summary"].map((c) =>
-        el("th", { attrs: { scope: "col" }, text: c })));
-      head.firstChild.append(el("span", { cls: "visually-hidden", text: "Details" }));
-      out.push(el("div", "table-wrap", el("table", { cls: "activity", attrs: { "aria-label": "Events, newest first" } },
-        el("thead", null, head), tbody)));
-    }
-    out.push(activityFoot(data, ctx, tbody, search));
+    // Always in the page, hidden while empty: a search whose first page ran out of its read
+    // budget has no rows yet, and "Search further back" adds them to this same table.
+    const head = el("tr", null, ["", "Time", "Source", "Service", "Event", "User", "Outcome", "Summary"].map((c) =>
+      el("th", { attrs: { scope: "col" }, text: c })));
+    head.firstChild.append(el("span", { cls: "visually-hidden", text: "Details" }));
+    const wrap = el("div", "table-wrap", el("table", { cls: "activity", attrs: { "aria-label": "Events, newest first" } },
+      el("thead", null, head), tbody));
+    wrap.hidden = !items.length;
+    out.push(wrap);
+    out.push(activityFoot(data, ctx, tbody, search, wrap));
     return out;
   }
 
   // "Load older" by cursor; for a search that ran out of its byte budget, "Search further".
-  function activityFoot(data, ctx, tbody, search) {
+  function activityFoot(data, ctx, tbody, search, wrap) {
     const foot = el("div", { cls: "pager", attrs: { "aria-live": "polite" } });
     const gen = state.gen;
     let cursor = typeof data.next_before === "number" ? data.next_before : null;
@@ -2103,6 +2105,7 @@
       if (gen !== state.gen) return;
       const items = arr(next.items).map(obj);
       for (const it of items) addActivityRows(tbody, it);
+      if (items.length) wrap.hidden = false;
       shown += items.length;
       cursor = typeof next.next_before === "number" ? next.next_before : null;
       draw(next.search ? obj(next.search) : null, next.read_cut);

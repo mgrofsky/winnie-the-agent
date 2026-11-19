@@ -440,9 +440,17 @@ def run_fetch(fetch: FetchSettings, local: SightingsSettings, state_dir, *,
                 summary["logged"] = False   # the same bad copy as before: logged once already
             new_state["refused_sha256"] = digest
         else:
+            # Compact, and checked against the reader's own limit: a copy the console would
+            # refuse must never replace a good one.
+            text = json.dumps(doc.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
             try:
-                _atomic_write(local.file(state_dir), json.dumps(doc.to_dict(), indent=2,
-                                                                sort_keys=True) + "\n")
+                if len(text.encode("utf-8")) > local.max_bytes:
+                    raise InvalidSightings(
+                        f"the document is larger than {local.max_bytes} bytes once normalised")
+                _atomic_write(local.file(state_dir), text)
+            except InvalidSightings as exc:
+                summary["error"] = f"fetched document refused: {str(exc)[:120]}"
+                summary["kept"] = "the last good local file"
             except OSError as exc:
                 summary["error"] = f"cannot write the local file ({type(exc).__name__})"
             else:

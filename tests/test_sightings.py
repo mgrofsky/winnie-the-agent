@@ -434,3 +434,26 @@ def test_an_unwritable_state_directory_never_raises(tmp_path):
     (tmp_path / "state").write_text("a file where the directory should be")
     res = _run(tmp_path, _s3(), FakeS3(body(doc(item()))))
     assert "error" in res and "status" not in res
+
+
+def test_the_local_copy_of_a_large_fetched_document_fits_the_reader(tmp_path):
+    items = [item(address=f"198.51.{100 + i // 250}.{i % 250 + 1}") for i in range(4200)]
+    raw = body(doc(*items))
+    assert len(raw) < sightings.DEFAULT_MAX_BYTES
+    res = _run(tmp_path, _s3(), FakeS3(raw))
+    assert res["status"] == "fetched" and res["sightings"] == 4200
+    stored = (tmp_path / "state" / "sightings.json").read_bytes()
+    assert len(stored) <= sightings.DEFAULT_MAX_BYTES
+    assert len(sightings.parse(stored).sightings) == 4200
+
+
+def test_a_copy_too_large_once_normalised_keeps_the_last_good_file(tmp_path):
+    good = body(doc(item()))
+    assert _run(tmp_path, _s3(), FakeS3(good))["status"] == "fetched"
+    before = (tmp_path / "state" / "sightings.json").read_bytes()
+    raw = json.dumps(doc(*[item(address=f"198.51.100.{i + 1}") for i in range(20)]),
+                     separators=(",", ":")).encode()
+    later = NOW + datetime.timedelta(days=1)
+    res = _run(tmp_path, _s3(), FakeS3(raw), now=later, local={"max_bytes": len(raw)})
+    assert "once normalised" in res["error"] and res["kept"] == "the last good local file"
+    assert (tmp_path / "state" / "sightings.json").read_bytes() == before
