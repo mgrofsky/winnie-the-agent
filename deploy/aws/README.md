@@ -232,13 +232,16 @@ Sign in:
 
 3. Open the link in a browser on the workstation (it starts with `http://127.0.0.1:8480/`).
 
-Not yet confirmed on a real instance. The loopback publish relies on Docker's DNAT rules
-with `"userland-proxy": false` (there is no proxy process listening on 127.0.0.1:8480), and
-the SSM agent has to connect to that address. Before relying on it, check on the instance
-that `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8480/` answers, that the port
-forward reaches it, and that `ss -tlnp` and `iptables -t nat -S DOCKER` show nothing on
-8480 beyond 127.0.0.1. If `S3Port` is ever set to 8480, the trap and the console collide;
-pick another port.
+The loopback publish is confirmed on a real instance built from this template's compose
+layout, with Docker's `"userland-proxy": false`: `curl http://127.0.0.1:8480/` on the host
+answers (401 before sign-in), `ss -tlnp` shows dockerd holding `127.0.0.1:8480` and nothing
+on another address, `iptables -t nat -S DOCKER` has one rule for 8480 with destination
+`127.0.0.1/32`, and the port does not answer on the public address. The SSM port forward
+itself (step 2) is not yet confirmed: the SSM agent has to connect to 127.0.0.1:8480,
+where dockerd holds the port but does not proxy it; the DNAT rule does the work. Check that it reaches
+the console before relying on it, and repeat the four checks above after any change to
+the Docker or compose setup. If `S3Port` is ever set to 8480, the trap and the console
+collide; pick another port.
 
 The console can also sit behind an HTTPS proxy on the instance and be reached over a
 private mesh VPN; see
