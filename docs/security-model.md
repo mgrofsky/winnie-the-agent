@@ -236,6 +236,9 @@ loopback, and the bind guard is unchanged. What changes:
 - Who can reach the console is then decided by the VPN's access rules, not by host
   access. Allow only the operator's devices, to that one port, and nothing initiated from
   the sensor towards them.
+- Join the sensor with a tagged key and check the tag after joining: an untagged key
+  joins it as the key's creator, with that person's access to the whole private network.
+  See [operations.md](operations.md#joining-the-sensor-to-the-vpn).
 - The token and session checks are unchanged. Under the external name a POST needs an
   `https://` `Origin` equal to that name, the cookie is `Secure`, and responses carry
   HSTS. A session is bound to the kind of name it was issued under (loopback or external),

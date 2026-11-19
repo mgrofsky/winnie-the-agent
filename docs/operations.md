@@ -458,6 +458,17 @@ secrets. The CLI commands keep working alongside it: the console only reads the 
 pipeline writes, and its decisions (with actions on) go through the same functions as the
 CLI's, so you can use either at any time.
 
+The console shows what the agents have produced; it does not triage anything itself. On a
+fresh host, or after the agent volumes are lost, Overview, Queue, Records and Digests stay
+empty until the first `run-all` pass finishes. The `agents` service runs one when it
+starts and then every `RUN_ALL_INTERVAL_SECONDS` (an hour by default). To run one now, use
+`run-all` without `--dry-run` as in [Running agent commands in
+Docker](#running-agent-commands-in-docker):
+
+```bash
+$dc exec agents python -m agents run-all --log /data/ssh_log.log $args
+```
+
 ### Starting it
 
 Without Docker, from the repository root (same default paths as the other commands; pass
@@ -565,11 +576,53 @@ headers the proxy adds; it trusts only the token.
 
 - Set a fixed `WINNIE_UI_TOKEN` (24 characters or more, kept in your password manager), so
   signing in does not need the container log. At start the console logs both links and a
-  warning that it is reachable through a proxy.
+  warning that it is reachable through a proxy. Those links carry the token, so keep the
+  console's log on the host (a `local` or `json-file` log driver; the AWS template sets
+  `driver: local`), never a driver that ships it elsewhere, and treat the log as a secret.
 - Start read-only. Add the actions override only when you mean to act from the console,
   and take it off again after.
 - Limit the VPN's access rules to your own devices and this one port. See
   [security-model.md](security-model.md#operator-console).
+
+#### Joining the sensor to the VPN
+
+The sensor is a host attackers are invited to probe. Join it so that, if it is ever taken
+over, it reaches nothing on the private network. With Tailscale:
+
+- **Join with a tagged auth key, and check the tag after joining.** An auth key without a
+  tag joins the host as the person who made the key, with that person's access to
+  everything else on the tailnet. This is the line that matters most: confirm in the admin
+  console that the node shows the tag and no user before going further.
+- **Access rules: people in, nothing out.** Allow named people or a group to the tag on
+  tcp 443 only, and write no rule with the tag as a source. Check from the host:
+  `tailscale status` should list no peers beyond the devices you let in, and a connection
+  from the host to any of them should fail.
+- **Turn off Tailscale's firewall management on a Docker host:**
+  `tailscale up --netfilter-mode=off`. In the default mode it inserts its own chain at the
+  top of `FORWARD`, ahead of Docker's `DOCKER-USER` jump, and that chain accepts forwarded
+  traffic into and out of `tailscale0`. A bridged container could then reach the tailnet,
+  and the tailnet the containers, past the [egress rules](#egress-control-in-production)
+  this project relies on. With `off` it writes no rules; the next line is the only one
+  you need.
+- **Drop forwarded traffic from the tunnel:**
+  `iptables -I DOCKER-USER -i tailscale0 -j DROP` (and persist it with the other
+  `DOCKER-USER` rules). Without it, a device on the tailnet can reach the honeypot's
+  published ports and show up as an attacker in the event log. The proxy on 443 is a host
+  process, so this does not affect the console.
+- **Nothing else on the sensor:** no Tailscale SSH, no accepted routes, no Tailscale-managed
+  DNS, no exit node (`--ssh=false --accept-routes=false --accept-dns=false`, and no
+  `--exit-node`).
+- **Kernel (TUN) mode, not userspace networking.** In userspace mode tailscaled terminates
+  connections itself and there is no `tailscale0` interface, so the rule above has nothing
+  to match.
+- **Outbound tcp 443.** The node needs it to reach the coordination server and relays.
+  The AWS template has no such egress rule; adding one (tcp 443 to anywhere) opens it to
+  every process on the host network, including the event export and anything else running
+  on the host, but not to the bridged containers, which the `DOCKER-USER` rules still stop.
+  Decide that knowingly.
+- **A rebuilt host is a new node.** The node's identity lives in tailscaled's state on the
+  instance; a replaced instance needs a new tagged key (and the old node removed), unless
+  that state is kept outside the instance.
 
 ### Turning actions on
 
