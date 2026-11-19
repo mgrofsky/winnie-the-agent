@@ -137,7 +137,11 @@ authentication only and are never rendered into a prompt.
 - **Tiers fixed in code.** Local actions change only this honeypot. Notify actions go only
   to connectors the operator enabled. Enforce actions (blocklist, detection publishing,
   tickets, block webhook) never run without `python -m agents approve <id>`, and only if
-  `[respond] queue_enforce = true`. Approvals expire.
+  `[respond] queue_enforce = true`. Approvals expire. With `[respond]
+  track_before_enforce = true`, approving a blocklist entry only tracks it, and blocking
+  takes a second decision by a person (`python -m agents enforce <address>` or the
+  console's Enforce), which runs the approval checks again. Nothing triggers enforcement
+  on its own, sightings included.
 - **Source gates.** UDP sources that never completed a nonce round trip, non-global
   addresses and `never_act_on` ranges get no per-source action of any tier. This prevents
   an attacker from spoofing a victim's address into a blocklist or a tarpit. Gates are
@@ -184,6 +188,33 @@ authentication only and are never rendered into a prompt.
   for the sensor. AWS endpoints are not pinned the way connector destinations are; the
   TLS certificate check against the AWS host name is the protection. Delivery is at least
   once.
+- **Tracked list and sightings.** Two more flows, both off by default and run by the
+  agents process only (see [operations.md](operations.md#tracked-list-and-sightings)):
+  - *One object out.* `[connector.tracked_export]` sends `tracked.json`: each listed
+    address, its status (`tracked` or `enforced`), its approval and expiry times, and the
+    sensor name. No approval ids, playbooks, operator names or secrets.
+  - *One object in.* `[connector.sightings]` fetches `sightings.json`, written by the
+    operator's environment. It is untrusted: whoever can write that object, or the
+    local file, controls its content. It is parsed strictly and refused whole on the first
+    problem (size and entry caps, exact types, valid addresses and timestamps), strings are
+    cut to 64 characters with control and invisible characters removed, unknown keys and
+    unlisted addresses are ignored, and a refused copy never replaces a good one. The
+    console renders it as text like everything else. It is display only: no code path
+    acts on a sighting.
+  - With `kind = s3`, each flow builds its own client with a guard that refuses, before a
+    request is sent, every operation but its one (`PutObject` out, `GetObject` in) and
+    every bucket and key but the configured one. Credentials come from the default chain.
+    An `endpoint_url` for another S3-compatible store must be `https` and is checked at
+    load (a private address or `localhost` needs `allow_private`), but the S3 client
+    resolves the name itself on each call, so unlike the HTTP connectors the address is
+    not pinned; the TLS certificate check is the protection. With `kind = https`, the
+    connector rules above apply, and the token may come from `secret_file`, read at each
+    call and never logged.
+  - What a sensor taken over learns from them: which addresses the operator tracks and
+    enforces, and when, from `tracked.json`; and where, on which service, how often and
+    when each was seen elsewhere, at whatever granularity the producer chose to write. The
+    producer should write the minimum: listed addresses only, coarse labels, no internal
+    host names, addresses or account ids.
 - **Notification content.** Built from structured fields; attacker-derived URLs, domains,
   addresses and `@` are defanged in chat, email and ticket outputs; the enrichment
   response is treated as untrusted and flattened to a few short scalar fields.
@@ -209,14 +240,15 @@ it: almost everything it displays was typed by attackers.
 
 | Mode | Reads | Writes |
 |---|---|---|
-| Read-only (default) | event log, agent data (records, digests, queue, tuner and decoy state, detections), overlay, playbooks | nothing (in Docker every mount is read-only) |
-| Actions on (`--actions` or `[ui] actions = true`, plus agent data mounted read-write) | the same | approval queue, blocklist store and file, `response/` audit records, approved detections: what `approve`, `reject` and `unblock` write |
+| Read-only (default) | event log, agent data (records, digests, queue, tuner and decoy state, detections, sightings file), overlay, playbooks | nothing (in Docker every mount is read-only) |
+| Actions on (`--actions` or `[ui] actions = true`, plus agent data mounted read-write) | the same | approval queue, blocklist store and file, `tracked.json`, `response/` audit records, approved detections: what `approve`, `reject`, `unblock` and `enforce` write |
 
-With actions on it calls the same `approve`, `reject` and `unblock` functions as the CLI,
-so the same gates apply: the source is re-checked at approval time, the queue lock stops a
-double execution, expired items cannot be approved. Decisions are recorded as
-`ui:<operator>`. The overlay and the event log stay read-only in both modes. With actions
-on, the console is in the same trust zone as the agents container.
+With actions on it calls the same `approve`, `reject`, `unblock` and `enforce` functions as
+the CLI, so the same gates apply: the source is re-checked at approval and at
+enforcement, the queue lock stops a double execution, expired items cannot be approved.
+Decisions are recorded as `ui:<operator>`. The overlay and the event log stay read-only
+in both modes. With actions on, the console is in the same trust zone as the agents
+container.
 
 **Loopback only, behind a tunnel.** The server binds a loopback address and refuses
 anything else unless told otherwise; the Docker service binds 0.0.0.0 inside its container
@@ -281,6 +313,9 @@ loopback, and the bind guard is unchanged. What changes:
 - The console's unblock removes exactly one listed entry: the target must parse to a key
   already on the blocklist. A network covering several entries (or everything, such as
   `0.0.0.0/0`) is refused; ranges are unblocked with `python -m agents unblock`.
+- Enforce takes one tracked entry exactly as listed, with a hash of the entry as the page
+  showed it (address, status, times). An entry that changed, expired or was enforced since
+  the page loaded gets a 409 and nothing changes.
 
 **Displayed text is attacker-controlled.** Commands, usernames, passwords, HTTP requests
 and transcripts are all hostile input. The console renders them as text only, never as
@@ -374,6 +409,10 @@ bundled one. The bundled scenarios are examples.
   not by cryptography.
 - The captured data contains real-looking and sometimes real credentials. Protecting it is
   the operator's job.
+- Code execution on the sensor is out of scope as an attack, but if it happens the
+  attacker can read the tracked list and the sightings file, and with the exchange
+  credentials overwrite the export object and read the sightings object. Keep the
+  sightings file to the minimum the operator needs to decide.
 - The operator console trusts anyone who can reach its loopback port and read its log.
   Host access is the only control in front of it. With `external_host` set, the VPN's
   access rules and the token are.

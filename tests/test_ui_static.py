@@ -43,6 +43,7 @@ API_LITERALS = {
     "/api/queue/",
     "/api/blocklist",
     "/api/blocklist/unblock",
+    "/api/blocklist/enforce",
     "/api/digests",
     "/api/digests/",
     "/api/decoy",

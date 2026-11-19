@@ -3,7 +3,8 @@
 ``UrlTransport`` is the default ``Transport``: ``http.client`` over TLS, https only, no
 redirects, no proxies, a socket timeout on every operation plus one overall deadline per
 call (``timeout`` seconds from start to the last body byte, so a server that drips bytes
-cannot hold a call open), a 64 KB response cap and no retries. It
+cannot hold a call open), a 64 KB response cap (a caller may pass a different
+``max_bytes``) and no retries. It
 connects to the address pinned by ``pin_address`` and never resolves the host name itself;
 the host name is used for SNI, certificate verification (default SSL context) and the
 ``Host`` header.
@@ -108,7 +109,8 @@ class UrlTransport:
         self._clock = clock
 
     def request(self, method: str, url: str, headers: dict[str, str], body: Optional[bytes],
-                timeout: float, address: str) -> tuple[int, bytes]:
+                timeout: float, address: str,
+                max_bytes: int = MAX_RESPONSE_BYTES) -> tuple[int, bytes]:
         parts = urlsplit(url)
         if parts.scheme != "https":
             raise ValueError("https only")
@@ -137,9 +139,9 @@ class UrlTransport:
             status = int(resp.status)
             chunks: list[bytes] = []
             size = 0
-            while size <= MAX_RESPONSE_BYTES:
+            while size <= max_bytes:
                 remaining()
-                chunk = resp.read(min(self.READ_CHUNK, MAX_RESPONSE_BYTES + 1 - size))
+                chunk = resp.read(min(self.READ_CHUNK, max_bytes + 1 - size))
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -150,7 +152,7 @@ class UrlTransport:
             conn.close()
         if status >= 300:
             return status, data[:MAX_RESPONSE_BYTES]
-        if len(data) > MAX_RESPONSE_BYTES:
+        if len(data) > max_bytes:
             raise ResponseTooLarge()
         return status, data
 
@@ -164,6 +166,10 @@ class EndpointConfig:
     max_per_day: int
     timeout: float
     allow_private: bool
+    secret_file: Optional[str] = None
+
+
+MAX_SECRET_FILE_BYTES = 4096
 
 
 def parse_limits(section, name: str) -> tuple[int, float, bool]:
@@ -208,12 +214,41 @@ def load_endpoint(section, name: str, url: Optional[str] = None) -> EndpointConf
     header = (section.get("header", "Authorization") or "Authorization").strip()
     if not _HEADER_NAME.match(header):
         raise ConfigError("header must be a plain header name")
-    return EndpointConfig(name=name, url=raw_url, secret_env=parse_env_name(section, "secret_env"),
+    secret_env = parse_env_name(section, "secret_env")
+    secret_file = (section.get("secret_file", "") or "").strip() or None
+    if secret_file is not None and not os.path.isabs(secret_file):
+        raise ConfigError("secret_file must be an absolute path")
+    if secret_env and secret_file:
+        raise ConfigError("set secret_env or secret_file, not both")
+    return EndpointConfig(name=name, url=raw_url, secret_env=secret_env,
                           header=header, max_per_day=max_per_day, timeout=timeout,
-                          allow_private=allow_private)
+                          allow_private=allow_private, secret_file=secret_file)
 
 
-def read_secret(env_name: Optional[str]) -> Optional[str]:
+def read_secret_file(path: str) -> str:
+    """The token in ``path`` (one line; a trailing newline is dropped). Read at call time
+    so a rotated file is picked up; the value is never logged."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(MAX_SECRET_FILE_BYTES + 1)
+    except OSError:
+        raise SecretMissing() from None
+    if len(raw) > MAX_SECRET_FILE_BYTES:
+        raise InvalidSecret()
+    try:
+        value = raw.decode("utf-8").rstrip("\r\n")
+    except UnicodeDecodeError:
+        raise InvalidSecret() from None
+    if not value:
+        raise SecretMissing()
+    if any(c in value for c in "\r\n\x00"):
+        raise InvalidSecret()
+    return value
+
+
+def read_secret(env_name: Optional[str], secret_file: Optional[str] = None) -> Optional[str]:
+    if secret_file is not None:
+        return read_secret_file(secret_file)
     if env_name is None:
         return None
     value = os.environ.get(env_name, "")
@@ -243,7 +278,7 @@ class HttpEndpoint:
                                         cfg.max_per_day)
 
     def _auth_headers(self) -> dict[str, str]:
-        secret = read_secret(self.cfg.secret_env)
+        secret = read_secret(self.cfg.secret_env, self.cfg.secret_file)
         if secret is None:
             return {}
         if self.cfg.header.lower() == "authorization":
@@ -251,7 +286,11 @@ class HttpEndpoint:
         return {self.cfg.header: secret}
 
     def perform(self, method: str, url: str, body: Optional[bytes] = None,
-                on_body: Optional[Callable[[bytes], ConnectorResult]] = None) -> ConnectorResult:
+                on_body: Optional[Callable[[bytes], ConnectorResult]] = None,
+                max_bytes: Optional[int] = None) -> ConnectorResult:
+        """One call. ``max_bytes`` raises the response cap for this call (the transport
+        must accept it; the default 64 KB cap needs nothing)."""
+        limit = max_bytes or MAX_RESPONSE_BYTES
         try:
             headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
             headers.update(self._auth_headers())
@@ -269,8 +308,9 @@ class HttpEndpoint:
                 address = pin_address(host, port, self.cfg.allow_private)
             else:
                 address = pin_address(host, port, self.cfg.allow_private, self.resolver)
+            extra = {"max_bytes": limit} if max_bytes else {}
             status, data = self.transport.request(method, url, headers, body, self.cfg.timeout,
-                                                  address)
+                                                  address, **extra)
             status = int(status)
         except Exception as exc:
             return error_result(exc)
@@ -278,7 +318,7 @@ class HttpEndpoint:
             return ConnectorResult(False, f"error: redirect_{status}")
         if not 200 <= status < 300:
             return ConnectorResult(False, f"error: http_{status}")
-        if data is not None and len(data) > MAX_RESPONSE_BYTES:
+        if data is not None and len(data) > limit:
             return ConnectorResult(False, "error: response_too_large")
         if on_body is not None:
             try:

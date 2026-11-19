@@ -40,7 +40,8 @@ them before deploying, and run the checks below after every change.
   It has its own `config-ship.ini` with `[connector.s3_events]` on (`passwords = hash`,
   `bucket_owner` sent as `ExpectedBucketOwner`); the shared `config.ini` keeps the export
   off, because `run-all` in the agents container would otherwise try to ship without
-  credentials or egress.
+  credentials or egress. Of the agents' data it mounts only the `blocklist` volume,
+  read-only (see [Tracked blocklist export](#tracked-blocklist-export-optional)).
 - **Bucket.** Versioned, encrypted, public access blocked, lifecycle expiry. Its policy
   lets the sensor role (matched by ARN) put under the events prefix and denies everything
   else to every principal in the sensor account, so nothing there can read, list or
@@ -248,6 +249,57 @@ private mesh VPN; see
 [Reaching it over a private network](../../docs/operations.md#reaching-it-over-a-private-network).
 This template does not set that up: it installs no VPN agent, opens no egress for one and
 writes no `external_host`. SSM stays the supported way in on AWS.
+
+## Tracked blocklist export (optional)
+
+`TrackedExport=true` sets `[respond] track_before_enforce = true` in both config files:
+approving `export_blocklist` then only puts the address on the tracked list, and a second,
+separate decision enforces it (see `[respond]` in `SSH/config.ini.TEMPLATE`). The agents
+write the list as `tracked.json` next to the blocklist file, and the exporter puts it,
+whole and only when it changed, to `<EventsPrefix>/<TrackedKey>` (default
+`events/tracked/tracked.json`). `[connector.tracked_export]` is on in `config-ship.ini`
+only; `config.ini` keeps it off for the same reason as the event export. It is off by
+default.
+
+`TrackedKey` is relative to `EventsPrefix` and its pattern refuses a leading `/`, `..`, empty
+parts and anything but lower case letters, digits, `.`, `_` and `-`, so the object always
+lands under the events prefix. That is why no IAM, endpoint or bucket policy changes: the
+instance role, the S3 gateway endpoint policy and the bucket policy already allow
+`s3:PutObject` on `<EventsPrefix>/*` and nothing else. The object also falls under the
+bucket's `expire-events` lifecycle rule; it is sent again whenever the list changes and at
+least once a day, so it does not expire while the sensor runs (as long as `ExpirationDays`
+is more than one). Older versions are kept for `ExpirationDays`.
+
+Anything that reads the events prefix (for example a SIEM ingesting `events/`) should skip
+`events/tracked/`: that object is one JSON document, not JSON lines.
+
+**The `blocklist` volume.** The blocklist directory (`approved.txt` and `tracked.json`) is
+its own named volume, mounted read-write by the agents at `/agents/reports/blocklist`
+(inside `agentdata`), read-only by the console at the same path, and read-only by the
+exporter at `/blocklist`. So the exporter, the one container holding the instance role,
+reads only the directory it has to send, and none of the agents' approvals, state or
+reports. It does see `approved.txt` there, which it never sends. `check.py` fails if the
+exporter mounts anything else of the agents' data or if any service but the agents can
+write the volume.
+
+**Sightings are not fetched here.** `[connector.sightings]` with `kind = s3` needs
+`s3:GetObject`, which this deployment's write-only bucket design refuses on purpose. Leave
+it off on AWS, or feed `sightings.json` another way.
+
+Not proven without a real deploy:
+
+- Mounting `blocklist` inside an existing `agentdata` volume. Docker has to create the
+  mount point `/agents/reports/blocklist` inside `agentdata`; the agents' read-write mount
+  does that, and the console (read-only) starts after the agents for that reason. A
+  fresh `agentdata` gets the directory from the image.
+- Ownership of a fresh `blocklist` volume. The image creates `/agents/reports/blocklist` and
+  `/blocklist` owned by uid 10001, so a fresh volume should inherit that owner from
+  whichever container mounts it first; check with `docker compose exec agents ls -ld
+  /agents/reports/blocklist` and `docker compose exec exporter ls -l /blocklist` after the
+  first approval.
+- The PutObject itself: from the bucket account, `aws s3api head-object --bucket
+  example-winnie-events --key events/tracked/tracked.json $B` should succeed after the
+  first approval with `TrackedExport=true`.
 
 ## Stop and rollback
 

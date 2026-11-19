@@ -8,8 +8,8 @@ Rules every connector follows:
   resolves to at send time) unless ``allow_private = true`` for that connector.
 - The host name is resolved once per call and the connection goes to that validated
   address (see ``pin_address``); nothing resolves the name a second time.
-- Secrets are read from environment variables named in config (``secret_env``); values
-  never appear in config, the repo, logs or reports.
+- Secrets are read from environment variables named in config (``secret_env``) or from a
+  file (``secret_file``); values never appear in config, the repo, logs or reports.
 - A socket timeout on every operation plus one overall deadline per call, retries off,
   no redirects, and a per-day call cap.
 - Network I/O goes through an injected ``Transport`` so tests never touch the network.
@@ -117,10 +117,13 @@ class Transport(Protocol):
     transport connects to that address and must not resolve the URL's host name itself;
     the host name from ``url`` is used only for TLS (SNI and certificate verification)
     and the ``Host`` header.
+
+    A caller that needs a response cap other than the default 64 KB (the sightings fetch)
+    passes ``max_bytes``; a transport used for that must accept it.
     """
 
     def request(self, method: str, url: str, headers: dict[str, str], body: Optional[bytes],
-                timeout: float, address: str) -> tuple[int, bytes]:
+                timeout: float, address: str, max_bytes: int = 64 * 1024) -> tuple[int, bytes]:
         ...
 
 

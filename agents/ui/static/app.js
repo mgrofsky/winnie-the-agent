@@ -49,6 +49,7 @@
     reject: (id) => "/api/queue/" + enc(id) + "/reject",
     blocklist: "/api/blocklist",
     unblock: "/api/blocklist/unblock",
+    enforce: "/api/blocklist/enforce",
     digests: "/api/digests",
     digest: (day) => "/api/digests/" + enc(day),
     decoy: "/api/decoy",
@@ -970,7 +971,7 @@
       const f = obj(failures[0]);
       rows.push(["Event export", "bad", [plural(failures.length, "recent failure", "recent failures") +
         "; newest ", timeNode(f.timestamp), ": " + str(f.event) + " " + str(f.error) +
-        " (" + plural(f.lines || 0, "line", "lines") + ")."]]);
+        (typeof f.lines === "number" ? " (" + plural(f.lines, "line", "lines") + ")" : "") + "."]]);
     }
     return rows;
   }
@@ -1074,6 +1075,7 @@
   }
 
   function drawPending(data, ctx) {
+    ctx.track = obj(data.mode).track_before_enforce === true;
     const items = arr(data.items).filter((it) => obj(obj(it).approval).status === "pending");
     if (!items.length) return empty("Nothing is waiting for a decision.");
     const more = typeof data.total === "number" && data.total > arr(data.items).length
@@ -1171,9 +1173,12 @@
           ["Approval", mono(id)], ["Playbook", mono(a.playbook)]]
         : [["Action", mono(action)], ["Target", mono(target)], ["Approval", mono(id)],
           ["Playbook", mono(a.playbook)]];
+      // With two stages, approving export_blocklist only tracks the address; say so.
+      const tracking = ctx.track === true && action === "export_blocklist";
       const approveTitle = publish
         ? "Approve and publish " + plural(names.length, "detection file", "detection files") + ": " + names.join(", ") + "?"
-        : "Approve and run " + action + " on " + target + "?";
+        : tracking ? "Approve and track " + target + "?"
+          : "Approve and run " + action + " on " + target + "?";
       // Reject works for every pending item. Approve only when this process can run the
       // action (open_ticket and block_webhook need a connector the console usually lacks).
       if (item.can_approve_here !== true) {
@@ -1193,8 +1198,11 @@
         foot.append(button("Approve", () => openConfirm(foot, {
           title: approveTitle,
           rows: rows(),
-          note: "Approving runs the action now. It can take as long as the action does.",
-          confirmLabel: "Approve and run",
+          note: tracking
+            ? "Approving adds " + target + " to the tracked list (tracked.json) for your cloud to watch. " +
+              "Nothing is blocked; enforcing it is a separate decision on the blocklist below."
+            : "Approving runs the action now. It can take as long as the action does.",
+          confirmLabel: tracking ? "Approve and track" : "Approve and run",
           danger: true,
           onConfirm: () => decide("approve", id, viewHash, ctx),
         }), "btn-primary"));
@@ -1262,6 +1270,9 @@
 
   function drawBlocklist(data, ctx, hrefFor) {
     const items = arr(data.items).map((it) => obj(it));
+    // The server adds mode (and per-entry status and sightings) only when entries have two
+    // stages; otherwise the list is drawn as one stage.
+    if (data.mode && typeof data.mode === "object") return drawStagedBlocklist(data, items, ctx, hrefFor);
     if (!items.length) return empty("The blocklist is empty.");
     const columns = [{ label: "Target" }, { label: "Approved" }, { label: "Expires" }];
     if (ctx.actions) columns.push({ label: "" });
@@ -1283,6 +1294,113 @@
       return { cells };
     }));
     return [wrap, pager(data, hrefFor)];
+  }
+
+  const STAGE_LABEL = { tracked: "Tracked", enforced: "Enforced" };
+  const STAGE_CLASS = { tracked: "st-pending", enforced: "st-bad" };
+
+  // Where the sightings file stands: age, stale or refused. All text nodes.
+  function sightingsLine(info) {
+    const s = obj(info);
+    if (s.state === "missing") {
+      return el("p", { cls: "muted", text: "No sightings file yet. Sightings are display only; see docs/operations.md." });
+    }
+    const parts = [];
+    if (s.generated_at) {
+      parts.push(el("span", null, "Sightings file generated ", timeNode(s.generated_at), "."));
+    }
+    if (s.stale === true) {
+      parts.push(" ", badge("stale", "st-bad"),
+        el("span", { text: " older than " + num(s.stale_hours) + " hours; counts may be out of date." }));
+    }
+    if (s.state === "invalid") {
+      parts.push(" ", badge("refused", "st-bad"),
+        el("span", { text: " The newest file was refused (" + str(s.error) + ")" +
+          (s.generated_at ? "; showing the last good copy." : "; nothing to show.") }));
+    }
+    return el("p", { cls: "muted" }, parts);
+  }
+
+  function sightingsCell(sum) {
+    const s = obj(sum);
+    const rows = arr(s.rows).map((r) => obj(r));
+    if (!rows.length) return el("span", { cls: "faint", text: "No sightings yet" });
+    const head = el("div", null, el("strong", { text: num(s.total) }),
+      el("span", { cls: "muted", text: " seen in " + plural(num(s.places), "place", "places") + ", last " }),
+      timeNode(s.last_seen));
+    const detail = table([{ label: "Where" }, { label: "Service" }, { label: "Count", num: true },
+      { label: "Last seen" }, { label: "Source" }],
+    rows.map((r) => ({ cells: [clip(r.where), clip(r.service), num(r.count), timeNode(r.last_seen), clip(r.source)] })),
+    { short: true });
+    return el("div", "stack", head, detail);
+  }
+
+  function drawStagedBlocklist(data, items, ctx, hrefFor) {
+    const mode = obj(data.mode);
+    const fileName = str(mode.blocklist_file) || "the blocklist file";
+    const trackedName = str(mode.tracked_file) || "tracked.json";
+    const line = sightingsLine(data.sightings);
+    if (!items.length) return [line, empty("The blocklist is empty.")];
+    const columns = [{ label: "Target" }, { label: "Status" }, { label: "Since" }, { label: "Expires" },
+      { label: "Sightings" }];
+    if (ctx.actions) columns.push({ label: "" });
+    const wrap = table(columns, items.map((it) => {
+      const target = str(it.target);
+      const stage = it.status === "enforced" ? "enforced" : "tracked";
+      const since = stage === "enforced" && it.enforced_at ? it.enforced_at : it.approved_at;
+      const cells = [mono(target), badge(STAGE_LABEL[stage], STAGE_CLASS[stage]), timeNode(since),
+        timeNode(it.expires_at), sightingsCell(it.sightings)];
+      if (ctx.actions) {
+        const cell = el("span", "stack");
+        const viewHash = typeof it.view_hash === "string" ? it.view_hash : null;
+        if (stage === "tracked" && viewHash) {
+          const connector = mode.block_connector === true
+            ? "The block connector is enabled and will be called with " + target + "."
+            : "The block connector is not enabled here, so nothing is sent to it.";
+          cell.append(button("Enforce", () => openConfirm(wrap, {
+            title: "Enforce " + target + "?",
+            rows: [["Target", mono(target)], ["Now", el("span", { text: "Tracked" })],
+              ["After", el("span", { text: "Enforced" })]],
+            note: "This blocks it: " + target + " is added to " + fileName + " (what your firewall loads) and " +
+              "marked enforced in " + trackedName + ". " + connector + " Unblock removes it again.",
+            confirmLabel: "Enforce",
+            danger: true,
+            onConfirm: () => enforceEntry(target, viewHash, ctx),
+          }), "btn-small btn-danger"));
+        }
+        cell.append(button("Unblock", () => openConfirm(wrap, {
+          title: "Remove " + target + " from the blocklist?",
+          rows: [["Target", mono(target)], ["Status", el("span", { text: STAGE_LABEL[stage] })]],
+          note: "It is removed from " + trackedName + (stage === "enforced" ? " and from " + fileName : "") +
+            ". Every live entry equal to or inside this address or network is removed.",
+          confirmLabel: "Unblock",
+          danger: true,
+          onConfirm: () => unblock(target, ctx),
+        }), "btn-small btn-danger"));
+        cells.push(cell);
+      }
+      return { cells };
+    }));
+    return [line, wrap, pager(data, hrefFor)];
+  }
+
+  async function enforceEntry(target, viewHash, ctx) {
+    try {
+      const res = obj(await apiPost(API.enforce, { target: target, view_hash: viewHash }));
+      const conn = obj(res.connector);
+      const level = conn.ok === false ? "warn" : "ok";
+      ctx.say(level, el("div", null, "Enforced " + str(res.target) + "; it is in " + str(res.file) + "."),
+        el("div", null, "Block connector: ", el("span", { cls: "mono wrap", text: str(conn.status) })));
+    } catch (err) {
+      if (err.status === 401) return;
+      if (err.status === 409) {
+        ctx.say("warn", "The entry for " + target + " changed after this page loaded, so nothing was enforced. " +
+          "The list has been reloaded; check it and decide again.");
+      } else {
+        ctx.say("bad", "Enforce " + target + " was refused: ", el("span", { cls: "mono wrap", text: err.message }));
+      }
+    }
+    await ctx.reload();
   }
 
   async function unblock(target, ctx) {

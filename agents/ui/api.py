@@ -21,12 +21,15 @@ Everything returned here was typed by attackers or derived from it. The rules:
   directory signature changes; the event log is indexed incrementally (``logindex``).
 - Errors are ``{"error": <fixed text>}``; request input and exception text are never
   echoed.
-- POST (approve, reject, unblock) runs only for a signed-in operator with ``[ui] actions``
-  on (the shell checks that). It calls ``respond.approve`` / ``reject`` / ``unblock`` with
-  the arguments the CLI passes, so every gate stays in one place. A decision names the
-  ``view_hash`` the operator saw (the raw approval, what the card showed and, for
-  ``publish_detection``, the files it names); any difference now is a 409 and nothing
-  changes.
+- POST (approve, reject, unblock, enforce) runs only for a signed-in operator with ``[ui]
+  actions`` on (the shell checks that). It calls ``respond.approve`` / ``reject`` /
+  ``unblock`` / ``enforce`` with the arguments the CLI passes, so every gate stays in one
+  place. A decision names the ``view_hash`` the operator saw (the raw approval, what the
+  card showed and, for ``publish_detection``, the files it names; for ``enforce``, the
+  blocklist entry as listed); any difference now is a 409 and nothing changes.
+- Sightings (``agents.sightings``) are display only. The file is parsed strictly, the last
+  good copy stays on show when a new one is refused, and only sightings of listed
+  addresses are served.
 """
 
 from __future__ import annotations
@@ -59,15 +62,22 @@ from agents.playbooks import PLAYBOOKS_DIR, load_playbooks, tier_of
 from agents.respond import (
     APPROVAL_ID_RE,
     DETECTION_FILE_RE,
+    ENFORCED,
+    TRACKED,
+    TRACKED_FILE,
     ApprovalError,
+    EnforceError,
     EngineState,
     RespondSettings,
     approve,
+    enforce,
+    entry_status,
     peek_blocklist,
     reject,
     size_alarm,
     unblock,
 )
+from agents.sightings import SightingsReader, SightingsSettings, by_address
 from agents.runtime import event_log_state
 from agents.source_state import load as load_source_state
 from agents.source_state import valid_source_key
@@ -143,6 +153,7 @@ APPROVAL_FILE_RE = re.compile(APPROVAL_ID_RE + r"\.json")
 RECORD_FILE_RE = re.compile(r"[^.].*\.json")   # what triage.load_records globs (*.json)
 VIEW_HASH_RE = re.compile(r"[0-9a-f]{64}")
 DECIDE_RE = re.compile(r"queue/([^/]+)/(approve|reject)")
+SIGHTING_ROWS = 20
 MAX_TARGET = 64
 ERROR_CAP = 200
 # Approved actions that send through a connector, and the connector each one needs.
@@ -266,6 +277,25 @@ def view_hash(raw: dict, approval: dict, record: Optional[dict],
     text = _canonical({"raw": raw, "approval": approval, "record": record,
                        "files": files or {}})
     return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def blocklist_view_hash(key: str, entry: dict) -> str:
+    """What the blocklist row showed and ``enforce`` acts on: the key, its stage and times."""
+    shown = {"target": key, "status": entry_status(entry),
+             "approved_at": entry.get("approved_at"), "expires_at": entry.get("expires_at")}
+    return hashlib.sha256(_canonical(shown).encode()).hexdigest()
+
+
+def sightings_summary(rows: list) -> dict:
+    """Total count, last seen and the most recent rows (where, service, count, times)."""
+    rows = sorted(rows, key=lambda s: s.last_seen, reverse=True)
+    return {"total": sum(s.count for s in rows),
+            "last_seen": rows[0].last_seen.isoformat(timespec="seconds") if rows else None,
+            "places": len(rows),
+            "rows": [{"where": s.where, "service": s.service, "count": s.count,
+                      "first_seen": s.first_seen.isoformat(timespec="seconds"),
+                      "last_seen": s.last_seen.isoformat(timespec="seconds"),
+                      "source": s.source} for s in rows[:SIGHTING_ROWS]]}
 
 
 def project_approval(raw: dict) -> dict:
@@ -605,8 +635,11 @@ class Api:
     operator: str = ""
     respond_settings: Optional[Callable[[], RespondSettings]] = None
     connectors: Optional[Callable[[], object]] = None
+    sensor: str = ""
+    sightings: SightingsSettings = field(default_factory=SightingsSettings)
 
     def __post_init__(self) -> None:
+        self._sightings = SightingsReader(self.sightings.file(self.paths.state), self.sightings)
         self._connectors_lock = threading.Lock()
         self._connectors_built = False
         self._connectors_value: object = None
@@ -650,11 +683,13 @@ class Api:
             return NOT_FOUND
         rest = path[len("/api/"):]
         m = DECIDE_RE.fullmatch(rest)
-        if m is None and rest != "blocklist/unblock":
+        if m is None and rest not in ("blocklist/unblock", "blocklist/enforce"):
             return NOT_FOUND
         try:
             if m is not None:
                 return self._decide(m.group(1), m.group(2), body)
+            if rest == "blocklist/enforce":
+                return self._enforce(body)
             return self._unblock(body)
         except Exception:  # noqa: BLE001 - details go to the log, never to the client
             log.exception("api action failed")
@@ -975,13 +1010,45 @@ class Api:
         page = paginate(items, query)
         by_id = self._records.get().by_id
         page["items"] = [self._card(a, now, by_id) for a in page["items"]]
+        page["mode"] = {"track_before_enforce": bool(self.settings.track_before_enforce)}
         return 200, page
 
+    def _block_connector(self) -> bool:
+        conns = self._connectors()
+        return conns is not None and bool(conns.enabled("block_webhook"))
+
     def blocklist(self, query: dict[str, str]) -> tuple[int, object]:
-        entries = peek_blocklist(self.paths.state, self.now(), self.settings.blocklist_ttl_days)
-        items = sorted(({"target": k, **v} for k, v in entries.items()),
+        now = self.now()
+        entries = peek_blocklist(self.paths.state, now, self.settings.blocklist_ttl_days)
+        track = bool(self.settings.track_before_enforce)
+        staged = track or any(entry_status(v) == TRACKED for v in entries.values())
+        items = sorted(({"target": k, "approved_at": v["approved_at"],
+                         "expires_at": v["expires_at"]} for k, v in entries.items()),
                        key=lambda e: e["approved_at"], reverse=True)
-        return 200, paginate(items, query)
+        page = paginate(items, query)
+        if not staged:
+            return 200, page
+        seen = self._sightings.read(now)
+        groups = by_address(seen["doc"], (e["target"] for e in page["items"]))
+        for e in page["items"]:
+            value = entries[e["target"]]
+            e["status"] = entry_status(value)
+            if e["status"] == ENFORCED and isinstance(value.get("enforced_at"), str):
+                e["enforced_at"] = value["enforced_at"]
+            if e["status"] == TRACKED:
+                e["view_hash"] = blocklist_view_hash(e["target"], value)
+            e["sightings"] = sightings_summary(groups.get(e["target"], []))
+        page["mode"] = {"track_before_enforce": track, "block_connector": self._block_connector(),
+                        "blocklist_file": self._blocklist_file_name(),
+                        "tracked_file": TRACKED_FILE}
+        page["sightings"] = {k: seen[k] for k in ("state", "error", "generated_at",
+                                                    "age_hours", "stale", "stale_hours")}
+        return 200, page
+
+    def _blocklist_file_name(self) -> str:
+        name = Path(self.settings.blocklist_file).name if self.settings.blocklist_file \
+            else "approved.txt"
+        return name[:64]
 
     def digests(self, query: dict[str, str]) -> tuple[int, object]:
         names = _list_names(self.paths.reports / "daily", re.compile(r"\d{4}-\d{2}-\d{2}\.md"))
@@ -1171,7 +1238,9 @@ class Api:
                                  blocklist_format=settings.blocklist_format,
                                  blocklist_ttl_days=settings.blocklist_ttl_days,
                                  expired_suppress_hours=settings.expired_suppress_hours,
-                                 never_act_on=settings.never_act_on)
+                                 never_act_on=settings.never_act_on,
+                                 track_before_enforce=settings.track_before_enforce,
+                                 sensor=self.sensor)
         except ApprovalError as exc:
             # Fixed text from respond: the validated id and status / expiry read from disk.
             return 400, {"error": clean_text(str(exc), ERROR_CAP)}
@@ -1216,9 +1285,51 @@ class Api:
             result = unblock(key, self.paths.state, self.paths.reports,
                              blocklist_file=settings.blocklist_file,
                              blocklist_format=settings.blocklist_format,
-                             ttl_days=settings.blocklist_ttl_days, by=self._by())
+                             ttl_days=settings.blocklist_ttl_days, by=self._by(),
+                             track_before_enforce=settings.track_before_enforce,
+                             sensor=self.sensor)
         except ValueError:
             return self.UNBLOCK_REFUSED
+        return 200, result
+
+    ENFORCE_REFUSED = (400, {"error": "target must be one tracked blocklist entry exactly as "
+                                      "listed"})
+
+    def _enforce(self, body: dict) -> tuple[int, object]:
+        """Move exactly one listed tracked entry to enforced. ``view_hash`` must match the
+        entry as it is on disk now (status and times), so an entry that changed, expired or
+        was enforced since the page loaded is a 409 and nothing changes."""
+        raw = body.get("target")
+        if not isinstance(raw, str) or len(raw) > MAX_TARGET:
+            return self.ENFORCE_REFUSED
+        wanted = self._unblock_network(raw.strip())
+        if wanted is None:
+            return self.ENFORCE_REFUSED
+        given = body.get("view_hash")
+        if not isinstance(given, str) or not VIEW_HASH_RE.fullmatch(given):
+            return BAD_VIEW_HASH
+        settings = self._decision_settings()
+        if settings is None:
+            return BAD_SETTINGS
+        entries = peek_blocklist(self.paths.state, self.now(), settings.blocklist_ttl_days)
+        key = next((k for k in entries if self._unblock_network(k) == wanted), None)
+        if key is None:
+            return CHANGED
+        if not hmac.compare_digest(blocklist_view_hash(key, entries[key]).encode(),
+                                   given.encode()):
+            return CHANGED
+        try:
+            result = enforce(key, self.paths.state, self.paths.reports,
+                             connectors=self._connectors(), by=self._by(),
+                             blocklist_file=settings.blocklist_file,
+                             blocklist_format=settings.blocklist_format,
+                             ttl_days=settings.blocklist_ttl_days,
+                             never_act_on=settings.never_act_on,
+                             track_before_enforce=settings.track_before_enforce,
+                             sensor=self.sensor)
+        except EnforceError as exc:
+            # Fixed text from respond: the listed key and the check that refused it.
+            return 400, {"error": clean_text(str(exc), ERROR_CAP)}
         return 200, result
 
     @staticmethod

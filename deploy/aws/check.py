@@ -29,10 +29,19 @@ ROLE_ACTIONS = {"ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability",
 UNSCOPABLE = {"ecr:GetAuthorizationToken"}     # AWS offers no resource-level permission
 DOCUMENTATION_ACCOUNT_IDS = {"000000000000", "123456789012"}
 UI_PORT = 8480                                 # operator console, host loopback only
+# Keys TrackedKey's pattern must refuse: each would leave EventsPrefix/ or be ambiguous.
+TRACKED_KEY_ESCAPES = ("../tracked.json", "tracked/../../tracked.json", "/tracked.json",
+                       "tracked//tracked.json", "tracked/..json", "tracked/./tracked.json")
+# The exporter's mounts: source -> (target, read-only). Nothing else of the agents' data.
+EXPORTER_MOUNTS = {"./config-ship.ini": ("/config/config.ini", True),
+                   "frontend": ("/data", True),
+                   "exportstate": ("/agents", False),
+                   "blocklist": ("/blocklist", True)}
 # Literal parameter defaults: project or example names, scenario names, instance types,
 # public SSM parameter paths, addresses, numbers and switches. Nothing that could name an
 # organisation.
 GENERIC_DEFAULT = re.compile(r"^(winnie[a-z0-9-]*|example[a-z0-9.-]*|events|compose-bin|"
+                             r"tracked/tracked\.json|"
                              r"[a-z][0-9][a-z]*\.[a-z0-9]+|/aws/service/[a-z0-9/_.-]+|"
                              r"[0-9./]+|true|false|)$")
 
@@ -182,6 +191,11 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
             errors.append(f"ingress rule {name} reaches the console port {UI_PORT}")
     if (params.get("UiEnabled") or {}).get("Default") != "false":
         errors.append("parameter UiEnabled is not off by default")
+    if (params.get("TrackedExport") or {}).get("Default") != "false":
+        errors.append("parameter TrackedExport is not off by default")
+    pattern = (params.get("TrackedKey") or {}).get("AllowedPattern")
+    if not isinstance(pattern, str) or any(re.search(pattern, k) for k in TRACKED_KEY_ESCAPES):
+        errors.append("parameter TrackedKey allows a key outside the events prefix")
 
     templates = resources(doc, "AWS::EC2::LaunchTemplate")
     if not templates:
@@ -221,6 +235,8 @@ USER_DATA_FACTS = {
     "the Compose plugin is not taken from the repository": "docker cp \"$cid:/docker-compose\"",
     "the exporter does not get its own config": "./config-ship.ini:/config/config.ini:ro",
     "passwords are not hashed in the export": '"passwords": "hash"',
+    "the tracked key is not under the events prefix": "${EventsPrefix}/${TrackedKey}",
+    "the tracked export is not read from the blocklist mount": '"file": "/blocklist/tracked.json"',
 }
 
 
@@ -233,7 +249,10 @@ def check_user_data(user_data: str) -> list[str]:
         for opt in ("--config", "--log", "--data-dir /data", "--state-dir"):
             if opt not in cmd:
                 errors.append(f"the ship command lacks {opt}")
-    errors += check_ui(embedded_compose(user_data))
+    compose = embedded_compose(user_data)
+    errors += check_ui(compose)
+    if compose is not None:
+        errors += check_exporter(compose) + check_blocklist(compose)
     return errors
 
 
@@ -282,6 +301,55 @@ def check_ui(compose: Optional[dict]) -> list[str]:
             errors.append(f"the ui service gets {key}")
     if (ui.get("logging") or {}).get("driver") != "local":
         errors.append("the ui service log (with its sign-in link) leaves the host")
+    return errors
+
+
+def _mounts(service: dict) -> list[tuple[str, str, bool]]:
+    """(source, target, read-only) for each short-syntax volume of a compose service."""
+    out = []
+    for volume in as_list(service.get("volumes") or []):
+        parts = str(volume).split(":")
+        out.append((parts[0], parts[1] if len(parts) > 1 else "",
+                    len(parts) > 2 and parts[2] == "ro"))
+    return out
+
+
+def check_exporter(compose: dict) -> list[str]:
+    """The exporter holds the instance role, so it mounts its own config and state, the
+    front-end log (read-only) and the blocklist directory (read-only), nothing else."""
+    exporter = (compose.get("services") or {}).get("exporter")
+    if not isinstance(exporter, dict):
+        return ["the embedded compose file has no exporter service"]
+    errors: list[str] = []
+    for source, target, read_only in _mounts(exporter):
+        if source not in EXPORTER_MOUNTS:
+            errors.append(f"the exporter mounts {source}")
+            continue
+        want_target, want_ro = EXPORTER_MOUNTS[source]
+        if target != want_target:
+            errors.append(f"the exporter mounts {source} at {target}")
+        if want_ro and not read_only:
+            errors.append(f"the exporter mounts {source} read-write")
+    return errors
+
+
+def check_blocklist(compose: dict) -> list[str]:
+    """Only the agents write the blocklist volume, at the blocklist file's directory."""
+    errors: list[str] = []
+    agents_write = False
+    for name, service in (compose.get("services") or {}).items():
+        for source, target, read_only in _mounts(service or {}):
+            if source != "blocklist":
+                continue
+            if name == "agents":
+                agents_write |= target == "/agents/reports/blocklist" and not read_only
+            elif not read_only:
+                errors.append(f"the blocklist volume is writable by the {name} service")
+    if not agents_write:
+        errors.append("the agents service does not write the blocklist volume at "
+                      "/agents/reports/blocklist")
+    if "blocklist" not in (compose.get("volumes") or {}):
+        errors.append("the blocklist volume is not declared")
     return errors
 
 

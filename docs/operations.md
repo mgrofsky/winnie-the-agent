@@ -217,6 +217,8 @@ Everything runs without any model configured:
 | Detection drafts | `agentdata`: `/agents/detections/pending/` | no |
 | Blocklist candidates | `agentdata`: `/agents/detections/pending/blocklist-candidates.csv` | rewritten each detect run; rows past `expires` (`[agents] blocklist_expiry_days`, 14, or `blocklist_access_expiry_days`, 30) are left out |
 | Event export cursor and failure events | `agentdata`: `/agents/state/ship_cursor.json`, `ship_events.jsonl` | the failure file is kept under 1 MB |
+| Tracked list | `agentdata`: `/agents/reports/blocklist/tracked.json` | rewritten whole on every respond run while `track_before_enforce` is on; entries expire with the blocklist |
+| Sightings and transfer state | `agentdata`: `/agents/state/sightings.json`, `tracked_export_state.json`, `sightings_fetch_state.json` | no; the sightings file is replaced by each good fetch |
 
 Rotate the event log yourself, and only when nothing is pending. The summary of every
 `triage`, `ship` and `run-all` run carries `log_rotation`: `{"safe": true}` when triage has
@@ -369,12 +371,235 @@ hash keeps the correlation value without copying those secrets into another syst
 holding the sensor seed can still test guesses against the hashes, so the seed stays on the
 front-end volume.
 
+## Tracked list and sightings
+
+With `[respond] track_before_enforce = true`, approving a blocklist entry only tracks it,
+and blocking it is a second decision. The stages, the `enforce` command and what happens
+to existing entries are in [playbooks.md](playbooks.md#track-before-enforce). This section
+covers the two files that connect the tracked list to the rest of your environment:
+
+- **Out:** `tracked.json`, written by respond next to the blocklist file. Your cloud can
+  watch it. `[connector.tracked_export]` sends it.
+- **In:** `sightings.json`, written by your environment: where else it saw a listed
+  address. The console shows it next to each entry. `[connector.sightings]` can fetch it.
+
+Both transfers are off by default. They run in the agents process only, in
+`python -m agents ship` and at the end of `run-all`.
+
+### Turning it on
+
+1. Set `[respond] track_before_enforce = true` (and `queue_enforce = true`, without which
+   nothing is queued) and restart the services. Entries already on the blocklist stay
+   enforced.
+2. Approve an `export_blocklist` item. It appears in `tracked.json`
+   (`reports/blocklist/tracked.json` by default) and as Tracked on the console's blocklist
+   screen. Nothing is blocked.
+3. Optional: enable `[connector.tracked_export]` so your cloud can read the list. Check it
+   with `python -m agents ship --dry-run`.
+4. Optional: have your environment produce the sightings document, and either write it to
+   `[sightings] path` or enable `[connector.sightings]` to fetch it.
+5. When you decide to block an entry: `python -m agents enforce 198.51.100.7`, or Enforce
+   on the console with [actions on](#turning-actions-on).
+
+### Tracked export
+
+```ini
+[connector.tracked_export]
+enabled = true
+kind = s3                          ; s3 or https
+#file = /blocklist/tracked.json    ; default: tracked.json next to the blocklist file
+# kind = s3: PutObject of one key
+bucket = example-honeypot-events
+key = tracked/tracked.json
+region = us-east-1
+#bucket_owner = 123456789012
+#endpoint_url = https://s3.example.com
+# kind = https: one PUT or POST
+#url = https://intel.example.com/api/tracked
+#method = PUT
+#secret_file = /run/secrets/tracked-token
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | false | |
+| `kind` | none | `s3` or `https`; required |
+| `file` | `tracked.json` next to `[respond] blocklist_file` | absolute path to read the document from, for a process that does not see the agents' reports directory |
+| `bucket`, `key` | none | `s3`: the one object written; required |
+| `region` | none | `s3`: the bucket's region; with `endpoint_url`, the store's own region name |
+| `bucket_owner` | none | `s3`: 12-digit account id, sent as `ExpectedBucketOwner` |
+| `endpoint_url` | none | `s3`: another store that speaks the S3 API; `https` only |
+| `url` | none | `https`: the destination; required |
+| `method` | `PUT` | `https`: `PUT` or `POST` |
+| `secret_env`, `secret_file` | none | `https`: bearer token from an environment variable, or from a file (absolute path, read at each call); one or the other |
+| `header` | `Authorization` | `https`: the header that carries the token |
+| `max_per_day` | 200 | `https`: sends per day |
+| `timeout` | 10 | seconds, at most 30 |
+| `allow_private` | false | allow a private or loopback `endpoint_url` or `url` |
+
+- The document is sent whole when its content (everything but `generated_at`) differs from
+  the last copy stored (a hash in `<state-dir>/tracked_export_state.json`), so a removal or
+  an expiry reaches the remote copy on the next run, and at least once every 24 hours
+  otherwise, so the remote `generated_at` shows the sensor is still exporting.
+- Before sending, the file is checked to be a tracked export of at most 8 MiB.
+- `kind = s3` writes exactly one object with `PutObject`. As with the event export, a hook
+  on the client refuses every other operation, bucket and key before a request is sent, so
+  the sensor needs `s3:PutObject` on that one key and nothing else. Credentials come from
+  the default AWS credential chain, never from `config.ini`. `endpoint_url` must be
+  `https`, and a private address or `localhost` in it is refused at load unless
+  `allow_private` is set. The S3 client resolves the name itself on each call, so unlike
+  the HTTP connectors the address is not pinned.
+- `kind = https` follows the [connector rules](playbooks.md#connectors): `https` only,
+  public destinations unless `allow_private`, the address resolved and pinned per call, no
+  redirects, timeouts, a response cap and the daily cap.
+- A failure is logged, recorded in `ship_events.jsonl` (shown in the Event export row of
+  the console's overview) and tried again on the next run. It never stops the event
+  export or the rest of the run.
+
+On AWS, see [deploy/aws/README.md](../deploy/aws/README.md) for running the tracked export
+from the exporter container.
+
+### Sightings
+
+Your environment writes one JSON document, by any means it likes:
+
+```json
+{
+  "version": 1,
+  "generated_at": "2026-11-18T09:00:00Z",
+  "sightings": [
+    {
+      "address": "198.51.100.7",
+      "where": "prod",
+      "service": "tcp/443",
+      "first_seen": "2026-11-17T22:10:00Z",
+      "last_seen": "2026-11-18T08:55:00Z",
+      "count": 14,
+      "source": "flow logs"
+    },
+    {
+      "address": "2001:db8:4:5::1f",
+      "where": "staging",
+      "service": "tcp/22",
+      "first_seen": "2026-11-16T03:00:00Z",
+      "last_seen": "2026-11-16T03:40:00Z",
+      "count": 3,
+      "source": "threat-list finding"
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | 1 |
+| `generated_at` | when the producer wrote it; ISO 8601, UTC if no zone is given |
+| `sightings[].address` | an IPv4 address, or an IPv6 address or /64; IPv6 is matched by its /64 |
+| `where` | where it was seen, a short label of your choosing |
+| `service` | what it reached, for example `tcp/443` |
+| `first_seen`, `last_seen` | ISO 8601; `first_seen` not after `last_seen` |
+| `count` | a non-negative integer |
+| `source` | what reported it, for example `flow logs` |
+
+The file is untrusted and checked strictly. The whole file is refused on the first
+problem: over the size or entry cap, a wrong type, an invalid address or timestamp, a
+negative or non-integer count, a string over 256 characters. Strings are cut to 64
+characters with control and other
+invisible characters removed. Unknown keys are ignored. Sightings of addresses that are
+not on the list are ignored.
+
+```ini
+[sightings]
+#path = /agents/state/sightings.json   ; default: sightings.json in the state directory
+max_bytes = 1048576
+max_entries = 5000
+stale_hours = 48
+
+[connector.sightings]
+enabled = true
+kind = s3                              ; s3 or https
+interval_minutes = 15
+bucket = example-honeypot-events
+key = sightings/sightings.json
+region = us-east-1
+#url = https://intel.example.com/api/sightings
+#secret_env = WINNIE_SIGHTINGS_TOKEN
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `[sightings] path` | `<state-dir>/sightings.json` | absolute path of the local file the console reads |
+| `max_bytes` | 1048576 (1 MiB) | larger files are refused; at most 16 MiB |
+| `max_entries` | 5000 | more sightings than this and the file is refused; at most 100,000 |
+| `stale_hours` | 48 | the console marks the file stale when `generated_at` is older than this |
+| `[connector.sightings] enabled` | false | |
+| `kind` | none | `s3` (`GetObject` of one key) or `https` (`GET`); required |
+| `interval_minutes` | 15 | fetch at most this often, 1 to 1440 |
+
+The other `[connector.sightings]` keys are those of the tracked export: `bucket`, `key`,
+`region`, `bucket_owner`, `endpoint_url` for `s3`; `url`, `secret_env` or `secret_file`,
+`header`, `max_per_day` for `https`; `timeout` and `allow_private` for both. The `s3`
+client is its own, guarded to `GetObject` of that one key. An `https` response may be as
+large as `max_bytes`.
+
+How it is used:
+
+- **Display only.** Nothing acts on a sighting. It never triggers enforcement.
+- **Fetch.** The local file is replaced atomically, and only by a copy that passed the
+  checks. A failed or refused fetch keeps the local file, is logged (the same refused copy
+  only once), is recorded in `ship_events.jsonl` and is tried again when next due.
+- **A refused local file.** The console keeps showing the last good copy it read, marks the
+  file refused and logs the problem once. The good copy is held in memory, so after a
+  console restart a refused file shows no sightings until a good one arrives.
+- **Stale.** A file older than `stale_hours` is still shown, marked stale.
+
+On the console's blocklist screen, when the switch is on or any entry is tracked, each
+entry shows its status (Tracked or Enforced), since when, its expiry and its sightings:
+total count, number of places, last seen, and a small table of where, service, count, last
+seen and source ("No sightings yet" when there are none). A line above the list gives the
+sightings file's age and the stale and refused markers. With actions on, a tracked entry
+has Enforce next to Unblock. Its confirmation says which files change and whether the
+block connector will be called, and the request carries a hash of the entry as shown, so an
+entry that changed or expired since the page loaded is refused. With the switch off and no
+tracked entries the screen is as before.
+
+### Using this with your cloud
+
+The contract is the two JSON documents above: the tracked export going out and the
+sightings document coming in. Anything that can read one object and write another can take
+part. This repository has no adapter for any cloud, so every row below is a likely shape,
+not something that has been tested.
+
+| Platform | Out: the tracked export feeds | In: sightings come from | Status |
+|---|---|---|---|
+| AWS | `kind = s3` to a bucket; a scheduled job you own turns it into a managed threat list, for example a GuardDuty threat list, or a watch rule in your SIEM | GuardDuty findings, VPC flow logs or load balancer logs, summarised by a scheduled job into `sightings.json` in a bucket; `[connector.sightings] kind = s3` | not tested |
+| Azure | `kind = https` to an endpoint you run, which loads it into a Microsoft Sentinel watchlist or threat-intelligence import | Sentinel or Defender alerts, or network flow logs, summarised by a scheduled job and served over `https` | not tested |
+| Google Cloud | `kind = https` to an endpoint you run, or `kind = s3` with `endpoint_url` if your bucket offers an S3-compatible endpoint; loaded into a Security Command Center or Chronicle reference list | Security Command Center findings or VPC flow logs, summarised by a scheduled job | not tested |
+| Self-hosted or S3-compatible store | `kind = s3` with `endpoint_url` (and `allow_private` for an internal one) | any job that writes `sightings.json` to the same store | not tested |
+
+Things to hold on both sides:
+
+- **The producer decides what the sensor learns.** The sensor is a machine attackers are
+  invited to probe. Assume whoever takes it over reads the sightings file. Write the
+  minimum: only addresses that are on the tracked list, a coarse `where` (an environment
+  label such as `prod`, never a host name, an internal address or an account id), the
+  service as protocol and port, counts and times. Leave out anything you would not hand to
+  the attacker.
+- **The consumer owns the conversion.** A list built from the tracked export is evidence
+  from an exposed host. Apply the rules in [Using the intelligence outside the
+  sensor](#using-the-intelligence-outside-the-sensor): validate every entry, check an
+  allow-list, cap the size and honour `expires_at`. A watch list or threat list that alerts
+  fits the tracked stage; blocking belongs to enforced entries only, if at all.
+- **One object each way.** Give the sensor write access to the one export object and read
+  access to the one sightings object, nothing else, and no credentials for the systems the
+  lists feed.
+
 ## Using the intelligence outside the sensor
 
 The sensor produces addresses and indicators: `detections/pending/blocklist-candidates.csv`,
-Sigma drafts, the approved blocklist file (`[respond] blocklist_file`) and, with export on,
-the raw events. Feeding any of them into a firewall, a WAF, a session border controller, a
-SIEM or a paging system happens outside the sensor's fences, and a mistake there blocks or
+Sigma drafts, the approved blocklist file (`[respond] blocklist_file`), the tracked list
+(`tracked.json`) and, with export on, the raw events. Feeding any of them into a firewall,
+a WAF, a session border controller, a SIEM or a paging system happens outside the sensor's fences, and a mistake there blocks or
 wakes up the wrong people. The guidance below applies to all of them, including the
 approved blocklist: a person approving an entry does not make the entry's source more
 trustworthy.
@@ -626,8 +851,9 @@ over, it reaches nothing on the private network. With Tailscale:
 
 ### Turning actions on
 
-With actions on, the console can approve, reject and unblock. It calls the same functions
-as `python -m agents approve`, `reject` and `unblock`, so every gate those commands have
+With actions on, the console can approve, reject and unblock, and enforce a tracked entry.
+It calls the same functions as `python -m agents approve`, `reject`, `unblock` and
+`enforce`, so every gate those commands have
 still applies (source re-checks at approval time, the queue lock, expiry). Decisions are
 recorded as `ui:<operator>`, from `--by` or `[ui] operator`.
 
@@ -642,7 +868,8 @@ docker compose -f docker-compose.yml -f docker-compose.ui-actions.yml --profile 
 Actions need write access to the agent data (the approval queue, the blocklist and the
 `response/` audit records under `reports/`). The overlay and the event log stay
 read-only. In Docker the console holds no connector secrets, so approve `open_ticket` and
-`block_webhook` items with the CLI in the `agents` container, which has them.
+`block_webhook` items with the CLI in the `agents` container, which has them. Likewise,
+with the block connector enabled, run `enforce` there if the connector should be called.
 
 The console's unblock takes one blocklist entry exactly as listed. To remove a range
 (every entry inside a network), use `python -m agents unblock <network>`.
@@ -728,5 +955,6 @@ label whatever its style, and `{{sha1:LABEL}}` hashes the pinned value.
 | `sipsak` REGISTER gets no reply over UDP | Its request is smaller than the 401 challenge. Set `[listeners] sip_udp_slack_bytes` (for example 128) if you need to answer it. |
 | Agents log "no sensor seed yet" | The front-ends have not started yet or the `frontend` volume is not mounted; the seed is created on first start. |
 | Playbooks run but nothing is sent or queued | Notify steps need an enabled connector; enforce steps need `[respond] queue_enforce = true`. Run `python -m agents respond --dry-run` to see each step's status. |
+| The blocklist screen marks sightings `refused` | The newest sightings file failed the checks; the console log names the first problem. Fix the producer. The last good copy stays on show. |
 | Steps show `refused: non-global source` or `refused: never_act_on` | The source is private, loopback or similar (expected in a lab), or inside a `[respond] never_act_on` range. |
 | `run-all` exits with status 2 | One stage failed; the JSON summary on stderr names it. The other stages still ran. A `run_lock` error means another `respond` or `run-all` run was still in progress, so nothing ran. |

@@ -28,7 +28,8 @@ On top of that SSH honeypot this project adds:
 - **Response playbooks**: deterministic rules that react to triage records with local
   changes (tarpit, deeper or shallower interaction, per-source honeytokens), notifications
   through opt-in connectors, and enforcement actions that run only after a person approves
-  them.
+  them. Optionally in two steps: a blocklist entry is tracked first, for your cloud to
+  watch and report sightings of, and blocked only on a second decision.
 
 > Winnie is used in a live production environment. Review the [deployment guidance](#deployment)
 > before setting up your own instance.
