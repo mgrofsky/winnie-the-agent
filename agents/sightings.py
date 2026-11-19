@@ -289,7 +289,9 @@ def _atomic_write(path: Path, text: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
-    os.chmod(tmp, 0o644)
+    # Owner only: the file says where an address was seen elsewhere, and only the sensor's
+    # own processes (one user) read it.
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
