@@ -43,6 +43,7 @@ API_LITERALS = {
     "/api/queue/",
     "/api/blocklist",
     "/api/blocklist/unblock",
+    "/api/blocklist/enforce",
     "/api/digests",
     "/api/digests/",
     "/api/decoy",
@@ -50,10 +51,12 @@ API_LITERALS = {
     "/api/detections",
     "/api/detections/",
     "/api/honeytokens",
+    "/api/activity",
+    "/api/activity/session/",
 }
-# Suffixes appended after an id: GET /api/records/{id}/transcript and
+# Suffixes appended after an id: GET /api/records/{id}/transcript|replies and
 # POST /api/queue/{id}/approve|reject.
-API_SUFFIXES = {"/transcript", "/approve", "/reject"}
+API_SUFFIXES = {"/transcript", "/replies", "/approve", "/reject"}
 
 
 def test_static_dir_has_files():
@@ -215,3 +218,97 @@ def test_js_parses(path):
     result = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True,
                             timeout=60)
     assert result.returncode == 0, result.stderr
+
+
+def test_activity_links_only_checked_values():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    # A source from the log becomes a link only when it is plainly an address, and a
+    # session only when it matches the server's session id pattern.
+    assert "ADDRESS_RE.test(src) ? link(" in _function(text, "sourceLink")
+    assert "SESSION_ID_RE.test(id)" in _function(text, "sessionHref")
+    rows = _function(text, "addActivityRows")
+    assert "attrs" not in rows.split("const toggle")[0]
+    assert '"aria-label": "Show details"' in rows and "it." not in rows.split("const flip")[0]
+
+
+def test_background_refresh_never_inserts_activity_rows():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    view = _function(text, "viewActivity")
+    assert 'kind === "poll" ? checkNewActivity(ctx)' in view
+    check = _function(text, "checkNewActivity")
+    assert "after: ctx.newest" in check and "addActivityRows" not in check
+
+
+def test_replies_say_when_none_was_recorded():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    replies = _function(text, "commandReplies")
+    assert 'it.recorded === true' in replies and "replyNote(it.status)" in replies
+    assert "API.replies(id)" in replies and "read_cut === true" in replies
+    note = _function(text, "replyNote")
+    assert '"no reply recorded"' in note
+    assert 'status === "unmatched"' in note and "could not be matched" in note
+    assert 'status === "not_read"' in note
+
+
+def test_activity_cursors_carry_the_log_id_and_reload_when_it_changes():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    check = _function(text, "checkNewActivity")
+    assert "after: ctx.newest, log_id: ctx.logId" in check
+    assert "err.status === 409" in check and "logChanged(ctx)" in check
+    foot = _function(text, "activityFoot")
+    assert "before: cursor, log_id: ctx.logId" in foot
+    assert "err.status === 409" in foot and "logChanged(ctx)" in foot
+    changed = _function(text, "logChanged")
+    assert "ctx.logNotice = " in changed and "manualRefresh()" in changed
+    draw = _function(text, "drawActivity")
+    assert "ctx.logId = " in draw and "ctx.logNotice" in draw
+
+
+def test_activity_says_when_a_read_stopped_at_the_limit():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "readCut === true" in _function(text, "activityFoot")
+    session = _function(text, "drawActivitySession")
+    assert "data.read_cut === true" in session and "data.events_cut === true" in session
+
+
+def test_ssh_session_heading_is_accurate():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    session = _function(text, "drawActivitySession")
+    assert 'data.connection_lines !== true' in session
+    assert '"Logins and commands in this session, in order"' in session
+    assert '"Everything in this session, in order"' in session
+
+
+def test_every_section_has_a_number_key():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    sections = re.findall(r'\{ key: "([a-z]+)", label: "[A-Za-z ]+", hash: "#/', text)
+    n = len(sections)
+    assert "activity" in sections
+    assert f"/^[1-{n}]$/.test(ev.key)" in text and f"Keys: 1-{n} switch sections" in text
+
+
+def test_every_screen_says_what_it_is():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    views = re.findall(r"\n  function (view[A-Z]\w*)\(", text)
+    for name in views:
+        body = _function(text, name)
+        if "pageHead(" in body and name != "viewNotFound":
+            assert "intro(" in body or "lead" in body, name
+
+
+def test_decoy_screen_speaks_in_words_with_raw_detail_behind_an_expander():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    draw = _function(text, "drawDecoy")
+    for heading in ("Current adjustments to the fake system", "What the tuner changed and when",
+                    "What returning attackers are shown"):
+        assert f'"{heading}"' in draw, heading
+    view = _function(text, "viewDecoy")
+    assert "Nothing here needs a decision." in view
+    # Internal field names are not used as labels; the raw data is text in an expander.
+    for key in ("tarpit_ms", "budget_mode", "capture_more", "plant_token", "after_n"):
+        assert f'label: "{key}' not in draw and f'"{key}"' not in draw, key
+    assert "textBlock(JSON.stringify(value, null, 2))" in _function(text, "rawDetails")
+    # Empty states say why and what would fill them.
+    assert draw.count("empty(") >= 4
+    assert "The tuner has not changed anything yet" in draw
+    assert "No attacker has been singled out yet" in draw

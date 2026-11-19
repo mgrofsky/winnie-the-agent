@@ -93,6 +93,13 @@ def all_requests(tree):
         ("/api/detections/pending/README.md", {}), ("/api/detections/other/x.yml", {}),
         ("/api/honeytokens", {}), ("/api/honeytokens", {"reveal": HONEYTOKEN_NAME}),
         ("/api/honeytokens", {"reveal": "missing"}), ("/api/honeytokens", {"reveal": "../x"}),
+        ("/api/activity", {}), ("/api/activity", {"q": "script", "per": "3"}),
+        ("/api/activity", {"service": "ssh", "kind": "input", "src": "198.51.100.0/24"}),
+        ("/api/activity", {"outcome": "maybe"}), ("/api/activity", {"before": "x"}),
+        ("/api/activity", {"after": "0"}),
+        (f"/api/activity/session/{sa}", {}), ("/api/activity/session/redis-0001", {}),
+        ("/api/activity/session/../x", {}),
+        (f"/api/records/{sa}/replies", {}), (f"/api/records/{tree.ids['ftp']}/replies", {}),
         ("/api/nothing", {}), ("/api/", {}), ("/elsewhere", {}),
     ]
 
@@ -279,6 +286,20 @@ def test_transcript(api, tree):
     assert len(page["turns"]["items"]) == 2 and page["turns"]["page"] == 3
 
 
+def test_transcript_masks_honeytoken_values(api, tree):
+    # Masked as everywhere else in the console; only the honeytokens screen reveals one.
+    with open(tree.log, "a", encoding="utf-8") as f:
+        for line in ui_fixture.ssh_lines(tree.ids["session_a"], "198.51.100.7", tree.now,
+                                         [("root", HONEYTOKEN_VALUE, False)], []):
+            if line["message"].startswith("Auth"):
+                f.write(json.dumps(line) + "\n")
+    body = ok(api, f"/api/records/{tree.ids['session_a']}/transcript", per=200)
+    assert HONEYTOKEN_VALUE not in json.dumps(body)
+    inputs = [t["text"] for t in body["turns"]["items"] if t["role"] == "input"]
+    assert inputs[5] == "aws s3 ls --profile " + HONEYTOKEN_VALUE[:2] + "......"
+    assert body["auth_attempts"][-1]["password"] == HONEYTOKEN_VALUE[:2] + "......"
+
+
 def test_transcript_of_traversal_username_session(api, tree):
     body = ok(api, f"/api/records/{tree.ids['session_b']}/transcript")
     assert [a["username"] for a in body["auth_attempts"]] == [TRAVERSAL_USER] * 2
@@ -413,6 +434,24 @@ def test_decoy(api):
     assert body["tuner_runs"][0]["snapshot"] == 1 and SCRIPT in body["tuner_runs"][0]["rejected"][0]
     assert body["source_state"]["items"][0]["key"] == "198.51.100.7"
     assert body["source_state"]["items"][0]["tarpit_ms"] == 500
+
+
+def test_decoy_says_when_each_source_was_last_seen(api, tree):
+    body = ok(api, "/api/decoy")
+    entry = body["source_state"]["items"][0]
+    record = ok(api, f"/api/records/{tree.ids['session_a']}")["record"]
+    assert entry["key"] == record["src_ip"] == "198.51.100.7"
+    assert entry["last_seen"] == record["last_seen"][:19] + "+00:00"
+
+
+def test_decoy_last_seen_is_none_for_a_source_without_records(tree):
+    from agents.source_state import SourceState, new_entry
+
+    entry = new_entry("2001:db8:5::/64", tree.now)
+    tree.source_state.write_text(SourceState(entries={entry.key: entry}).model_dump_json())
+    body = ok(Api(tree.api_paths(), cache_seconds=0), "/api/decoy")
+    (item,) = body["source_state"]["items"]
+    assert item["key"] == "2001:db8:5::/64" and item["last_seen"] is None
 
 
 def test_playbooks(api):

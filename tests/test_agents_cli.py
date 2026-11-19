@@ -354,3 +354,13 @@ def test_ui_refuses_bad_settings_with_an_error(tmp_path, monkeypatch):
     assert cli.main(["ui", "--port", "0", *args]) == 2
     args = _ui_setup(tmp_path, monkeypatch, "[ui]\nport = eighty\n")
     assert "error" in cli.run(["ui", *args])["ui"]
+
+
+@pytest.mark.parametrize("value,expected", [("200000", 200_000), ("2000000", 500_000),
+                                            ("5", 1_000)])
+def test_ui_activity_entries_are_clamped_to_the_documented_range(tmp_path, monkeypatch, value,
+                                                                  expected):
+    args = _ui_setup(tmp_path, monkeypatch, f"[ui]\nactivity_entries = {value}\n")
+    seen = _capture_serve(monkeypatch)
+    cli.run(["ui", *args])
+    assert seen["routes"].events.max_entries == expected

@@ -290,6 +290,14 @@ blocklist_format = plain
 # Approved entries expire after this many days; `python -m agents unblock <ip-or-network>`
 # removes one sooner.
 blocklist_ttl_days = 30
+# Two stages for export_blocklist. false: approving writes the address straight to the
+# blocklist file (above). true: approving only puts it on the tracked list (tracked.json,
+# written next to the blocklist file, for your cloud to watch; see [connector.tracked_export])
+# and nothing is blocked; `python -m agents enforce <address>` (or Enforce in the console) is
+# a second, separate decision that moves it to the blocklist file and calls
+# [connector.block_webhook] if enabled. Entries approved before this was turned on stay
+# enforced.
+track_before_enforce = false
 # A rejected request is not queued again for the same (playbook, source, action) for this
 # long; an approval that expired undecided is held back for expired_suppress_hours.
 reject_suppress_hours = 168
@@ -341,6 +349,10 @@ actions = false
 # HTTPS name of a reverse proxy on this host that forwards to the port above (--external-host
 # overrides it). Empty: loopback names only. See docs/operations.md, "Reaching it".
 #external_host = sensor.example-tailnet.ts.net
+# Event-log lines the Activity screen keeps in memory (one small entry each, oldest
+# dropped first; 1000 to 500000). Worst case about 115 MiB at the default and 275 MiB at
+# 500000; see docs/operations.md, "The indexed window".
+#activity_entries = 200000
 
 # Outbound connectors. All disabled by default. Destinations must be https and public
 # (allow_private = true to permit internal ones). Secrets are environment variable NAMES.
@@ -348,6 +360,7 @@ actions = false
 #   max_per_day = 200       sends per day before the connector stops
 #   timeout = 10            seconds per send (at most 30)
 #   allow_private = false
+#   secret_file =           absolute path of a file holding the token, instead of secret_env
 # The HTTP connectors (all but email) send secret_env's value in the header named by
 # header (default Authorization).
 #[connector.webhook]
@@ -408,3 +421,52 @@ actions = false
 #max_objects_per_run = 50
 #max_bytes_per_object = 5242880
 #timeout = 10
+
+# Tracked export (python -m agents ship; also the last step of run-all). Sends tracked.json,
+# the tracked list written by [respond] track_before_enforce, whole, only when it changed.
+# kind = s3: PutObject of exactly one key (the client refuses every other operation, bucket
+# and key). Credentials come from the default chain, never from this file.
+# kind = https: one PUT or POST of the document, with the HTTP connector rules above.
+#[connector.tracked_export]
+#enabled = false
+#kind = s3
+# Where to read tracked.json when this process does not see the agents' reports directory
+# (default: next to the blocklist file).
+#file = /blocklist/tracked.json
+#bucket = example-honeypot-events
+#key = events/tracked/tracked.json
+#region = us-east-1
+#bucket_owner = 123456789012
+# Another store that speaks the S3 API (https only; allow_private for an internal one).
+#endpoint_url = https://s3.example.com
+#url = https://intel.example.com/api/winnie/tracked
+#method = PUT
+#secret_env = WINNIE_TRACKED_TOKEN
+#header = Authorization
+
+# Sightings: where else your environment saw a listed address, shown on the console's
+# blocklist screen. Display only; nothing acts on them. The file is untrusted and checked
+# strictly; a refused file keeps the last good one. See docs/operations.md, "Sightings".
+[sightings]
+# Default: sightings.json in the agents' state directory.
+#path = /agents/state/sightings.json
+max_bytes = 1048576
+max_entries = 5000
+# The console marks the file stale when its generated_at is older than this.
+stale_hours = 48
+
+# Optional sightings fetch (python -m agents ship; also run-all), at most once per
+# interval_minutes. kind = s3: GetObject of exactly one key; kind = https: GET. The local
+# file is replaced only by a copy that passes the checks.
+#[connector.sightings]
+#enabled = false
+#kind = s3
+#interval_minutes = 15
+#bucket = example-honeypot-events
+#key = sightings/sightings.json
+#region = us-east-1
+#bucket_owner = 123456789012
+#endpoint_url = https://s3.example.com
+#url = https://intel.example.com/api/winnie/sightings
+#secret_env = WINNIE_SIGHTINGS_TOKEN
+#header = Authorization

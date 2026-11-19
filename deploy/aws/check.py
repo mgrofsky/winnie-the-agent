@@ -8,10 +8,14 @@ so tests can feed them altered copies and see each rule fire.
 
 from __future__ import annotations
 
+import configparser
+import functools
 import ipaddress
 import json
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -29,10 +33,29 @@ ROLE_ACTIONS = {"ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability",
 UNSCOPABLE = {"ecr:GetAuthorizationToken"}     # AWS offers no resource-level permission
 DOCUMENTATION_ACCOUNT_IDS = {"000000000000", "123456789012"}
 UI_PORT = 8480                                 # operator console, host loopback only
+# Keys TrackedKey's pattern must refuse: each would leave EventsPrefix/ or be ambiguous.
+TRACKED_KEY_ESCAPES = ("../tracked.json", "tracked/../../tracked.json", "/tracked.json",
+                       "tracked//tracked.json", "tracked/..json", "tracked/./tracked.json")
+# Keys that could land among the exported events, which are written under
+# EventsPrefix/YYYY/MM/DD/: TrackedKey's first segment must start with a letter.
+TRACKED_KEY_COLLISIONS = ("2026/11/18/tracked.json", "2026.json", "0/tracked.json",
+                          "2026-11/tracked.json", "9tracked/tracked.json")
+CONFIG_TEMPLATE = HERE.parents[1] / "SSH" / "config.ini.TEMPLATE"
+# Each config file the bootstrap renders, and the shipping switch its render call must
+# pass: only the exporter's copy may turn a transport on.
+RENDER_CALLS = {"config.ini": "false", "config-ship.ini": "true"}
+# Position of TrackedExport among render_config.py's arguments after src and dst.
+TRACKED_ARG = 8
+# The exporter's mounts: source -> (target, read-only). Nothing else of the agents' data.
+EXPORTER_MOUNTS = {"./config-ship.ini": ("/config/config.ini", True),
+                   "frontend": ("/data", True),
+                   "exportstate": ("/agents", False),
+                   "blocklist": ("/blocklist", True)}
 # Literal parameter defaults: project or example names, scenario names, instance types,
 # public SSM parameter paths, addresses, numbers and switches. Nothing that could name an
 # organisation.
 GENERIC_DEFAULT = re.compile(r"^(winnie[a-z0-9-]*|example[a-z0-9.-]*|events|compose-bin|"
+                             r"tracked/tracked\.json|"
                              r"[a-z][0-9][a-z]*\.[a-z0-9]+|/aws/service/[a-z0-9/_.-]+|"
                              r"[0-9./]+|true|false|)$")
 
@@ -182,6 +205,18 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
             errors.append(f"ingress rule {name} reaches the console port {UI_PORT}")
     if (params.get("UiEnabled") or {}).get("Default") != "false":
         errors.append("parameter UiEnabled is not off by default")
+    if (params.get("TrackedExport") or {}).get("Default") != "false":
+        errors.append("parameter TrackedExport is not off by default")
+    tracked_key = params.get("TrackedKey") or {}
+    pattern = tracked_key.get("AllowedPattern")
+    if not isinstance(pattern, str) or any(re.search(pattern, k) for k in TRACKED_KEY_ESCAPES):
+        errors.append("parameter TrackedKey allows a key outside the events prefix")
+    if not isinstance(pattern, str) or any(re.search(pattern, k)
+                                           for k in TRACKED_KEY_COLLISIONS):
+        errors.append("parameter TrackedKey allows a key among the exported events")
+    default = tracked_key.get("Default")
+    if not isinstance(default, str) or not re.match(r"[a-z]", default):
+        errors.append("parameter TrackedKey default does not start with a letter")
 
     templates = resources(doc, "AWS::EC2::LaunchTemplate")
     if not templates:
@@ -221,6 +256,8 @@ USER_DATA_FACTS = {
     "the Compose plugin is not taken from the repository": "docker cp \"$cid:/docker-compose\"",
     "the exporter does not get its own config": "./config-ship.ini:/config/config.ini:ro",
     "passwords are not hashed in the export": '"passwords": "hash"',
+    "the tracked key is not under the events prefix": "${EventsPrefix}/${TrackedKey}",
+    "the tracked export is not read from the blocklist mount": '"file": "/blocklist/tracked.json"',
 }
 
 
@@ -233,7 +270,79 @@ def check_user_data(user_data: str) -> list[str]:
         for opt in ("--config", "--log", "--data-dir /data", "--state-dir"):
             if opt not in cmd:
                 errors.append(f"the ship command lacks {opt}")
-    errors += check_ui(embedded_compose(user_data))
+    compose = embedded_compose(user_data)
+    errors += check_ui(compose)
+    if compose is not None:
+        errors += check_exporter(compose) + check_blocklist(compose) + check_configs(compose)
+    errors += check_render(user_data)
+    return errors
+
+
+def check_render(user_data: str) -> list[str]:
+    """The bootstrap's render_config.py, run on the repository's config template: the
+    tracked export is on only when shipping and TrackedExport both are, and the agents'
+    config.ini keeps every transport off (only config-ship.ini, the exporter's, ships)."""
+    m = re.search(r"^cat > render_config\.py <<'PY'\n(.*?)\nPY$", user_data, re.S | re.M)
+    if not m:
+        return ["the bootstrap does not write render_config.py"]
+    errors: list[str] = []
+    calls = dict(re.findall(r'^python3 render_config\.py config\.ini\.TEMPLATE (\S+) \$ARGS '
+                            r'"\$\{NeverActOn\}" (\S+)$', user_data, re.M))
+    if calls != RENDER_CALLS:
+        errors.append("the configs are not rendered as config.ini without shipping and "
+                      "config-ship.ini with it")
+    args = re.search(r'^ARGS="([^"]*)"$', user_data, re.M)
+    words = args.group(1).split() if args else []
+    if len(words) <= TRACKED_ARG or words[TRACKED_ARG] != "${TrackedExport}":
+        errors.append("render_config.py does not get TrackedExport as its tracked switch")
+    for ship in ("true", "false"):
+        for tracked in ("true", "false"):
+            got = _render(m.group(1), ship, tracked)
+            if got is None:
+                errors.append(f"render_config.py fails with shipping {ship} and "
+                              f"TrackedExport {tracked}")
+                continue
+            want = {("connector.tracked_export", "enabled"):
+                    "true" if ship == tracked == "true" else "false",
+                    ("connector.s3_events", "enabled"): ship,
+                    ("respond", "track_before_enforce"): tracked}
+            for (section, key), value in want.items():
+                if got.get((section, key)) != value:
+                    errors.append(f"with shipping {ship} and TrackedExport {tracked} the "
+                                  f"rendered [{section}] {key} is not {value}")
+    return errors
+
+
+@functools.lru_cache(maxsize=16)
+def _render(script: str, ship: str, tracked: str) -> Optional[dict]:
+    """Run render_config.py on the config template; the switches it writes, or None."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "render_config.py"
+        path.write_text(script, encoding="utf-8")
+        out = Path(tmp) / "config.ini"
+        try:
+            subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),
+                            "winnie-sensor", "example", "192.0.2.10", "false",
+                            "example-events", "events", "us-east-1", "123456789012", tracked,
+                            "events/tracked/tracked.json", "", ship],
+                           check=True, capture_output=True, timeout=60, cwd=tmp)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.read(out, encoding="utf-8")
+        return {(s, k): cp.get(s, k, fallback=None)
+                for s, k in (("connector.tracked_export", "enabled"),
+                             ("connector.s3_events", "enabled"),
+                             ("respond", "track_before_enforce"))}
+
+
+def check_configs(compose: dict) -> list[str]:
+    """Only the exporter mounts config-ship.ini; every other service mounts config.ini."""
+    errors: list[str] = []
+    for name, service in (compose.get("services") or {}).items():
+        for source, _, _ in _mounts(service or {}):
+            if source == "./config-ship.ini" and name != "exporter":
+                errors.append(f"the {name} service mounts the exporter's config-ship.ini")
     return errors
 
 
@@ -282,6 +391,61 @@ def check_ui(compose: Optional[dict]) -> list[str]:
             errors.append(f"the ui service gets {key}")
     if (ui.get("logging") or {}).get("driver") != "local":
         errors.append("the ui service log (with its sign-in link) leaves the host")
+    return errors
+
+
+def _mounts(service: dict) -> list[tuple[str, str, bool]]:
+    """(source, target, read-only) for each short-syntax volume of a compose service."""
+    out = []
+    for volume in as_list(service.get("volumes") or []):
+        parts = str(volume).split(":")
+        out.append((parts[0], parts[1] if len(parts) > 1 else "",
+                    len(parts) > 2 and parts[2] == "ro"))
+    return out
+
+
+def check_exporter(compose: dict) -> list[str]:
+    """The exporter holds the instance role, so it mounts its own config and state, the
+    front-end log (read-only) and the blocklist directory (read-only), nothing else."""
+    exporter = (compose.get("services") or {}).get("exporter")
+    if not isinstance(exporter, dict):
+        return ["the embedded compose file has no exporter service"]
+    errors: list[str] = []
+    if any(not isinstance(v, str) for v in as_list(exporter.get("volumes") or [])):
+        errors.append("the exporter has a volume that is not in short syntax")
+    sources = [source for source, _, _ in _mounts(exporter)]
+    for source in EXPORTER_MOUNTS:
+        if sources.count(source) != 1:
+            errors.append(f"the exporter does not mount {source} exactly once")
+    for source, target, read_only in _mounts(exporter):
+        if source not in EXPORTER_MOUNTS:
+            errors.append(f"the exporter mounts {source}")
+            continue
+        want_target, want_ro = EXPORTER_MOUNTS[source]
+        if target != want_target:
+            errors.append(f"the exporter mounts {source} at {target}")
+        if want_ro and not read_only:
+            errors.append(f"the exporter mounts {source} read-write")
+    return errors
+
+
+def check_blocklist(compose: dict) -> list[str]:
+    """Only the agents write the blocklist volume, at the blocklist file's directory."""
+    errors: list[str] = []
+    agents_write = False
+    for name, service in (compose.get("services") or {}).items():
+        for source, target, read_only in _mounts(service or {}):
+            if source != "blocklist":
+                continue
+            if name == "agents":
+                agents_write |= target == "/agents/reports/blocklist" and not read_only
+            elif not read_only:
+                errors.append(f"the blocklist volume is writable by the {name} service")
+    if not agents_write:
+        errors.append("the agents service does not write the blocklist volume at "
+                      "/agents/reports/blocklist")
+    if "blocklist" not in (compose.get("volumes") or {}):
+        errors.append("the blocklist volume is not declared")
     return errors
 
 

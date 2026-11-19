@@ -132,6 +132,24 @@ Parameters:
     Description: >-
       Also run the read-only operator console, published on the host's 127.0.0.1:8480 only
       and reached through SSM port forwarding. No security group, role or endpoint change.
+  TrackedExport:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Approving export_blocklist only tracks the address ([respond] track_before_enforce),
+      and the exporter puts the tracked list (tracked.json) to EventsPrefix/TrackedKey. No
+      role, endpoint or bucket policy change: the key is under the events prefix.
+  TrackedKey:
+    Type: String
+    Default: tracked/tracked.json
+    MaxLength: 128
+    AllowedPattern: '^[a-z][a-z0-9]*([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*){0,3}\.json$'
+    ConstraintDescription: >-
+      A relative key ending in .json, lower case, at most four parts, no leading slash and
+      no "..". It starts with a letter, so it never lands among the events, which are
+      written under EventsPrefix/YYYY/MM/DD/.
+    Description: Key of the tracked list, relative to EventsPrefix (the object is EventsPrefix/TrackedKey).
 
 Mappings:
   # Listener services per scenario ("python -m listeners --list-scenarios"). SSH is always on.
@@ -794,24 +812,32 @@ Resources:
               docker run --rm --network none --entrypoint cat "$IMAGE" /app/SSH/config.ini.TEMPLATE > config.ini.TEMPLATE
               cat > render_config.py <<'PY'
               import configparser, re, sys
-              src, dst, name, scenario, public_ip, smtp, bucket, prefix, region, owner, never, ship = sys.argv[1:13]
+              (src, dst, name, scenario, public_ip, smtp, bucket, prefix, region, owner, tracked,
+               tracked_key, never, ship) = sys.argv[1:15]
               lines = open(src, encoding="utf-8").read().splitlines()
               want = {
                   "honeypot": {"sensor_name": name},
                   "scenario": {"active": scenario.replace("-", "_")},
                   "listeners": {"ftp_pasv_ports": "30000-30019", "ftp_pasv_address": public_ip,
                                 "llm": "false"},
-                  "respond": {"queue_enforce": "true"},
+                  "respond": {"queue_enforce": "true", "track_before_enforce": tracked},
                   "connector.s3_events": {"enabled": ship, "bucket": bucket, "prefix": prefix + "/",
                                           "region": region, "bucket_owner": owner,
                                           "layout": "wrapped", "passwords": "hash"},
+                  "connector.tracked_export": {
+                      "enabled": "true" if ship == "true" and tracked == "true" else "false",
+                      "kind": "s3", "file": "/blocklist/tracked.json", "bucket": bucket,
+                      "key": tracked_key, "region": region, "bucket_owner": owner},
               }
               if smtp != "true":
                   want["listeners"]["smtp_enabled"] = "false"
               if never.strip():
                   want["respond"]["never_act_on"] = never.strip()
-              if "[connector.s3_events]" not in [l.strip() for l in lines]:
-                  lines += ["", "[connector.s3_events]"]
+              # Sections the template has only commented out ("#[connector.s3_events]") get
+              # a real header at the end.
+              for section in want:
+                  if "[%s]" % section not in [l.strip() for l in lines]:
+                      lines += ["", "[%s]" % section]
               def section_range(section):
                   start = None
                   for i, line in enumerate(lines):
@@ -835,6 +861,8 @@ Resources:
                           if hit is not None:
                               break
                       if hit is None:
+                          while end > start + 1 and not lines[end - 1].strip():
+                              end -= 1
                           lines.insert(end, "%s = %s" % (key, value))
                       else:
                           lines[hit] = "%s = %s" % (key, value)
@@ -847,10 +875,11 @@ Resources:
                           sys.exit("config.ini check failed: [%s] %s" % (section, key))
               print("%s written" % dst)
               PY
-              # Two files from one template. run-all also ships when the connector is enabled,
+              # Two files from one template. run-all also ships when a connector is enabled,
               # and the agents container has neither credentials nor egress, so config.ini
-              # (front-ends and agents) keeps it off; config-ship.ini (exporter only) turns it on.
-              ARGS="${NamePrefix} ${Scenario} ${ElasticIp} ${SmtpEnabled} ${EventsBucketName} ${EventsPrefix} $REGION ${EventsBucketOwner}"
+              # (front-ends and agents) keeps s3_events and tracked_export off; config-ship.ini
+              # (exporter only) turns them on. Both get the same track_before_enforce.
+              ARGS="${NamePrefix} ${Scenario} ${ElasticIp} ${SmtpEnabled} ${EventsBucketName} ${EventsPrefix} $REGION ${EventsBucketOwner} ${TrackedExport} ${EventsPrefix}/${TrackedKey}"
               python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "${NeverActOn}" false
               python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "${NeverActOn}" true
               chown 10001:10001 config.ini config-ship.ini ssh_host_key
@@ -911,11 +940,14 @@ Resources:
                     - ./config.ini:/config/config.ini:ro
                     - frontend:/data:ro
                     - agentdata:/agents
+                    - blocklist:/agents/reports/blocklist
                     - overlay:/overlay
                 # The exporter: host network, the only container that can use the instance
                 # role (IMDS hop limit 1 and the DOCKER-USER rules stop every bridged one).
                 # It reads the log and the sensor seed (--data-dir, for passwords = hash) and
-                # keeps its cursor and run lock on its own volume (--state-dir).
+                # keeps its cursor and run lock on its own volume (--state-dir). Of the agents'
+                # data it sees only the blocklist volume, the directory holding tracked.json,
+                # read-only, never agentdata (approvals, state, reports).
                 exporter:
                   <<: *hardening
                   depends_on: [listeners]
@@ -928,14 +960,18 @@ Resources:
                     - ./config-ship.ini:/config/config.ini:ro
                     - frontend:/data:ro
                     - exportstate:/agents
+                    - blocklist:/blocklist:ro
                 # Operator console, read-only (no --actions), only with UiEnabled=true (the
                 # ui profile, switched in .env below). On the backend network, which may only
                 # send replies; published on the host's loopback only, for SSM port
                 # forwarding. Logs stay on the host (driver local), so the sign-in link is
-                # read with "docker compose logs ui" and never reaches CloudWatch.
+                # read with "docker compose logs ui" and never reaches CloudWatch. It starts
+                # after the agents, whose read-write mounts create the blocklist mount point
+                # inside agentdata that this read-only mount needs.
                 ui:
                   <<: *hardening
                   profiles: [ui]
+                  depends_on: [agents]
                   logging:
                     driver: local
                   environment:
@@ -949,6 +985,7 @@ Resources:
                     - ./config.ini:/config/config.ini:ro
                     - frontend:/data:ro
                     - agentdata:/agents:ro
+                    - blocklist:/agents/reports/blocklist:ro
                     - overlay:/overlay:ro
               networks:
                 frontend:
@@ -960,6 +997,9 @@ Resources:
               volumes:
                 frontend: {}
                 agentdata: {}
+                # The blocklist directory (approved.txt, tracked.json): written by the agents,
+                # read-only for everyone else, so the exporter needs no part of agentdata.
+                blocklist: {}
                 overlay: {}
                 exportstate: {}
               EOF

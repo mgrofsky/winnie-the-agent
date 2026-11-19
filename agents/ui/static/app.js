@@ -24,6 +24,8 @@
   const STALE_BAD_HOURS = 24;
   const PER_PAGE = 50;
   const TRANSCRIPT_PER = 100;
+  const MORE_LINES = 6;
+  const MORE_CHARS = 600;
 
   // Same patterns the server enforces (agents/ui/api.py).
   const RECORD_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
@@ -34,6 +36,10 @@
   const PROTOCOL_RE = /^[a-z0-9]{1,16}$/;
   const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
   const COMPACT_TIME_RE = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/;
+  const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+  // An IPv4 or IPv6 address as the log writes it: only these characters reach a link.
+  const ADDRESS_RE = /^[0-9A-Fa-f:.]{2,45}$/;
+  const USER_TIME_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:\d{2})?)?$/;
 
   // Every API path this page requests. Ids are checked against their pattern by the caller
   // and URL-encoded here as well.
@@ -44,11 +50,15 @@
     records: "/api/records",
     record: (id) => "/api/records/" + enc(id),
     transcript: (id) => "/api/records/" + enc(id) + "/transcript",
+    replies: (id) => "/api/records/" + enc(id) + "/replies",
+    activity: "/api/activity",
+    activitySession: (id) => "/api/activity/session/" + enc(id),
     queue: "/api/queue",
     approve: (id) => "/api/queue/" + enc(id) + "/approve",
     reject: (id) => "/api/queue/" + enc(id) + "/reject",
     blocklist: "/api/blocklist",
     unblock: "/api/blocklist/unblock",
+    enforce: "/api/blocklist/enforce",
     digests: "/api/digests",
     digest: (day) => "/api/digests/" + enc(day),
     decoy: "/api/decoy",
@@ -68,6 +78,13 @@
   const ROLE_CLASS = { input: "turn t-input", response: "turn t-response" };
   const ROLE_LABEL = { input: "attacker", response: "decoy" };
   const HEALTH_MARK = { ok: "OK", warn: "Check", bad: "Problem" };
+  const ACTIVITY_KINDS = [
+    ["connection", "Connection"], ["login", "Login attempt"], ["input", "Input"], ["reply", "Reply"],
+    ["request", "Request"], ["transfer", "Transfer"], ["register", "Register"], ["call", "Call attempt"],
+    ["error", "Error"], ["close", "Close"], ["other", "Other"],
+  ];
+  const ACTIVITY_KIND_LABEL = Object.fromEntries(ACTIVITY_KINDS);
+  const ACTIVITY_WINDOWS = { "1h": 3600000, "24h": 86400000, "7d": 7 * 86400000 };
 
   const SECTIONS = [
     { key: "overview", label: "Overview", hash: "#/" },
@@ -76,6 +93,7 @@
     { key: "digests", label: "Digests", hash: "#/digests" },
     { key: "decoy", label: "Decoy", hash: "#/decoy" },
     { key: "playbooks", label: "Playbooks", hash: "#/playbooks" },
+    { key: "activity", label: "Activity", hash: "#/activity" },
   ];
 
   const state = {
@@ -407,6 +425,11 @@
     }
   }
 
+  // One line under a screen's title saying what the screen is.
+  function intro(text) {
+    return el("p", { cls: "intro", text: text });
+  }
+
   function pageHead(title, ...extras) {
     return el("div", "page-head", el("h1", { text: title }), el("div", "spacer"), ...extras);
   }
@@ -614,7 +637,7 @@
       el("div", "header-right", shell.mode, who, shell.updated, refresh));
     shell.main = el("main", "main");
     const hint = el("div", { cls: "footer-hint",
-      text: "Keys: 1-6 switch sections, r refreshes, / searches records, Esc closes a confirmation." });
+      text: "Keys: 1-7 switch sections, r refreshes, / searches records or activity, Esc closes a confirmation." });
     document.body.replaceChildren(header, shell.main, el("div", "main", hint));
   }
 
@@ -661,8 +684,8 @@
   }
 
   function resolve(route) {
-    const [a, b, c] = route.parts;
-    if (c !== undefined) return { view: viewNotFound, key: null };
+    const [a, b, c, d] = route.parts;
+    if (d !== undefined || (c !== undefined && a !== "activity")) return { view: viewNotFound, key: null };
     if (!a) return { view: viewOverview, key: "overview" };
     if (a === "queue" && !b) return { view: viewQueue, key: "queue" };
     if (a === "records" && !b) return { view: viewRecords, key: "records" };
@@ -670,6 +693,8 @@
     if (a === "digests") return { view: viewDigests, key: "digests" };
     if (a === "decoy" && !b) return { view: viewDecoy, key: "decoy" };
     if (a === "playbooks" && !b) return { view: viewPlaybooks, key: "playbooks" };
+    if (a === "activity" && !b) return { view: viewActivity, key: "activity" };
+    if (a === "activity" && b === "session" && c !== undefined) return { view: viewActivitySession, key: "activity" };
     return { view: viewNotFound, key: null };
   }
 
@@ -765,7 +790,7 @@
     if (target instanceof Element && target.closest("input, select, textarea, button, [contenteditable]")) return;
     if (ev.key === "r") {
       manualRefresh();
-    } else if (/^[1-6]$/.test(ev.key)) {
+    } else if (/^[1-7]$/.test(ev.key)) {
       location.hash = SECTIONS[Number(ev.key) - 1].hash;
     } else if (ev.key === "/") {
       const search = shell.main.querySelector("input[data-search]");
@@ -812,7 +837,8 @@
       location.hash = hashFor("/", value === "7d" ? { window: "7d" } : {});
     });
     const body = el("div");
-    main.append(pageHead("Overview", toggle), body);
+    main.append(pageHead("Overview", toggle),
+      intro("What the sensor has seen lately and whether the pipeline is healthy. Start here."), body);
     return {
       refresh: (kind) => fill(body, () => apiGet(API.overview, { window: win }),
         (data) => drawOverview(obj(data), win), kind !== "initial"),
@@ -970,7 +996,7 @@
       const f = obj(failures[0]);
       rows.push(["Event export", "bad", [plural(failures.length, "recent failure", "recent failures") +
         "; newest ", timeNode(f.timestamp), ": " + str(f.event) + " " + str(f.error) +
-        " (" + plural(f.lines || 0, "line", "lines") + ")."]]);
+        (typeof f.lines === "number" ? " (" + plural(f.lines, "line", "lines") + ")" : "") + "."]]);
     }
     return rows;
   }
@@ -1024,7 +1050,9 @@
     const pendingBody = el("div");
     const closed = showClosed ? section("Closed items", { flush: true }) : null;
     const block = section("Approved blocklist", { flush: true });
-    main.append(pageHead("Approval queue", toggle), noticeBox);
+    main.append(pageHead("Approval queue", toggle),
+      intro("Actions the playbooks want to take that wait for a person to approve or reject them, " +
+        "and the blocklist those approvals feed."), noticeBox);
     if (!actions) {
       main.append(el("p", "readonly-line",
         "Read-only. Decide with ", el("code", { text: "python -m agents approve <id>" }), " or ",
@@ -1074,6 +1102,7 @@
   }
 
   function drawPending(data, ctx) {
+    ctx.track = obj(data.mode).track_before_enforce === true;
     const items = arr(data.items).filter((it) => obj(obj(it).approval).status === "pending");
     if (!items.length) return empty("Nothing is waiting for a decision.");
     const more = typeof data.total === "number" && data.total > arr(data.items).length
@@ -1171,9 +1200,13 @@
           ["Approval", mono(id)], ["Playbook", mono(a.playbook)]]
         : [["Action", mono(action)], ["Target", mono(target)], ["Approval", mono(id)],
           ["Playbook", mono(a.playbook)]];
+      // With two stages, approving export_blocklist or block_webhook only tracks the
+      // address (enforce is what blocks and calls the block connector); say so.
+      const tracking = ctx.track === true && (action === "export_blocklist" || action === "block_webhook");
       const approveTitle = publish
         ? "Approve and publish " + plural(names.length, "detection file", "detection files") + ": " + names.join(", ") + "?"
-        : "Approve and run " + action + " on " + target + "?";
+        : tracking ? "Approve and track " + target + "?"
+          : "Approve and run " + action + " on " + target + "?";
       // Reject works for every pending item. Approve only when this process can run the
       // action (open_ticket and block_webhook need a connector the console usually lacks).
       if (item.can_approve_here !== true) {
@@ -1193,8 +1226,12 @@
         foot.append(button("Approve", () => openConfirm(foot, {
           title: approveTitle,
           rows: rows(),
-          note: "Approving runs the action now. It can take as long as the action does.",
-          confirmLabel: "Approve and run",
+          note: tracking
+            ? "Approving adds " + target + " to the tracked list (tracked.json) for your cloud to watch. " +
+              "Nothing is blocked and no connector is called; enforcing it is a separate decision " +
+              "on the blocklist below."
+            : "Approving runs the action now. It can take as long as the action does.",
+          confirmLabel: tracking ? "Approve and track" : "Approve and run",
           danger: true,
           onConfirm: () => decide("approve", id, viewHash, ctx),
         }), "btn-primary"));
@@ -1262,6 +1299,9 @@
 
   function drawBlocklist(data, ctx, hrefFor) {
     const items = arr(data.items).map((it) => obj(it));
+    // The server adds mode (and per-entry status and sightings) only when entries have two
+    // stages; otherwise the list is drawn as one stage.
+    if (data.mode && typeof data.mode === "object") return drawStagedBlocklist(data, items, ctx, hrefFor);
     if (!items.length) return empty("The blocklist is empty.");
     const columns = [{ label: "Target" }, { label: "Approved" }, { label: "Expires" }];
     if (ctx.actions) columns.push({ label: "" });
@@ -1283,6 +1323,113 @@
       return { cells };
     }));
     return [wrap, pager(data, hrefFor)];
+  }
+
+  const STAGE_LABEL = { tracked: "Tracked", enforced: "Enforced" };
+  const STAGE_CLASS = { tracked: "st-pending", enforced: "st-bad" };
+
+  // Where the sightings file stands: age, stale or refused. All text nodes.
+  function sightingsLine(info) {
+    const s = obj(info);
+    if (s.state === "missing") {
+      return el("p", { cls: "muted", text: "No sightings file yet. Sightings are display only; see docs/operations.md." });
+    }
+    const parts = [];
+    if (s.generated_at) {
+      parts.push(el("span", null, "Sightings file generated ", timeNode(s.generated_at), "."));
+    }
+    if (s.stale === true) {
+      parts.push(" ", badge("stale", "st-bad"),
+        el("span", { text: " older than " + num(s.stale_hours) + " hours; counts may be out of date." }));
+    }
+    if (s.state === "invalid") {
+      parts.push(" ", badge("refused", "st-bad"),
+        el("span", { text: " The newest file was refused (" + str(s.error) + ")" +
+          (s.generated_at ? "; showing the last good copy." : "; nothing to show.") }));
+    }
+    return el("p", { cls: "muted" }, parts);
+  }
+
+  function sightingsCell(sum) {
+    const s = obj(sum);
+    const rows = arr(s.rows).map((r) => obj(r));
+    if (!rows.length) return el("span", { cls: "faint", text: "No sightings yet" });
+    const head = el("div", null, el("strong", { text: num(s.total) }),
+      el("span", { cls: "muted", text: " seen in " + plural(num(s.places), "place", "places") + ", last " }),
+      timeNode(s.last_seen));
+    const detail = table([{ label: "Where" }, { label: "Service" }, { label: "Count", num: true },
+      { label: "Last seen" }, { label: "Source" }],
+    rows.map((r) => ({ cells: [clip(r.where), clip(r.service), num(r.count), timeNode(r.last_seen), clip(r.source)] })),
+    { short: true });
+    return el("div", "stack", head, detail);
+  }
+
+  function drawStagedBlocklist(data, items, ctx, hrefFor) {
+    const mode = obj(data.mode);
+    const fileName = str(mode.blocklist_file) || "the blocklist file";
+    const trackedName = str(mode.tracked_file) || "tracked.json";
+    const line = sightingsLine(data.sightings);
+    if (!items.length) return [line, empty("The blocklist is empty.")];
+    const columns = [{ label: "Target" }, { label: "Status" }, { label: "Since" }, { label: "Expires" },
+      { label: "Sightings" }];
+    if (ctx.actions) columns.push({ label: "" });
+    const wrap = table(columns, items.map((it) => {
+      const target = str(it.target);
+      const stage = it.status === "enforced" ? "enforced" : "tracked";
+      const since = stage === "enforced" && it.enforced_at ? it.enforced_at : it.approved_at;
+      const cells = [mono(target), badge(STAGE_LABEL[stage], STAGE_CLASS[stage]), timeNode(since),
+        timeNode(it.expires_at), sightingsCell(it.sightings)];
+      if (ctx.actions) {
+        const cell = el("span", "stack");
+        const viewHash = typeof it.view_hash === "string" ? it.view_hash : null;
+        if (stage === "tracked" && viewHash) {
+          const connector = mode.block_connector === true
+            ? "The block connector is enabled and will be called with " + target + "."
+            : "The block connector is not enabled here, so nothing is sent to it.";
+          cell.append(button("Enforce", () => openConfirm(wrap, {
+            title: "Enforce " + target + "?",
+            rows: [["Target", mono(target)], ["Now", el("span", { text: "Tracked" })],
+              ["After", el("span", { text: "Enforced" })]],
+            note: "This blocks it: " + target + " is added to " + fileName + " (what your firewall loads) and " +
+              "marked enforced in " + trackedName + ". " + connector + " Unblock removes it again.",
+            confirmLabel: "Enforce",
+            danger: true,
+            onConfirm: () => enforceEntry(target, viewHash, ctx),
+          }), "btn-small btn-danger"));
+        }
+        cell.append(button("Unblock", () => openConfirm(wrap, {
+          title: "Remove " + target + " from the blocklist?",
+          rows: [["Target", mono(target)], ["Status", el("span", { text: STAGE_LABEL[stage] })]],
+          note: "It is removed from " + trackedName + (stage === "enforced" ? " and from " + fileName : "") +
+            ". Every live entry equal to or inside this address or network is removed.",
+          confirmLabel: "Unblock",
+          danger: true,
+          onConfirm: () => unblock(target, ctx),
+        }), "btn-small btn-danger"));
+        cells.push(cell);
+      }
+      return { cells };
+    }));
+    return [line, wrap, pager(data, hrefFor)];
+  }
+
+  async function enforceEntry(target, viewHash, ctx) {
+    try {
+      const res = obj(await apiPost(API.enforce, { target: target, view_hash: viewHash }));
+      const conn = obj(res.connector);
+      const level = conn.ok === false ? "warn" : "ok";
+      ctx.say(level, el("div", null, "Enforced " + str(res.target) + "; it is in " + str(res.file) + "."),
+        el("div", null, "Block connector: ", el("span", { cls: "mono wrap", text: str(conn.status) })));
+    } catch (err) {
+      if (err.status === 401) return;
+      if (err.status === 409) {
+        ctx.say("warn", "The entry for " + target + " changed after this page loaded, so nothing was enforced. " +
+          "The list has been reloaded; check it and decide again.");
+      } else {
+        ctx.say("bad", "Enforce " + target + " was refused: ", el("span", { cls: "mono wrap", text: err.message }));
+      }
+    }
+    await ctx.reload();
   }
 
   async function unblock(target, ctx) {
@@ -1373,7 +1520,9 @@
 
     const filterSection = el("section", "section", form);
     const results = section("Records", { flush: true });
-    main.append(pageHead("Records"), filterSection, results.node);
+    main.append(pageHead("Records"),
+      intro("Triaged sessions and campaigns: what each source did and how serious it looks. Open one for the detail."),
+      filterSection, results.node);
 
     const query = Object.assign({}, f, { page: page, per: PER_PAGE, sort: f.sort || "newest" });
     return {
@@ -1486,9 +1635,13 @@
 
     const creds = section("Credentials tried");
     creds.body.append(credentials(obj(r.credentials)));
-    const commands = section("Command sample");
     const sample = arr(r.command_sample).map(str);
-    commands.body.append(sample.length ? textBlock(sample.join("\n")) : empty("No commands recorded."));
+    // An SSH session's commands are shown with what the decoy answered to each; a campaign
+    // keeps its sample (commands from many connections, with no single sequence).
+    const replies = r.kind === "session" && r.protocol === "ssh" && data.transcript_available === true && sample.length;
+    const commands = section(replies ? "Commands and replies" : "Command sample");
+    commands.body.append(replies ? commandReplies(id) : sample.length ? textBlock(sample.join("\n")) : empty("No commands recorded."));
+    commands.body.append(el("p", null, rawActivityLink(r, id)));
     out.push(el("div", "grid-2", creds.node, commands.node));
 
     const tokens = section("Honeytokens");
@@ -1523,6 +1676,23 @@
       out.push(transcript.node);
     }
     return out;
+  }
+
+  // From a record to its raw events: a session's own view, or a campaign's source and
+  // service over its time span.
+  function rawActivityLink(r, id) {
+    if (r.kind === "session") {
+      const href = sessionHref(id);
+      return href ? link(href, "Raw activity for this session") : null;
+    }
+    const params = { win: "custom", from: str(r.first_seen).slice(0, 40), to: str(r.last_seen).slice(0, 40),
+      service: PROTOCOL_RE.test(str(r.protocol)) ? r.protocol : "" };
+    if (!parseTime(params.from) || !parseTime(params.to)) {
+      params.win = "all";
+      params.from = params.to = "";
+    }
+    if (typeof r.src_ip === "string" && ADDRESS_RE.test(r.src_ip)) params.src = r.src_ip;
+    return link(activityHref(params), "Raw activity for this source");
   }
 
   function fact(label, value) {
@@ -1641,6 +1811,490 @@
     return row;
   }
 
+  // ---- screen: activity -----------------------------------------------------------------
+
+  // Every event-log line, raw and newest first. Filters live in the hash like Records.
+  // Background polls only count newer events and offer them; rows the operator is reading
+  // never move under them.
+  function activityFilters(params) {
+    const pick = (name, allowed) => {
+      const v = params.get(name);
+      return v && allowed.includes(v) ? v : "";
+    };
+    const service = (params.get("service") || "").toLowerCase();
+    const win = params.get("win") || "";
+    return {
+      win: ["1h", "24h", "7d", "all", "custom"].includes(win) ? win : "24h",
+      from: (params.get("from") || "").trim().slice(0, 40),
+      to: (params.get("to") || "").trim().slice(0, 40),
+      service: PROTOCOL_RE.test(service) ? service : "",
+      kind: pick("kind", ACTIVITY_KINDS.map((k) => k[0])),
+      outcome: pick("outcome", ["success", "failure"]),
+      src: (params.get("src") || "").trim().slice(0, 64),
+      user: (params.get("user") || "").slice(0, 64),
+      q: (params.get("q") || "").slice(0, 200),
+    };
+  }
+
+  // "2026-11-18 09:00", "2026-11-18T09:00:00Z" or a date alone; no zone means UTC.
+  function parseUserTime(value) {
+    const t = str(value).trim().replace(" ", "T");
+    if (!USER_TIME_RE.test(t)) return null;
+    const full = t.length === 10 ? t + "T00:00" : t;
+    const d = new Date(/(Z|[+-]\d{2}:\d{2})$/.test(full) ? full : full + "Z");
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  function activityQuery(f) {
+    const q = { service: f.service, kind: f.kind, outcome: f.outcome, src: f.src, user: f.user, q: f.q };
+    if (f.win === "custom") {
+      const from = parseUserTime(f.from);
+      const to = parseUserTime(f.to);
+      if (from) q.from = from.toISOString();
+      if (to) q.to = to.toISOString();
+    } else if (f.win !== "all") {
+      q.from = new Date(Date.now() - ACTIVITY_WINDOWS[f.win]).toISOString();
+    }
+    return q;
+  }
+
+  function activityHref(params) {
+    return hashFor("/activity", params);
+  }
+
+  function sessionHref(id) {
+    return typeof id === "string" && SESSION_ID_RE.test(id) ? "#/activity/session/" + enc(id) : null;
+  }
+
+  // A source address from the log becomes a filter link only when it is plainly an address.
+  function sourceLink(src) {
+    if (typeof src !== "string" || !src) return el("span", { cls: "faint", text: "-" });
+    return ADDRESS_RE.test(src) ? link(activityHref({ src: src }), mono(src)) : mono(src);
+  }
+
+  function kindLabel(kind) {
+    return lookup(ACTIVITY_KIND_LABEL, kind, str(kind) || "-");
+  }
+
+  function outcomeBadge(outcome) {
+    if (outcome === "success") return badge("success", "st-bad");
+    if (outcome === "failure") return statusBadgeText("failure");
+    return el("span", { cls: "faint", text: "-" });
+  }
+
+  function viewActivity(route, main) {
+    setTitle("Activity");
+    const f = activityFilters(route.params);
+    const active = Boolean(f.service || f.kind || f.outcome || f.src || f.user || f.q || f.win !== "24h");
+
+    const select = (name, label, options) => {
+      const s = el("select", { attrs: { name: name } },
+        options.map(([value, text]) => el("option", { attrs: { value: value }, text: text })));
+      s.value = f[name];
+      return el("label", "field", el("span", { text: label }), s);
+    };
+    const input = (name, label, placeholder, wide) => {
+      const i = el("input", { cls: wide ? "wide" : "", attrs: { type: "text", name: name, placeholder: placeholder,
+        autocomplete: "off", spellcheck: "false" } });
+      i.value = f[name];
+      return el("label", "field", el("span", { text: label }), i);
+    };
+    // Services come from the indexed window once it has loaded; a chosen one stays listed.
+    const serviceField = select("service", "Service", [["", "Any"]].concat(f.service ? [[f.service, f.service]] : []));
+    const fromField = input("from", "From (UTC)", "2026-11-18 09:00");
+    const toField = input("to", "To (UTC)", "now");
+    const form = el("form", { cls: "filters", attrs: { role: "search", "aria-label": "Activity filters" } },
+      input("q", "Search", "what was sent or answered", true),
+      select("win", "Time", [["1h", "Last hour"], ["24h", "Last 24 hours"], ["7d", "Last 7 days"],
+        ["all", "Everything indexed"], ["custom", "Custom"]]),
+      fromField, toField, serviceField,
+      select("kind", "Event", [["", "Any"]].concat(ACTIVITY_KINDS)),
+      select("outcome", "Outcome", [["", "Any"], ["success", "Success"], ["failure", "Failure"]]),
+      input("src", "Source", "address or network"),
+      input("user", "User", "exact username"),
+      el("button", { cls: "btn btn-primary", attrs: { type: "submit" }, text: "Apply" }),
+      active ? link("#/activity", "Clear filters") : null);
+    form.elements.namedItem("q").setAttribute("data-search", "");
+    const winSelect = form.elements.namedItem("win");
+    const showCustom = () => {
+      fromField.hidden = toField.hidden = winSelect.value !== "custom";
+    };
+    showCustom();
+    winSelect.addEventListener("change", showCustom);
+    for (const name of ["win", "service", "kind", "outcome"]) {
+      form.elements.namedItem(name).addEventListener("change", () => {
+        if (name !== "win" || winSelect.value !== "custom") apply();
+      });
+    }
+    for (const name of ["from", "to"]) {
+      const i = form.elements.namedItem(name);
+      i.addEventListener("input", () => i.setCustomValidity(""));
+    }
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      apply();
+    });
+
+    function apply() {
+      const data = new FormData(form);
+      const next = {};
+      for (const key of ["q", "win", "from", "to", "service", "kind", "outcome", "src", "user"]) {
+        next[key] = String(data.get(key) || "").trim();
+      }
+      if (next.win === "24h") next.win = "";
+      if (next.win !== "custom") {
+        next.from = "";
+        next.to = "";
+      } else {
+        for (const key of ["from", "to"]) {
+          if (next[key] && !parseUserTime(next[key])) {
+            const i = form.elements.namedItem(key);
+            i.setCustomValidity("A time like 2026-11-18 09:00 (UTC).");
+            form.reportValidity();
+            return;
+          }
+        }
+      }
+      location.hash = activityHref(next);
+    }
+
+    const lead = intro("Every event in the log, raw: who tried what, on which service, " +
+      "what they sent and what the honeypot answered. Newest first; open a row for the details.");
+    const notices = el("div", { cls: "stack", attrs: { "aria-live": "polite" } });
+    const results = section("Events", { flush: true });
+    main.append(pageHead("Activity"), lead, el("section", "section", form), notices, results.node);
+
+    const ctx = { f: f, query: activityQuery(f), newest: null, logId: null, logNotice: null,
+      serviceField: serviceField, notices: notices };
+    return {
+      refresh: (kind) => kind === "poll" ? checkNewActivity(ctx)
+        : fill(results.body, () => {
+          ctx.query = activityQuery(f);
+          return apiGet(API.activity, ctx.query);
+        }, (data) => drawActivity(obj(data), ctx, active), kind !== "initial"),
+    };
+  }
+
+  async function checkNewActivity(ctx) {
+    if (ctx.newest === null) return true;
+    const gen = state.gen;
+    let data;
+    try {
+      data = obj(await apiGet(API.activity, Object.assign({}, ctx.query, { after: ctx.newest, log_id: ctx.logId })));
+    } catch (err) {
+      if (gen === state.gen && err.status === 409) {
+        logChanged(ctx);
+        return true;
+      }
+      return false;
+    }
+    if (gen !== state.gen) return true;
+    const n = typeof data.new === "number" ? data.new : 0;
+    if (n > 0) {
+      setKids(ctx.notices, notice("ok",
+        plural(n, "new event", "new events") + (data.approximate === true ? " match the filters before the search. " : ". "),
+        button("Show", manualRefresh, "btn-small")));
+    }
+    return true;
+  }
+
+  // Cursors are byte offsets into one log. When the server says the log changed (rotated,
+  // truncated, or the console restarted), the list is reloaded from the top with a notice
+  // instead of mixing rows from two logs.
+  function logChanged(ctx) {
+    ctx.logNotice = "The event log was rotated or replaced (or the console restarted), so the list was reloaded from the newest events.";
+    ctx.newest = null;
+    manualRefresh();
+  }
+
+  function fillServices(ctx, facets) {
+    const s = ctx.serviceField.querySelector("select");
+    const services = Object.keys(obj(facets.services)).filter((k) => PROTOCOL_RE.test(k)).sort();
+    const keep = s.value;
+    const names = services.includes(keep) || !keep ? services : services.concat([keep]);
+    setKids(s, el("option", { attrs: { value: "" }, text: "Any" }),
+      names.map((k) => el("option", { attrs: { value: k },
+        text: k + (typeof facets.services[k] === "number" ? " (" + num(facets.services[k]) + ")" : "") })));
+    s.value = keep;
+  }
+
+  function drawActivity(data, ctx, filtered) {
+    ctx.newest = typeof data.newest === "number" ? data.newest : null;
+    ctx.logId = typeof data.log_id === "string" ? data.log_id : null;
+    ctx.notices.replaceChildren();
+    if (ctx.logNotice) {
+      ctx.notices.append(notice("warn", ctx.logNotice));
+      ctx.logNotice = null;
+    }
+    const facets = obj(data.facets);
+    fillServices(ctx, facets);
+    const win = obj(data.window);
+    const search = data.search ? obj(data.search) : null;
+    const notes = [];
+    if (win.caught_up === false) {
+      notes.push(notice("warn", "Still reading a backlog of the log; the newest events may be missing for a minute."));
+    }
+    if (win.older_outside === true) {
+      notes.push(notice("warn", "Older lines exist outside the indexed window. It holds the newest " +
+        plural(win.entries || 0, "event", "events") + (win.oldest ? ", back to " : "."),
+      win.oldest ? timeNode(win.oldest) : null, win.oldest ? "." : null,
+      " Read older lines on the host."));
+    }
+    const items = arr(data.items).map(obj);
+    const out = [];
+    if (notes.length) out.push(el("div", "stack pad", notes));
+    if (!items.length) {
+      const why = search && search.complete === false ? null
+        : (win.entries || 0) === 0 ? "No events in the indexed window yet. They appear as the services log them."
+          : filtered ? "No events match these filters." : "No events in the last 24 hours.";
+      if (why) out.push(empty(why));
+    }
+    const tbody = el("tbody");
+    for (const it of items) addActivityRows(tbody, it);
+    // Always in the page, hidden while empty: a search whose first page ran out of its read
+    // budget has no rows yet, and "Search further back" adds them to this same table.
+    const head = el("tr", null, ["", "Time", "Source", "Service", "Event", "User", "Outcome", "Summary"].map((c) =>
+      el("th", { attrs: { scope: "col" }, text: c })));
+    head.firstChild.append(el("span", { cls: "visually-hidden", text: "Details" }));
+    const wrap = el("div", "table-wrap", el("table", { cls: "activity", attrs: { "aria-label": "Events, newest first" } },
+      el("thead", null, head), tbody));
+    wrap.hidden = !items.length;
+    out.push(wrap);
+    out.push(activityFoot(data, ctx, tbody, search, wrap));
+    return out;
+  }
+
+  // "Load older" by cursor; for a search that ran out of its byte budget, "Search further".
+  function activityFoot(data, ctx, tbody, search, wrap) {
+    const foot = el("div", { cls: "pager", attrs: { "aria-live": "polite" } });
+    const gen = state.gen;
+    let cursor = typeof data.next_before === "number" ? data.next_before : null;
+    let shown = tbody.childElementCount / 2;
+
+    function draw(s, readCut) {
+      const parts = [el("span", { text: plural(shown, "event", "events") + " shown" })];
+      if (s) {
+        parts.push(el("span", null, s.complete === true ? " - searched the whole indexed window"
+          : s.searched_back_to ? [" - searched back to ", timeNode(s.searched_back_to)] : " - search stopped at its read limit"));
+      } else if (readCut === true) {
+        parts.push(el("span", { text: " - this page stopped at the server's read limit (very long log lines); Load older continues" }));
+      }
+      parts.push(el("span", "spacer"));
+      if (cursor !== null) {
+        parts.push(button(s && s.complete === false ? "Search further back" : "Load older", more, "btn-small"));
+      }
+      setKids(foot, parts);
+    }
+
+    async function more() {
+      const b = foot.querySelector("button");
+      if (b) b.disabled = true;
+      let next;
+      try {
+        next = obj(await apiGet(API.activity, Object.assign({}, ctx.query, { before: cursor, log_id: ctx.logId })));
+      } catch (err) {
+        if (gen !== state.gen || err.status === 401) return;
+        if (err.status === 409) {
+          logChanged(ctx);
+          return;
+        }
+        setKids(foot, el("span", { cls: "state-error", text: errorMessage(err) }), el("span", "spacer"),
+          button("Retry", more, "btn-small"));
+        return;
+      }
+      if (gen !== state.gen) return;
+      const items = arr(next.items).map(obj);
+      for (const it of items) addActivityRows(tbody, it);
+      if (items.length) wrap.hidden = false;
+      shown += items.length;
+      cursor = typeof next.next_before === "number" ? next.next_before : null;
+      draw(next.search ? obj(next.search) : null, next.read_cut);
+    }
+
+    draw(search, data.read_cut);
+    return foot;
+  }
+
+  // One event: a summary row and a details row below it, built when first opened.
+  function addActivityRows(tbody, it) {
+    const toggle = el("button", { cls: "row-toggle", text: "+",
+      attrs: { type: "button", "aria-expanded": "false", "aria-label": "Show details" } });
+    const detailCell = el("td", { attrs: { colspan: "8" } });
+    const detail = el("tr", "row-detail", detailCell);
+    detail.hidden = true;
+    let built = false;
+    const flip = () => {
+      const open = detail.hidden;
+      if (open && !built) {
+        detailCell.append(eventDetail(it));
+        built = true;
+      }
+      detail.hidden = !open;
+      toggle.textContent = open ? "-" : "+";
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      toggle.setAttribute("aria-label", open ? "Hide details" : "Show details");
+    };
+    toggle.addEventListener("click", flip);
+    const row = el("tr", "nav-row",
+      el("td", null, toggle),
+      el("td", null, timeNode(it.time)),
+      el("td", null, sourceLink(it.src)),
+      el("td", null, mono(it.service)),
+      el("td", null, kindLabel(it.kind)),
+      el("td", null, clip(it.username)),
+      el("td", null, outcomeBadge(it.outcome)),
+      el("td", null, el("span", { cls: "clip clip-wide mono", text: str(it.summary) })));
+    row.addEventListener("click", (ev) => {
+      if (ev.target.closest("a, button") || String(window.getSelection())) return;
+      flip();
+    });
+    tbody.append(row, detail);
+  }
+
+  function eventDetail(it) {
+    const blocks = [];
+    if (it.unreadable === true) {
+      blocks.push(notice("warn", "This line is no longer in the event log (it was rotated or cut), so its content cannot be shown."));
+    }
+    if (typeof it.sent === "string" && it.sent) {
+      blocks.push(el("div", null, el("div", { cls: "label", text: "Sent" }), moreBlock(it.sent, it.sent_truncated, "attacker")));
+    }
+    if (typeof it.answered === "string" && it.answered) {
+      blocks.push(el("div", null, el("div", { cls: "label", text: "Answered" }), moreBlock(it.answered, it.answered_truncated)));
+    } else if (it.kind === "input" || it.kind === "request") {
+      blocks.push(el("p", { cls: "muted", text: "No reply is recorded in the log for this event." }));
+    }
+    const sid = sessionHref(it.session);
+    blocks.push(kv([
+      it.result ? ["Result", el("span", { cls: "mono wrap", text: str(it.result) })] : null,
+      it.kind === "login" && it.password !== undefined ? ["Password", el("span", { cls: "mono wrap", text: str(it.password) })] : null,
+      it.message ? ["Logged as", el("span", { cls: "wrap", text: str(it.message) })] : null,
+      ["Session", sid ? link(sid, mono(it.session)) : el("span", { cls: "faint", text: "-" })],
+      ["Source", sourceLink(it.src)],
+    ]));
+    return el("div", "stack pad", blocks);
+  }
+
+  // Long attacker text collapsed to its first lines, with "Show more".
+  function moreBlock(text, truncated, who) {
+    const full = str(text);
+    const lines = full.split("\n");
+    const long = lines.length > MORE_LINES || full.length > MORE_CHARS;
+    const short = long ? lines.slice(0, MORE_LINES).join("\n").slice(0, MORE_CHARS) : full;
+    const pre = textBlock(short, who === "attacker" ? "attacker" : "");
+    const out = el("div", "more", pre);
+    if (long) {
+      let open = false;
+      const b = button("Show more", () => {
+        open = !open;
+        pre.textContent = open ? full : short;
+        b.textContent = open ? "Show less" : "Show more";
+        b.setAttribute("aria-expanded", open ? "true" : "false");
+      }, "btn-small");
+      b.setAttribute("aria-expanded", "false");
+      out.append(b);
+    }
+    if (truncated === true) out.append(el("div", { cls: "note-faint", text: "Cut at 4,000 characters by the server." }));
+    return out;
+  }
+
+  // ---- screen: one session's activity ---------------------------------------------------
+
+  function viewActivitySession(route, main) {
+    setTitle("Session");
+    const id = route.parts[2];
+    main.append(el("p", null, link("#/activity", "Back to activity")));
+    if (!SESSION_ID_RE.test(id || "")) {
+      main.append(empty("That is not a session id."));
+      return {};
+    }
+    const body = el("div");
+    main.append(body);
+    return {
+      // Like a record, a session is reloaded only by the Refresh control.
+      refresh: (kind) => kind === "poll" ? Promise.resolve(true)
+        : fill(body, () => apiGet(API.activitySession(id)), (data) => drawActivitySession(obj(data), id),
+          kind !== "initial"),
+    };
+  }
+
+  function drawActivitySession(data, id) {
+    const events = arr(data.events).map(obj);
+    const record = recordHref(data.record_id);
+    const head = el("div", "detail-head",
+      el("h1", { text: id }),
+      el("span", { cls: "tag", text: str(data.service) }),
+      record ? link(record, "Open the triage record") : el("span", { cls: "muted", text: "No triage record for this session yet." }));
+    const facts = el("section", "section", el("div", "section-body", el("div", "facts",
+      fact("Source", sourceLink(data.src)),
+      fact("Started", timeNode(data.start)),
+      fact("Ended", timeNode(data.end)),
+      fact("Events", num(events.length)))));
+    // For SSH, logins and commands come from the transcript; connection, close and error
+    // lines only when the indexed window still holds them, and the heading says which.
+    const partial = data.from === "transcript" && data.connection_lines !== true;
+    const s = section(partial ? "Logins and commands in this session, in order" : "Everything in this session, in order");
+    const term = el("div", { cls: "terminal", attrs: { tabindex: "0", role: "log", "aria-label": "Session events" } });
+    for (const ev of events) {
+      const sent = typeof ev.sent === "string" && ev.sent;
+      const answered = typeof ev.answered === "string" && ev.answered;
+      if (sent) term.append(turnNode({ ts: ev.time, role: "input", text: ev.sent, truncated: ev.sent_truncated }));
+      if (answered) term.append(turnNode({ ts: ev.time, role: "response", text: ev.answered, truncated: ev.answered_truncated }));
+      if (!sent && !answered) {
+        // The summary of an event with nothing sent or answered is already its result.
+        term.append(turnNode({ ts: ev.time, role: "other", text: kindLabel(ev.kind) + ": " + str(ev.summary) }));
+      } else if (ev.result) {
+        term.append(turnNode({ ts: ev.time, role: "other", text: "result: " + str(ev.result) }));
+      } else if (sent && !answered && data.from === "index" && ev.kind === "input") {
+        term.append(turnNode({ ts: ev.time, role: "other", text: "no reply recorded" }));
+      }
+    }
+    append(s.body, [events.length ? term : empty("No events recorded for this session."),
+      data.events_cut === true ? el("p", { cls: "muted", text: "Only the first " + num(events.length) + " events are shown" +
+        (data.read_cut === true ? ": the view stopped at the server's read limit for one request (very long log lines)." : ".") }) : null,
+      el("p", { cls: "muted", text: data.from !== "transcript"
+        ? "Read from the event log's indexed window. Where a service logs only a status or result, that is shown; no reply is made up."
+        : partial ? "Logins and commands replayed from the SSH transcript, as on the record page. Its connection and close lines are not in the indexed window."
+          : "Logins and commands replayed from the SSH transcript, as on the record page, with the connection, close and error lines from the indexed window." })]);
+    return [head, facts, s.node];
+  }
+
+  // Under each command of an SSH session record: what the decoy answered, paired by place
+  // in the session (the server does the pairing), collapsed to its first lines.
+  function commandReplies(id) {
+    const box = el("div", { cls: "stack", attrs: { "aria-live": "polite" } }, el("div", { cls: "muted", text: "Loading replies..." }));
+    const gen = state.gen;
+    apiGet(API.replies(id)).then((data) => {
+      if (gen !== state.gen) return;
+      const items = arr(obj(data).items).map(obj);
+      if (!items.length) {
+        box.replaceChildren(empty("No commands recorded."));
+        return;
+      }
+      box.replaceChildren(el("ol", { cls: "commands", attrs: { "aria-label": "Commands and replies" } },
+        items.map((it) => el("li", "command-item",
+          el("pre", { cls: "command-text", text: str(it.command) }),
+          it.recorded === true
+            ? moreBlock(it.reply, it.truncated)
+            : el("div", { cls: "note-faint", text: replyNote(it.status) })))));
+      if (obj(data).read_cut === true) {
+        box.append(el("p", { cls: "muted", text: "This session is longer than the server reads for one request; replies past that point are not shown." }));
+      }
+    }).catch((err) => {
+      if (gen !== state.gen || err.status === 401) return;
+      box.replaceChildren(el("div", { cls: "muted", text: "Replies not available (" + err.message + ")." }));
+    });
+    return box;
+  }
+
+  // Why a command has no reply shown. The server checks each pairing: the paired input must
+  // start with the command, or it is not shown as its reply.
+  function replyNote(status) {
+    if (status === "unmatched") return "reply could not be matched to this command";
+    if (status === "not_read") return "not read (past the server's read limit for one request)";
+    return "no reply recorded";
+  }
+
   // ---- screen: digests ------------------------------------------------------------------
 
   function viewDigests(route, main) {
@@ -1649,7 +2303,9 @@
     const day = asked && DAY_RE.test(asked) ? asked : null;
     const list = section("Days", { flush: true });
     const content = el("div");
-    main.append(pageHead("Daily digests"), el("div", "split", list.node, content));
+    main.append(pageHead("Daily digests"),
+      intro("One summary per day of what the sensor saw, written by the pipeline's digest step."),
+      el("div", "split", list.node, content));
     if (asked && !day) {
       content.append(empty("That is not a day (expected YYYY-MM-DD)."));
     }
@@ -1702,94 +2358,226 @@
     setTitle("Decoy");
     const spage = pageParam(route.params, "spage");
     const body = el("div");
-    main.append(pageHead("Decoy"), body);
+    main.append(pageHead("Decoy"),
+      intro("This screen shows how the fake system is being adjusted to stay convincing to attackers. " +
+        "Nothing here needs a decision."), body);
     return {
       refresh: (kind) => fill(body, () => apiGet(API.decoy, { page: spage, per: PER_PAGE }),
         (data) => drawDecoy(obj(data), (p) => hashFor("/decoy", { spage: p })), kind !== "initial"),
     };
   }
 
+  // A heading, one sentence on what the part is and why it matters, then its content.
+  function explained(title, why, opts) {
+    const s = section(title, opts);
+    s.node.insertBefore(el("p", { cls: "section-why", text: why }), s.body);
+    return s;
+  }
+
+  // The raw value behind a plain description, for anyone who wants the exact data.
+  function rawDetails(label, value) {
+    return el("details", "raw", el("summary", { text: label }),
+      textBlock(JSON.stringify(value, null, 2)));
+  }
+
+  function plainList(items) {
+    return el("ul", "plain-list", items.map((it) => el("li", null, it)));
+  }
+
   function drawDecoy(d, hrefFor) {
     const out = [];
 
-    const overlay = section("Current overlay");
+    const overlay = explained("Current adjustments to the fake system",
+      "What the tuner has added on top of the configured scenario: the fake logins, files and names " +
+      "attackers find. Keeping these in line with what attackers look for makes the decoy look lived in.");
     if (d.overlay && typeof d.overlay === "object") {
       const o = obj(d.overlay);
-      const accounts = obj(o.accounts);
-      const accountRows = [];
-      for (const service of Object.keys(accounts)) {
-        for (const acct of arr(accounts[service]).map(obj)) {
-          accountRows.push({ cells: [mono(service), mono(acct.username), mono(acct.password)] });
-        }
-      }
-      const policies = obj(o.policies);
-      overlay.body.append(el("div", "stack",
-        kv([
-          ["Hostname", o.hostname ? mono(o.hostname) : el("span", { cls: "faint", text: "default" })],
-          ["Lures", tags(o.lures)],
-          ["SIP extensions", tags(arr(o.sip_extensions).map(fmtValue))],
-          ["Policies", Object.keys(policies).length
-            ? tags(Object.keys(policies).map((k) => k + ": " + fmtValue(policies[k]))) : el("span", { cls: "faint", text: "none" })],
-        ]),
-        el("div", null, el("div", { cls: "label", text: "Bait accounts (fake by design)" }),
-          accountRows.length ? table([{ label: "Service" }, { label: "Username" }, { label: "Password" }], accountRows, { short: true })
-            : empty("No bait accounts in the overlay."))));
+      const lines = overlayLines(o);
+      append(overlay.body, [lines.length ? plainList(lines)
+        : empty("No adjustments: the fake system is exactly the configured scenario. The tuner adds some " +
+          "when triage records show attackers trying logins, files or extensions the decoy does not have."),
+      rawDetails("Show the raw adjustments file", o)]);
     } else if (d.overlay_error) {
-      overlay.body.append(notice("bad", str(d.overlay_error)));
+      overlay.body.append(notice("bad", "The adjustments file cannot be read (" + str(d.overlay_error) + "). " +
+        "Restore an earlier one with python -m agents tune --rollback N (the undo points are listed below)."));
     } else {
-      overlay.body.append(empty("No overlay yet. The tuner writes one on its first change."));
+      overlay.body.append(empty("No adjustments yet: the fake system is exactly the configured scenario. " +
+        "The tuner writes adjustments the first time triage records give it a reason to change something."));
     }
     out.push(overlay.node);
 
-    const runs = section("Tuner runs, newest first");
+    const runs = explained("What the tuner changed and when",
+      "Each time the tuner changed the fake system, with the reason for each change and any change its " +
+      "safety checks refused. It only changes things inside fixed limits, and every change can be undone.",
+      { flush: true });
     const runItems = arr(d.tuner_runs).map(obj);
-    runs.body.append(runItems.length ? el("div", "stack", runItems.map(tunerRun)) : empty("The tuner has not run yet."));
+    append(runs.body, [runItems.length ? tunerRunTable(runItems)
+      : empty("The tuner has not changed anything yet. It runs with each pipeline pass (hourly by default) " +
+        "and makes a change only when triage records show a reason, such as an account attackers keep " +
+        "trying. It works without a model; a configured model only reorders its suggestions.")]);
+    const snaps = arr(d.history).map(obj);
+    if (snaps.length) {
+      runs.body.append(el("div", "pad", el("details", "raw",
+        el("summary", { text: "Undo points (" + num(snaps.length) + ")" }),
+        el("p", { cls: "muted" }, "Restore the fake system as it was before an undo point with ",
+          el("code", { text: "python -m agents tune --rollback N" }), "."),
+        table([{ label: "N", num: true }, { label: "When" }, { label: "What happened" }],
+          snaps.map((s) => ({ cells: [num(s.n), timeNode(s.timestamp), snapshotText(s)] })),
+          { short: true }))));
+    }
     out.push(runs.node);
 
-    const history = section("Overlay snapshots", { flush: true });
-    const snaps = arr(d.history).map(obj);
-    history.body.append(snaps.length
-      ? table([{ label: "N", num: true }, { label: "Time" }, { label: "Action" }, { label: "Changes" }],
-        snaps.map((s) => ({ cells: [num(s.n), timeNode(s.timestamp), str(s.action), tags(s.changes)] })), { short: true })
-      : empty("No snapshots yet."));
-    if (snaps.length) {
-      history.head.append(el("span", { cls: "muted", text: "Restore with " }),
-        el("code", { text: "python -m agents tune --rollback N" }));
-    }
-    out.push(history.node);
-
-    const sources = section("Per-source state", { flush: true });
+    const sources = explained("What returning attackers are shown",
+      "Sources a playbook singled out, and what the decoy keeps the same for them on every visit, so a " +
+      "returning attacker sees a consistent system (and the same planted secret).", { flush: true });
     const ss = obj(d.source_state);
     const items = arr(ss.items).map(obj);
-    sources.body.append(items.length
-      ? table([
-        { label: "Source" }, { label: "Tags" }, { label: "Tarpit ms", num: true }, { label: "Budget" },
-        { label: "Capture more" }, { label: "Plant token" }, { label: "Reasons" }, { label: "Updated" }, { label: "Expires" },
-      ], items.map((s) => ({ cells: [mono(s.key), tags(s.tags), num(s.tarpit_ms), str(s.budget_mode),
-        yesNo(s.capture_more), yesNo(s.plant_token), tags(s.reasons), timeNode(s.updated_at), timeNode(s.expires_at)] })))
-      : empty("No per-source treatment is active."));
-    append(sources.body, [pager(ss, hrefFor)]);
+    append(sources.body, [items.length
+      ? table([{ label: "Source" }, { label: "Last seen" }, { label: "Kept for them" }, { label: "Why" }, { label: "Until" }],
+        items.map((s) => ({ cells: [sourceLink(s.key),
+          s.last_seen ? timeNode(s.last_seen) : el("span", { cls: "faint", text: "no stored record" }),
+          treatment(s), s.reasons && arr(s.reasons).length ? "playbooks: " + arr(s.reasons).map(str).join(", ")
+            : el("span", { cls: "faint", text: "-" }),
+          timeNode(s.expires_at)] })))
+      : empty("No attacker has been singled out yet. A source appears here when a playbook's local step " +
+        "(slow it down, deepen or shorten replies, plant a token, tag it, log more) matches its activity."),
+    pager(ss, hrefFor)]);
     out.push(sources.node);
     return out;
   }
 
-  function tunerRun(run) {
-    const changes = arr(run.changes).map(obj);
-    const rejected = arr(run.rejected).map(str);
-    const describe = (c) => Object.keys(c).filter((k) => k !== "kind" && k !== "reason")
-      .map((k) => k + "=" + fmtValue(c[k])).join(" ");
-    return el("div", "section",
-      el("div", "section-head",
-        el("h3", null, timeNode(run.timestamp)),
-        run.snapshot !== null && run.snapshot !== undefined ? el("span", { cls: "muted", text: "snapshot " + str(run.snapshot) }) : null,
-        el("span", "spacer"),
-        run.commit ? mono(run.commit) : null,
-        el("span", { cls: "faint mono", text: str(run.file) })),
-      el("div", "section-body stack",
-        changes.length ? table([{ label: "Applied" }, { label: "Details" }, { label: "Reason" }],
-          changes.map((c) => ({ cells: [mono(c.kind), el("span", { cls: "mono wrap", text: describe(c) }), str(c.reason)] })), { short: true })
-          : el("p", { cls: "muted", text: "No changes applied." }),
-        rejected.length ? el("div", null, el("div", { cls: "label", text: "Rejected" }), textBlock(rejected.join("\n"), "bad")) : null));
+  function overlayLines(o) {
+    const lines = [];
+    if (o.hostname) lines.push(["The fake system's host name is ", mono(o.hostname), "."]);
+    const accounts = obj(o.accounts);
+    for (const service of Object.keys(accounts)) {
+      for (const acct of arr(accounts[service]).map(obj)) {
+        lines.push(["A fake ", mono(service), " login: user ", mono(acct.username), ", password ",
+          mono(acct.password), " (bait, fake by design)."]);
+      }
+    }
+    for (const lure of arr(o.lures)) lines.push(["A bait file at ", mono(lure), "."]);
+    for (const ext of arr(o.sip_extensions).map(obj)) lines.push(["A SIP phone extension ", mono(ext.extension), "."]);
+    const policies = obj(o.policies);
+    for (const service of Object.keys(policies)) {
+      const p = obj(policies[service]);
+      lines.push(["On ", mono(service), ", a login is let in after " + num(p.after_n_min) + " to " +
+        num(p.after_n_max) + " tries, as a weak real system would."]);
+    }
+    return lines;
+  }
+
+  // One tuner change in words.
+  function changeText(c) {
+    const who = (u) => "“" + str(u) + "”";
+    switch (c.kind) {
+      case "add_account": return "Added a fake " + str(c.service) + " login " + who(c.username) + ".";
+      case "remove_account": return "Removed the fake " + str(c.service) + " login " + who(c.username) + " it had added.";
+      case "set_hostname": return "Changed the host name to " + str(c.value) + ".";
+      case "add_lure": return "Added a bait file at " + str(c.value) + ".";
+      case "add_sip_extension": return "Added the SIP extension " + str(c.username) + ".";
+      case "set_after_n": return "On " + str(c.service) + ", let a login in after " + str(c.after_n_min) + " to " +
+        str(c.after_n_max) + " tries.";
+      default: return "A change of a kind this console does not know.";
+    }
+  }
+
+  // An undo point: a tuner run (its changes as the tuner summarised them, "add_account
+  // ftp:backup") or a rollback ("rollback to before 3").
+  function snapshotText(s) {
+    const action = str(s.action);
+    const back = /^rollback to before (\d+)$/.exec(action);
+    if (back) return "Rolled back to how it was before undo point " + back[1] + ".";
+    const changes = arr(s.changes).map((c) => {
+      const m = /^([a-z_]+) (.*)$/.exec(str(c));
+      if (!m) return str(c);
+      const [svc, user] = m[2].includes(":") ? m[2].split(/:(.*)/s) : ["", m[2]];
+      if (m[1] === "add_account" || m[1] === "remove_account") {
+        return changeText({ kind: m[1], service: svc, username: user });
+      }
+      if (m[1] === "set_after_n") {
+        const [service, range] = m[2].split(" ");
+        const [lo, hi] = str(range).split("-");
+        return changeText({ kind: m[1], service: service, after_n_min: lo, after_n_max: hi });
+      }
+      return changeText({ kind: m[1], value: m[2], username: m[2] });
+    });
+    return changes.length ? changes.join(" ") : action === "tune" ? "A tuner change." : action;
+  }
+
+  // "FenceError: max accounts reached" -> the reason, said as a refusal by the safety checks.
+  function rejectionText(text) {
+    const value = str(text);
+    const i = value.indexOf(": ");
+    const reason = i > 0 ? value.slice(i + 2) : value;
+    return "Refused by the safety checks: " + (reason || "no reason given") + ".";
+  }
+
+  function tunerRunTable(runs) {
+    const tbody = el("tbody");
+    for (const run of runs) {
+      const changes = arr(run.changes).map(obj);
+      const rejected = arr(run.rejected).map(str);
+      const toggle = el("button", { cls: "row-toggle", text: "+",
+        attrs: { type: "button", "aria-expanded": "false", "aria-label": "Show what changed" } });
+      const cell = el("td", { attrs: { colspan: "5" } });
+      const detail = el("tr", "row-detail", cell);
+      detail.hidden = true;
+      let built = false;
+      const flip = () => {
+        const open = detail.hidden;
+        if (open && !built) {
+          cell.append(el("div", "stack pad",
+            changes.length ? el("div", null, el("div", { cls: "label", text: "Changes" }),
+              plainList(changes.map((c) => [changeText(c), c.reason ? el("span", { cls: "muted", text: " Why: " + str(c.reason) + "." }) : null])))
+              : el("p", { cls: "muted", text: "Nothing was changed in this run." }),
+            rejected.length ? el("div", null, el("div", { cls: "label", text: "Refused" }),
+              plainList(rejected.map(rejectionText))) : null,
+            rawDetails("Show the raw run record", run)));
+          built = true;
+        }
+        detail.hidden = !open;
+        toggle.textContent = open ? "-" : "+";
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+        toggle.setAttribute("aria-label", open ? "Hide what changed" : "Show what changed");
+      };
+      toggle.addEventListener("click", flip);
+      const row = el("tr", "nav-row",
+        el("td", null, toggle),
+        el("td", null, timeNode(run.timestamp)),
+        el("td", "num", num(changes.length)),
+        el("td", "num", num(rejected.length)),
+        el("td", null, run.snapshot !== null && run.snapshot !== undefined
+          ? "undo point " + str(run.snapshot) : el("span", { cls: "faint", text: "-" })));
+      row.addEventListener("click", (ev) => {
+        if (ev.target.closest("a, button") || String(window.getSelection())) return;
+        flip();
+      });
+      tbody.append(row, detail);
+    }
+    const head = el("tr", null, ["", "When", "Changes", "Refused", "Undo with"].map((c, i) =>
+      el("th", { cls: i === 2 || i === 3 ? "num" : "", attrs: { scope: "col" }, text: c })));
+    head.firstChild.append(el("span", { cls: "visually-hidden", text: "Details" }));
+    return el("div", "table-wrap", el("table", { attrs: { "aria-label": "Tuner runs, newest first" } },
+      el("thead", null, head), tbody));
+  }
+
+  // What a returning source is shown, in words.
+  function treatment(s) {
+    const parts = [];
+    if (s.plant_token === true) parts.push("its own planted secret, the same one each visit" + untilText(s.token_until));
+    if (typeof s.tarpit_ms === "number" && s.tarpit_ms > 0) parts.push("replies slowed by " + num(s.tarpit_ms) + " ms" + untilText(s.tarpit_until));
+    if (s.budget_mode === "deep") parts.push("longer, model-written replies" + untilText(s.mode_until));
+    if (s.budget_mode === "shallow") parts.push("short canned replies, no model" + untilText(s.mode_until));
+    if (s.capture_more === true) parts.push("fuller logging of what it sends" + untilText(s.capture_until));
+    const tagList = arr(s.tags).map(str);
+    if (tagList.length) parts.push("labelled " + tagList.join(", "));
+    return parts.length ? plainList(parts) : el("span", { cls: "faint", text: "nothing special" });
+  }
+
+  function untilText(value) {
+    const d = parseTime(value);
+    return d ? " (until " + absUtc(d) + ")" : "";
   }
 
   // ---- screen: playbooks ----------------------------------------------------------------
@@ -1803,7 +2591,9 @@
     const pbBody = el("div");
     const detections = section("Detections");
     const tokens = section("Honeytokens", { flush: true });
-    main.append(pageHead("Playbooks"), pbBody, detections.node, tokens.node);
+    main.append(pageHead("Playbooks"),
+      intro("The rules that decide what happens when a record matches, with today's runs, and the " +
+        "detection drafts and honeytokens they use."), pbBody, detections.node, tokens.node);
 
     return {
       refresh: async (kind) => {

@@ -24,9 +24,9 @@ COPY playbooks ./playbooks
 
 # Volume mount points owned by the runtime user, so fresh named volumes inherit the owner.
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin winnie \
-    && mkdir -p /data /agents /overlay \
-    && chown winnie:winnie /data /agents /overlay \
-    && chmod 0750 /data /agents /overlay
+    && mkdir -p /data /agents/reports/blocklist /overlay /blocklist \
+    && chown winnie:winnie /data /agents /agents/reports /agents/reports/blocklist /overlay /blocklist \
+    && chmod 0750 /data /agents /agents/reports /agents/reports/blocklist /overlay /blocklist
 USER 10001
 
 EXPOSE 8022

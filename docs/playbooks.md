@@ -86,10 +86,10 @@ cannot change it.
 | local | `capture_more` | `hours` (default 72) | log fuller request bodies for the source, within caps |
 | notify | `notify` | `connectors` (`webhook`, `siem_http`, `email`), `include` | send a notification |
 | notify | `enrich` | | look up the source address at the configured reputation service |
-| enforce | `export_blocklist` | | add the source to the approved blocklist file |
+| enforce | `export_blocklist` | | add the source to the approved blocklist file (with [track before enforce](#track-before-enforce) on, to the tracked list only) |
 | enforce | `publish_detection` | | move matching Sigma drafts from `detections/pending/` to `detections/approved/` |
 | enforce | `open_ticket` | `priority` (`low`, `medium`, `high`) | open a ticket through the ticket connector |
-| enforce | `block_webhook` | | send the source to the block webhook |
+| enforce | `block_webhook` | | send the source to the block webhook (with [track before enforce](#track-before-enforce) on, to the tracked list only; `enforce` sends it) |
 
 How each tier runs:
 
@@ -180,8 +180,11 @@ Rules every connector follows:
   overall deadline per call, so a slow server cannot hold a call open. Responses are capped
   at 64 KB.
 - A daily call cap per connector.
-- Secrets come from environment variables named in config. URLs with embedded credentials
-  are rejected.
+- Secrets come from environment variables named in config (`secret_env`). The HTTP
+  connectors can read the token from a file instead (`secret_file`, an absolute path, read
+  at each call so a rotated token is picked up; set one or the other). The value is never
+  logged. URLs with embedded credentials are
+  rejected.
 
 Enabling `enrich` discloses attacker addresses to a third party. Only enable it for a
 service you are allowed to send that data to.
@@ -194,6 +197,7 @@ python -m agents queue --all           # include decided and expired ones
 python -m agents approve a-0123456789ab [--by alice]
 python -m agents reject  a-0123456789ab [--by alice]
 python -m agents unblock 203.0.113.7   # or a network, e.g. 2001:db8:1:2::/64
+python -m agents enforce 198.51.100.7  # track before enforce only: block a tracked entry
 ```
 
 The operator console offers the same decisions when its actions are on, through the same
@@ -223,10 +227,114 @@ The blocklist is written to `[respond] blocklist_file` (default
   the sets from your own rules, for example
   `ip saddr @winnie_block_v4 drop` in a chain of that table.
 
+## Track before enforce
+
+With `[respond] track_before_enforce = true`, a blocklist entry goes through three stages
+instead of one:
+
+1. **Track.** Approving `export_blocklist` or `block_webhook` puts the source on the
+   tracked list, blocks nothing and calls no connector. The entry is stored with status `tracked` and written to `tracked.json`, next to
+   the blocklist file. The blocklist file (`plain`, `csv` or `nftables`) lists only
+   enforced entries, so a tracked entry never reaches it. Your cloud can watch the tracked
+   list (see [operations.md](operations.md#tracked-list-and-sightings)).
+2. **Sightings.** Your environment reports where else it saw a listed address, in a
+   sightings file the operator console shows next to the entry. Sightings are display
+   only. Nothing acts on them; they help a person decide.
+3. **Enforce.** `python -m agents enforce <address>` (or Enforce on the console's blocklist
+   screen, with actions on) is a second, separate decision. It moves one tracked entry to
+   `enforced`, and only then does it reach the blocklist file and the block connector.
+
+Off (the default), approving writes the entry straight to the blocklist file, exactly as
+before, and `tracked.json` is not written.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `track_before_enforce` | false | approving `export_blocklist` or `block_webhook` tracks the source; `enforce` blocks it |
+
+`enforce` takes an address (an IPv6 address or its /64, as listed) and:
+
+- refuses an entry that is not on the list (never approved, removed or expired), or is
+  already enforced;
+- runs approval's checks again: the source was recorded as verified when it was approved
+  (and the approval file agrees while it still exists), it is a public address, it is not
+  in `never_act_on`, and the entry has not expired;
+- records `enforced_at` and `enforced_by` (`--by`, default the OS user) on the entry,
+  rewrites the blocklist file and `tracked.json`, and writes an audit record
+  `reports/response/<stamp>-enforce-<random>.json`;
+- calls the block connector (`[connector.block_webhook]`) if it is enabled, the same way the
+  `block_webhook` action does with the switch off. With the switch on, `enforce` is the only
+  thing that calls it. A failed call is reported in the result and the audit
+  record; the entry stays enforced in the file.
+
+Enforcement always needs a person. No sighting, playbook or schedule triggers it.
+
+Other rules:
+
+- Approving an address that is already enforced keeps it enforced and extends its expiry.
+  Approving one that is tracked starts a new tracked entry with a new expiry.
+- `blocklist_ttl_days` applies to both stages. `unblock` removes tracked and enforced
+  entries alike, from both files.
+- `tracked.json` is rewritten whole and atomically whenever the list changes and on every
+  respond run while the switch is on, so its `generated_at` shows it is current and a
+  removed or expired entry disappears from it.
+- `blocklist_file` may not itself be named `tracked.json`.
+- Approving `block_webhook` needs no connector while the switch is on, so the console can
+  approve it; with the switch off it still needs the block connector enabled.
+- The respond run rewrites the blocklist file (and `tracked.json` while the switch is on)
+  whenever it is missing, for example after a new volume is mounted over its directory.
+
+**Turning it on.** Entries approved before the switch carry no status and count as
+enforced. They stay in the blocklist file and appear in `tracked.json` as `enforced`.
+Nothing already blocked is unblocked.
+
+**Turning it off.** Tracked entries stay tracked and stay out of the blocklist file until
+they are enforced, unblocked or expire; `enforce` still works on them. `tracked.json` is no
+longer updated and is left as it was, so delete it (or stop exporting it) if nothing should
+read a stale copy. New approvals go straight to the blocklist file again.
+
+### Tracked list format
+
+`tracked.json` holds every live entry, tracked and enforced, sorted by address:
+
+```json
+{
+  "entries": [
+    {
+      "address": "198.51.100.7",
+      "approved_at": "2026-11-17T22:14:03+00:00",
+      "expires_at": "2026-12-17T22:14:03+00:00",
+      "status": "tracked"
+    },
+    {
+      "address": "2001:db8:4:5::/64",
+      "approved_at": "2026-11-10T08:02:41+00:00",
+      "expires_at": "2026-12-10T08:02:41+00:00",
+      "status": "enforced"
+    }
+  ],
+  "generated_at": "2026-11-18T09:00:00+00:00",
+  "sensor": "sensor-1",
+  "version": 1
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | always 1 |
+| `generated_at` | when the file was written, UTC |
+| `sensor` | `[honeypot] sensor_name`, else the host name; letters, digits, `.`, `_` and `-` only |
+| `entries[].address` | an IPv4 address, or an IPv6 /64 |
+| `entries[].status` | `tracked` or `enforced` |
+| `entries[].approved_at`, `expires_at` | when the entry was approved and when it expires |
+
+Keys are sorted. Nothing else is in the file: no approval ids, playbooks, operator names
+or secrets.
+
 ## Records and retention
 
 Every playbook run is recorded as JSON in `reports/response/` (trigger, playbook, each step
-with its tier and result; for enforce steps, who approved it and when). Per-source state
+with its tier and result; for enforce steps, who approved it and when). `unblock` and
+`enforce` write their own audit records there too. Per-source state
 changes are snapshotted under `<state dir>/source-state-snapshots/`.
 
 `[respond]` retention settings:
@@ -256,7 +364,7 @@ enabled, and enforce steps are inert until `queue_enforce = true`.
 ## CLI reference
 
 ```
-python -m agents {triage,respond,digest,tune,detect,ship,run-all,queue,approve,reject,unblock,playbooks}
+python -m agents {triage,respond,digest,tune,detect,ship,run-all,queue,approve,reject,unblock,enforce,playbooks}
 ```
 
 | Option | Meaning |
@@ -274,17 +382,19 @@ python -m agents {triage,respond,digest,tune,detect,ship,run-all,queue,approve,r
 | `--model`, `--max-llm-calls`, `--max-changes` | override `[agents]` settings |
 | `--day` | digest day, `YYYY-MM-DD` |
 | `--history`, `--rollback N`, `--git-commit` | tuner snapshots and opt-in commit |
-| `--by` | approve / reject: who decided (default: the OS user) |
+| `--by` | approve / reject / unblock / enforce: who decided (default: the OS user) |
 | `--all` | queue: include decided and expired items |
 | `--list`, `--validate` | playbooks: list or validate |
 
 `run-all` runs triage, respond, digest, tune and detect in that order, then the event
-export (`ship`) when `[connector.s3_events]` is enabled. Each stage runs even if another
-fails; failures are reported in the JSON summary on stderr and in the exit code (2).
+export (`ship`) when `[connector.s3_events]` is enabled, then the tracked export and the
+sightings fetch when `[connector.tracked_export]` and `[connector.sightings]` are enabled
+(see [operations.md](operations.md#tracked-list-and-sightings)). Each stage runs even if
+another fails; failures are reported in the JSON summary on stderr and in the exit code (2).
 `[respond] enabled = false` turns respond off, alone and in `run-all`. Every command that
 writes (`triage`, `respond`, `digest`, `tune` including `--rollback`, `detect`, `ship` and
 `run-all`) holds an exclusive lock (`agents.lock` in the state directory)
 for the whole run; a second run started while one is in progress exits at once with a
 `run_lock` error and status 2. Dry runs write nothing and take no lock. The `approve`,
-`reject`, `queue` and `unblock` commands must use the same `--state-dir` and
+`reject`, `queue`, `unblock` and `enforce` commands must use the same `--state-dir` and
 `--reports-dir` as the runs that queued the items.

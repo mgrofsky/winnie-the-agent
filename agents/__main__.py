@@ -1,5 +1,5 @@
 """CLI: python -m agents {triage,respond,digest,tune,detect,ship,run-all,queue,approve,reject,unblock,
-playbooks,ui}.
+enforce,playbooks,ui}.
 
 Directories:
 - ``--data-dir``: the front-ends' data directory (log, sensor seed). Only read here.
@@ -8,8 +8,12 @@ Directories:
   (default ``<reports-dir>/state``).
 - ``--overlay``: the tuner-owned overlay file.
 
-``ship`` sends the event log to S3 when ``[connector.s3_events]`` is enabled; ``run-all``
-runs it as its last step.
+``ship`` sends the event log to S3 when ``[connector.s3_events]`` is enabled, the tracked
+export when ``[connector.tracked_export]`` is, and fetches sightings when
+``[connector.sightings]`` is; ``run-all`` runs it as its last step.
+
+``enforce <address>`` moves one tracked blocklist entry to enforced (``[respond]
+track_before_enforce``).
 
 ``ui`` serves the operator console on loopback (``[ui]``; ``--bind``, ``--port``,
 ``--actions``, ``--by``, ``--external-host``). It reads the same directories, takes no run
@@ -90,6 +94,7 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     config file: ``WINNIE_UI_TOKEN`` or a fresh one (``serve`` logs the sign-in link)."""
     from agents.budget import BudgetConfig
     from agents.respond import RespondSettings
+    from agents.ui.activity import DEFAULT_MAX_ENTRIES, MAX_ENTRIES, MIN_ENTRIES
     from agents.ui.api import Api, ApiLimits, ApiPaths
     from agents.ui.server import UiSettings, serve
 
@@ -109,8 +114,11 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
             external_host=args.external_host if args.external_host is not None
             else str(ui_cfg.get("external_host", "")).strip())
         analyst_cap = int(agents_cfg.get("max_analyst_calls_per_day", 500))
+        activity_entries = min(MAX_ENTRIES, max(MIN_ENTRIES, int(ui_cfg.get(
+            "activity_entries", DEFAULT_MAX_ENTRIES))))
     except ValueError:
-        return {"error": "[ui] port or [agents] max_analyst_calls_per_day is not a number"}
+        return {"error": "[ui] port or activity_entries, or [agents] "
+                         "max_analyst_calls_per_day, is not a number"}
     try:
         respond_settings = runtime.respond_settings(cp)
     except ValueError as exc:
@@ -123,17 +131,28 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
         token_cap = budget.max_tokens_per_day
     except ValueError:
         pass
+    from agents.ship import sensor_label
+    from agents.sightings import ConfigError as SightingsConfigError
+    from agents.sightings import SightingsSettings
+
+    try:
+        sightings = SightingsSettings.from_config(cp)
+    except SightingsConfigError as exc:
+        log.warning("%s; the console uses the [sightings] defaults", str(exc)[:200])
+        sightings = SightingsSettings()
     api = Api(ApiPaths(reports=reports, state=state, data=data_dir, detections=detections,
                        overlay=overlay, source_state=source_state,
                        log=Path(log_path) if log_path else None, budget_state=budget_state),
               settings=respond_settings,
               limits=ApiLimits(analyst_calls_per_day=analyst_cap,
-                               frontend_tokens_per_day=token_cap),
+                               frontend_tokens_per_day=token_cap,
+                               activity_entries=activity_entries),
               # Decisions use what approve / reject / unblock use, re-read per decision so
               # a bad [respond] refuses them rather than acting on the defaults above.
               operator=operator,
               respond_settings=lambda: runtime.respond_settings(cp),
-              connectors=lambda: runtime.respond_connectors(cp, state))
+              connectors=lambda: runtime.respond_connectors(cp, state),
+              sensor=sensor_label(cp), sightings=sightings)
     try:
         serve(settings, api)
     except (ValueError, OSError) as exc:
@@ -152,9 +171,9 @@ def _run(argv=None) -> dict:
     parser = argparse.ArgumentParser(prog="python -m agents", description=__doc__)
     parser.add_argument("command", choices=["triage", "respond", "digest", "tune", "detect",
                                             "ship", "run-all", "queue", "approve", "reject", "unblock",
-                                            "playbooks", "ui"])
+                                            "enforce", "playbooks", "ui"])
     parser.add_argument("target", nargs="?", help="approval id for approve / reject; address "
-                                                  "or network for unblock")
+                                                  "or network for unblock; address for enforce")
     parser.add_argument("--log", help="honeypot JSON-lines log (default: [honeypot] log_file)")
     parser.add_argument("--config", help="path to SSH/config.ini (read only)")
     parser.add_argument("--dry-run", action="store_true", help="print what would change, write nothing")
@@ -175,7 +194,7 @@ def _run(argv=None) -> dict:
     parser.add_argument("--max-changes", type=int, default=None)
     parser.add_argument("--day", default=None, help="digest day YYYY-MM-DD (default today, UTC)")
     parser.add_argument("--by", default=None,
-                        help="approve/reject/unblock: who decided (default: OS user); ui: the "
+                        help="approve/reject/unblock/enforce: who decided (default: OS user); ui: the "
                              "operator label (default [ui] operator)")
     parser.add_argument("--bind", default=None, help="ui: address (default [ui] bind, 127.0.0.1)")
     parser.add_argument("--port", type=int, default=None, help="ui: port (default [ui] port, 8480)")
@@ -243,7 +262,12 @@ def _run(argv=None) -> dict:
         if args.validate and errors:
             results["playbooks_error"] = {"error": f"{len(errors)} invalid playbook(s)"}
         return results
-    if args.command in ("queue", "approve", "reject", "unblock"):
+    def _sensor() -> str:
+        from agents.ship import sensor_label
+
+        return sensor_label(cp)
+
+    if args.command in ("queue", "approve", "reject", "unblock", "enforce"):
         try:
             settings = _settings()
         except ValueError as exc:
@@ -266,7 +290,8 @@ def _run(argv=None) -> dict:
                     blocklist_format=settings.blocklist_format,
                     blocklist_ttl_days=settings.blocklist_ttl_days,
                     expired_suppress_hours=settings.expired_suppress_hours,
-                    never_act_on=settings.never_act_on)
+                    never_act_on=settings.never_act_on,
+                    track_before_enforce=settings.track_before_enforce, sensor=_sensor())
             else:
                 results["approval"] = reject(args.target or "", state, by=args.by,
                                              suppress_hours=settings.reject_suppress_hours,
@@ -281,9 +306,24 @@ def _run(argv=None) -> dict:
             results["unblock"] = unblock(args.target or "", state, reports,
                                          blocklist_file=settings.blocklist_file,
                                          blocklist_format=settings.blocklist_format,
-                                         ttl_days=settings.blocklist_ttl_days, by=args.by)
+                                         ttl_days=settings.blocklist_ttl_days, by=args.by,
+                                         track_before_enforce=settings.track_before_enforce,
+                                         sensor=_sensor())
         except ValueError as exc:
             results["unblock"] = {"error": f"not an address or network: {str(exc)[:100]}"}
+        return results
+    if args.command == "enforce":
+        from agents.respond import EnforceError, enforce
+
+        try:
+            results["enforce"] = enforce(
+                args.target or "", state, reports, connectors=_connectors(), by=args.by,
+                blocklist_file=settings.blocklist_file,
+                blocklist_format=settings.blocklist_format,
+                ttl_days=settings.blocklist_ttl_days, never_act_on=settings.never_act_on,
+                track_before_enforce=settings.track_before_enforce, sensor=_sensor())
+        except EnforceError as exc:
+            results["enforce"] = {"error": str(exc)[:200]}
         return results
 
     def _ship_stage(always: bool) -> None:
@@ -310,6 +350,40 @@ def _run(argv=None) -> dict:
         if args.dry_run:
             print(json.dumps(res, indent=2, default=str))
         results["ship"] = res
+
+    def _exchange_stage() -> None:
+        """Tracked export out, sightings in. Each is off unless its connector is enabled; a
+        failure is recorded and never stops the other stages."""
+        from agents import sightings, tracked
+        from agents.respond import tracked_target
+
+        try:
+            exp = tracked.ExportSettings.from_config(cp)
+            if exp.enabled:
+                try:
+                    blocklist_file = _settings().blocklist_file
+                except ValueError:
+                    blocklist_file = None
+                results["tracked_export"] = tracked.run_export(
+                    exp, tracked_target(reports, blocklist_file), state, dry_run=args.dry_run)
+        except tracked.ConfigError as exc:
+            results["tracked_export"] = {"error": f"[{tracked.SECTION}]: {exc}"}
+            log.error("%s", results["tracked_export"]["error"])
+        except Exception as exc:  # noqa: BLE001 - the export never stops the other stages
+            results["tracked_export"] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            log.error("tracked export failed: %s", results["tracked_export"]["error"])
+        try:
+            fetch = sightings.FetchSettings.from_config(cp)
+            if fetch.enabled:
+                results["sightings_fetch"] = sightings.run_fetch(
+                    fetch, sightings.SightingsSettings.from_config(cp), state,
+                    dry_run=args.dry_run)
+        except sightings.ConfigError as exc:
+            results["sightings_fetch"] = {"error": f"[{sightings.SECTION}]: {exc}"}
+            log.error("%s", results["sightings_fetch"]["error"])
+        except Exception as exc:  # noqa: BLE001 - the fetch never stops the other stages
+            results["sightings_fetch"] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            log.error("sightings fetch failed: %s", results["sightings_fetch"]["error"])
 
     def locked(fn) -> dict:
         """One writing run at a time: a second one exits with an error instead of
@@ -404,7 +478,7 @@ def _run(argv=None) -> dict:
                     reports, state, detections, source_state_path(args.source_state),
                     connectors=None if args.dry_run else _connectors(),
                     scenario_name=scenario.scenario.name if scenario is not None else None,
-                    seed=seed, dry_run=args.dry_run, settings=_settings())
+                    seed=seed, dry_run=args.dry_run, settings=_settings(), sensor=_sensor())
                 if args.dry_run:
                     print(json.dumps(res, indent=2, default=str))
                 return {"runs": len(res["runs"]), "skipped": len(res["skipped"]),
@@ -448,12 +522,14 @@ def _run(argv=None) -> dict:
                 access_expiry_days=agents_cfg.get("blocklist_access_expiry_days", 30)))
         if args.command == "run-all":
             _ship_stage(always=False)
+            _exchange_stage()
 
         return results
 
     if args.command == "ship":
         def _ship() -> dict:
             _ship_stage(always=True)
+            _exchange_stage()
             return results
 
         return _ship() if args.dry_run else locked(_ship)
