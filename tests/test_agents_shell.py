@@ -561,7 +561,7 @@ def _worst_lines():
     yield " ; ".join([cpuinfo + " | ".join(["awk '{print $0}'"] * 7)] * 8)
     yield " ; ".join([cpuinfo + "awk '{print " + ",".join(["$1"] * 300) + "}'"] * 8)
     yield " ; ".join(["nvidia-smi --query-gpu=" + ",".join(["uuid"] * 100) + " --format=csv"] * 8)
-    # the reviewer's line: eight pipelines of 20 cpuinfo files through grep
+    # eight pipelines of 20 cpuinfo files through grep
     yield " ; ".join(["cat " + " ".join(["/proc/cpuinfo"] * 20) + " | grep -v 'q.'"
                       + " | grep -v 'q.'" * 6] * 8)
 
