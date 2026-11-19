@@ -722,3 +722,24 @@ async def test_fallback_after_a_model_cd_keeps_the_models_directory():
     assert r.content == "/var/tmp\r\nroot@srv01:/var/tmp# "
     hooks.session_close("s1")
     assert "s1" not in hooks._session_prompts
+
+
+def test_wc_of_only_unreadable_files_reports_the_error():
+    reply = out("wc -l /etc/redhat-release")
+    assert reply is not None and "No such file or directory" in reply
+    assert out("wc -l /etc/redhat-release /proc/version").count("\n") == 2
+
+
+@pytest.mark.parametrize("line", ["wget 'http://['", "curl 'http://[bad]'",
+                                  "curl -s 'http://[]:99999/x'"])
+def test_malformed_download_urls_get_a_reply(line):
+    assert out(line) is not None
+
+
+def test_a_fault_inside_a_command_falls_back_instead_of_raising(monkeypatch, caplog):
+    def boom(*_a, **_k):
+        raise RuntimeError("bug")
+    monkeypatch.setattr(shell.Shell, "_pipeline", boom)
+    assert out("uname -a") is None
+    assert "canned shell failed" in caplog.text
+    assert "command not found" in hooks.fallback_reply("uname -a", False, "root")

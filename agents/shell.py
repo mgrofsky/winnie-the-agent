@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import logging
 import math
 import posixpath
 import random
@@ -32,6 +33,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from scenarios.schema import GPU_SPECS, Hardware
+
+log = logging.getLogger(__name__)
 
 MAX_LINE = 4096            # longer input is not evaluated
 MAX_WORD = 1024
@@ -568,6 +571,10 @@ class Shell:
             self.failed = None
             return None
         except _Unsupported:
+            return None
+        except Exception:  # noqa: BLE001 - a fault here must not end the attacker's session
+            log.exception("canned shell failed on a line; falling back")
+            self.failed = None
             return None
         return Answer("".join(out), status, stateless)
 
@@ -1855,6 +1862,8 @@ def _wc(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
                 "c": len(text.encode("utf-8"))}
 
     rows = [(name, counts(text)) for name, text in texts]
+    if not rows:                                    # every operand was unreadable
+        return _Result("", errors, status, stateless)
     if len(rows) > 1:
         rows.append(("total", {k: sum(r[1][k] for r in rows) for k in "lwmc"}))
     if not files and len(order) == 1:
@@ -2234,12 +2243,16 @@ def _url(args: list[str], takes_value: set[str]) -> tuple[Optional[str], bool]:
 def _target(url: str) -> tuple[str, str, int]:
     """(shown URL, host, port) without any lookup."""
     shown = url if "://" in url else "http://" + url
-    parts = urllib.parse.urlsplit(shown)
+    try:
+        parts = urllib.parse.urlsplit(shown)
+        host = parts.hostname or ""
+    except ValueError:                              # e.g. an unclosed IPv6 bracket
+        return _url_text(shown), "", 80
     try:
         port = parts.port or {"https": 443, "ftp": 21}.get(parts.scheme, 80)
     except ValueError:
         port = 80
-    return _url_text(shown), _url_text(parts.hostname or ""), port
+    return _url_text(shown), _url_text(host), port
 
 
 def _is_ip(host: str) -> bool:
