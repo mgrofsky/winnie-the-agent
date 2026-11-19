@@ -317,7 +317,7 @@ def test_export_file_is_deterministic(tmp_path):
     write_tracked(b, dict(reversed(list(entries.items()))), NOW, "s")
     assert a.read_bytes() == b.read_bytes()
     assert a.read_text().endswith("}\n")
-    assert oct(a.stat().st_mode & 0o777) == "0o640"
+    assert oct(a.stat().st_mode & 0o777) == "0o600"
     assert not list(tmp_path.glob(".*.tmp"))
 
 

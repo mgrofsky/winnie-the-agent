@@ -736,9 +736,8 @@ def write_tracked(path: Path, entries: dict, now: datetime.datetime, sensor: str
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
-    # Owner and group, not world: the exporter reads it as the same user, and an
-    # operator's own tooling can be given the group.
-    os.chmod(tmp, 0o640)
+    # Owner only: the exporter and the console read it as the same user.
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
