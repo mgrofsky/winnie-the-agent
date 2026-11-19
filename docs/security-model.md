@@ -278,6 +278,23 @@ loopback, and the bind guard is unchanged. What changes:
 - The console never reads `X-Forwarded-*`, `Forwarded` or identity headers. It cannot tell
   a proxied request from a direct one, so nothing the proxy adds can sign anyone in or
   change a check.
+- A sign-in page that hands out the token (the AWS template's optional `/go`,
+  `UiTailnetSignIn`) removes the token as a second check: whoever the access rules let
+  reach the node is signed in, and with actions on can approve blocks. The console itself
+  still trusts no header; the page simply gives every admitted visitor the token.
+- Opening tcp 443 for the VPN client opens it for every process on the host network. On
+  the AWS template that would include the exporter, the one container with the instance
+  role, which reads attacker-written data; the template therefore limits its user (uid
+  10001) with host `OUTPUT` rules to what it reached before the option (its endpoints, the
+  S3 prefix list's CIDRs, the metadata service, DNS) and nothing over the tunnel, and
+  rejects the rest. Those rules fail closed: a missing or stale prefix list stops the
+  export, it never widens the reach. They depend on the exporter running as uid 10001 and
+  on nothing else unprivileged running on the host network.
+- If the node's state is kept outside the host (the AWS template keeps it in a Parameter
+  Store SecureString so a rebuilt host is the same node), that parameter is a credential
+  for the node: anyone who can read it can join a copy of the sensor to the network, with
+  the sensor's tag and access. The instance role is the only principal the template lets
+  write it.
 - A name a public CA issues a certificate for appears in certificate transparency logs.
   Give the node a neutral name that does not say it is a sensor or a honeypot.
 - This is for a private network. A public reverse proxy or tunnel would put the sign-in

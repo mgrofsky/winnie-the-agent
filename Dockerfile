@@ -21,6 +21,10 @@ COPY agents ./agents
 COPY listeners ./listeners
 COPY scenarios ./scenarios
 COPY playbooks ./playbooks
+# The AWS bootstrap (deploy/aws/sensor.yaml) copies these out of the image onto the host:
+# the config renderer, and with the tailnet option the egress rules and the tailscaled unit.
+COPY deploy/aws/render_config.py ./deploy/aws/render_config.py
+COPY deploy/aws/host ./deploy/aws/host
 
 # Volume mount points owned by the runtime user, so fresh named volumes inherit the owner.
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin winnie \

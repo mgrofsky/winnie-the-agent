@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh the S3 prefix list the exporter may reach every 15 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+[Install]
+WantedBy=timers.target

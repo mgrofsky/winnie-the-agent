@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import configparser
 import functools
+import importlib.util
 import ipaddress
 import json
 import re
@@ -25,12 +26,38 @@ HERE = Path(__file__).resolve().parent
 SENSOR = HERE / "sensor.yaml"
 BUCKET = HERE / "events-bucket.yaml"
 
+_spec = importlib.util.spec_from_file_location("strip_comments", HERE / "strip_comments.py")
+strip_comments = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(strip_comments)
+
 SSM_MANAGED = "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 # Everything the instance role may do beyond the SSM managed policy.
 ROLE_ACTIONS = {"ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability",
                 "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "logs:CreateLogStream",
                 "logs:PutLogEvents", "s3:PutObject"}
 UNSCOPABLE = {"ecr:GetAuthorizationToken"}     # AWS offers no resource-level permission
+# TailscaleEnabled only: what the role may do with Parameter Store, and on which names. The
+# node state is the only parameter it may write.
+SSM_PARAMETER = "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/"
+TAILSCALE_STATE = SSM_PARAMETER + "tailscale-state"
+TAILSCALE_READS = {TAILSCALE_STATE, SSM_PARAMETER + "tailscale-authkey",
+                   SSM_PARAMETER + "ui-token"}
+TAILSCALE_SWITCHES = ("TailscaleEnabled", "UiTailnetSignIn", "UiActions")
+# The only egress rule to an address range: tcp 443 for tailscaled, under TailscaleOn.
+TAILSCALE_EGRESS = "InstanceEgressTailscale"
+TAILSCALE_POLICY = "InstanceTailscaleParameters"
+# EC2 refuses user data over 16 KiB (raw, before base64), and CloudFormation an inline
+# template body over 51,200 bytes (strip_comments.py writes the deploy copy).
+USER_DATA_LIMIT = 16_384
+TEMPLATE_BODY_LIMIT = strip_comments.TEMPLATE_BODY_LIMIT
+# Longest values of what the user data substitutes besides parameters: a region name (14
+# characters today, so 16 leaves room), the URL suffix (amazonaws.com.cn), the partition
+# (aws-us-gov), an IPv4 address, and the space-joined service list.
+LONGEST = {"AWS::AccountId": 12, "AWS::Region": 16, "AWS::URLSuffix": 16, "AWS::Partition": 10,
+           "ElasticIp": 15, "Services": 64}
+# The ui service's mounts with UiActions on (docker-compose.actions.yml): exactly these two
+# become read-write, nothing else changes.
+UI_ACTIONS_MOUNTS = ["agentdata:/agents", "blocklist:/agents/reports/blocklist"]
 DOCUMENTATION_ACCOUNT_IDS = {"000000000000", "123456789012"}
 UI_PORT = 8480                                 # operator console, host loopback only
 # Keys TrackedKey's pattern must refuse: each would leave EventsPrefix/ or be ambiguous.
@@ -54,7 +81,7 @@ EXPORTER_MOUNTS = {"./config-ship.ini": ("/config/config.ini", True),
 # Literal parameter defaults: project or example names, scenario names, instance types,
 # public SSM parameter paths, addresses, numbers and switches. Nothing that could name an
 # organisation.
-GENERIC_DEFAULT = re.compile(r"^(winnie[a-z0-9-]*|example[a-z0-9.-]*|events|compose-bin|"
+GENERIC_DEFAULT = re.compile(r"^(winnie[a-z0-9-]*|example[a-z0-9.-]*|events|compose-bin|console|"
                              r"tracked/tracked\.json|"
                              r"[a-z][0-9][a-z]*\.[a-z0-9]+|/aws/service/[a-z0-9/_.-]+|"
                              r"[0-9./]+|true|false|)$")
@@ -191,7 +218,9 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
                 errors.append(f"security group {name} ingress reaches the console port {UI_PORT}")
     for name, rule in resources(doc, "AWS::EC2::SecurityGroupEgress").items():
         props = rule.get("Properties") or {}
-        if "CidrIp" in props or "CidrIpv6" in props:
+        if name == TAILSCALE_EGRESS:
+            errors += check_tailscale_egress(rule)
+        elif "CidrIp" in props or "CidrIpv6" in props:
             errors.append(f"egress rule {name} goes to an address range")
     for name, rule in resources(doc, "AWS::EC2::SecurityGroupIngress").items():
         props = rule.get("Properties") or {}
@@ -203,8 +232,13 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
             errors.append(f"ingress rule {name} is not limited to InboundCidr")
         if opens_port(props, UI_PORT):
             errors.append(f"ingress rule {name} reaches the console port {UI_PORT}")
-    if (params.get("UiEnabled") or {}).get("Default") != "false":
-        errors.append("parameter UiEnabled is not off by default")
+        if mentions_tailscale(rule):
+            errors.append(f"ingress rule {name} depends on a Tailscale switch (the tailnet "
+                          "needs no inbound rule)")
+    for switch in ("UiEnabled",) + TAILSCALE_SWITCHES:
+        if (params.get(switch) or {}).get("Default") != "false":
+            errors.append(f"parameter {switch} is not off by default")
+    errors += check_tailscale_switches(doc)
     if (params.get("TrackedExport") or {}).get("Default") != "false":
         errors.append("parameter TrackedExport is not off by default")
     tracked_key = params.get("TrackedKey") or {}
@@ -232,6 +266,9 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
             errors.append(f"launch template {name} sets a key pair")
         user_data = text((data.get("UserData") or {}).get("Fn::Base64"))
         errors += [f"launch template {name}: {e}" for e in check_user_data(user_data)]
+        errors += [f"launch template {name}: {e}"
+                   for e in check_user_data_steps(doc, (data.get("UserData") or {})
+                                                  .get("Fn::Base64"))]
     for name, inst in resources(doc, "AWS::EC2::Instance").items():
         props = inst.get("Properties") or {}
         if "KeyName" in props:
@@ -241,7 +278,445 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
 
     errors += check_role(doc)
     errors += check_repository(doc)
+    if raw:
+        errors += deploy_copy_problems(raw)
     return ["sensor: " + e for e in errors]
+
+
+# ---- size limits --------------------------------------------------------------------------
+
+def deploy_copy_problems(raw: str) -> list[str]:
+    """The comment-stripped deploy copy parses to the same document and fits the inline
+    template limit."""
+    stripped = strip_comments.strip(raw)
+    errors: list[str] = []
+    try:
+        same = yaml.load(stripped, Loader=CfnLoader) == yaml.load(raw, Loader=CfnLoader)
+    except yaml.YAMLError as exc:
+        return [f"the comment-stripped copy does not parse ({str(exc)[:80]})"]
+    if not same:
+        errors.append("the comment-stripped copy is not the same document")
+    size = len(stripped.encode())
+    if size > TEMPLATE_BODY_LIMIT:
+        errors.append(f"the comment-stripped copy is {size} bytes, over the "
+                      f"{TEMPLATE_BODY_LIMIT}-byte template body limit")
+    return errors
+
+
+def _pattern_width(pattern: str) -> Optional[int]:
+    """The longest string ``pattern`` can match, or None if it has no limit."""
+    import re._parser as sre_parse              # the stdlib's regex parser (Python 3.11+)
+    width = sre_parse.parse(pattern).getwidth()[1]
+    return None if width >= sre_parse.MAXREPEAT else width
+
+
+def longest_value(param: dict) -> Optional[int]:
+    """The longest value CloudFormation accepts for ``param``, or None if unbounded."""
+    if "MaxLength" in param:
+        return int(param["MaxLength"])
+    if "AllowedValues" in param:
+        return max(len(str(v)) for v in param["AllowedValues"])
+    if param.get("Type") == "Number" and "MaxValue" in param:
+        return max(len(str(param["MaxValue"])), len(str(param.get("MinValue", ""))))
+    if isinstance(param.get("AllowedPattern"), str):
+        return _pattern_width(param["AllowedPattern"])
+    return None
+
+
+def _longest(value, doc: dict, errors: list[str]) -> str:
+    """The longest rendering of a user data value: every Fn::If takes its longer branch
+    and every ${Name} its longest allowed value."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and "Fn::If" in value:
+        options = [_longest(v, doc, errors) for v in value["Fn::If"][1:]]
+        return max(options, key=lambda s: len(s.encode()))
+    if isinstance(value, dict) and "Fn::Join" in value:
+        sep, parts = value["Fn::Join"]
+        return sep.join(_longest(p, doc, errors) for p in parts)
+    if isinstance(value, dict) and "Fn::Sub" in value:
+        sub = value["Fn::Sub"]
+        template, variables = (sub, {}) if isinstance(sub, str) else (sub[0], sub[1])
+        local = {k: _longest(v, doc, errors) for k, v in variables.items()}
+        return re.sub(r"\$\{([^}]*)\}",
+                      lambda m: _placeholder(m.group(1), local, doc, errors), template)
+    errors.append(f"user data value {json.dumps(value)[:60]} cannot be measured")
+    return ""
+
+
+def _placeholder(name: str, local: dict, doc: dict, errors: list[str]) -> str:
+    if name.startswith("!"):
+        return "${" + name[1:] + "}"
+    if name in local:
+        return local[name]
+    if name in LONGEST:
+        return "x" * LONGEST[name]
+    params = doc.get("Parameters") or {}
+    prefix = "x" * (longest_value(params.get("NamePrefix") or {}) or 0)
+    if name == "HostLogGroup":
+        return f"/{prefix}/host"
+    if name == "Repository.RepositoryUri":
+        return "x" * LONGEST["AWS::AccountId"] + ".dkr.ecr." + "x" * LONGEST["AWS::Region"] \
+            + "." + "x" * LONGEST["AWS::URLSuffix"] + "/" + prefix
+    if name not in params:
+        errors.append(f"user data substitutes {name}, which has no known longest value")
+        return ""
+    width = longest_value(params[name])
+    if width is None:
+        errors.append(f"parameter {name} is in the user data but has no length limit")
+        return ""
+    return "x" * width
+
+
+def user_data_size(doc: dict, base64_value) -> tuple[int, list[str]]:
+    """Bytes of the user data at the longest allowed values, every switch on."""
+    errors: list[str] = []
+    rendered = _longest(base64_value, doc, errors)
+    return len(rendered.encode()), errors
+
+
+# ---- Tailscale ----------------------------------------------------------------------------
+
+def mentions_tailscale(node) -> bool:
+    """Whether a resource or expression refers to a Tailscale switch or its condition."""
+    blob = json.dumps(node)
+    return any(n in blob for n in ("TailscaleOn", "ConsoleStepOn") + TAILSCALE_SWITCHES[:2])
+
+
+def check_tailscale_egress(rule: dict) -> list[str]:
+    """tailscaled's way out: tcp 443 only, and only with TailscaleEnabled."""
+    props = rule.get("Properties") or {}
+    errors: list[str] = []
+    if rule.get("Condition") != "TailscaleOn":
+        errors.append(f"egress rule {TAILSCALE_EGRESS} does not depend on TailscaleOn")
+    if str(props.get("IpProtocol")) != "tcp" or props.get("FromPort") != 443 \
+            or props.get("ToPort") != 443:
+        errors.append(f"egress rule {TAILSCALE_EGRESS} allows more than tcp 443")
+    if "CidrIpv6" in props:
+        errors.append(f"egress rule {TAILSCALE_EGRESS} also allows IPv6")
+    return errors
+
+
+def _requires(switch: str, *assertions: dict) -> dict:
+    return {"RuleCondition": {"Fn::Equals": [{"Ref": switch}, "true"]},
+            "Assertions": list(assertions)}
+
+
+def _must_be_true(param: str, why: str) -> dict:
+    return {"Assert": {"Fn::Equals": [{"Ref": param}, "true"]}, "AssertDescription": why}
+
+
+def _must_be_set(param: str) -> dict:
+    return {"Assert": {"Fn::Not": [{"Fn::Equals": [{"Ref": param}, ""]}]},
+            "AssertDescription": f"{param} is required when TailscaleEnabled is true."}
+
+
+# The rules that refuse half a setup, exactly as they must read.
+TAILSCALE_RULES = {
+    "TailscaleNeedsItsSettings": _requires(
+        "TailscaleEnabled",
+        _must_be_true("UiEnabled", "TailscaleEnabled=true needs UiEnabled=true (it serves the "
+                                   "console)."),
+        _must_be_set("TailscaleImageTag"), _must_be_set("TailscaleHostname"),
+        _must_be_set("TailnetSuffix")),
+    "UiSignInNeedsTailscale": _requires(
+        "UiTailnetSignIn",
+        _must_be_true("TailscaleEnabled", "UiTailnetSignIn=true needs TailscaleEnabled=true (it "
+                                          "is a tailnet page).")),
+    "UiActionsNeedUi": _requires(
+        "UiActions", _must_be_true("UiEnabled", "UiActions=true needs UiEnabled=true.")),
+}
+# The one resource of its kind allowed to exist only with a switch: the EC2 API endpoint the
+# host firewall uses to read the S3 prefix list.
+EC2_ENDPOINT = "Ec2Endpoint"
+PREFIX_LIST_ARN = "arn:${AWS::Partition}:ec2:${AWS::Region}:aws:prefix-list/${S3PrefixListId}"
+EC2_ENDPOINT_POLICY = {"Version": "2012-10-17", "Statement": [
+    {"Sid": "S3PrefixListOnly", "Effect": "Allow", "Principal": "*",
+     "Action": "ec2:GetManagedPrefixListEntries", "Resource": {"Fn::Sub": PREFIX_LIST_ARN}}]}
+
+
+def check_ec2_endpoint(res: dict) -> list[str]:
+    props = res.get("Properties") or {}
+    errors: list[str] = []
+    if res.get("Condition") != "TailscaleOn":
+        errors.append(f"endpoint {EC2_ENDPOINT} exists without TailscaleOn")
+    if props.get("ServiceName") != {"Fn::Sub": "com.amazonaws.${AWS::Region}.ec2"}:
+        errors.append(f"endpoint {EC2_ENDPOINT} is not the EC2 API endpoint")
+    if props.get("PolicyDocument") != EC2_ENDPOINT_POLICY:
+        errors.append(f"endpoint {EC2_ENDPOINT} policy allows more than reading the S3 "
+                      "prefix list")
+    if props.get("SecurityGroupIds") != [{"Ref": "EndpointSecurityGroup"}]:
+        errors.append(f"endpoint {EC2_ENDPOINT} is not behind the endpoint security group")
+    return errors
+
+
+def check_tailscale_switches(doc: dict) -> list[str]:
+    """Each Tailscale switch has its condition and the rules that refuse half a setup."""
+    errors: list[str] = []
+    conditions = doc.get("Conditions") or {}
+    for cond, param in (("TailscaleOn", "TailscaleEnabled"), ("UiActionsOn", "UiActions")):
+        if conditions.get(cond) != {"Fn::Equals": [{"Ref": param}, "true"]}:
+            errors.append(f"condition {cond} is not {param} = true")
+    if conditions.get("ConsoleStepOn") != {"Fn::Or": [{"Condition": "TailscaleOn"},
+                                                      {"Condition": "UiActionsOn"}]}:
+        errors.append("condition ConsoleStepOn is not TailscaleOn or UiActionsOn")
+    rules = doc.get("Rules") or {}
+    for name, want in TAILSCALE_RULES.items():
+        if rules.get(name) != want:
+            errors.append(f"rule {name} is missing or not exactly as required")
+    for name, res in (doc.get("Resources") or {}).items():
+        if name == EC2_ENDPOINT:
+            errors += check_ec2_endpoint(res)
+            continue
+        if res.get("Type") in ("AWS::EC2::SecurityGroupIngress", "AWS::EC2::SecurityGroup",
+                               "AWS::EC2::EIP", "AWS::EC2::VPCEndpoint"):
+            if res.get("Condition") in ("TailscaleOn", "ConsoleStepOn", "UiActionsOn"):
+                errors.append(f"{res['Type']} {name} exists only with a console or tailnet switch")
+    if EC2_ENDPOINT not in (doc.get("Resources") or {}):
+        errors.append(f"no {EC2_ENDPOINT}: the host cannot read the S3 prefix list")
+    return errors
+
+
+# The node step's join: one up() with these flags exactly. Later flags win, so its callers
+# may add only a timeout and the join key file, and nothing else in the step may run
+# "tailscale up" or "tailscale set".
+UP_LINE = ('up() { timeout 200 $T up --reset --hostname=${TailscaleHostname} --ssh=false '
+           '--accept-routes=false --accept-dns=false --netfilter-mode=off --advertise-routes= '
+           '--advertise-exit-node=false --exit-node= "$@"; }')
+UP_EXTRA = re.compile(r"^(--timeout=\d+s|--auth-key=file:\$K)$")
+NODE_LINES = {
+    "the join flags are not exactly the required ones": UP_LINE,
+    "tailscale serve does not proxy to the loopback console":
+        "timeout 120 $T serve --bg --https=443 http://127.0.0.1:8480",
+    "a rerun does not replace tailscale by rename": "mv -f $T.new $T",
+    "a rerun does not replace tailscaled by rename": "mv -f $D.new $D",
+    "a rerun does not restart tailscaled": "systemctl restart tailscaled.service",
+    "the node's name is not compared with the expected one":
+        '[ "$n" = ${TailscaleHostname}.${TailnetSuffix}. ] || { echo "tailscale: joined as $n, '
+        'not ${TailscaleHostname}.${TailnetSuffix} (remove the old device); the console would '
+        'refuse that name" >&2; exit 1; }',
+}
+NAME_LOOKUP = ("n=$($T status --json | python3 -c 'import json,sys; "
+               "print(json.load(sys.stdin)[\"Self\"][\"DNSName\"])')")
+
+
+def check_node_step(node: str) -> list[str]:
+    lines = node.splitlines()
+    errors = [msg for msg, line in NODE_LINES.items() if lines.count(line) != 1]
+    serve = NODE_LINES["tailscale serve does not proxy to the loopback console"]
+    if NAME_LOOKUP not in lines:
+        errors.append("the node's name is not read from tailscale status")
+    elif UP_LINE in lines and serve in lines and not (
+            lines.index(UP_LINE) < lines.index(NAME_LOOKUP) < lines.index(serve)):
+        errors.append("the node's name is not checked between the join and serve")
+    if node.count("$T up") != 1 or node.count("tailscale up") or re.search(
+            r"(\$T|tailscale) set\b", node):
+        errors.append("the node step runs tailscale up or set outside up()")
+    for line in lines:
+        if line == UP_LINE:
+            continue
+        for m in re.finditer(r"(?:^|\|\||&&|;|then|do)\s*up\b([^|;&]*)", line):
+            extra = [a for a in m.group(1).split() if not UP_EXTRA.match(a)]
+            if extra:
+                errors.append(f"up() is called with {' '.join(extra)[:60]}")
+    for pattern, what in ((r"--advertise-routes=\S", "advertises routes"),
+                          (r"--exit-node=\S", "uses an exit node"),
+                          (r"funnel", "uses funnel"), (r"--auth-key=(?!file:\$K)", "passes a "
+                          "join key other than the file")):
+        if re.search(pattern, node, re.I):
+            errors.append(f"the node step {what}")
+    return errors
+
+
+# The host files the image carries for the tailnet option (deploy/aws/host), copied out by
+# the bootstrap. The Dockerfile must put them at /app/deploy/aws/host.
+HOST_DIR = HERE / "host"
+HOST_IN_IMAGE = "COPY deploy/aws/host ./deploy/aws/host"
+# The exporter's limits once tcp 443 is open to anywhere (host/sensor-egress.sh): these
+# lines, in this order, and no other iptables line.
+EGRESS_RULES = [
+    'w="iptables -w"',
+    'u="-m owner --uid-owner 10001"',
+    "$w -C OUTPUT $u -j REJECT 2>/dev/null || $w -I OUTPUT 1 $u -j REJECT",
+    "$w -N SENSOR-UID 2>/dev/null || $w -F SENSOR-UID",
+    "$w -C OUTPUT $u -j SENSOR-UID 2>/dev/null || $w -I OUTPUT 1 $u -j SENSOR-UID",
+    "$w -A SENSOR-UID -o tailscale0 -j REJECT",
+    "$w -A SENSOR-UID -o lo -d 127.0.0.53 -p udp --dport 53 -j ACCEPT",
+    "$w -A SENSOR-UID -o lo -d 127.0.0.53 -p tcp --dport 53 -j ACCEPT",
+    "$w -A SENSOR-UID -d 169.254.169.254 -p tcp --dport 80 -j ACCEPT",
+    "$w -A SENSOR-UID -d 169.254.169.253 -p udp --dport 53 -j ACCEPT",
+    '$w -A SENSOR-UID -d "$VPC_CIDR" -p udp --dport 53 -j ACCEPT',
+    '$w -A SENSOR-UID -d "$VPC_CIDR" -p tcp --dport 443 -j ACCEPT',
+    'for c in $(cat "$C" 2>/dev/null || :); do if good "$c"; then $w -A SENSOR-UID '
+    '-d "$c" -p tcp --dport 443 -j ACCEPT; fi; done',
+    "ip6tables -w -C OUTPUT $u -j REJECT 2>/dev/null || ip6tables -w -I OUTPUT 1 $u -j REJECT",
+]
+EGRESS_IP4 = 'ip4="^[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}$"'
+EGRESS_GOOD = 'good() { [[ $1 =~ $ip4 ]] && [ "${1#*/}" -ge 8 ] && [ "${1#*/}" -le 32 ]; }'
+# The step that installs it: its settings, the hooks into the boot-time firewall (including
+# the DOCKER-USER drop of tailnet traffic) and the first run, none of them allowed to fail.
+EGRESS_STEP_LINES = [
+    "printf 'REGION=%s\\nPREFIX_LIST=%s\\nVPC_CIDR=%s\\n' ${AWS::Region} ${S3PrefixListId} "
+    "${VpcCidr} > /etc/sensor-egress.env",
+    "H=/app/deploy/aws/host",
+    'docker run --rm --network none --entrypoint cat "$IMAGE" $H/sensor-egress.sh | install '
+    "-m 0700 /dev/stdin /usr/local/sbin/sensor-egress.sh",
+    "for u in sensor-egress.service sensor-egress.timer; do docker run --rm --network none "
+    '--entrypoint cat "$IMAGE" $H/$u > /etc/systemd/system/$u; done',
+    "F=/usr/local/sbin/sensor-firewall.sh",
+    "grep -q tailscale0 $F || echo 'add -i tailscale0 -j DROP' >> $F",
+    "grep -q sensor-egress $F || echo /usr/local/sbin/sensor-egress.sh >> $F",
+    "/usr/local/sbin/sensor-egress.sh refresh",
+    "$F",
+    "systemctl daemon-reload",
+    "systemctl enable --now sensor-egress.timer",
+]
+EGRESS_UNITS = {
+    "sensor-egress.service": ["Type=oneshot", "ExecStart=/usr/local/sbin/sensor-egress.sh refresh"],
+    "sensor-egress.timer": ["OnBootSec=2min", "OnUnitActiveSec=15min", "WantedBy=timers.target"],
+}
+# The node's unit (host/tailscaled.service) and what the node step writes for it.
+TAILSCALED_LINES = [
+    "EnvironmentFile=/etc/sensor-tailscale.env",
+    "ExecStart=/usr/local/sbin/tailscaled --statedir=/var/lib/tailscale --state=${TS_STATE}",
+    "NoNewPrivileges=yes", "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE",
+    "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "ProtectKernelModules=yes",
+    "RestrictSUIDSGID=yes", "MemoryDenyWriteExecute=yes", "DevicePolicy=closed",
+    "DeviceAllow=/dev/net/tun rw", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+]
+NODE_STEP_LINES = [
+    "printf 'TS_STATE=arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/"
+    "${NamePrefix}/tailscale-state\\n' > /etc/sensor-tailscale.env",
+    'docker run --rm --network none --entrypoint cat "$IMAGE" /app/deploy/aws/host/'
+    "tailscaled.service > /etc/systemd/system/tailscaled.service && "
+    '/usr/local/sbin/sensor-tailscale.sh || echo "tailscale: FAILED ($?)"',
+]
+
+
+def check_host_files(egress: Optional[str] = None, units: Optional[dict] = None,
+                     tailscaled: Optional[str] = None, dockerfile: Optional[str] = None) -> list[str]:
+    """The files under deploy/aws/host that the image carries for the tailnet option."""
+    egress = (HOST_DIR / "sensor-egress.sh").read_text(encoding="utf-8") if egress is None \
+        else egress
+    units = units if units is not None else {
+        n: (HOST_DIR / n).read_text(encoding="utf-8") for n in EGRESS_UNITS}
+    tailscaled = (HOST_DIR / "tailscaled.service").read_text(encoding="utf-8") \
+        if tailscaled is None else tailscaled
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8") if dockerfile is None else dockerfile
+    errors: list[str] = []
+    if HOST_IN_IMAGE not in dockerfile.splitlines():
+        errors.append("the Dockerfile does not put deploy/aws/host at /app/deploy/aws/host")
+    script = egress.splitlines()
+    positions = [script.index(r) if r in script else -1 for r in EGRESS_RULES]
+    if -1 in positions:
+        errors.append(f"the exporter's egress rules lack: {EGRESS_RULES[positions.index(-1)][:70]}")
+    elif positions != sorted(positions):
+        errors.append("the exporter's egress rules are out of order")
+    for line in script:
+        if not line.lstrip().startswith("#") and re.search(r"iptables|SENSOR-UID|OUTPUT", line) \
+                and line not in EGRESS_RULES:
+            errors.append(f"the egress script has an extra rule: {line[:70]}")
+    if EGRESS_IP4 not in script or EGRESS_GOOD not in script:
+        errors.append("the egress script does not validate CIDRs")
+    if "set -euo pipefail" not in script:
+        errors.append("the egress script does not stop on errors")
+    for name, needed in EGRESS_UNITS.items():
+        lines = units.get(name, "").splitlines()
+        if any(n not in lines for n in needed):
+            errors.append(f"{name} does not refresh the prefix list as required")
+    lines = tailscaled.splitlines()
+    for needed in TAILSCALED_LINES:
+        if needed not in lines:
+            errors.append(f"tailscaled.service lacks {needed}")
+    if sum(1 for line in lines if line.startswith("ExecStart=")) != 1:
+        errors.append("tailscaled.service has more than one ExecStart")
+    return errors
+
+
+def check_egress_step(step: str) -> list[str]:
+    lines = step.splitlines()
+    errors = [f"the egress step lacks the line: {line[:70]}" for line in EGRESS_STEP_LINES
+              if lines.count(line) != 1]
+    if [line for line in lines if line.strip()] != EGRESS_STEP_LINES:
+        errors.append("the egress step runs something other than its required lines")
+    return errors
+
+
+def _overlay(script: str, name: str):
+    m = re.search(r"printf '(services:.*?)' > " + re.escape(name), script)
+    if not m:
+        return None
+    try:
+        return yaml.safe_load(m.group(1).encode().decode("unicode_escape"))
+    except yaml.YAMLError:
+        return None
+
+
+# The console step's compose overlays, exactly: the token file for the ui service, and with
+# UiActions its two read-write mounts.
+TAILNET_OVERLAY = {"services": {"ui": {"env_file": ["./ui-token.env"]}}}
+ACTIONS_OVERLAY = {"services": {"ui": {"volumes": UI_ACTIONS_MOUNTS}}}
+
+
+def check_console_step(console: str) -> list[str]:
+    errors: list[str] = []
+    if _overlay(console, "docker-compose.tailnet.yml") != TAILNET_OVERLAY:
+        errors.append("the tailnet overlay is not exactly the token file for the ui service")
+    if _overlay(console, "docker-compose.actions.yml") != ACTIONS_OVERLAY:
+        errors.append("the actions overlay changes more than the agent data and blocklist "
+                      "mounts")
+    added = re.findall(r"^f=\$f:(\S+)$", console, re.M)
+    if added != ["docker-compose.tailnet.yml", "docker-compose.actions.yml"] or \
+            "f=docker-compose.yml:docker-compose.override.yml" not in console.splitlines():
+        errors.append("COMPOSE_FILE lists files other than the base, override and the two "
+                      "overlays")
+    lines = console.splitlines()
+    rewrite = ["sed -i '/^COMPOSE_FILE=/d' .env", 'echo "COMPOSE_FILE=$f" >> .env']
+    if not all(r in lines for r in rewrite) or lines.index(rewrite[0]) + 1 != lines.index(
+            rewrite[1]):
+        errors.append("a rerun appends another COMPOSE_FILE line instead of rewriting it")
+    return errors
+
+
+def _step_body(variables: dict, step: str) -> str:
+    return text((variables.get(step) or {}).get("Fn::If", [None, ""])[1])
+
+
+def check_user_data_steps(doc: dict, base64_value) -> list[str]:
+    """The optional bootstrap steps: off they render to nothing, on they keep the lines
+    above, and the whole script fits EC2's limit with every switch on."""
+    errors: list[str] = []
+    sub = (base64_value or {}).get("Fn::Sub") if isinstance(base64_value, dict) else None
+    if not isinstance(sub, list) or len(sub) != 2:
+        return ["the user data is not a !Sub with variables"]
+    variables = sub[1]
+    steps = {"EgressStep": "TailscaleOn", "ConsoleStep": "ConsoleStepOn",
+             "TailscaleNodeStep": "TailscaleOn"}
+    for step, cond in steps.items():
+        value = variables.get(step)
+        if not (isinstance(value, dict) and "Fn::If" in value
+                and value["Fn::If"][0] == cond and value["Fn::If"][2] == ""):
+            errors.append(f"step {step} is not empty unless {cond}")
+    lines = sub[0].splitlines()
+    if "${EgressStep}${ConsoleStep}cat > /etc/systemd/system/sensor.service <<'EOF'" not in lines:
+        errors.append("the egress and console steps do not run right before the stack is "
+                      "started")
+    if '${TailscaleNodeStep}echo "bootstrap complete"' not in lines:
+        errors.append("the node step does not run after the stack is up")
+    errors += check_egress_step(_step_body(variables, "EgressStep"))
+    node = _step_body(variables, "TailscaleNodeStep")
+    errors += check_node_step(node)
+    tail = node.split("\nEOF\n", 1)[-1].splitlines()
+    if [line for line in tail if line.strip()] != NODE_STEP_LINES:
+        errors.append("the node step does not write the state ARN and the unit exactly as "
+                      "required")
+    errors += check_console_step(_step_body(variables, "ConsoleStep"))
+    size, problems = user_data_size(doc, base64_value)
+    errors += problems
+    if size > USER_DATA_LIMIT:
+        errors.append(f"the user data is {size} bytes at the longest allowed values, over "
+                      f"EC2's {USER_DATA_LIMIT}")
+    return errors
 
 
 USER_DATA_FACTS = {
@@ -253,15 +728,28 @@ USER_DATA_FACTS = {
         "add -s 172.30.0.0/24 -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP",
     "the agents network can open connections":
         "add -s 172.30.1.0/24 -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP",
+    "the firewall script is not what the boot-time unit runs":
+        "ExecStart=/usr/local/sbin/sensor-firewall.sh",
     "the Compose plugin is not taken from the repository": "docker cp \"$cid:/docker-compose\"",
     "the exporter does not get its own config": "./config-ship.ini:/config/config.ini:ro",
-    "passwords are not hashed in the export": '"passwords": "hash"',
     "the tracked key is not under the events prefix": "${EventsPrefix}/${TrackedKey}",
+}
+# The bootstrap copies render_config.py out of the image built from this repository; the
+# Dockerfile must put it there, and the host runs it with Amazon Linux 2023's Python 3.9.
+RENDER_SCRIPT = HERE / "render_config.py"
+DOCKERFILE = HERE.parents[1] / "Dockerfile"
+RENDER_COPY = ('docker run --rm --network none --entrypoint cat "$IMAGE" '
+               '/app/deploy/aws/render_config.py > render_config.py')
+RENDER_IN_IMAGE = "COPY deploy/aws/render_config.py ./deploy/aws/render_config.py"
+HOST_PYTHON = (3, 9)
+RENDER_FACTS = {
+    "passwords are not hashed in the export": '"passwords": "hash"',
     "the tracked export is not read from the blocklist mount": '"file": "/blocklist/tracked.json"',
 }
 
 
-def check_user_data(user_data: str) -> list[str]:
+def check_user_data(user_data: str, render_script: Optional[str] = None,
+                    dockerfile: Optional[str] = None) -> list[str]:
     errors = [msg for msg, needle in USER_DATA_FACTS.items() if needle not in user_data]
     ships = re.findall(r"python -m agents ship[^\"\]]*", user_data)
     if not ships:
@@ -274,20 +762,35 @@ def check_user_data(user_data: str) -> list[str]:
     errors += check_ui(compose)
     if compose is not None:
         errors += check_exporter(compose) + check_blocklist(compose) + check_configs(compose)
-    errors += check_render(user_data)
+    errors += check_render(user_data, render_script, dockerfile)
+    errors += check_host_files(dockerfile=dockerfile)
     return errors
 
 
-def check_render(user_data: str) -> list[str]:
-    """The bootstrap's render_config.py, run on the repository's config template: the
-    tracked export is on only when shipping and TrackedExport both are, and the agents'
+def check_render(user_data: str, script: Optional[str] = None,
+                 dockerfile: Optional[str] = None) -> list[str]:
+    """render_config.py as the image carries it, run on the repository's config template:
+    the tracked export is on only when shipping and TrackedExport both are, and the agents'
     config.ini keeps every transport off (only config-ship.ini, the exporter's, ships)."""
-    m = re.search(r"^cat > render_config\.py <<'PY'\n(.*?)\nPY$", user_data, re.S | re.M)
-    if not m:
-        return ["the bootstrap does not write render_config.py"]
+    script = RENDER_SCRIPT.read_text(encoding="utf-8") if script is None else script
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8") if dockerfile is None else dockerfile
     errors: list[str] = []
+    if RENDER_COPY not in user_data.splitlines():
+        errors.append("the bootstrap does not copy render_config.py out of the image")
+    docker_lines = dockerfile.splitlines()
+    if RENDER_IN_IMAGE not in docker_lines or "WORKDIR /app" not in docker_lines:
+        errors.append("the Dockerfile does not put render_config.py at "
+                      "/app/deploy/aws/render_config.py")
+    try:
+        import ast
+        ast.parse(script, feature_version=HOST_PYTHON)
+    except SyntaxError:
+        errors.append("render_config.py does not parse as Python 3.9 (the host's python3)")
+    errors += [msg for msg, needle in RENDER_FACTS.items() if needle not in script]
     calls = dict(re.findall(r'^python3 render_config\.py config\.ini\.TEMPLATE (\S+) \$ARGS '
-                            r'"\$\{NeverActOn\}" (\S+)$', user_data, re.M))
+                            r'"\$NEVER" (\S+)$', user_data, re.M))
+    if not re.search(r'^NEVER="\$\{NeverActOn\}"$', user_data, re.M):
+        errors.append("render_config.py does not get NeverActOn")
     if calls != RENDER_CALLS:
         errors.append("the configs are not rendered as config.ini without shipping and "
                       "config-ship.ini with it")
@@ -297,7 +800,7 @@ def check_render(user_data: str) -> list[str]:
         errors.append("render_config.py does not get TrackedExport as its tracked switch")
     for ship in ("true", "false"):
         for tracked in ("true", "false"):
-            got = _render(m.group(1), ship, tracked)
+            got = _render(script, ship, tracked)
             if got is None:
                 errors.append(f"render_config.py fails with shipping {ship} and "
                               f"TrackedExport {tracked}")
@@ -463,24 +966,57 @@ def check_role(doc: dict) -> list[str]:
         errors.append(f"instance role {name} managed policies are not exactly "
                       "AmazonSSMManagedInstanceCore")
     for policy in as_list(props.get("Policies") or []):
-        for st in as_list(policy["PolicyDocument"]["Statement"]):
-            if st.get("Effect") != "Allow" or "NotAction" in st or "NotResource" in st:
-                errors.append(f"instance role {name} has a statement that is not a plain Allow")
-                continue
-            actions = as_list(st.get("Action"))
-            res = [text(r) for r in as_list(st.get("Resource"))]
-            for action in actions:
-                if "*" in action:
-                    errors.append(f"instance role {name} has a wildcard action {action}")
-                elif action not in ROLE_ACTIONS:
-                    errors.append(f"instance role {name} allows {action}")
-                if action.startswith("s3:") and (action != "s3:PutObject" or any(
-                        not r.endswith("/${EventsPrefix}/*") for r in res)):
-                    errors.append(f"instance role {name} allows {action} outside the events prefix")
-            if "*" in res and not set(actions) <= UNSCOPABLE:
-                errors.append(f"instance role {name} uses Resource * for {', '.join(actions)}")
-            if any(r != "*" and r.endswith(":*:*") for r in res):
-                errors.append(f"instance role {name} has a wildcard resource")
+        errors += _check_statements(name, as_list(policy["PolicyDocument"]["Statement"]))
+    # A role can be named in many forms (Ref, a Sub of its name, a literal), so every
+    # separate policy resource is suspect: only the one tailnet policy may exist.
+    for kind in ("AWS::IAM::ManagedPolicy", "AWS::IAM::Policy"):
+        for pname in resources(doc, kind):
+            errors.append(f"{kind} {pname} exists; the instance role's permissions must be "
+                          "its own inline policy and InstanceTailscaleParameters only")
+    for pname, policy in resources(doc, "AWS::IAM::RolePolicy").items():
+        pprops = policy.get("Properties") or {}
+        if pname != TAILSCALE_POLICY or pprops.get("RoleName") != {"Ref": name}:
+            errors.append(f"role policy {pname} is not {TAILSCALE_POLICY} on the instance role")
+            continue
+        if policy.get("Condition") != "TailscaleOn":
+            errors.append(f"role policy {pname} applies without TailscaleOn")
+        errors += _check_statements(name, as_list(pprops["PolicyDocument"]["Statement"]),
+                                    tailscale=True)
+    return errors
+
+
+def _check_statements(name: str, statements: list, tailscale: bool = False) -> list[str]:
+    errors: list[str] = []
+    allowed = ROLE_ACTIONS | ({"ssm:GetParameter", "ssm:PutParameter",
+                               "ec2:GetManagedPrefixListEntries"} if tailscale else set())
+    for st in statements:
+        if st.get("Effect") != "Allow" or "NotAction" in st or "NotResource" in st:
+            errors.append(f"instance role {name} has a statement that is not a plain Allow")
+            continue
+        actions = as_list(st.get("Action"))
+        res = [text(r) for r in as_list(st.get("Resource"))]
+        for action in actions:
+            if "*" in action:
+                errors.append(f"instance role {name} has a wildcard action {action}")
+            elif action not in allowed:
+                errors.append(f"instance role {name} allows {action}")
+            if action == "ssm:PutParameter" and res != [TAILSCALE_STATE]:
+                errors.append(f"instance role {name} may write a parameter other than "
+                              "the Tailscale node state")
+            if action == "ec2:GetManagedPrefixListEntries" and res != [PREFIX_LIST_ARN]:
+                errors.append(f"instance role {name} reads a prefix list other than S3's")
+            if action == "ssm:GetParameter" and not set(res) <= TAILSCALE_READS:
+                errors.append(f"instance role {name} reads a parameter other than the "
+                              "Tailscale state, join key and console token")
+            if action.startswith("s3:") and (action != "s3:PutObject" or any(
+                    not r.endswith("/${EventsPrefix}/*") for r in res)):
+                errors.append(f"instance role {name} allows {action} outside the events prefix")
+        if "*" in res and not set(actions) <= UNSCOPABLE:
+            errors.append(f"instance role {name} uses Resource * for {', '.join(actions)}")
+        if any(r != "*" and r.endswith(":*:*") for r in res):
+            errors.append(f"instance role {name} has a wildcard resource")
+        if any(r.startswith("arn:${AWS::Partition}:ssm:") and "*" in r for r in res):
+            errors.append(f"instance role {name} has a wildcard parameter")
     return errors
 
 

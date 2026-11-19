@@ -773,8 +773,11 @@ on `127.0.0.1`).
 
 To open the console from another machine without logging in to the host, put an HTTPS
 reverse proxy on the same host, in front of the loopback port, and reach it over a private
-mesh VPN. The console keeps listening on 127.0.0.1; it only accepts one more name. With
-Tailscale, for example:
+mesh VPN. The console keeps listening on 127.0.0.1; it only accepts one more name. On AWS,
+the example template sets all of this up with `TailscaleEnabled=true`, following the rules
+in [Joining the sensor to the VPN](#joining-the-sensor-to-the-vpn); see
+[Console over a tailnet](../deploy/aws/README.md#console-over-a-tailnet-optional). By
+hand, with Tailscale for example:
 
 ```bash
 tailscale serve --bg --https=443 http://127.0.0.1:8480
@@ -813,7 +816,9 @@ headers the proxy adds; it trusts only the token.
 #### Joining the sensor to the VPN
 
 The sensor is a host attackers are invited to probe. Join it so that, if it is ever taken
-over, it reaches nothing on the private network. With Tailscale:
+over, it reaches nothing on the private network. With Tailscale (the AWS template's
+`TailscaleEnabled` option does each of these for you, except the tag check and the access
+rules, which live in the tailnet's admin console):
 
 - **Join with a tagged auth key, and check the tag after joining.** An auth key without a
   tag joins the host as the person who made the key, with that person's access to
@@ -841,14 +846,33 @@ over, it reaches nothing on the private network. With Tailscale:
 - **Kernel (TUN) mode, not userspace networking.** In userspace mode tailscaled terminates
   connections itself and there is no `tailscale0` interface, so the rule above has nothing
   to match.
-- **Outbound tcp 443.** The node needs it to reach the coordination server and relays.
-  The AWS template has no such egress rule; adding one (tcp 443 to anywhere) opens it to
-  every process on the host network, including the event export and anything else running
-  on the host, but not to the bridged containers, which the `DOCKER-USER` rules still stop.
-  Decide that knowingly.
-- **A rebuilt host is a new node.** The node's identity lives in tailscaled's state on the
-  instance; a replaced instance needs a new tagged key (and the old node removed), unless
-  that state is kept outside the instance.
+- **Outbound tcp 443, for tailscaled only.** The node needs it to reach the coordination
+  server and relays. A cloud firewall rule for tcp 443 to anywhere opens it to every
+  process on the host network, not only tailscaled: on the AWS template that includes the
+  exporter, which holds the instance role and parses data attackers wrote, and could then
+  send the role's credentials anywhere. So limit the unprivileged host-network processes on
+  the host itself, by owner: the AWS template sends every packet of the exporter's user
+  (uid 10001) through an `OUTPUT` chain that accepts only what it needed before (its
+  endpoints, the S3 prefix list's CIDRs, the metadata service, DNS) and nothing out
+  `tailscale0`, and rejects the rest; see
+  [Console over a tailnet](../deploy/aws/README.md#console-over-a-tailnet-optional).
+  Bridged containers are not affected by the 443 rule: the `DOCKER-USER` rules stop every
+  new connection from them. No inbound rule is needed: the node reaches out, and relays
+  carry the traffic back.
+- **Delete the join key once the node has joined.** Wherever the key is kept for the
+  host to read, anything that takes over the host can read it too, and a valid tagged
+  key joins a new machine as the sensor. Revoke it in the admin console as well.
+- **A rebuilt host is a new node, unless its state is kept elsewhere.** The node's identity
+  lives in tailscaled's state. Kept on the instance, a replaced instance needs a new tagged
+  key (and the old node removed). The AWS template keeps it in one Parameter Store
+  SecureString instead (tailscaled's `--state=arn:...` store), so a rebuilt host comes back
+  as the same node. That parameter is then a credential: whoever can read it can run a
+  copy of the node. Its TLS certificate is not in the state and is issued again after
+  each rebuild, within Let's Encrypt's limit of five for the same name a week.
+- **A sign-in page makes the access rules the only gate.** The AWS template's optional
+  `/go` page (`UiTailnetSignIn`) signs in whoever the tailnet lets reach the node, so the
+  token stops being a second check. Use it only when the access rules name exactly the
+  people who should sign in.
 
 ### Activity
 
