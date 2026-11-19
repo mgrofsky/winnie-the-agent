@@ -144,10 +144,11 @@ Parameters:
     Type: String
     Default: tracked/tracked.json
     MaxLength: 128
-    AllowedPattern: '^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*){0,3}\.json$'
+    AllowedPattern: '^[a-z][a-z0-9]*([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*){0,3}\.json$'
     ConstraintDescription: >-
       A relative key ending in .json, lower case, at most four parts, no leading slash and
-      no "..".
+      no "..". It starts with a letter, so it never lands among the events, which are
+      written under EventsPrefix/YYYY/MM/DD/.
     Description: Key of the tracked list, relative to EventsPrefix (the object is EventsPrefix/TrackedKey).
 
 Mappings:

@@ -352,3 +352,85 @@ def test_ship_command_fetches_sightings(tmp_path, monkeypatch):
                    "--state-dir", str(tmp_path / "state"), "--data-dir", str(tmp_path / "data")])
     assert out["sightings_fetch"]["status"] == "fetched"
     assert _local(tmp_path)["sightings"][0]["address"] == "198.51.100.7"
+
+
+# ---- timestamps at the edge of the calendar ------------------------------------------------
+
+EDGE_TIMES = ["9999-12-31T23:59:59-23:00", "0001-01-01T00:00:00+10:00"]
+
+
+@pytest.mark.parametrize("value", EDGE_TIMES)
+@pytest.mark.parametrize("field", ["generated_at", "first_seen", "last_seen"])
+def test_out_of_range_timestamps_are_refused_not_raised(value, field):
+    d = doc(item(**{field: value})) if field != "generated_at" else doc(item(), generated_at=value)
+    with pytest.raises(sightings.InvalidSightings, match="not a timestamp"):
+        sightings.parse(body(d))
+
+
+@pytest.mark.parametrize("value", EDGE_TIMES)
+def test_the_reader_shows_an_out_of_range_file_as_refused(tmp_path, value):
+    path = tmp_path / "sightings.json"
+    reader = _reader(tmp_path)
+    path.write_bytes(body(doc(item(last_seen=value))))
+    for _ in range(2):   # a second read of the same copy is still refused, not "ok"
+        view = reader.read(NOW)
+        assert view["state"] == "invalid" and "not a timestamp" in view["error"]
+        assert view["doc"] is None
+
+
+def test_any_failure_while_checking_is_a_refusal_and_not_remembered_as_good(tmp_path,
+                                                                            monkeypatch):
+    path = tmp_path / "sightings.json"
+    path.write_bytes(body(doc(item())))
+    reader = _reader(tmp_path)
+
+    def broken(*a, **kw):
+        raise ArithmeticError("boom")
+
+    monkeypatch.setattr(sightings, "parse", broken)
+    for _ in range(2):
+        view = reader.read(NOW)
+        assert view["state"] == "invalid" and "ArithmeticError" in view["error"]
+        assert "boom" not in view["error"] and view["doc"] is None
+    monkeypatch.undo()
+    path.write_bytes(body(doc(item(count=3))))
+    view = reader.read(NOW)
+    assert view["state"] == "ok" and view["doc"].sightings[0].count == 3
+
+
+@pytest.mark.parametrize("value", EDGE_TIMES)
+def test_a_fetched_out_of_range_copy_is_refused_and_the_state_is_written(tmp_path, value):
+    _run(tmp_path, _s3(), FakeS3(body(doc(item()))))
+    good = (tmp_path / "state" / "sightings.json").read_bytes()
+    later = NOW + datetime.timedelta(minutes=20)
+    res = _run(tmp_path, _s3(), FakeS3(body(doc(item(first_seen=value)))), now=later)
+    assert res["error"].startswith("fetched document refused") and "kept" in res
+    assert (tmp_path / "state" / "sightings.json").read_bytes() == good
+    st = json.loads((tmp_path / "state" / sightings.FETCH_STATE_FILE).read_text())
+    assert st["attempted_at"] == later.isoformat(timespec="seconds") and st["refused_sha256"]
+
+
+def test_any_failure_while_checking_a_fetched_copy_never_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(sightings, "parse", lambda *a, **kw: 1 / 0)
+    res = _run(tmp_path, _s3(), FakeS3(body(doc(item()))))
+    assert res["error"] == "fetched document refused: could not be checked (ZeroDivisionError)"
+    assert (tmp_path / "state" / sightings.FETCH_STATE_FILE).exists()
+    assert not (tmp_path / "state" / "sightings.json").exists()
+
+
+@pytest.mark.parametrize("attempted", ["2026-11-18T08:59:00", "garbage", 12, None,
+                                       "9999-12-31T23:59:59-23:00"])
+def test_a_naive_or_malformed_attempted_at_means_the_fetch_is_due(tmp_path, attempted):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / sightings.FETCH_STATE_FILE).write_text(json.dumps({"attempted_at": attempted}))
+    res = _run(tmp_path, _s3(), FakeS3(body(doc(item()))))
+    assert res["status"] == "fetched"
+    st = json.loads((state / sightings.FETCH_STATE_FILE).read_text())
+    assert st["attempted_at"] == NOW.isoformat(timespec="seconds")
+
+
+def test_an_unwritable_state_directory_never_raises(tmp_path):
+    (tmp_path / "state").write_text("a file where the directory should be")
+    res = _run(tmp_path, _s3(), FakeS3(body(doc(item()))))
+    assert "error" in res and "status" not in res

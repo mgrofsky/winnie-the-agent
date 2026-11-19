@@ -113,8 +113,11 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
             external_host=args.external_host if args.external_host is not None
             else str(ui_cfg.get("external_host", "")).strip())
         analyst_cap = int(agents_cfg.get("max_analyst_calls_per_day", 500))
+        activity_entries = min(2_000_000, max(1_000, int(ui_cfg.get("activity_entries",
+                                                                    200_000))))
     except ValueError:
-        return {"error": "[ui] port or [agents] max_analyst_calls_per_day is not a number"}
+        return {"error": "[ui] port or activity_entries, or [agents] "
+                         "max_analyst_calls_per_day, is not a number"}
     try:
         respond_settings = runtime.respond_settings(cp)
     except ValueError as exc:
@@ -141,7 +144,8 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
                        log=Path(log_path) if log_path else None, budget_state=budget_state),
               settings=respond_settings,
               limits=ApiLimits(analyst_calls_per_day=analyst_cap,
-                               frontend_tokens_per_day=token_cap),
+                               frontend_tokens_per_day=token_cap,
+                               activity_entries=activity_entries),
               # Decisions use what approve / reject / unblock use, re-read per decision so
               # a bad [respond] refuses them rather than acting on the defaults above.
               operator=operator,

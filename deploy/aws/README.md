@@ -263,7 +263,8 @@ default.
 
 `TrackedKey` is relative to `EventsPrefix` and its pattern refuses a leading `/`, `..`, empty
 parts and anything but lower case letters, digits, `.`, `_` and `-`, so the object always
-lands under the events prefix. That is why no IAM, endpoint or bucket policy changes: the
+lands under the events prefix. It must start with a letter, so it never lands among the
+events themselves, which are written under `<EventsPrefix>/YYYY/MM/DD/`. That is why no IAM, endpoint or bucket policy changes: the
 instance role, the S3 gateway endpoint policy and the bucket policy already allow
 `s3:PutObject` on `<EventsPrefix>/*` and nothing else. The object also falls under the
 bucket's `expire-events` lifecycle rule; it is sent again whenever the list changes and at
@@ -281,6 +282,10 @@ reads only the directory it has to send, and none of the agents' approvals, stat
 reports. It does see `approved.txt` there, which it never sends. `check.py` fails if the
 exporter mounts anything else of the agents' data or if any service but the agents can
 write the volume.
+
+On an upgrade the new, empty `blocklist` volume hides the old blocklist file under
+`/agents/reports/blocklist`; the next agents run (at most an hour) writes it again from
+the stored list, along with `tracked.json` when `TrackedExport=true`.
 
 **Sightings are not fetched here.** `[connector.sightings]` with `kind = s3` needs
 `s3:GetObject`, which this deployment's write-only bucket design refuses on purpose. Leave

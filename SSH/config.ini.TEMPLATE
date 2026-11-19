@@ -349,6 +349,9 @@ actions = false
 # HTTPS name of a reverse proxy on this host that forwards to the port above (--external-host
 # overrides it). Empty: loopback names only. See docs/operations.md, "Reaching it".
 #external_host = sensor.example-tailnet.ts.net
+# Event-log lines the Activity screen keeps in memory (one small entry each, oldest
+# dropped first; 1000 to 2000000).
+#activity_entries = 200000
 
 # Outbound connectors. All disabled by default. Destinations must be https and public
 # (allow_private = true to permit internal ones). Secrets are environment variable NAMES.

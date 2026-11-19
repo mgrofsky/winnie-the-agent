@@ -89,7 +89,7 @@ cannot change it.
 | enforce | `export_blocklist` | | add the source to the approved blocklist file (with [track before enforce](#track-before-enforce) on, to the tracked list only) |
 | enforce | `publish_detection` | | move matching Sigma drafts from `detections/pending/` to `detections/approved/` |
 | enforce | `open_ticket` | `priority` (`low`, `medium`, `high`) | open a ticket through the ticket connector |
-| enforce | `block_webhook` | | send the source to the block webhook |
+| enforce | `block_webhook` | | send the source to the block webhook (with [track before enforce](#track-before-enforce) on, to the tracked list only; `enforce` sends it) |
 
 How each tier runs:
 
@@ -232,8 +232,8 @@ The blocklist is written to `[respond] blocklist_file` (default
 With `[respond] track_before_enforce = true`, a blocklist entry goes through three stages
 instead of one:
 
-1. **Track.** Approving `export_blocklist` puts the source on the tracked list and blocks
-   nothing. The entry is stored with status `tracked` and written to `tracked.json`, next to
+1. **Track.** Approving `export_blocklist` or `block_webhook` puts the source on the
+   tracked list, blocks nothing and calls no connector. The entry is stored with status `tracked` and written to `tracked.json`, next to
    the blocklist file. The blocklist file (`plain`, `csv` or `nftables`) lists only
    enforced entries, so a tracked entry never reaches it. Your cloud can watch the tracked
    list (see [operations.md](operations.md#tracked-list-and-sightings)).
@@ -249,7 +249,7 @@ before, and `tracked.json` is not written.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `track_before_enforce` | false | approving `export_blocklist` tracks the source; `enforce` blocks it |
+| `track_before_enforce` | false | approving `export_blocklist` or `block_webhook` tracks the source; `enforce` blocks it |
 
 `enforce` takes an address (an IPv6 address or its /64, as listed) and:
 
@@ -262,7 +262,8 @@ before, and `tracked.json` is not written.
   rewrites the blocklist file and `tracked.json`, and writes an audit record
   `reports/response/<stamp>-enforce-<random>.json`;
 - calls the block connector (`[connector.block_webhook]`) if it is enabled, the same way the
-  `block_webhook` action does. A failed call is reported in the result and the audit
+  `block_webhook` action does with the switch off. With the switch on, `enforce` is the only
+  thing that calls it. A failed call is reported in the result and the audit
   record; the entry stays enforced in the file.
 
 Enforcement always needs a person. No sighting, playbook or schedule triggers it.
@@ -277,6 +278,10 @@ Other rules:
   respond run while the switch is on, so its `generated_at` shows it is current and a
   removed or expired entry disappears from it.
 - `blocklist_file` may not itself be named `tracked.json`.
+- Approving `block_webhook` needs no connector while the switch is on, so the console can
+  approve it; with the switch off it still needs the block connector enabled.
+- The respond run rewrites the blocklist file (and `tracked.json` while the switch is on)
+  whenever it is missing, for example after a new volume is mounted over its directory.
 
 **Turning it on.** Entries approved before the switch carry no status and count as
 enforced. They stay in the blocklist file and appear in `tracked.json` as `enforced`.

@@ -323,6 +323,15 @@ HTML: no inline script, a strict Content-Security-Policy (`default-src 'none'`, 
 and styles from the console itself only, `frame-ancestors 'none'`), `nosniff`, no
 referrer, no caching, and JSON with `<`, `>`, `&`, U+2028 and U+2029 escaped.
 
+**The Activity screen adds no new trust.** It reads the same event log the transcript
+replay reads, read-only, through the same GET-only checks (signed-in session, Host and
+Origin rules), and has no POST route. Its index lives in memory and writes nothing. Every
+answer goes through the same sanitising boundary as the rest of the API (control and
+invisible characters removed, strings, lists and dicts capped, long fields flagged as
+cut), honeytoken values the sensor planted are masked, and the page renders everything as
+text. A source or session from the log becomes a link only when it matches a strict
+pattern (an address, a session id), and only inside the console.
+
 **What it deliberately cannot do.** It never calls a model, so nothing it shows can steer
 one. It never displays configuration or secrets. It cannot roll back the tuner (use
 `python -m agents tune --rollback N`) or change playbooks, scenarios or the overlay.

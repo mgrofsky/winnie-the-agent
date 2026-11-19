@@ -186,9 +186,11 @@ def _timestamp(value, where: str) -> datetime.datetime:
         raise InvalidSightings(f"{where}: not a timestamp")
     try:
         dt = datetime.datetime.fromisoformat(value.strip())
-    except ValueError:
+        # A time at the edge of the calendar with an offset that moves it past year 1 or
+        # 9999 overflows on conversion; it is not a timestamp either.
+        return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC)
+    except (ValueError, OverflowError):
         raise InvalidSightings(f"{where}: not a timestamp") from None
-    return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC)
 
 
 def _address_key(value, where: str) -> str:
@@ -322,15 +324,19 @@ class SightingsReader:
                 return self._view(None, "missing", None, now)
             c = self._cache
             if signature != c.signature:
-                c.signature = signature
+                # The outcome is worked out first and stored with its signature after, so
+                # a failure part way can never leave this copy remembered as a good read.
+                good, error = c.good, None
                 try:
-                    c.good, c.error = parse(_read_capped(self.path, self.settings.max_bytes),
-                                            self.settings.max_bytes,
-                                            self.settings.max_entries), None
+                    good = parse(_read_capped(self.path, self.settings.max_bytes),
+                                 self.settings.max_bytes, self.settings.max_entries)
                 except InvalidSightings as exc:
-                    c.error = str(exc)[:200]
+                    error = str(exc)[:200]
                 except OSError as exc:
-                    c.error = f"cannot read the file ({type(exc).__name__})"
+                    error = f"cannot read the file ({type(exc).__name__})"
+                except Exception as exc:  # noqa: BLE001 - any other failure is a refusal
+                    error = f"refused: the file could not be checked ({type(exc).__name__})"
+                c.signature, c.good, c.error = signature, good, error
                 if c.error and signature not in c.logged:
                     c.logged = {signature}
                     log.warning("sightings file refused (%s); showing the last good copy",
@@ -398,10 +404,12 @@ def run_fetch(fetch: FetchSettings, local: SightingsSettings, state_dir, *,
     st = _fetch_state(state_dir)
     try:
         last = datetime.datetime.fromisoformat(str(st.get("attempted_at", "")))
-        if now - last < datetime.timedelta(minutes=fetch.interval_minutes):
+        # A time in the future (a clock that jumped back, or a bad file) is not a reason
+        # to stop fetching.
+        if datetime.timedelta(0) <= now - last < datetime.timedelta(minutes=fetch.interval_minutes):
             return {"status": "not due", "kind": fetch.kind}
-    except ValueError:
-        pass
+    except (ValueError, TypeError, OverflowError):
+        pass   # missing, malformed or naive: treat the fetch as due
     if dry_run:
         return {"status": "would fetch", "kind": fetch.kind, "dry_run": True}
     summary: dict = {"kind": fetch.kind}
@@ -420,19 +428,28 @@ def run_fetch(fetch: FetchSettings, local: SightingsSettings, state_dir, *,
     else:
         try:
             doc = parse(body, local.max_bytes, local.max_entries)
-        except InvalidSightings as exc:
-            digest = hashlib.sha256(body).hexdigest()
-            summary["error"] = f"fetched document refused: {str(exc)[:120]}"
+        except Exception as exc:  # noqa: BLE001 - anything parse raises is a refusal
+            digest = hashlib.sha256(body if isinstance(body, bytes) else b"").hexdigest()
+            why = str(exc)[:120] if isinstance(exc, InvalidSightings) \
+                else f"could not be checked ({type(exc).__name__})"
+            summary["error"] = f"fetched document refused: {why}"
             summary["kept"] = "the last good local file"
             if st.get("refused_sha256") == digest:
                 summary["logged"] = False   # the same bad copy as before: logged once already
             new_state["refused_sha256"] = digest
         else:
-            _atomic_write(local.file(state_dir), json.dumps(doc.to_dict(), indent=2,
-                                                            sort_keys=True) + "\n")
-            new_state["refused_sha256"] = None
-            summary.update(status="fetched", sightings=len(doc.sightings))
-    _atomic_write(state_dir / FETCH_STATE_FILE, json.dumps(new_state) + "\n")
+            try:
+                _atomic_write(local.file(state_dir), json.dumps(doc.to_dict(), indent=2,
+                                                                sort_keys=True) + "\n")
+            except OSError as exc:
+                summary["error"] = f"cannot write the local file ({type(exc).__name__})"
+            else:
+                new_state["refused_sha256"] = None
+                summary.update(status="fetched", sightings=len(doc.sightings))
+    try:
+        _atomic_write(state_dir / FETCH_STATE_FILE, json.dumps(new_state) + "\n")
+    except OSError as exc:
+        summary.setdefault("error", f"cannot write the fetch state ({type(exc).__name__})")
     if "error" in summary and summary.pop("logged", True):
         log.error("sightings fetch: %s", summary["error"])
         _record_event(state_dir, {"timestamp": now.isoformat(timespec="seconds"),

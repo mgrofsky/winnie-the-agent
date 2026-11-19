@@ -213,7 +213,71 @@ def _tracked_file_elsewhere(d):
     _user_data_edit(d, '"file": "/blocklist/tracked.json"', '"file": "/agents/tracked.json"')
 
 
+def _tracked_export_without_shipping(d):
+    _user_data_edit(d, '"enabled": "true" if ship == "true" and tracked == "true" else "false"',
+                    '"enabled": tracked')
+
+
+def _tracked_export_always_on(d):
+    _user_data_edit(d, '"enabled": "true" if ship == "true" and tracked == "true" else "false"',
+                    '"enabled": "true"')
+
+
+def _agents_config_ships(d):
+    _user_data_edit(d, 'config.ini.TEMPLATE config.ini $ARGS "${NeverActOn}" false',
+                    'config.ini.TEMPLATE config.ini $ARGS "${NeverActOn}" true')
+
+
+def _tracked_arg_swapped(d):
+    _user_data_edit(d, "${EventsBucketOwner} ${TrackedExport} ${EventsPrefix}/${TrackedKey}",
+                    "${EventsBucketOwner} true ${EventsPrefix}/${TrackedKey}")
+
+
+def _render_script_broken(d):
+    _user_data_edit(d, "lines = open(src", "lines = opn(src")
+
+
+def _agents_mount_ship_config(d):
+    _service_edit(d, "agents", "./config.ini:/config/config.ini:ro",
+                  "./config-ship.ini:/config/config.ini:ro")
+
+
+def _exporter_without_blocklist(d):
+    _service_edit(d, "exporter", "\n      - blocklist:/blocklist:ro\n", "\n")
+
+
+def _exporter_blocklist_twice(d):
+    _service_edit(d, "exporter", "- blocklist:/blocklist:ro\n",
+                  "- blocklist:/blocklist:ro\n      - blocklist:/more:ro\n")
+
+
+def _exporter_mounts_agent_state(d):
+    _service_edit(d, "exporter", "- blocklist:/blocklist:ro\n",
+                  "- blocklist:/blocklist:ro\n      - agentdata:/agents/state:ro\n")
+
+
+def _tracked_key_numeric(d):
+    d["Parameters"]["TrackedKey"]["AllowedPattern"] = \
+        r"^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*){0,3}\.json$"
+
+
+def _tracked_key_numeric_default(d):
+    d["Parameters"]["TrackedKey"]["Default"] = "2026/tracked.json"
+
+
 SENSOR_BREAKS = {
+    "tracked_export] enabled is not false": _tracked_export_without_shipping,
+    "with shipping false and TrackedExport false the rendered [connector.tracked_export]":
+        _tracked_export_always_on,
+    "config.ini without shipping and config-ship.ini with it": _agents_config_ships,
+    "does not get TrackedExport as its tracked switch": _tracked_arg_swapped,
+    "render_config.py fails": _render_script_broken,
+    "the agents service mounts the exporter's config-ship.ini": _agents_mount_ship_config,
+    "the exporter does not mount blocklist exactly once": _exporter_without_blocklist,
+    "the exporter mounts blocklist at /more": _exporter_blocklist_twice,
+    "the exporter mounts agentdata": _exporter_mounts_agent_state,
+    "TrackedKey allows a key among the exported events": _tracked_key_numeric,
+    "TrackedKey default does not start with a letter": _tracked_key_numeric_default,
     "InboundCidr has a default": _set_inbound_default,
     "InSsh does not depend on InboundOn": _drop_inbound_condition,
     "InS3 does not depend on InboundOn": _service_condition_only,
@@ -393,8 +457,11 @@ def test_tracked_key_stays_under_the_events_prefix(sensor):
     assert re.fullmatch(pattern, param["Default"])
     for key in ("tracked/tracked.json", "a/b-c/d_e/f.g.json"):
         assert re.fullmatch(pattern, key), key
-    for key in check.TRACKED_KEY_ESCAPES + ("tracked", "Tracked.json", "a/b/c/d/e.json"):
+    for key in check.TRACKED_KEY_ESCAPES + check.TRACKED_KEY_COLLISIONS + (
+            "tracked", "Tracked.json", "a/b/c/d/e.json"):
         assert not re.fullmatch(pattern, key), key
+    # Events are written under <prefix>YYYY/MM/DD/; a key starting with a letter never is.
+    assert re.fullmatch(pattern, "t2026/11/tracked.json")
     assert check.GENERIC_DEFAULT.match(param["Default"])
     assert not check.GENERIC_DEFAULT.match("tracked/initech.json")
 

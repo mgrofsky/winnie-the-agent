@@ -241,3 +241,137 @@ def test_queue_card_still_decides_with_its_own_hash(tree):
     api = make_api(tree)
     item = queue_items(api)[tree.ids["pending"]]
     assert item["can_approve_here"] is True and item["view_hash"]
+
+
+# ---- block_webhook approvals while tracking ------------------------------------------------
+
+def test_block_webhook_is_approved_here_as_tracking_without_a_connector(tree):
+    from test_ui_actions import queue_extra
+
+    aid = queue_extra(tree, "block_webhook")
+    api = make_api(tree)                       # no connectors at all
+    assert queue_items(api)[aid]["can_approve_here"] is True
+    status, body = decide(api, aid, "approve")
+    assert status == 200 and body["approval"]["status"] == "done"
+    assert body["approval"]["result"]["status"] == "tracked in tracked.json; nothing blocked"
+    redis_ip = body["approval"]["subject"]
+    assert rows(api)[redis_ip]["status"] == "tracked"
+    assert redis_ip not in (tree.reports / "blocklist" / "approved.txt").read_text().split()
+
+
+def test_block_webhook_approval_while_tracking_calls_no_connector(tree):
+    from test_ui_actions import queue_extra
+
+    aid = queue_extra(tree, "block_webhook")
+    conns = FakeConnectors()
+    api = make_api(tree, conns)
+    status, body = decide(api, aid, "approve")
+    assert status == 200 and body["approval"]["result"]["status"].startswith("tracked")
+    assert conns.calls == []
+
+
+def test_block_webhook_with_the_switch_off_still_needs_its_connector(tree):
+    from test_ui_actions import queue_extra
+
+    aid = queue_extra(tree, "block_webhook")
+    api = make_api(tree, settings=RespondSettings())
+    assert queue_items(api)[aid]["can_approve_here"] is False
+    before = snapshot(tree.root)
+    status, _ = decide(api, aid, "approve")
+    assert status == 400 and snapshot(tree.root) == before
+
+
+# ---- a sightings file the parser cannot convert --------------------------------------------
+
+@pytest.mark.parametrize("value", ["9999-12-31T23:59:59-23:00", "0001-01-01T00:00:00+10:00"])
+def test_out_of_range_sighting_times_are_shown_as_refused(tree, value):
+    api = tracked_api(tree)
+    write_sightings(tree, [sighting(last_seen=value)])
+    for _ in range(2):
+        status, body = api.get("/api/blocklist", {})
+        assert status == 200
+        assert body["sightings"]["state"] == "invalid"
+        assert "not a timestamp" in body["sightings"]["error"]
+        assert {e["target"]: e for e in body["items"]}[TARGET]["sightings"]["total"] == 0
+
+
+# ---- what the operator saw is re-checked under the lock -----------------------------------
+
+def test_unblock_and_approve_again_between_view_and_enforce_is_refused(tree, monkeypatch):
+    import agents.ui.api as api_module
+
+    api = tracked_api(tree, FakeConnectors())
+    hash_ = rows(api)[TARGET]["view_hash"]
+    store = tree.state / "approved_blocklist.json"
+    real = api_module.enforce
+
+    def race(*a, **kw):
+        # After the console's unlocked check and before enforce takes its lock, the entry is
+        # removed and approved again within the same second: same times, new approval.
+        entries = json.loads(store.read_text())
+        entries[TARGET]["approval_id"] = "a-0123456789ab"
+        store.write_text(json.dumps(entries))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(api_module, "enforce", race)
+    before_file = (tree.reports / "blocklist" / "approved.txt").read_text()
+    assert enforce(api, hash_=hash_) == (409, {"error": "changed"})
+    assert (tree.reports / "blocklist" / "approved.txt").read_text() == before_file
+    assert json.loads(store.read_text())[TARGET]["status"] == "tracked"
+
+
+def test_unblock_and_approve_again_before_enforce_changes_the_view_hash(tree):
+    api = tracked_api(tree, FakeConnectors())
+    seen = rows(api)[TARGET]["view_hash"]
+    store = tree.state / "approved_blocklist.json"
+    entries = json.loads(store.read_text())
+    entries[TARGET]["approval_id"] = "a-0123456789ab"
+    store.write_text(json.dumps(entries))
+    assert enforce(api, hash_=seen) == (409, {"error": "changed"})
+
+
+# ---- request protections on enforce, and the queue with the switch off --------------------
+
+def test_enforce_with_a_valid_origin_but_no_csrf_token_or_no_session(tree, serve_api):
+    api = tracked_api(tree, FakeConnectors())
+    hash_ = rows(api)[TARGET]["view_hash"]
+    c = serve_api(api, actions=True)
+    payload = json.dumps({"target": TARGET, "view_hash": hash_}).encode()
+    origin = {"Origin": f"http://{c.host}", "Content-Type": "application/json"}
+    csrf = c.get("/api/session")[1]["csrf"]
+    before = snapshot(tree.root)
+    status, _, _ = c.request("POST", "/api/blocklist/enforce", body=payload, headers=origin)
+    assert status == 403                                  # valid Origin, no CSRF token
+    cookie, c.cookie = c.cookie, ""
+    status, _, _ = c.request("POST", "/api/blocklist/enforce", body=payload,
+                             headers={**origin, "X-Winnie-CSRF": csrf})
+    assert status == 401                                  # valid Origin and token, no session
+    assert snapshot(tree.root) == before
+    c.cookie = cookie
+    assert c.post("/api/blocklist/enforce", {"target": TARGET, "view_hash": hash_})[0] == 200
+
+
+def test_switch_off_queue_is_unchanged_but_for_its_mode(tree):
+    from test_ui_actions import queue_extra
+
+    hook = queue_extra(tree, "block_webhook")
+    off = make_api(tree, settings=RespondSettings())
+    status, body = off.get("/api/queue", {"all": "1", "per": "200"})
+    assert status == 200
+    assert set(body) == {"total", "page", "per", "items", "mode"}
+    assert body["mode"] == {"track_before_enforce": False}
+    cards = {i["id"]: i for i in body["items"]}
+    for card in cards.values():
+        assert set(card) <= {"id", "approval", "view_hash", "can_decide_here",
+                             "can_approve_here", "undecidable_reason", "record",
+                             "detection_files"}
+    assert cards[hook]["can_approve_here"] is False        # still needs its connector
+    assert cards[tree.ids["pending"]]["can_approve_here"] is True
+    # The same queue with the switch on differs only in mode and that one connector flag.
+    on = make_api(tree)
+    body_on = on.get("/api/queue", {"all": "1", "per": "200"})[1]
+    assert body_on["mode"] == {"track_before_enforce": True}
+    on_cards = {i["id"]: i for i in body_on["items"]}
+    assert on_cards[hook]["can_approve_here"] is True
+    on_cards[hook]["can_approve_here"] = False
+    assert on_cards == cards

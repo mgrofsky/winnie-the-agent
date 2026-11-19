@@ -20,9 +20,9 @@ domains and addresses; the SIEM output keeps raw values.
   (playbook, source, action) for a configurable period.
 - ``unblock``: remove an address or network from the approved blocklist. Blocklist entries
   also expire on their own (default 30 days).
-- With ``[respond] track_before_enforce`` on, approving ``export_blocklist`` only puts the
-  source on the tracked list (``tracked.json``, written next to the blocklist file for the
-  operator's cloud to watch); ``enforce`` is the second, separate decision that moves one
+- With ``[respond] track_before_enforce`` on, approving ``export_blocklist`` (or
+  ``block_webhook``) only puts the source on the tracked list (``tracked.json``, written
+  next to the blocklist file for the operator's cloud to watch) and calls nothing; ``enforce`` is the second, separate decision that moves one
   tracked entry into the enforcement blocklist file and calls the block connector if it is
   enabled. Off (the default), approving writes the entry straight to the blocklist file.
 - Every run is recorded as JSON in ``reports/response/``. ``dry_run`` writes nothing and
@@ -798,6 +798,11 @@ class EnforceError(ValueError):
     """``enforce`` refused; the message says why and nothing changed."""
 
 
+class EnforceChanged(EnforceError):
+    """``enforce`` refused because the entry no longer matches what the caller saw."""
+
+
+
 def _verified_entry(state_dir: Path, key: str, entry: dict) -> bool:
     """Whether the tracked entry still comes from a verified source: it was recorded as one
     when approved and, while its approval file exists, that file agrees."""
@@ -810,7 +815,7 @@ def _verified_entry(state_dir: Path, key: str, entry: dict) -> bool:
     if not path.exists():
         return True   # aged out by retention; the entry's own record stands
     a = _read_json(path, {})
-    return (a.get("status") == "done" and a.get("action") == "export_blocklist"
+    return (a.get("status") == "done" and a.get("action") in ("export_blocklist", "block_webhook")
             and a.get("subject") == key and not a.get("unverified_source"))
 
 
@@ -819,7 +824,7 @@ def enforce(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike 
             blocklist_file: Optional[os.PathLike | str] = None, blocklist_format: str = "plain",
             now: Optional[datetime.datetime] = None, ttl_days: float = 30.0,
             never_act_on: tuple[str, ...] = (), track_before_enforce: bool = True,
-            sensor: str = "") -> dict:
+            sensor: str = "", expected: Optional[dict] = None) -> dict:
     """Move one tracked entry to ``enforced``: the second, separate decision that blocks.
 
     ``target`` is an address (or its IPv6 /64 key) exactly as listed. The checks approval
@@ -827,7 +832,11 @@ def enforce(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike 
     an entry that is not tracked, or already enforced, is refused with ``EnforceError``.
     Then the blocklist file (and the tracked export) is rewritten, an audit record is
     written and, if the block connector is enabled, it is called as ``block_webhook`` is.
-    A failed connector call is reported; the entry stays enforced in the file."""
+    A failed connector call is reported; the entry stays enforced in the file.
+
+    ``expected`` is what the caller saw of the entry (for example its ``approved_at``,
+    ``expires_at`` and ``approval_id``); when given, it is compared under the lock and any
+    difference (the entry was removed and approved again since) raises ``EnforceChanged``."""
     state_dir, reports_dir = Path(state_dir), Path(reports_dir)
     now = now or _now()
     networks = RespondSettings(never_act_on=tuple(never_act_on)).networks()
@@ -843,6 +852,8 @@ def enforce(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike 
             raise EnforceError(f"{sanitize(target, 64)} is not on the tracked list "
                                "(never approved, removed or expired)")
         entry = entries[key]
+        if expected is not None and any(entry.get(k) != v for k, v in expected.items()):
+            raise EnforceChanged(f"{key} changed since it was shown")
         if entry_status(entry) == ENFORCED:
             raise EnforceError(f"{key} is already enforced")
         if not _verified_entry(state_dir, key, entry):
@@ -877,8 +888,9 @@ def approve(aid: str, state_dir: os.PathLike | str, reports_dir: os.PathLike | s
             track_before_enforce: bool = False, sensor: str = "") -> dict:
     """Execute one queued enforce action after re-checking it. Returns the approval.
 
-    With ``track_before_enforce``, ``export_blocklist`` adds the source to the tracked list
-    only; an entry that is already enforced stays enforced and gets a fresh expiry.
+    With ``track_before_enforce``, ``export_blocklist`` and ``block_webhook`` add the source
+    to the tracked list only and call nothing; an entry that is already enforced stays
+    enforced and gets a fresh expiry. ``enforce`` is what calls the block connector.
 
     The pending -> executing transition happens under the queue lock, so only one of
     several concurrent approvals of the same id executes."""
@@ -910,7 +922,10 @@ def approve(aid: str, state_dir: os.PathLike | str, reports_dir: os.PathLike | s
         result = {"ok": False, "status": f"refused: {reason}"}
     else:
         action = a.get("action")
-        if action == "export_blocklist":
+        # With the switch on, approving block_webhook is the same first decision as
+        # export_blocklist: the source is tracked and nothing is called. Only enforce
+        # calls the block connector.
+        if action == "export_blocklist" or (action == "block_webhook" and track_before_enforce):
             times = {"approved_at": _iso(now), "expires_at": _iso(
                 now + datetime.timedelta(days=blocklist_ttl_days))}
             with _locked(state_dir):
@@ -1382,7 +1397,12 @@ def _finish(run: _Run) -> tuple[dict, Optional[dict]]:
     with _locked(run.state_dir):
         entries, changed = _load_blocklist(run.state_dir, now, settings.blocklist_ttl_days)
         # Tracked mode rewrites every run, so the export's generated_at shows it is current.
-        if changed or settings.track_before_enforce:
+        # A missing blocklist file is rewritten too: a new volume mounted over its
+        # directory (an upgrade) must not leave the firewall without its list.
+        # Nothing is written before the first approval, as before.
+        missing = _blocklist_store(run.state_dir).exists() and \
+            not _blocklist_target(run.reports_dir, settings.blocklist_file).exists()
+        if changed or missing or settings.track_before_enforce:
             _write_blocklist_files(run.state_dir, run.reports_dir, entries,
                                    settings.blocklist_file, settings.blocklist_format,
                                    settings.track_before_enforce, now, run.sensor)

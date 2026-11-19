@@ -673,9 +673,10 @@ $dc exec agents python -m agents ship --dry-run --log /data/ssh_log.log $args
 
 - an overview and pipeline health;
 - the response approval queue;
-- triage records, with SSH transcript replay;
+- triage records, with SSH transcript replay and the decoy's reply under each command;
+- raw activity: every event in the log, any service, with filters and search;
 - daily digests;
-- decoy and tuner state;
+- how the decoy is being adjusted (Decoy);
 - playbooks and detections.
 
 It is read-only by default. It never calls a model and never shows configuration or
@@ -849,6 +850,88 @@ over, it reaches nothing on the private network. With Tailscale:
   instance; a replaced instance needs a new tagged key (and the old node removed), unless
   that state is kept outside the instance.
 
+### Activity
+
+The Activity screen (key `7`) lists every line of the event log, newest first: time,
+source, service, event, username, outcome and a one-line summary. Open a row to see what
+was sent and what the honeypot answered, in plain monospace text, with long values
+collapsed behind "Show more". Click a source to filter to it; click a session to see all
+of its events in order, for any service, with a link to its triage record when there is
+one. A record's page links back to its raw activity: a session to its own events, a
+campaign to its source and service over its time span.
+
+Filters live in the address, so a view can be bookmarked and the back button works:
+
+| Filter | Matches |
+|---|---|
+| Time | the last hour, 24 hours (default) or 7 days, everything indexed, or a custom range in UTC |
+| Service | the protocol (`ssh`, `telnet`, `http`, `s3`, `ftp`, `smtp`, `sip`, `redis`, `postgres`, `mysql`, `mssql`, `mllp`); the list shows the services in the window with counts |
+| Event | connection, login attempt, input, reply, request, transfer, register, call attempt, error, close, other |
+| Outcome | success or failure (login attempts and SIP registrations carry one) |
+| Source | one exact address, or a network such as `198.51.100.0/24` |
+| User | one exact username |
+| Search | text in what was sent or answered, the log message, username, password, source or session (case-insensitive) |
+
+What "answered" means depends on what each service logs:
+
+| Service | Sent | Answered or result |
+|---|---|---|
+| SSH | the typed input (decoded from the log's base64) | the decoy's reply, a separate "reply" event |
+| Telnet | the input line | the reply text |
+| HTTP | method, path, query and body | the status code only |
+| S3 | method, path and query | the operation and status code |
+| PostgreSQL, MySQL, SQL Server | the statement | the result the log records (rows returned, rows affected or an error code) |
+| FTP, SMTP, Redis, MLLP | the command or message | none for commands (the log does not record the reply); a transfer's file and size, an accepted message's size and recipients |
+| SIP | the request and dialed number | the stage (challenge, rejected, registered) |
+
+Where the log has only a status or result, that is shown and nothing more; an input with
+no recorded reply says so.
+
+**The indexed window.** The console keeps one small entry per log line in memory (offset,
+time, source, service, event, session, username, outcome); nothing is written to disk. It
+starts at the last 64 MiB of the log and grows from there, up to `[ui] activity_entries`
+lines (default 200,000), dropping the oldest. When older lines exist outside the window,
+the screen says so and how far back it reaches; read those on the host. Each refresh reads
+at most 64 MiB of new log, and log rotation or truncation starts the index again. A
+search reads candidate lines from disk under a budget of 16 MiB per request; when it runs
+out, the screen says how far back it searched and offers to search further.
+
+The screen checks for new events every 30 seconds and offers them ("3 new events, Show")
+instead of inserting rows under what you are reading. Honeytoken values the sensor planted
+are masked as on the honeytokens screen; other passwords attackers typed are shown, as in
+the transcript.
+
+On a record's page, an SSH session's commands are listed with the decoy's reply under
+each, collapsed to its first lines. Replies are paired with commands by their place in the
+session (the third command gets the reply that followed the third input), never by text,
+so repeated identical commands keep their own replies. A command with no reply logged says
+"no reply recorded". Campaign records keep their command sample as before: it gathers
+commands from many connections and has no single sequence to pair (Telnet sessions are
+campaigns, so their replies are read on the session view instead).
+
+### Decoy
+
+The Decoy screen shows how the fake system is being adjusted to stay convincing. Nothing on
+it needs a decision. It has three parts:
+
+- **Current adjustments to the fake system**: what the tuner has layered over the
+  configured scenario (`decoy/overlay.json`), in words: fake logins per service, bait
+  files, the host name, SIP extensions and how many tries a login takes. The raw file is
+  behind "Show the raw adjustments file". Empty means the fake system is the scenario as
+  configured.
+- **What the tuner changed and when**: one row per tuner run with its time, how many
+  changes it made and how many its fence refused. Open a row for each change in words
+  with its reason, each refusal with its reason, and the raw run record. "Undo points"
+  lists the snapshots `python -m agents tune --rollback N` restores. Empty means the tuner
+  has found no reason to change anything yet; it runs with every `run-all` pass and works
+  without a model (a model only reorders its suggestions).
+- **What returning attackers are shown**: each source a playbook's local step singled
+  out, when a stored record last saw it, and what is kept for it on every visit (its own
+  planted secret, slowed replies, longer or canned replies, fuller logging, labels), with
+  the playbooks that set it and when it expires.
+
+Times are relative, with the exact UTC time on hover, as on the other screens.
+
 ### Turning actions on
 
 With actions on, the console can approve, reject and unblock, and enforce a tracked entry.
@@ -868,8 +951,10 @@ docker compose -f docker-compose.yml -f docker-compose.ui-actions.yml --profile 
 Actions need write access to the agent data (the approval queue, the blocklist and the
 `response/` audit records under `reports/`). The overlay and the event log stay
 read-only. In Docker the console holds no connector secrets, so approve `open_ticket` and
-`block_webhook` items with the CLI in the `agents` container, which has them. Likewise,
-with the block connector enabled, run `enforce` there if the connector should be called.
+`block_webhook` items with the CLI in the `agents` container, which has them. With track
+before enforce on, approving `block_webhook` only tracks the source and calls nothing, so
+the console can approve it. Likewise, with the block connector enabled, run `enforce` there
+if the connector should be called.
 
 The console's unblock takes one blocklist entry exactly as listed. To remove a range
 (every entry inside a network), use `python -m agents unblock <network>`.

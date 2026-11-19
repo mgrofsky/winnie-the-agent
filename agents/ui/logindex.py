@@ -1,4 +1,6 @@
-"""In-memory index of SSH sessions in the event log, for transcript replay in the console.
+"""In-memory indexes of the event log for the console: ``LogTail`` (incremental tailing,
+shared with ``activity.EventIndex``) and ``SessionIndex`` (SSH sessions, for transcript
+replay).
 
 No transcript is stored anywhere: an SSH session's turns exist only as base64 ``details``
 on its event-log lines. The index maps each ``session-*`` task name to the byte range that
@@ -112,33 +114,51 @@ def _session_task(rec: Optional[dict]) -> Optional[str]:
     return sessions._cap(task, 128)
 
 
-class SessionIndex:
-    """Session id -> (start, end) byte range in the event log. Thread-safe."""
+class LogTail:
+    """Incremental, read-only tailing of the event log, shared by the console's indexes.
 
-    def __init__(self, path: Optional[os.PathLike | str], max_sessions: int = DEFAULT_MAX_SESSIONS,
-                 min_interval: float = 2.0, max_bytes_per_refresh: int = MAX_BYTES_PER_REFRESH,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+    Each refresh reads complete lines from the last offset (at most
+    ``max_bytes_per_refresh`` of them) and hands each to ``_consume``. Rotation or
+    truncation (new inode, a different first line, a size below the offset, or no newline
+    just before the offset) resets the index through ``_clear`` and starts again. With
+    ``tail_bytes``, a fresh index starts at the first line inside the last ``tail_bytes``
+    of the log instead of at its start (``start_offset`` says where). Nothing is written.
+    Subclasses hold ``_lock`` while reading their own state."""
+
+    def __init__(self, path: Optional[os.PathLike | str], min_interval: float = 2.0,
+                 max_bytes_per_refresh: int = MAX_BYTES_PER_REFRESH,
+                 clock: Callable[[], float] = time.monotonic,
+                 tail_bytes: Optional[int] = None) -> None:
         self.path = Path(path) if path else None
-        self.max_sessions = max(1, int(max_sessions))
         self.min_interval = min_interval
         self.max_bytes_per_refresh = max(1, int(max_bytes_per_refresh))
         self.clock = clock
+        self.tail_bytes = None if tail_bytes is None else max(0, int(tail_bytes))
         self._lock = threading.Lock()
-        self._ranges: OrderedDict[str, list[int]] = OrderedDict()
         self._offset = 0
         self._identity: Optional[tuple[int, int]] = None
         self._head: Optional[str] = None
         self._checked = float("-inf")
+        self.start_offset = 0
         self.rebuilds = 0
         self.caught_up = True
+
+    # -- for subclasses --
+
+    def _clear(self) -> None:
+        raise NotImplementedError
+
+    def _consume(self, start: int, end: int, rec: Optional[dict]) -> None:
+        raise NotImplementedError
 
     # -- maintenance --
 
     def _reset(self) -> None:
-        self._ranges.clear()
+        self._clear()
         self._offset = 0
         self._identity = None
         self._head = None
+        self.start_offset = 0
         self.rebuilds += 1
 
     def refresh(self, force: bool = False) -> None:
@@ -160,7 +180,7 @@ class SessionIndex:
         try:
             st = os.stat(self.path)
         except FileNotFoundError:
-            if self._ranges or self._offset:
+            if self._offset:
                 self._reset()
             self.caught_up = True
             return
@@ -174,6 +194,9 @@ class SessionIndex:
                 stale = f.read(1) != b"\n"
             if stale:
                 self._reset()
+            if self._offset == 0 and self.tail_bytes is not None \
+                    and st.st_size > self.tail_bytes:
+                self._offset = self.start_offset = _line_start(f, st.st_size - self.tail_bytes)
         self._identity, self._head = identity, head
         if st.st_size <= self._offset:
             self.caught_up = True
@@ -186,18 +209,52 @@ class SessionIndex:
                 self.caught_up = False
                 break
             offset = end
-            task = _session_task(rec)
-            if task is None:
-                continue
-            span = self._ranges.get(task)
-            if span is None:
-                self._ranges[task] = [start, end]
-                if len(self._ranges) > self.max_sessions:
-                    self._ranges.popitem(last=False)
-            else:
-                span[1] = end
-                self._ranges.move_to_end(task)
+            self._consume(start, end, rec)
         self._offset = offset
+
+
+def _line_start(f, pos: int) -> int:
+    """The start of the first line at or after ``pos``: ``pos`` itself when a newline is
+    just before it, else just past the next newline (read past in chunks)."""
+    if pos <= 0:
+        return 0
+    f.seek(pos - 1)
+    if f.read(1) == b"\n":
+        return pos
+    while True:
+        chunk = f.readline(SKIP_CHUNK)
+        if not chunk:
+            return pos
+        pos += len(chunk)
+        if chunk.endswith(b"\n"):
+            return pos
+
+
+class SessionIndex(LogTail):
+    """Session id -> (start, end) byte range in the event log. Thread-safe."""
+
+    def __init__(self, path: Optional[os.PathLike | str], max_sessions: int = DEFAULT_MAX_SESSIONS,
+                 min_interval: float = 2.0, max_bytes_per_refresh: int = MAX_BYTES_PER_REFRESH,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        super().__init__(path, min_interval, max_bytes_per_refresh, clock)
+        self.max_sessions = max(1, int(max_sessions))
+        self._ranges: OrderedDict[str, list[int]] = OrderedDict()
+
+    def _clear(self) -> None:
+        self._ranges.clear()
+
+    def _consume(self, start: int, end: int, rec: Optional[dict]) -> None:
+        task = _session_task(rec)
+        if task is None:
+            return
+        span = self._ranges.get(task)
+        if span is None:
+            self._ranges[task] = [start, end]
+            if len(self._ranges) > self.max_sessions:
+                self._ranges.popitem(last=False)
+        else:
+            span[1] = end
+            self._ranges.move_to_end(task)
 
     # -- queries --
 

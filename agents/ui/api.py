@@ -27,6 +27,9 @@ Everything returned here was typed by attackers or derived from it. The rules:
   place. A decision names the ``view_hash`` the operator saw (the raw approval, what the
   card showed and, for ``publish_detection``, the files it names; for ``enforce``, the
   blocklist entry as listed); any difference now is a 409 and nothing changes.
+- Activity (``agents.ui.activity``) reads the event log only: an in-memory index of every
+  line, and back-reads of the lines shown (or searched, under a byte budget). Honeytoken
+  values the sensor planted are masked in it.
 - Sightings (``agents.sightings``) are display only. The file is parsed strictly, the last
   good copy stays on show when a new one is refused, and only sightings of listed
   addresses are served.
@@ -57,6 +60,7 @@ from typing import Callable, Optional
 from pydantic import ValidationError
 
 from agents import triage
+from agents.budget import ip_key
 from agents.llm import DailyCallCounter
 from agents.playbooks import PLAYBOOKS_DIR, load_playbooks, tier_of
 from agents.respond import (
@@ -66,6 +70,7 @@ from agents.respond import (
     TRACKED,
     TRACKED_FILE,
     ApprovalError,
+    EnforceChanged,
     EnforceError,
     EngineState,
     RespondSettings,
@@ -83,7 +88,8 @@ from agents.source_state import load as load_source_state
 from agents.source_state import valid_source_key
 from agents.triage import JUDGEMENT_RANK, Judgement, TriageRecord, rank
 from agents.tuner import history as tuner_history
-from agents.ui import logindex
+from agents.ui import activity, logindex
+from agents.ui.activity import EventIndex
 from agents.ui.logindex import DEFAULT_MAX_SESSIONS, RangeTooLarge, SessionIndex
 from scenarios.loader import load_overlay
 
@@ -279,10 +285,17 @@ def view_hash(raw: dict, approval: dict, record: Optional[dict],
     return hashlib.sha256(text.encode("ascii")).hexdigest()
 
 
+# The entry fields a blocklist view hash covers, and ``enforce`` re-checks under its lock.
+# ``approval_id`` is not shown; it tells apart an entry removed and approved again within
+# the same second.
+VIEW_FIELDS = ("approved_at", "expires_at", "approval_id")
+
+
 def blocklist_view_hash(key: str, entry: dict) -> str:
-    """What the blocklist row showed and ``enforce`` acts on: the key, its stage and times."""
+    """What the blocklist row showed and ``enforce`` acts on: the key, its stage and times
+    (and the approval that put it there)."""
     shown = {"target": key, "status": entry_status(entry),
-             "approved_at": entry.get("approved_at"), "expires_at": entry.get("expires_at")}
+             **{k: entry.get(k) for k in VIEW_FIELDS}}
     return hashlib.sha256(_canonical(shown).encode()).hexdigest()
 
 
@@ -590,6 +603,29 @@ def _mask(value: str) -> str:
     return value[:2] + MASK if len(value) >= MASK_PREFIX_MIN else MASK
 
 
+def pair_replies(turns: list[dict]) -> list[Optional[str]]:
+    """One entry per input turn, in order: the decoy's response turns that follow it (before
+    the next input) joined by newlines, or None when none was logged. Responses before the
+    first input belong to no command."""
+    out: list[Optional[str]] = []
+    for t in turns:
+        if t.get("role") == "input":
+            out.append(None)
+        elif t.get("role") == "response" and out:
+            text = t.get("text") if isinstance(t.get("text"), str) else ""
+            out[-1] = text if out[-1] is None else out[-1] + "\n" + text
+    return out
+
+
+def _iso_ts(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(value, UTC).isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 # ---- the API -------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -614,6 +650,7 @@ class ApiLimits:
     analyst_calls_per_day: int = 500
     frontend_tokens_per_day: Optional[int] = None
     index_sessions: int = DEFAULT_MAX_SESSIONS
+    activity_entries: int = activity.DEFAULT_MAX_ENTRIES
 
 
 @dataclass
@@ -650,6 +687,10 @@ class Api:
                                 self.cache_seconds, self.clock)
         self.index = SessionIndex(p.log, max_sessions=self.limits.index_sessions,
                                   min_interval=self.cache_seconds, clock=self.clock)
+        self.events = EventIndex(p.log, max_entries=self.limits.activity_entries,
+                                 min_interval=self.cache_seconds, clock=self.clock)
+        self._facets_lock = threading.Lock()
+        self._facets: tuple[object, dict] = (None, {})
         self._alarm_lock = threading.Lock()
         self._alarm: tuple[float, object] = (float("-inf"), None)
         self._routes: list[tuple[re.Pattern, Callable]] = [
@@ -657,6 +698,9 @@ class Api:
             (re.compile(r"records"), self.records),
             (re.compile(r"records/([^/]+)"), self.record),
             (re.compile(r"records/([^/]+)/transcript"), self.transcript),
+            (re.compile(r"records/([^/]+)/replies"), self.replies),
+            (re.compile(r"activity"), self.activity),
+            (re.compile(r"activity/session/([^/]+)"), self.activity_session),
             (re.compile(r"queue"), self.queue),
             (re.compile(r"blocklist"), self.blocklist),
             (re.compile(r"digests"), self.digests),
@@ -999,6 +1043,284 @@ class Api:
         t["turns"] = paginate(turns, query)
         return 200, t
 
+    def replies(self, query: dict[str, str], rid: str) -> tuple[int, object]:
+        """What the decoy answered to each command of an SSH session record, paired with
+        the record's command list by place in the session (the n-th input turn is the n-th
+        command), never by text. A command with no reply logged says so."""
+        r = self._record_id(rid)
+        if r is None or r.kind != "session" or r.protocol != "ssh":
+            return NOT_FOUND
+        try:
+            t = self.index.transcript(r.id)
+        except RangeTooLarge:
+            return 422, {"error": "transcript too large"}
+        if t is None:
+            return 404, {"error": "transcript not available"}
+        mask = self._masker()
+        paired = pair_replies(t["turns"])
+        items = []
+        for i, command in enumerate(r.command_sample):
+            reply = paired[i] if i < len(paired) else None
+            items.append({"index": i, "command": mask(command),
+                          "recorded": reply is not None,
+                          "reply": mask(reply[:TEXT_CAP]) if reply is not None else None,
+                          "truncated": reply is not None and len(reply) > TEXT_CAP})
+        return 200, {"id": r.id, "items": items, "commands_in_session": len(paired)}
+
+    # -- activity --
+
+    def _masker(self) -> Callable[[Optional[str]], Optional[str]]:
+        """Replaces the sensor's own honeytoken values in attacker text, as the honeytoken
+        screen shows them (``_mask``). Typed passwords are otherwise shown as logged."""
+        registry = _read_json(self.paths.reports / "honeytokens.json", {})
+        raw = registry.get("tokens") if isinstance(registry.get("tokens"), list) else []
+        values = sorted({t["value"] for t in raw if isinstance(t, dict)
+                         and isinstance(t.get("value"), str) and len(t["value"]) >= 4},
+                        key=len, reverse=True)[:500]
+
+        def mask(text: Optional[str]) -> Optional[str]:
+            if not isinstance(text, str):
+                return text
+            for v in values:
+                if v in text:
+                    text = text.replace(v, _mask(v))
+            return text
+        return mask
+
+    def _activity_filters(self, query: dict[str, str]) -> activity.Filters:
+        def ts(name: str) -> Optional[float]:
+            raw = query.get(name) or ""
+            if not raw:
+                return None
+            dt = _parse_ts(raw) if len(raw) <= 40 else None
+            if dt is None:
+                raise _BadQuery
+            return dt.timestamp()
+
+        def text(name: str, cap: int, pattern: Optional[re.Pattern] = None) -> Optional[str]:
+            raw = (query.get(name) or "").strip()
+            if not raw:
+                return None
+            if len(raw) > cap or clean_text(raw, cap) != raw \
+                    or (pattern is not None and not pattern.fullmatch(raw)):
+                raise _BadQuery
+            return raw
+
+        src = text("src", 64)
+        if src is not None and "/" in src:
+            try:
+                ipaddress.ip_network(src, strict=False)
+            except ValueError:
+                raise _BadQuery from None
+        kind = text("kind", 16)
+        if kind is not None and kind not in activity.KINDS:
+            raise _BadQuery
+        outcome = text("outcome", 8)
+        if outcome is not None and outcome not in ("success", "failure"):
+            raise _BadQuery
+        service = text("service", 16)
+        if service is not None:
+            service = service.lower()
+            if not activity.SERVICE_RE.fullmatch(service):
+                raise _BadQuery
+        return activity.Filters(since=ts("from"), until=ts("to"), src=src, service=service,
+                                kind=kind, outcome=outcome, username=text("user", 64),
+                                session=text("session", 128, activity.SESSION_ID_RE))
+
+    def _activity_facets(self, entries: list, info: dict) -> dict:
+        with self._facets_lock:
+            key, value = self._facets
+            if key != info["generation"]:
+                value = activity.facets(entries)
+                self._facets = (info["generation"], value)
+            return value
+
+    def _activity_item(self, e: tuple, rec: Optional[dict], mask) -> dict:
+        outcome = None if e[activity.OK] is None else \
+            "success" if e[activity.OK] else "failure"
+        item = {"offset": e[activity.OFF], "src": e[activity.SRC],
+                "service": e[activity.SERVICE], "kind": e[activity.KIND],
+                "session": e[activity.SESSION], "username": mask(e[activity.USER]),
+                "outcome": outcome}
+        if rec is None:
+            item.update(time=None, summary="this line is no longer in the event log",
+                        unreadable=True)
+            return item
+        when = rec.get("timestamp")
+        d = activity.describe(rec, e[activity.SERVICE], e[activity.KIND], TEXT_CAP)
+        item["time"] = when[:40] if isinstance(when, str) else None
+        item["summary"] = mask(activity.summary(e[activity.KIND], e[activity.USER],
+                                                e[activity.OK], d))
+        item["message"] = mask(d["message"])
+        for name in ("sent", "answered", "result"):
+            value = d[name]
+            item[name] = mask(value[:TEXT_CAP]) if isinstance(value, str) else None
+            item[name + "_truncated"] = isinstance(value, str) and len(value) > TEXT_CAP
+        if "password" in d:
+            item["password"] = mask(d["password"])
+        return item
+
+    def activity(self, query: dict[str, str]) -> tuple[int, object]:
+        """Raw events, newest first. Structured filters run on the in-memory index; ``q``
+        reads candidate lines under ``activity.SEARCH_BUDGET`` bytes and hands back a cursor
+        (``next_before``) when the budget runs out. ``after`` returns only how many matching
+        events are newer than that offset (for the "new events" notice)."""
+        filters = self._activity_filters(query)
+        q = (query.get("q") or "").strip()
+        if len(q) > 200 or clean_text(q, 200) != q:
+            raise _BadQuery
+        q = q.lower()
+        before = self._offset_param(query, "before")
+        after = self._offset_param(query, "after")
+        per = _int(query, "per", activity.PAGE_SIZE, 1, activity.MAX_PAGE_SIZE)
+        entries, info = self.events.snapshot()
+        newest = entries[-1][activity.OFF] if entries else None
+        if after is not None:
+            start = activity.before_index(entries, after + 1)
+            n = sum(1 for e in entries[start:] if filters.match(e))
+            return 200, {"new": n, "newest": newest, "approximate": bool(q)}
+        mask = self._masker()
+        items: list[dict] = []
+        budget = activity.SEARCH_BUDGET
+        i = activity.before_index(entries, before) - 1
+        last_examined: Optional[tuple] = None
+        exhausted = False
+        f = activity.open_log(self.paths.log)
+        try:
+            while i >= 0 and len(items) < per:
+                e = entries[i]
+                if filters.match(e):
+                    if q:
+                        if budget <= 0:
+                            exhausted = True
+                            break
+                        budget -= e[activity.LEN]
+                    rec = activity.read_line(f, e) if f is not None else None
+                    if not q:
+                        items.append(self._activity_item(e, rec, mask))
+                    elif rec is not None and q in self._haystack(e, rec):
+                        items.append(self._activity_item(e, rec, mask))
+                last_examined = e
+                i -= 1
+        finally:
+            if f is not None:
+                f.close()
+        more = i >= 0
+        if exhausted:
+            next_before = last_examined[activity.OFF] if last_examined else before
+        elif more and items:
+            next_before = items[-1]["offset"] if not q else last_examined[activity.OFF]
+        else:
+            next_before = None
+        out: dict = {"items": items, "per": per, "next_before": next_before, "newest": newest,
+                     "window": self._activity_window(entries, info),
+                     "facets": self._activity_facets(entries, info)}
+        if q:
+            reached = last_examined[activity.TS] if last_examined else None
+            out["search"] = {"complete": not exhausted, "budget_bytes": activity.SEARCH_BUDGET,
+                             "searched_back_to": _iso_ts(reached)}
+        return 200, out
+
+    @staticmethod
+    def _offset_param(query: dict[str, str], name: str) -> Optional[int]:
+        raw = query.get(name)
+        if raw is None or raw == "":
+            return None
+        if not re.fullmatch(r"\d{1,15}", raw):
+            raise _BadQuery
+        return int(raw)
+
+    @staticmethod
+    def _activity_window(entries: list, info: dict) -> dict:
+        times = [e[activity.TS] for e in (entries[0], entries[-1])] if entries else [None, None]
+        return {"entries": info["entries"], "max_entries": info["max_entries"],
+                "older_outside": info["older_outside"], "caught_up": info["caught_up"],
+                "oldest": _iso_ts(times[0]), "newest": _iso_ts(times[1])}
+
+    @staticmethod
+    def _haystack(e: tuple, rec: dict) -> str:
+        d = activity.describe(rec, e[activity.SERVICE], e[activity.KIND], TEXT_CAP)
+        parts = [d.get(k) for k in ("sent", "answered", "result", "message", "password")]
+        parts += [e[activity.USER], e[activity.SRC], e[activity.SESSION]]
+        return "\n".join(p for p in parts if isinstance(p, str)).lower()
+
+    def activity_session(self, query: dict[str, str], sid: str) -> tuple[int, object]:
+        """Every event of one session in order, any service. An SSH session is replayed
+        from the transcript code (``SessionIndex.transcript``), as on its record page."""
+        if not activity.SESSION_ID_RE.fullmatch(sid):
+            return NOT_FOUND
+        mask = self._masker()
+        if sid.startswith("session-"):
+            try:
+                t = self.index.transcript(sid)
+            except RangeTooLarge:
+                return 422, {"error": "transcript too large"}
+            if t is not None:
+                return 200, self._ssh_session(sid, t, mask)
+        entries, _ = self.events.snapshot()
+        mine = [e for e in entries if e[activity.SESSION] == sid]
+        if not mine:
+            return 404, {"error": "session not in the indexed window"}
+        cut = len(mine) > activity.SESSION_EVENTS
+        mine = mine[:activity.SESSION_EVENTS]
+        f = activity.open_log(self.paths.log)
+        try:
+            events = [self._activity_item(e, activity.read_line(f, e) if f else None, mask)
+                      for e in mine]
+        finally:
+            if f is not None:
+                f.close()
+        first = next((e for e in mine if e[activity.SRC]), mine[0])
+        times = [ev["time"] for ev in events if ev.get("time")]
+        return 200, {"id": sid, "service": mine[0][activity.SERVICE], "src": first[activity.SRC],
+                     "start": times[0] if times else None, "end": times[-1] if times else None,
+                     "from": "index", "events": events, "events_cut": cut,
+                     "record_id": self._record_for(sid, mine[0][activity.SERVICE],
+                                                   first[activity.SRC], mine[0][activity.TS])}
+
+    def _ssh_session(self, sid: str, t: dict, mask) -> dict:
+        events = []
+        for a in t["auth_attempts"]:
+            events.append({"time": a["ts"], "kind": "login", "username": mask(a["username"]),
+                           "password": mask(a["password"]),
+                           "outcome": "success" if a["success"] else "failure",
+                           "summary": mask(activity.summary("login", a["username"],
+                                                            a["success"], {}))})
+        for turn in t["turns"]:
+            name = "sent" if turn["role"] == "input" else "answered"
+            events.append({"time": turn["ts"],
+                           "kind": "input" if turn["role"] == "input" else "reply",
+                           name: mask(turn["text"][:TEXT_CAP]),
+                           name + "_truncated": len(turn["text"]) > TEXT_CAP,
+                           "summary": mask(turn["text"].strip().split("\n", 1)[0]
+                                           [:activity.SUMMARY_CAP])})
+        events.sort(key=lambda ev: str(ev.get("time") or ""))
+        cut = len(events) > activity.SESSION_EVENTS
+        return {"id": sid, "service": "ssh", "src": t["src_ip"], "start": t["start"],
+                "end": t["end"], "from": "transcript", "events": events[:activity.SESSION_EVENTS],
+                "events_cut": cut,
+                "record_id": sid if sid in self._records.get().by_id else None}
+
+    def _record_for(self, sid: str, service: str, src: Optional[str],
+                    ts: Optional[float]) -> Optional[str]:
+        """The triage record a listener session went into: the campaign for its service
+        and source whose time span holds it."""
+        recs = self._records.get()
+        if sid in recs.by_id:
+            return sid
+        if src is None or ts is None:
+            return None
+        for r in recs.newest:
+            if r.kind != "campaign" or r.protocol != service:
+                continue
+            if r.src_ip != src and src not in r.src_addresses:
+                continue
+            first, last = _parse_ts(r.first_seen), _parse_ts(r.last_seen)
+            if first is not None and last is not None \
+                    and first.timestamp() - 1 <= ts <= last.timestamp() + 1:
+                return r.id
+        return None
+
     def queue(self, query: dict[str, str]) -> tuple[int, object]:
         everything = query.get("all") or "0"
         if everything not in ("0", "1"):
@@ -1104,9 +1426,29 @@ class Api:
         state = load_source_state(p.source_state)
         entries = sorted((e.model_dump(mode="json") for e in state.entries.values()),
                          key=lambda e: e["updated_at"], reverse=True)
+        page = paginate(entries, query)
+        seen = self._last_seen_by_source()
+        for e in page["items"]:
+            stamp = seen.get(e["key"])
+            e["last_seen"] = stamp.isoformat(timespec="seconds") if stamp else None
         return 200, {"overlay": overlay, "overlay_error": overlay_error,
                      "history": list(reversed(tuner_history(p.state / "tuner")))[:50],
-                     "tuner_runs": tuner_runs, "source_state": paginate(entries, query)}
+                     "tuner_runs": tuner_runs, "source_state": page}
+
+    def _last_seen_by_source(self) -> dict[str, datetime.datetime]:
+        """Source key (IPv4 address or IPv6 /64, as source state keys them) -> the newest
+        time a stored triage record saw it."""
+        recs = self._records.get()
+        out: dict[str, datetime.datetime] = {}
+        for r in recs.newest:
+            stamp = recs.stamps.get(r.id)
+            if stamp is None:
+                continue
+            for addr in {r.src_ip, *r.src_addresses}:
+                key = ip_key(addr)
+                if key not in out or stamp > out[key]:
+                    out[key] = stamp
+        return out
 
     def playbooks(self, query: dict[str, str]) -> tuple[int, object]:
         pbs, errors = load_playbooks(self.paths.playbooks)
@@ -1173,10 +1515,19 @@ class Api:
                         log.exception("building connectors failed; connector actions are off")
             return self._connectors_value
 
+    @staticmethod
+    def _needed_connector(action: str, track: bool) -> Optional[str]:
+        """The connector approving ``action`` calls, or None. With track before enforce on,
+        approving ``block_webhook`` only tracks the source (enforce calls the connector)."""
+        if track and action == "block_webhook":
+            return None
+        return CONNECTOR_FOR.get(action)
+
     def _connector_ready(self, approval: dict) -> bool:
         """Whether approving would run the action here rather than consume the approval: a
         connector action needs that connector enabled in this process."""
-        name = CONNECTOR_FOR.get(str(approval.get("action", "")))
+        name = self._needed_connector(str(approval.get("action", "")),
+                                      bool(self.settings.track_before_enforce))
         if name is None:
             return True
         conns = self._connectors()
@@ -1229,7 +1580,8 @@ class Api:
                                 reports_dir=reports)
             else:
                 conns = self._connectors()
-                needed = CONNECTOR_FOR.get(str(current.shown.get("action", "")))
+                needed = self._needed_connector(str(current.shown.get("action", "")),
+                                                bool(settings.track_before_enforce))
                 if needed is not None and (conns is None or not conns.enabled(needed)):
                     # approve would mark it executing and then failed: refuse, keep it pending.
                     return NO_CONNECTOR
@@ -1318,6 +1670,10 @@ class Api:
         if not hmac.compare_digest(blocklist_view_hash(key, entries[key]).encode(),
                                    given.encode()):
             return CHANGED
+        # The read above takes no lock; enforce compares what was checked here again under
+        # its lock, so a change in between (unblock and approve again) is still refused.
+        seen = {k: entries[key].get(k) for k in VIEW_FIELDS}
+        seen["status"] = entries[key].get("status")
         try:
             result = enforce(key, self.paths.state, self.paths.reports,
                              connectors=self._connectors(), by=self._by(),
@@ -1326,7 +1682,9 @@ class Api:
                              ttl_days=settings.blocklist_ttl_days,
                              never_act_on=settings.never_act_on,
                              track_before_enforce=settings.track_before_enforce,
-                             sensor=self.sensor)
+                             sensor=self.sensor, expected=seen)
+        except EnforceChanged:
+            return CHANGED
         except EnforceError as exc:
             # Fixed text from respond: the listed key and the check that refused it.
             return 400, {"error": clean_text(str(exc), ERROR_CAP)}

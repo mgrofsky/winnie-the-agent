@@ -9,12 +9,14 @@ import pytest
 
 from agents.addresses import public_for_tests
 from agents.respond import (
+    EnforceChanged,
     EnforceError,
     RespondSettings,
     approve,
     enforce,
     list_queue,
     peek_blocklist,
+    queue_enforce_action,
     tracked_document,
     tracked_target,
     unblock,
@@ -37,9 +39,10 @@ def _dirs(tmp_path):
     return tmp_path / "state", tmp_path / "reports", tmp_path / "det"
 
 
-def _queue(tmp_path, ip="198.51.100.34", rid="r1", name="block_pb", unverified=False):
+def _queue(tmp_path, ip="198.51.100.34", rid="r1", name="block_pb", unverified=False,
+           action="export_blocklist"):
     write(tmp_path / "reports", rec(rid=rid, ip=ip, unverified=unverified))
-    run(tmp_path, [pb(name=name, steps=[{"action": "export_blocklist"}])], queue_enforce=True)
+    run(tmp_path, [pb(name=name, steps=[{"action": action}])], queue_enforce=True)
 
 
 def _approve_all(tmp_path, track=True, now=NOW, **kw):
@@ -419,3 +422,103 @@ def test_cli_approve_tracks_and_enforce_blocks(tmp_path, monkeypatch):
     out = _cli(tmp_path, monkeypatch, "unblock", "198.51.100.34")
     assert out["unblock"]["removed"] == ["198.51.100.34"]
     assert _export(tmp_path)["entries"] == []
+
+
+# ---- block_webhook approvals ---------------------------------------------------------------
+
+def test_approving_block_webhook_while_tracking_tracks_and_calls_nothing(tmp_path):
+    _queue(tmp_path, action="block_webhook")
+    conns = FakeConnectors()
+    [a] = _approve_all(tmp_path, connectors=conns)
+    assert a["status"] == "done"
+    assert a["result"]["status"] == "tracked in tracked.json; nothing blocked"
+    assert conns.calls == []
+    assert _blocklist(tmp_path) == []
+    assert [e["status"] for e in _export(tmp_path)["entries"]] == ["tracked"]
+    # Only enforce calls the block connector, once.
+    out = _enforce(tmp_path, connectors=conns)
+    assert out["connector"] == {"ok": True, "status": "sent"}
+    assert conns.calls == [("block", "198.51.100.34", "block_pb")]
+    assert _blocklist(tmp_path) == ["198.51.100.34"]
+
+
+def test_approving_block_webhook_while_tracking_needs_no_connector(tmp_path):
+    _queue(tmp_path, action="block_webhook")
+    [a] = _approve_all(tmp_path, connectors=None)
+    assert a["status"] == "done" and a["result"]["status"].startswith("tracked")
+
+
+def test_approving_block_webhook_with_the_switch_off_calls_the_connector(tmp_path):
+    _queue(tmp_path, action="block_webhook")
+    conns = FakeConnectors()
+    [a] = _approve_all(tmp_path, track=False, connectors=conns)
+    assert a["status"] == "done" and a["result"] == {"ok": True, "status": "sent"}
+    assert conns.calls == [("block", "198.51.100.34", "block_pb")]
+    assert not tracked_target(tmp_path / "reports").exists()
+    assert peek_blocklist(tmp_path / "state", NOW) == {}
+
+
+def test_an_unverified_block_webhook_source_is_never_tracked(tmp_path):
+    _queue(tmp_path, action="block_webhook")
+    [queued] = list_queue(tmp_path / "state", now=NOW)
+    path = tmp_path / "state" / "approvals" / f"{queued['id']}.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "unverified_source": True}))
+    conns = FakeConnectors()
+    [a] = _approve_all(tmp_path, connectors=conns)
+    assert a["status"] == "failed" and conns.calls == []
+    assert peek_blocklist(tmp_path / "state", NOW) == {}
+
+
+# ---- a missing blocklist file is written again ---------------------------------------------
+
+@pytest.mark.parametrize("track", [True, False])
+def test_a_missing_blocklist_file_is_rewritten_by_the_next_run(tmp_path, track):
+    _queue(tmp_path)
+    _approve_all(tmp_path, track=track)
+    if track:
+        _enforce(tmp_path)
+    blocklist_dir = tmp_path / "reports" / "blocklist"
+    for p in blocklist_dir.iterdir():
+        p.unlink()   # a new, empty volume mounted over the directory
+    later = NOW + datetime.timedelta(hours=1)
+    run(tmp_path, [pb(name="noop_pb")], now=later, track_before_enforce=track)
+    assert _blocklist(tmp_path) == ["198.51.100.34"]
+    assert tracked_target(tmp_path / "reports").exists() is track
+
+
+def test_nothing_is_written_before_the_first_approval(tmp_path):
+    run(tmp_path, [pb(name="noop_pb")])
+    assert not (tmp_path / "reports" / "blocklist").exists()
+
+
+def test_a_present_blocklist_file_is_left_alone_with_the_switch_off(tmp_path):
+    _queue(tmp_path)
+    _approve_all(tmp_path, track=False)
+    path = tmp_path / "reports" / "blocklist" / "approved.txt"
+    before = path.stat().st_mtime_ns, path.stat().st_ino
+    run(tmp_path, [pb(name="noop_pb")], now=NOW + datetime.timedelta(hours=1))
+    assert (path.stat().st_mtime_ns, path.stat().st_ino) == before
+
+
+# ---- what the caller saw is re-checked under the lock --------------------------------------
+
+def test_enforce_refuses_an_entry_that_changed_since_it_was_seen(tmp_path):
+    _tracked(tmp_path)
+    state, reports, _ = _dirs(tmp_path)
+    seen = dict(peek_blocklist(state, NOW)["198.51.100.34"])
+    # Removed and approved again in the same second: same times, a new approval.
+    unblock("198.51.100.34", state, reports, now=NOW, track_before_enforce=True)
+    playbook = pb(name="block_pb", steps=[{"action": "export_blocklist"}])
+    _, aid = queue_enforce_action(state, playbook, rec(rid="r2"), playbook.steps[0], NOW, 72, {})
+    approve(aid, state, reports, tmp_path / "det", by="alice", now=NOW,
+            track_before_enforce=True)
+    fresh = peek_blocklist(state, NOW)["198.51.100.34"]
+    assert fresh["approved_at"] == seen["approved_at"]
+    assert fresh["approval_id"] != seen["approval_id"]
+    before = _blocklist(tmp_path), _export(tmp_path)
+    expected = {k: seen.get(k) for k in ("approved_at", "expires_at", "approval_id", "status")}
+    with pytest.raises(EnforceChanged):
+        _enforce(tmp_path, expected=expected)
+    assert (_blocklist(tmp_path), _export(tmp_path)) == before
+    expected["approval_id"] = fresh["approval_id"]
+    assert _enforce(tmp_path, expected=expected)["status"] == "enforced"
