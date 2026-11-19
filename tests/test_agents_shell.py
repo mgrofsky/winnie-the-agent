@@ -742,4 +742,4 @@ def test_a_fault_inside_a_command_falls_back_instead_of_raising(monkeypatch, cap
     monkeypatch.setattr(shell.Shell, "_pipeline", boom)
     assert out("uname -a") is None
     assert "canned shell failed" in caplog.text
-    assert "command not found" in hooks.fallback_reply("uname -a", False, "root")
+    assert hooks.fallback_reply("uname -a", False, "root") == ""    # a known command: no tell
