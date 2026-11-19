@@ -542,19 +542,25 @@ rule, `--netfilter-mode=off`, `tailscale serve`, `/go`, console actions) has run
 AWS account in a private deployment built from a fork of this template: a rebuilt
 instance came back as the same node without a join key, the console answered over the
 tailnet and from `/go` before and after a reboot, tailscaled added no firewall chains, and
-443 and 8480 stayed closed from the internet. These are not yet run as written here:
+443 and 8480 stayed closed from the internet.
+
+The exporter's host rules have run there too, from the host files in this repository
+copied out of an image built from it: the prefix-list lookup through the `ec2` endpoint
+succeeded (the ARN form `arn:aws:ec2:<region>:aws:prefix-list/<id>` is accepted by IAM and
+by the endpoint policy); as the exporter's user on the host network, connections to a
+public address, out `tailscale0` and over IPv6 were refused, while the metadata service,
+S3 through the gateway endpoint and an interface endpoint connected; root still reached
+the internet; a bridged container reached neither the internet nor the metadata service.
+After a reboot `sensor-egress-boot.service` had finished before Docker started and before
+the exporter's container did, the same probes gave the same answers, and
+`systemctl restart docker` left the rules unchanged. `tests/test_deploy_aws.py` also runs
+`sensor-egress.sh` against a fake `iptables` for the order and the fail-closed paths.
+
+These are not yet run as written here:
 
 - this template's own version of the steps (the combined console step, `[ui] actions` set
   in `config.ini` rather than a command line, the read-write `blocklist` mount, the
   parameter names derived from `NamePrefix`, the name check, files copied out of the image);
-- the exporter's host rules and everything they rely on: the `ec2` endpoint and the
-  prefix-list ARN form `arn:aws:ec2:<region>:aws:prefix-list/<id>` that the IAM statement
-  and the endpoint policy name (if AWS evaluates another form, the lookup is refused and
-  the export waits, it does not open), the exporter's DNS going to `127.0.0.53` or the VPC
-  resolver, the export still reaching S3 through the gateway endpoint under the rules, and
-  `sensor-egress-boot.service` running before Docker restarts the containers at a reboot.
-  `tests/test_deploy_aws.py` runs `sensor-egress.sh` against a fake `iptables`, which
-  proves the order and the fail-closed paths of the script, not the kernel's behaviour;
 - a first join with the state in Parameter Store from the start: that deployment moved
   an existing node's state into the parameter. tailscaled's AWS store writes `{}` when
   the parameter does not exist and then starts logged out (read in its source, not
