@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Winnie the Agent sensor, model access on Amazon Bedrock (optional). In the sensor account
+  and region, after sensor.yaml: a bedrock-runtime and an sts interface endpoint in the
+  sensor's network, and one role per caller that may only invoke that caller's model
+  through that endpoint. The sensor host assumes each role and hands its credentials to
+  that caller's container alone. Deploy sensor.yaml with the same two model ids.
+
+# Why a separate stack: sensor.yaml's comment-stripped copy must stay under CloudFormation's
+# 51,200-byte inline template limit, and these resources do not fit there.
+#
+# Both clients use the Converse API (the persona through langchain_aws ChatBedrockConverse,
+# the analyst through boto3), and neither streams. Converse is authorised as
+# bedrock:InvokeModel (there is no bedrock:Converse action); ConverseStream would need
+# bedrock:InvokeModelWithResponseStream, which is not granted, so a client that started
+# streaming would be refused rather than widen anything.
+#
+# The grant for one model id, the same in the endpoint policy and the role:
+# - a plain model id (anthropic.claude-...): that foundation model in this region;
+# - an inference profile id (a geographic prefix, us., us-gov., eu., apac., jp., au. or
+#   global., then the model id): the profile in this region, and its foundation model in
+#   any region (*), because the profile sends each call to a region of its own choosing
+#   and the list differs by model and changes over time. The model id stays exact. The
+#   foundation model id is the profile id without its first part; model names hold no dots
+#   (AllowedPattern), so it is the second and third parts. The id is padded with ".."
+#   before splitting so both parts exist whichever branch CloudFormation evaluates.
+#
+# One role per caller, not one shared role: the ssh container faces attackers, and with a
+# shared role its credentials could also invoke the analyst's model. Two roles keep each
+# grant a fixed part of this template that check.py evaluates offline; one role with a
+# session policy per caller would put the narrowing in the host script instead.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: winnie-sensor
+    AllowedPattern: '^[a-z][a-z0-9-]{2,29}$'
+    Description: The sensor stack's NamePrefix (its instance role is NamePrefix-host).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The sensor stack's VpcId output.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: The sensor stack's SubnetId output.
+  EndpointSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      The sensor stack's EndpointSecurityGroupId output. It already allows tcp 443 from the
+      sensor instance only, and the instance may already send tcp 443 to it, so no rule is
+      added.
+  PersonaModelId:
+    Type: String
+    Default: ""
+    MaxLength: 100
+    AllowedPattern: '^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
+    Description: Bedrock model or inference profile id for the SSH persona; empty for none.
+  AnalystModelId:
+    Type: String
+    Default: ""
+    MaxLength: 100
+    AllowedPattern: '^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
+    Description: Bedrock model or inference profile id for the analyst; empty for none.
+
+Conditions:
+  PersonaOn: !Not [!Equals [!Ref PersonaModelId, ""]]
+  AnalystOn: !Not [!Equals [!Ref AnalystModelId, ""]]
+  PersonaProfile: !Or
+    - !Equals [!Select [0, !Split [".", !Ref PersonaModelId]], us]
+    - !Equals [!Select [0, !Split [".", !Ref PersonaModelId]], us-gov]
+    - !Equals [!Select [0, !Split [".", !Ref PersonaModelId]], eu]
+    - !Equals [!Select [0, !Split [".", !Ref PersonaModelId]], apac]
+    - !Equals [!Select [0, !Split [".", !Ref PersonaModelId]], jp]
+    - !Equals [!Select [0, !Split [".", !Ref PersonaModelId]], au]
+    - !Equals [!Select [0, !Split [".", !Ref PersonaModelId]], global]
+  AnalystProfile: !Or
+    - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], us]
+    - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], us-gov]
+    - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], eu]
+    - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], apac]
+    - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], jp]
+    - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], au]
+    - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], global]
+
+Rules:
+  NeedsAModel:
+    Assertions:
+      - Assert: !Not [!And [!Equals [!Ref PersonaModelId, ""], !Equals [!Ref AnalystModelId, ""]]]
+        AssertDescription: Set PersonaModelId, AnalystModelId or both (with neither, do not deploy this stack).
+
+Resources:
+  # bedrock:InvokeModel on the configured models, for any principal that comes through this
+  # endpoint. Only the sensor host's network reaches it (EndpointSecurityGroupId).
+  BedrockEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.bedrock-runtime
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref EndpointSecurityGroupId]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - !If
+            - PersonaOn
+            - Sid: Persona
+              Effect: Allow
+              Principal: "*"
+              Action: bedrock:InvokeModel
+              Resource: !If
+                - PersonaProfile
+                - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${PersonaModelId}
+                  - !Sub
+                    - arn:${AWS::Partition}:bedrock:*::foundation-model/${P}.${N}
+                    - P: !Select [1, !Split [".", !Sub "${PersonaModelId}.."]]
+                      N: !Select [2, !Split [".", !Sub "${PersonaModelId}.."]]
+                - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${PersonaModelId}
+            - !Ref AWS::NoValue
+          - !If
+            - AnalystOn
+            - Sid: Analyst
+              Effect: Allow
+              Principal: "*"
+              Action: bedrock:InvokeModel
+              Resource: !If
+                - AnalystProfile
+                - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${AnalystModelId}
+                  - !Sub
+                    - arn:${AWS::Partition}:bedrock:*::foundation-model/${P}.${N}
+                    - P: !Select [1, !Split [".", !Sub "${AnalystModelId}.."]]
+                      N: !Select [2, !Split [".", !Sub "${AnalystModelId}.."]]
+                - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${AnalystModelId}
+            - !Ref AWS::NoValue
+
+  # Through this endpoint: assuming the callers' roles, and GetCallerIdentity. Its private
+  # name answers for the whole VPC, so every other STS call from the sensor's network is
+  # refused here, including an operator's assume-role into another role on the host.
+  # GetCallerIdentity needs no permission and only names the caller; it is allowed so that
+  # "aws sts get-caller-identity" still works in a session on the host.
+  StsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sts
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref EndpointSecurityGroupId]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AssumeModelRoles
+            Effect: Allow
+            Principal: "*"
+            Action: sts:AssumeRole
+            Resource:
+              - !If [PersonaOn, !GetAtt PersonaRole.Arn, !Ref AWS::NoValue]
+              - !If [AnalystOn, !GetAtt AnalystRole.Arn, !Ref AWS::NoValue]
+          - Sid: WhoAmI
+            Effect: Allow
+            Principal: "*"
+            Action: sts:GetCallerIdentity
+            Resource: "*"
+
+  # The callers' roles, one each: its caller's model only, and only through the
+  # bedrock-runtime endpoint (aws:SourceVpce), so the credentials are of no use anywhere
+  # else. Sessions last at most an hour. Only the sensor's instance role may assume them.
+  # The ssh container gets PersonaRole's credentials, the agents container AnalystRole's.
+  PersonaRole:
+    Type: AWS::IAM::Role
+    Condition: PersonaOn
+    Properties:
+      RoleName: !Sub ${NamePrefix}-model-persona
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-host
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-model
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Persona
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !If
+                  - PersonaProfile
+                  - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${PersonaModelId}
+                    - !Sub
+                      - arn:${AWS::Partition}:bedrock:*::foundation-model/${P}.${N}
+                      - P: !Select [1, !Split [".", !Sub "${PersonaModelId}.."]]
+                        N: !Select [2, !Split [".", !Sub "${PersonaModelId}.."]]
+                  - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${PersonaModelId}
+                Condition:
+                  StringEquals:
+                    aws:SourceVpce: !Ref BedrockEndpoint
+
+  AnalystRole:
+    Type: AWS::IAM::Role
+    Condition: AnalystOn
+    Properties:
+      RoleName: !Sub ${NamePrefix}-model-analyst
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-host
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-model
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Analyst
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !If
+                  - AnalystProfile
+                  - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${AnalystModelId}
+                    - !Sub
+                      - arn:${AWS::Partition}:bedrock:*::foundation-model/${P}.${N}
+                      - P: !Select [1, !Split [".", !Sub "${AnalystModelId}.."]]
+                        N: !Select [2, !Split [".", !Sub "${AnalystModelId}.."]]
+                  - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${AnalystModelId}
+                Condition:
+                  StringEquals:
+                    aws:SourceVpce: !Ref BedrockEndpoint
+
+  # The sensor's instance role may assume the callers' roles and gets nothing on Bedrock
+  # itself. Deleting this stack removes this policy with the rest.
+  InstanceAssumeModelRole:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Sub ${NamePrefix}-host
+      PolicyName: sensor-host-model
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AssumeModelRoles
+            Effect: Allow
+            Action: sts:AssumeRole
+            Resource:
+              - !If [PersonaOn, !GetAtt PersonaRole.Arn, !Ref AWS::NoValue]
+              - !If [AnalystOn, !GetAtt AnalystRole.Arn, !Ref AWS::NoValue]
+
+Outputs:
+  PersonaRoleArn:
+    Condition: PersonaOn
+    Value: !GetAtt PersonaRole.Arn
+  AnalystRoleArn:
+    Condition: AnalystOn
+    Value: !GetAtt AnalystRole.Arn
+  BedrockEndpointId:
+    Value: !Ref BedrockEndpoint
