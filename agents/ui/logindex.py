@@ -269,15 +269,20 @@ class SessionIndex(LogTail):
             return {"sessions": len(self._ranges), "offset": self._offset,
                     "caught_up": self.caught_up, "rebuilds": self.rebuilds}
 
-    def transcript(self, sid: str) -> Optional[dict]:
+    def transcript(self, sid: str, max_bytes: Optional[int] = None) -> Optional[dict]:
         """Auth attempts and turns of one session, or None when the index has no lines for
-        it. Raises ``RangeTooLarge``."""
+        it. Raises ``RangeTooLarge``. With ``max_bytes``, only the lines that start in the
+        first ``max_bytes`` of the range are read, and ``cut`` says whether that left any
+        out; ``read_bytes`` is the length of the range read."""
         span = self.range_of(sid)
         if span is None or self.path is None:
             return None
         start, end = span
         if end - start > MAX_RANGE_BYTES:
             raise RangeTooLarge(sid)
+        cut = max_bytes is not None and end - start > max_bytes
+        if cut:
+            end = start + max(1, max_bytes)
         try:
             parsed = sessions.parse_log(self.path, start_offset=start, end_offset=end)
         except OSError:
@@ -291,8 +296,9 @@ class SessionIndex(LogTail):
                 return None  # the range no longer holds this session (rotated meanwhile)
             return {"id": sid, "src_ip": None, "start": None, "end": None, "closed": True,
                     "username": next((a.username for a in auth if a.success), None),
-                    "auth_attempts": [_auth(a) for a in auth], "turns": []}
-        return {"id": sid, "src_ip": s.src_ip,
+                    "auth_attempts": [_auth(a) for a in auth], "turns": [], "cut": cut,
+                    "read_bytes": end - start}
+        return {"id": sid, "cut": cut, "read_bytes": end - start, "src_ip": s.src_ip,
                 "start": s.start.isoformat() if s.start else None,
                 "end": s.end.isoformat() if s.end else None, "closed": s.closed,
                 "username": s.username, "auth_attempts": [_auth(a) for a in s.auth_attempts],

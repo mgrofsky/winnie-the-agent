@@ -328,8 +328,11 @@ replay reads, read-only, through the same GET-only checks (signed-in session, Ho
 Origin rules), and has no POST route. Its index lives in memory and writes nothing. Every
 answer goes through the same sanitising boundary as the rest of the API (control and
 invisible characters removed, strings, lists and dicts capped, long fields flagged as
-cut), honeytoken values the sensor planted are masked, and the page renders everything as
-text. A source or session from the log becomes a link only when it matches a strict
+cut), honeytoken values the sensor planted are masked (in the whole text before any cut,
+and in sources and session ids too, as in the transcript), and the page renders
+everything as text. Every request reads at most 16 MiB of the log back, and its in-memory
+index and facet counters are bounded, so a flood of long lines or made-up values cannot
+make one request or the index grow without limit. A source or session from the log becomes a link only when it matches a strict
 pattern (an address, a session id), and only inside the console.
 
 **What it deliberately cannot do.** It never calls a model, so nothing it shows can steer

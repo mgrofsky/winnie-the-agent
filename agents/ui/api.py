@@ -603,18 +603,38 @@ def _mask(value: str) -> str:
     return value[:2] + MASK if len(value) >= MASK_PREFIX_MIN else MASK
 
 
-def pair_replies(turns: list[dict]) -> list[Optional[str]]:
-    """One entry per input turn, in order: the decoy's response turns that follow it (before
-    the next input) joined by newlines, or None when none was logged. Responses before the
-    first input belong to no command."""
-    out: list[Optional[str]] = []
+def pair_inputs(turns: list[dict]) -> list[tuple[str, Optional[str]]]:
+    """One (input text, reply) pair per input turn, in order: the reply is the decoy's
+    response turns that follow the input (before the next input) joined by newlines, or
+    None when none was logged. Responses before the first input belong to no command."""
+    out: list[list] = []
     for t in turns:
+        text = t.get("text") if isinstance(t.get("text"), str) else ""
         if t.get("role") == "input":
-            out.append(None)
+            out.append([text, None])
         elif t.get("role") == "response" and out:
-            text = t.get("text") if isinstance(t.get("text"), str) else ""
-            out[-1] = text if out[-1] is None else out[-1] + "\n" + text
-    return out
+            out[-1][1] = text if out[-1][1] is None else out[-1][1] + "\n" + text
+    return [(i, r) for i, r in out]
+
+
+def pair_replies(turns: list[dict]) -> list[Optional[str]]:
+    """The replies of ``pair_inputs`` alone."""
+    return [r for _, r in pair_inputs(turns)]
+
+
+def _merge(first: list[dict], second: list[dict], second_first) -> list[dict]:
+    """Two lists, each kept in its own order, merged: the next of ``second`` goes before
+    the next of ``first`` when ``second_first(next_second, next_first)`` says so."""
+    out: list[dict] = []
+    i = j = 0
+    while i < len(first) and j < len(second):
+        if second_first(second[j], first[i]):
+            out.append(second[j])
+            j += 1
+        else:
+            out.append(first[i])
+            i += 1
+    return out + first[i:] + second[j:]
 
 
 def _iso_ts(value: Optional[float]) -> Optional[str]:
@@ -1039,33 +1059,56 @@ class Api:
             return 422, {"error": "transcript too large"}
         if t is None:
             return 404, {"error": "transcript not available"}
-        turns = [{**turn, "truncated": len(turn["text"]) > TEXT_CAP} for turn in t["turns"]]
+        # Masked whole, then cut by ``scrub``: honeytoken values are masked everywhere in
+        # the console except the explicit reveal on the honeytokens screen.
+        mask = self._masker()
+        turns = []
+        for turn in t["turns"]:
+            text = mask(turn["text"])
+            turns.append({**turn, "text": text, "truncated": len(text) > TEXT_CAP})
         t["turns"] = paginate(turns, query)
+        t["auth_attempts"] = [{**a, "username": mask(a["username"]),
+                               "password": mask(a["password"])} for a in t["auth_attempts"]]
+        t["username"], t["src_ip"] = mask(t["username"]), mask(t["src_ip"])
         return 200, t
 
     def replies(self, query: dict[str, str], rid: str) -> tuple[int, object]:
         """What the decoy answered to each command of an SSH session record, paired with
         the record's command list by place in the session (the n-th input turn is the n-th
-        command), never by text. A command with no reply logged says so."""
+        command), never by text. As a check on the pairing, the paired input must start
+        with the record's command; when it does not, the pair is marked ``unmatched`` and
+        no reply is shown. ``status`` per command: ``reply``, ``none`` (no reply logged),
+        ``unmatched``, or ``not_read`` (past ``activity.READ_BUDGET`` of the session)."""
         r = self._record_id(rid)
         if r is None or r.kind != "session" or r.protocol != "ssh":
             return NOT_FOUND
         try:
-            t = self.index.transcript(r.id)
+            t = self.index.transcript(r.id, max_bytes=activity.READ_BUDGET)
         except RangeTooLarge:
             return 422, {"error": "transcript too large"}
         if t is None:
             return 404, {"error": "transcript not available"}
         mask = self._masker()
-        paired = pair_replies(t["turns"])
+        pairs = pair_inputs(t["turns"])
+        cut = t.get("cut") is True
         items = []
         for i, command in enumerate(r.command_sample):
-            reply = paired[i] if i < len(paired) else None
-            items.append({"index": i, "command": mask(command),
-                          "recorded": reply is not None,
-                          "reply": mask(reply[:TEXT_CAP]) if reply is not None else None,
-                          "truncated": reply is not None and len(reply) > TEXT_CAP})
-        return 200, {"id": r.id, "items": items, "commands_in_session": len(paired)}
+            item = {"index": i, "command": mask(command), "status": "none",
+                    "recorded": False, "reply": None, "truncated": False}
+            if i >= len(pairs):
+                if cut:
+                    item["status"] = "not_read"
+            elif not pairs[i][0].startswith(command):
+                item["status"] = "unmatched"
+            elif pairs[i][1] is not None:
+                reply = mask(pairs[i][1])
+                # The last pair read may be missing reply lines past the read limit.
+                partial = cut and i == len(pairs) - 1
+                item.update(status="reply", recorded=True, reply=reply[:TEXT_CAP],
+                            truncated=len(reply) > TEXT_CAP or partial)
+            items.append(item)
+        return 200, {"id": r.id, "items": items, "commands_in_session": len(pairs),
+                     "read_cut": cut}
 
     # -- activity --
 
@@ -1079,8 +1122,11 @@ class Api:
                         key=len, reverse=True)[:500]
 
         def mask(text: Optional[str]) -> Optional[str]:
+            # Hidden characters are removed first (``scrub`` would remove them anyway), so
+            # a value split by one is still found. Callers mask whole text and cut after.
             if not isinstance(text, str):
                 return text
+            text = _STRIP_RE.sub("", text)
             for v in values:
                 if v in text:
                     text = text.replace(v, _mask(v))
@@ -1127,44 +1173,54 @@ class Api:
                                 kind=kind, outcome=outcome, username=text("user", 64),
                                 session=text("session", 128, activity.SESSION_ID_RE))
 
-    def _activity_facets(self, entries: list, info: dict) -> dict:
+    def _activity_facets(self, entries: list, info: dict, mask) -> dict:
         with self._facets_lock:
             key, value = self._facets
             if key != info["generation"]:
                 value = activity.facets(entries)
                 self._facets = (info["generation"], value)
-            return value
+        # Counted on the raw values, masked as served (the registry can change).
+        return {"services": {mask(k): n for k, n in value["services"].items()},
+                "kinds": value["kinds"], "approximate": value["approximate"],
+                "top_sources": [{"src": mask(s["src"]), "events": s["events"]}
+                                for s in value["top_sources"]]}
 
     def _activity_item(self, e: tuple, rec: Optional[dict], mask) -> dict:
         outcome = None if e[activity.OK] is None else \
             "success" if e[activity.OK] else "failure"
-        item = {"offset": e[activity.OFF], "src": e[activity.SRC],
-                "service": e[activity.SERVICE], "kind": e[activity.KIND],
-                "session": e[activity.SESSION], "username": mask(e[activity.USER]),
+        # Every text is masked whole and cut after (``describe`` does the same), so a
+        # honeytoken across a cut point is never shown in part.
+        user = mask(e[activity.USER])
+        item = {"offset": e[activity.OFF], "src": mask(e[activity.SRC]),
+                "service": mask(e[activity.SERVICE]), "kind": e[activity.KIND],
+                "session": mask(e[activity.SESSION]), "username": user,
                 "outcome": outcome}
         if rec is None:
             item.update(time=None, summary="this line is no longer in the event log",
                         unreadable=True)
             return item
         when = rec.get("timestamp")
-        d = activity.describe(rec, e[activity.SERVICE], e[activity.KIND], TEXT_CAP)
+        d = activity.describe(rec, e[activity.SERVICE], e[activity.KIND], TEXT_CAP, mask)
         item["time"] = when[:40] if isinstance(when, str) else None
-        item["summary"] = mask(activity.summary(e[activity.KIND], e[activity.USER],
-                                                e[activity.OK], d))
-        item["message"] = mask(d["message"])
+        item["summary"] = activity.summary(e[activity.KIND], user, e[activity.OK], d)
+        item["message"] = d["message"]
         for name in ("sent", "answered", "result"):
             value = d[name]
-            item[name] = mask(value[:TEXT_CAP]) if isinstance(value, str) else None
+            item[name] = value[:TEXT_CAP] if isinstance(value, str) else None
             item[name + "_truncated"] = isinstance(value, str) and len(value) > TEXT_CAP
         if "password" in d:
-            item["password"] = mask(d["password"])
+            item["password"] = d["password"]
         return item
 
     def activity(self, query: dict[str, str]) -> tuple[int, object]:
-        """Raw events, newest first. Structured filters run on the in-memory index; ``q``
-        reads candidate lines under ``activity.SEARCH_BUDGET`` bytes and hands back a cursor
-        (``next_before``) when the budget runs out. ``after`` returns only how many matching
-        events are newer than that offset (for the "new events" notice)."""
+        """Raw events, newest first. Structured filters run on the in-memory index; the
+        lines shown (and, for ``q``, the candidate lines) are read back under
+        ``activity.READ_BUDGET`` bytes per request, and when it runs out the answer says so
+        (``read_cut``) and hands back a cursor (``next_before``) to continue from. ``after``
+        returns only how many matching events are newer than that offset (for the "new
+        events" notice). Every answer carries ``log_id``; a cursor (``before``, ``after``)
+        must come with the ``log_id`` it was handed out with, and one from another log (the
+        log was rotated or truncated, or the console restarted) is refused with 409."""
         filters = self._activity_filters(query)
         q = (query.get("q") or "").strip()
         if len(q) > 200 or clean_text(q, 200) != q:
@@ -1174,14 +1230,18 @@ class Api:
         after = self._offset_param(query, "after")
         per = _int(query, "per", activity.PAGE_SIZE, 1, activity.MAX_PAGE_SIZE)
         entries, info = self.events.snapshot()
+        log_id = info["log_id"]
+        if (before is not None or after is not None) and query.get("log_id") != log_id:
+            return 409, {"error": "the event log changed since this list was loaded",
+                         "log_id": log_id}
         newest = entries[-1][activity.OFF] if entries else None
         if after is not None:
             start = activity.before_index(entries, after + 1)
             n = sum(1 for e in entries[start:] if filters.match(e))
-            return 200, {"new": n, "newest": newest, "approximate": bool(q)}
+            return 200, {"new": n, "newest": newest, "approximate": bool(q), "log_id": log_id}
         mask = self._masker()
         items: list[dict] = []
-        budget = activity.SEARCH_BUDGET
+        budget = activity.READ_BUDGET
         i = activity.before_index(entries, before) - 1
         last_examined: Optional[tuple] = None
         exhausted = False
@@ -1190,34 +1250,30 @@ class Api:
             while i >= 0 and len(items) < per:
                 e = entries[i]
                 if filters.match(e):
-                    if q:
-                        if budget <= 0:
-                            exhausted = True
-                            break
-                        budget -= e[activity.LEN]
+                    if budget <= 0:
+                        exhausted = True
+                        break
+                    budget -= activity.read_cost(e)
                     rec = activity.read_line(f, e) if f is not None else None
-                    if not q:
-                        items.append(self._activity_item(e, rec, mask))
-                    elif rec is not None and q in self._haystack(e, rec):
+                    if not q or (rec is not None and q in self._haystack(e, rec)):
                         items.append(self._activity_item(e, rec, mask))
                 last_examined = e
                 i -= 1
         finally:
             if f is not None:
                 f.close()
-        more = i >= 0
-        if exhausted:
-            next_before = last_examined[activity.OFF] if last_examined else before
-        elif more and items:
-            next_before = items[-1]["offset"] if not q else last_examined[activity.OFF]
-        else:
-            next_before = None
+        # Stopped with older entries left (a full page or the read budget): continue below
+        # the last one examined.
+        next_before = last_examined[activity.OFF] \
+            if i >= 0 and last_examined is not None else None
         out: dict = {"items": items, "per": per, "next_before": next_before, "newest": newest,
+                     "log_id": log_id, "read_cut": exhausted,
+                     "budget_bytes": activity.READ_BUDGET,
                      "window": self._activity_window(entries, info),
-                     "facets": self._activity_facets(entries, info)}
+                     "facets": self._activity_facets(entries, info, mask)}
         if q:
             reached = last_examined[activity.TS] if last_examined else None
-            out["search"] = {"complete": not exhausted, "budget_bytes": activity.SEARCH_BUDGET,
+            out["search"] = {"complete": not exhausted, "budget_bytes": activity.READ_BUDGET,
                              "searched_back_to": _iso_ts(reached)}
         return 200, out
 
@@ -1245,60 +1301,102 @@ class Api:
         return "\n".join(p for p in parts if isinstance(p, str)).lower()
 
     def activity_session(self, query: dict[str, str], sid: str) -> tuple[int, object]:
-        """Every event of one session in order, any service. An SSH session is replayed
-        from the transcript code (``SessionIndex.transcript``), as on its record page."""
+        """Every event of one session in order, any service, read under
+        ``activity.READ_BUDGET`` bytes (``events_cut`` and ``read_cut`` say when the view
+        stops short). An SSH session's logins and turns are replayed from the transcript
+        code (``SessionIndex.transcript``), as on its record page, with its connection,
+        close and error lines from the indexed window merged in."""
         if not activity.SESSION_ID_RE.fullmatch(sid):
             return NOT_FOUND
         mask = self._masker()
+        key = sid[:activity.SESSION_CAP]       # the index keeps session ids this long
+        entries, info = self.events.snapshot()
+        mine = [e for e in entries if e[activity.SESSION] == key]
         if sid.startswith("session-"):
             try:
-                t = self.index.transcript(sid)
+                t = self.index.transcript(sid, max_bytes=activity.READ_BUDGET)
             except RangeTooLarge:
                 return 422, {"error": "transcript too large"}
             if t is not None:
-                return 200, self._ssh_session(sid, t, mask)
-        entries, _ = self.events.snapshot()
-        mine = [e for e in entries if e[activity.SESSION] == sid]
+                return 200, self._ssh_session(sid, t, mine, mask)
         if not mine:
             return 404, {"error": "session not in the indexed window"}
-        cut = len(mine) > activity.SESSION_EVENTS
-        mine = mine[:activity.SESSION_EVENTS]
-        f = activity.open_log(self.paths.log)
-        try:
-            events = [self._activity_item(e, activity.read_line(f, e) if f else None, mask)
-                      for e in mine]
-        finally:
-            if f is not None:
-                f.close()
+        events, read_cut = self._read_events(mine[:activity.SESSION_EVENTS],
+                                             activity.READ_BUDGET, mask)
+        cut = len(mine) > activity.SESSION_EVENTS or read_cut
         first = next((e for e in mine if e[activity.SRC]), mine[0])
         times = [ev["time"] for ev in events if ev.get("time")]
-        return 200, {"id": sid, "service": mine[0][activity.SERVICE], "src": first[activity.SRC],
+        return 200, {"id": sid, "service": mask(mine[0][activity.SERVICE]),
+                     "src": mask(first[activity.SRC]),
                      "start": times[0] if times else None, "end": times[-1] if times else None,
                      "from": "index", "events": events, "events_cut": cut,
+                     "read_cut": read_cut, "log_id": info["log_id"],
                      "record_id": self._record_for(sid, mine[0][activity.SERVICE],
                                                    first[activity.SRC], mine[0][activity.TS])}
 
-    def _ssh_session(self, sid: str, t: dict, mask) -> dict:
-        events = []
+    def _read_events(self, mine: list, budget: int, mask) -> tuple[list[dict], bool]:
+        """Items for ``mine`` in order, read back until ``budget`` bytes run out, and
+        whether they ran out first."""
+        events: list[dict] = []
+        f = activity.open_log(self.paths.log)
+        try:
+            for e in mine:
+                if budget <= 0:
+                    return events, True
+                budget -= activity.read_cost(e)
+                events.append(self._activity_item(e, activity.read_line(f, e) if f else None,
+                                                  mask))
+        finally:
+            if f is not None:
+                f.close()
+        return events, False
+
+    # Kinds an SSH session view takes from the transcript; every other kind of the
+    # session's lines (connection, close, error, other) comes from the index.
+    SSH_TRANSCRIPT_KINDS = ("login", "input", "reply")
+
+    def _ssh_session(self, sid: str, t: dict, mine: list, mask) -> dict:
+        """Logins and turns from the transcript, turns in transcript order and logins
+        merged by parsed time (a login whose time, or the next turn's, is missing comes
+        first, as auth lines come before the shell's); then the connection, close and error
+        lines the index holds, merged by parsed time (without one, a connection line comes
+        first and the others last, each in file order)."""
+        logins = []
         for a in t["auth_attempts"]:
-            events.append({"time": a["ts"], "kind": "login", "username": mask(a["username"]),
-                           "password": mask(a["password"]),
+            user = mask(a["username"])
+            logins.append({"time": a["ts"], "_t": activity._ts(a["ts"]), "kind": "login",
+                           "username": user, "password": mask(a["password"]),
                            "outcome": "success" if a["success"] else "failure",
-                           "summary": mask(activity.summary("login", a["username"],
-                                                            a["success"], {}))})
+                           "summary": activity.summary("login", user, a["success"], {})})
+        turns = []
         for turn in t["turns"]:
             name = "sent" if turn["role"] == "input" else "answered"
-            events.append({"time": turn["ts"],
-                           "kind": "input" if turn["role"] == "input" else "reply",
-                           name: mask(turn["text"][:TEXT_CAP]),
-                           name + "_truncated": len(turn["text"]) > TEXT_CAP,
-                           "summary": mask(turn["text"].strip().split("\n", 1)[0]
-                                           [:activity.SUMMARY_CAP])})
-        events.sort(key=lambda ev: str(ev.get("time") or ""))
-        cut = len(events) > activity.SESSION_EVENTS
-        return {"id": sid, "service": "ssh", "src": t["src_ip"], "start": t["start"],
+            text = mask(turn["text"])
+            turns.append({"time": turn["ts"], "_t": activity._ts(turn["ts"]),
+                          "kind": "input" if turn["role"] == "input" else "reply",
+                          name: text[:TEXT_CAP], name + "_truncated": len(text) > TEXT_CAP,
+                          "summary": text.strip().split("\n", 1)[0][:activity.SUMMARY_CAP]})
+        events = _merge(turns, logins, lambda login, turn: login["_t"] is None
+                        or turn["_t"] is None or login["_t"] <= turn["_t"])
+        others = [e for e in mine if e[activity.KIND] not in self.SSH_TRANSCRIPT_KINDS]
+        budget = activity.READ_BUDGET - int(t.get("read_bytes") or 0)
+        extra, read_cut = self._read_events(others[:activity.SESSION_EVENTS], budget, mask)
+        for item, e in zip(extra, others):
+            item["_t"] = e[activity.TS]
+
+        def extra_first(x: dict, y: dict) -> bool:
+            if x["_t"] is not None and y["_t"] is not None:
+                return x["_t"] < y["_t"]
+            return x["kind"] == "connection"
+        events = _merge(events, extra, extra_first)
+        for ev in events:
+            del ev["_t"]
+        read_cut = read_cut or t.get("cut") is True
+        cut = len(events) > activity.SESSION_EVENTS or read_cut \
+            or len(others) > activity.SESSION_EVENTS
+        return {"id": sid, "service": "ssh", "src": mask(t["src_ip"]), "start": t["start"],
                 "end": t["end"], "from": "transcript", "events": events[:activity.SESSION_EVENTS],
-                "events_cut": cut,
+                "events_cut": cut, "read_cut": read_cut, "connection_lines": bool(others),
                 "record_id": sid if sid in self._records.get().by_id else None}
 
     def _record_for(self, sid: str, service: str, src: Optional[str],

@@ -94,6 +94,7 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     config file: ``WINNIE_UI_TOKEN`` or a fresh one (``serve`` logs the sign-in link)."""
     from agents.budget import BudgetConfig
     from agents.respond import RespondSettings
+    from agents.ui.activity import DEFAULT_MAX_ENTRIES, MAX_ENTRIES, MIN_ENTRIES
     from agents.ui.api import Api, ApiLimits, ApiPaths
     from agents.ui.server import UiSettings, serve
 
@@ -113,8 +114,8 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
             external_host=args.external_host if args.external_host is not None
             else str(ui_cfg.get("external_host", "")).strip())
         analyst_cap = int(agents_cfg.get("max_analyst_calls_per_day", 500))
-        activity_entries = min(2_000_000, max(1_000, int(ui_cfg.get("activity_entries",
-                                                                    200_000))))
+        activity_entries = min(MAX_ENTRIES, max(MIN_ENTRIES, int(ui_cfg.get(
+            "activity_entries", DEFAULT_MAX_ENTRIES))))
     except ValueError:
         return {"error": "[ui] port or activity_entries, or [agents] "
                          "max_analyst_calls_per_day, is not a number"}

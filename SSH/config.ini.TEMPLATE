@@ -350,7 +350,8 @@ actions = false
 # overrides it). Empty: loopback names only. See docs/operations.md, "Reaching it".
 #external_host = sensor.example-tailnet.ts.net
 # Event-log lines the Activity screen keeps in memory (one small entry each, oldest
-# dropped first; 1000 to 2000000).
+# dropped first; 1000 to 500000). Worst case about 115 MiB at the default and 275 MiB at
+# 500000; see docs/operations.md, "The indexed window".
 #activity_entries = 200000
 
 # Outbound connectors. All disabled by default. Destinations must be https and public

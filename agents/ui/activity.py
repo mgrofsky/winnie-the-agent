@@ -3,14 +3,18 @@
 ``EventIndex`` tails the event log with ``logindex.LogTail`` (the same rotation checks and
 per-refresh read cap as the session index) and keeps one small entry per line: byte
 offset, length, time, source, service, a normalised event kind, session id, username and
-success flag. The entry count is capped (oldest dropped first) and a fresh index starts at
+success flag (the strings cut at ``SRC_CAP``, ``SESSION_CAP`` and ``USER_CAP``, and
+interned). The entry count is capped (oldest dropped first) and a fresh index starts at
 the last ``tail_bytes`` of the log, so memory stays bounded on a large log and the screen
 can say when older lines exist outside the window. Nothing is written.
 
 Structured filters run on the entries alone. What a line sent and what the honeypot
 answered are read back from disk only for the lines shown, or, for a free-text search,
-for candidate lines under a byte budget per request; a search that runs out of budget
-returns a cursor to continue from and the time it searched back to.
+for candidate lines, under one byte budget per request (``READ_BUDGET``); a request that
+runs out of budget returns what it read and a cursor to continue from. Cursors are byte
+offsets and only mean something for the log they came from, so every snapshot carries a
+``log_id`` that changes when the index is rebuilt (rotation, truncation) or the process
+restarts.
 
 Normalised kinds (one filter for every service):
 connection, login, input, reply, request, transfer, register, call, error, close, other.
@@ -32,6 +36,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -40,17 +45,32 @@ from agents import sessions
 from agents.ui.logindex import MAX_BYTES_PER_REFRESH, MAX_LINE_BYTES, LogTail
 
 DEFAULT_MAX_ENTRIES = 200_000
+# The most ``[ui] activity_entries`` accepts. Measured worst case (every entry with its own
+# source, session id and username, each at its cap): about 0.55 KiB an entry, so about
+# 115 MiB of process memory at the default and 275 MiB at this maximum
+# (``tests/test_ui_activity.py`` checks the per-entry size).
+MAX_ENTRIES = 500_000
+MIN_ENTRIES = 1_000
 # A fresh index starts this far from the end of the log (and catches up in one refresh).
 DEFAULT_TAIL_BYTES = MAX_BYTES_PER_REFRESH
-# Bytes of log lines a free-text search reads per request before it hands back a cursor.
-SEARCH_BUDGET = 16 * 1024 * 1024
+# Bytes of log lines one request reads back (a page, a search, a session view or a
+# record's replies) before it stops and says so (a free-text search hands back a cursor).
+READ_BUDGET = 16 * 1024 * 1024
 PAGE_SIZE = 100
 MAX_PAGE_SIZE = 200
 SESSION_EVENTS = 2_000
 TOP_SOURCES = 10
+TOP_SERVICES = 50
+# Distinct keys a facet counter holds before it drops its least counted half.
+FACET_KEYS = 4_096
 SUMMARY_CAP = 200
 FIELD_CAP = 512
 SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+# Per-entry string caps: the longest IPv6 text form, a session id well past the sensor's
+# own (``session-`` and 32 hex digits, or ``<service>-<n>``), and a username.
+SRC_CAP = 46
+SESSION_CAP = 64
+USER_CAP = 64
 SERVICE_RE = re.compile(r"[a-z0-9]{1,16}")
 
 KINDS = ("connection", "login", "input", "reply", "request", "transfer", "register", "call",
@@ -79,10 +99,16 @@ S3_TRANSFERS = {"GetObject", "PutObject", "PostObject", "UploadPart", "UploadPar
 SQL_SERVICES = {"postgres", "mysql", "mssql"}
 
 
-def _cap(value, limit: int = FIELD_CAP) -> Optional[str]:
+def _same(text: str) -> str:
+    return text
+
+
+def _cap(value, limit: int = FIELD_CAP, mask: Callable[[str], str] = _same) -> Optional[str]:
+    """``value`` as text, masked whole and only then cut (a value cut first could keep part
+    of a honeytoken that straddles the cut)."""
     if value is None:
         return None
-    return (value if isinstance(value, str) else str(value))[:limit]
+    return mask(value if isinstance(value, str) else str(value))[:limit]
 
 
 def _ts(value) -> Optional[float]:
@@ -116,11 +142,11 @@ def classify(rec: dict) -> tuple:
         if kind not in ("login", "register"):
             success = None
     task = rec.get("task_name")
-    session = task[:128] if isinstance(task, str) and task not in ("", "-") else None
+    session = task[:SESSION_CAP] if isinstance(task, str) and task not in ("", "-") else None
     src = rec.get("src_ip")
-    src = src[:64] if isinstance(src, str) and src not in ("", "-") else None
+    src = src[:SRC_CAP] if isinstance(src, str) and src not in ("", "-") else None
     user = rec.get("username")
-    user = user[:64] if isinstance(user, str) and user else None
+    user = user[:USER_CAP] if isinstance(user, str) and user else None
     return _ts(rec.get("timestamp")), src, service, kind, session, user, success
 
 
@@ -158,72 +184,77 @@ def _join(*parts) -> Optional[str]:
     return " ".join(out) if out else None
 
 
-def describe(rec: dict, service: str, kind: str, cap: int) -> dict:
+def describe(rec: dict, service: str, kind: str, cap: int,
+             mask: Callable[[str], str] = _same) -> dict:
     """``sent``, ``answered`` and ``result`` (each None when the line has none), plus the
-    password of a login line. Text fields are cut at ``2 * cap`` here (the caller flags
-    anything over ``cap`` as truncated, as the transcript does)."""
+    password of a login line. Every text is passed whole through ``mask`` and then cut, at
+    ``2 * cap`` for the long fields (the caller flags anything over ``cap`` as truncated,
+    as the transcript does)."""
     limit = cap * 2
+
+    def c(value, n: int = FIELD_CAP) -> Optional[str]:
+        return _cap(value, n, mask)
+
     data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
-    message = _cap(rec.get("message"), 300)
+    message = c(rec.get("message"), 300)
     sent = answered = result = None
     if service == sessions.SSH_PROTOCOL and "event" not in rec:
         if kind == "input":
-            sent = sessions._b64(rec.get("details"))[:limit]
+            sent = c(sessions._b64(rec.get("details")), limit)
         elif kind == "reply":
-            answered = sessions._b64(rec.get("details"))[:limit]
+            answered = c(sessions._b64(rec.get("details")), limit)
         elif kind in ("error", "close") and rec.get("reason") is not None:
-            result = _cap(rec.get("reason"), 200)
+            result = c(rec.get("reason"), 200)
     elif kind == "close":
         if "bytes_read" in data or "commands" in data:
-            result = f"{_cap(data.get('bytes_read'), 20)} bytes read, " \
-                     f"{_cap(data.get('commands'), 20)} commands"
+            result = f"{c(data.get('bytes_read'), 20)} bytes read, " \
+                     f"{c(data.get('commands'), 20)} commands"
     elif kind == "error":
-        result = _cap(data.get("reason"), 200)
+        result = c(data.get("reason"), 200)
     elif service == "http":
-        target = _cap(data.get("path"), limit) or ""
-        query = _cap(data.get("query"), limit)
-        sent = _join(_cap(data.get("method"), 16), target + ("?" + query if query else ""))
-        body = _cap(data.get("body"), limit)
+        target = c(data.get("path"), limit) or ""
+        query = c(data.get("query"), limit)
+        sent = _join(c(data.get("method"), 16), target + ("?" + query if query else ""))
+        body = c(data.get("body"), limit)
         if sent and body:
             sent = f"{sent}\n\n{body}"
         if data.get("status") is not None:
-            result = f"HTTP {_cap(data.get('status'), 8)}"
+            result = f"HTTP {c(data.get('status'), 8)}"
     elif service == "s3":
-        target = _cap(data.get("path"), limit) or ""
-        query = _cap(data.get("query"), limit)
-        sent = _join(_cap(data.get("method"), 16), target + ("?" + query if query else ""))
+        target = c(data.get("path"), limit) or ""
+        query = c(data.get("query"), limit)
+        sent = _join(c(data.get("method"), 16), target + ("?" + query if query else ""))
         if data.get("status") is not None:
-            result = _join(_cap(data.get("operation"), 64),
-                           f"HTTP {_cap(data.get('status'), 8)}")
+            result = _join(c(data.get("operation"), 64), f"HTTP {c(data.get('status'), 8)}")
     elif service == "sip":
-        sent = _join(message, _cap(data.get("dialed"), 64))
+        sent = _join(message, c(data.get("dialed"), 64))
         if data.get("stage") is not None:
-            result = f"stage: {_cap(data.get('stage'), 32)}"
+            result = f"stage: {c(data.get('stage'), 32)}"
     elif "capture_label" in data:
         parts = [data[k] for k in sorted(data) if k.startswith("part_")
                  and isinstance(data[k], str)]
-        sent = "".join(parts)[:limit] or None
+        sent = c("".join(parts), limit) or None
     elif service == "ftp" and kind == "transfer":
-        path = _cap(data.get("path"), 500)
         size = data.get("size")
-        result = _join(message, path, f"({_cap(size, 20)} bytes)" if size is not None else None)
+        result = _join(message, c(data.get("path"), 500),
+                       f"({c(size, 20)} bytes)" if size is not None else None)
     elif service == "smtp" and kind == "transfer":
-        result = f"message accepted: {_cap(data.get('size'), 20)} bytes to " \
-                 f"{_cap(data.get('rcpt_count'), 8)} recipients"
+        result = f"message accepted: {c(data.get('size'), 20)} bytes to " \
+                 f"{c(data.get('rcpt_count'), 8)} recipients"
     else:
         for key in ("input", "statement", "text", "copy", "command"):
             value = data.get(key)
             if isinstance(value, str) and value:
-                sent = value[:limit]
+                sent = c(value, limit)
                 break
         if service == "telnet" and isinstance(data.get("response"), str):
-            answered = data["response"][:limit]
+            answered = c(data["response"], limit)
         if service in SQL_SERVICES:
-            result = _sql_result(data.get("result"))
+            result = _sql_result(c(data.get("result"), 200))
     out = {"message": message, "sent": sent, "answered": answered, "result": result}
     if kind == "login":
         password = rec.get("password")
-        out["password"] = _cap(password, FIELD_CAP) if password is not None else None
+        out["password"] = c(password) if password is not None else None
     return out
 
 
@@ -253,6 +284,10 @@ class EventIndex(LogTail):
         self._strings: dict[str, str] = {}
         self.dropped = 0
         self.generation = 0
+        # Offsets handed out as cursors are only meaningful for one log as indexed: a
+        # cursor carries ``log_id`` (this process's nonce and the rebuild count), and one
+        # from another process or from before a rotation or truncation is refused.
+        self._nonce = secrets.token_hex(4)
 
     def _clear(self) -> None:
         self._entries = []
@@ -293,8 +328,14 @@ class EventIndex(LogTail):
             info = {"entries": len(entries), "max_entries": self.max_entries,
                     "older_outside": self.start_offset > 0 or self.dropped > 0,
                     "dropped": self.dropped, "caught_up": self.caught_up,
-                    "generation": (self.rebuilds, self.generation)}
+                    "generation": (self.rebuilds, self.generation),
+                    "log_id": f"{self._nonce}.{self.rebuilds}"}
         return entries, info
+
+
+def read_cost(entry: tuple) -> int:
+    """Bytes ``read_line`` reads for ``entry`` (none for a line too long to read)."""
+    return 0 if entry[LEN] > MAX_LINE_BYTES + 1 else entry[LEN]
 
 
 def read_line(f, entry: tuple) -> Optional[dict]:
@@ -376,19 +417,46 @@ def before_index(entries: list[tuple], before: Optional[int]) -> int:
     return bisect.bisect_left(entries, before, key=lambda e: e[OFF])
 
 
-def facets(entries: list[tuple]) -> dict:
-    services: dict[str, int] = {}
-    kinds: dict[str, int] = {}
-    sources: dict[str, int] = {}
+class TopCounter:
+    """Counts keys in at most ``cap`` counters. When full, the least counted half is
+    dropped (``pruned`` says so), so attacker-chosen values cannot grow it without limit
+    and keys seen often (real services, busy sources) stay. Counts of a key that was
+    dropped and seen again are low by what was dropped."""
+
+    def __init__(self, cap: int = FACET_KEYS) -> None:
+        self.cap = max(2, cap)
+        self.counts: dict[str, int] = {}
+        self.pruned = False
+
+    def add(self, key: str) -> None:
+        counts = self.counts
+        n = counts.get(key)
+        if n is not None:
+            counts[key] = n + 1
+            return
+        if len(counts) >= self.cap:
+            keep = sorted(counts.items(), key=lambda kv: -kv[1])[:self.cap // 2]
+            self.counts = counts = dict(keep)
+            self.pruned = True
+        counts[key] = 1
+
+    def top(self, n: int) -> list[tuple[str, int]]:
+        return sorted(self.counts.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def facets(entries: list[tuple], cap: int = FACET_KEYS) -> dict:
+    """Services, event kinds and sources in the window, each the most counted first and
+    capped (``TOP_SERVICES``, every kind, ``TOP_SOURCES``)."""
+    services, kinds, sources = TopCounter(cap), TopCounter(cap), TopCounter(cap)
     for e in entries:
-        services[e[SERVICE]] = services.get(e[SERVICE], 0) + 1
-        kinds[e[KIND]] = kinds.get(e[KIND], 0) + 1
+        services.add(e[SERVICE])
+        kinds.add(e[KIND])
         if e[SRC] is not None:
-            sources[e[SRC]] = sources.get(e[SRC], 0) + 1
-    top = sorted(sources.items(), key=lambda kv: (-kv[1], kv[0]))[:TOP_SOURCES]
-    return {"services": dict(sorted(services.items())),
-            "kinds": {k: kinds[k] for k in KINDS if k in kinds},
-            "top_sources": [{"src": s, "events": n} for s, n in top]}
+            sources.add(e[SRC])
+    return {"services": dict(services.top(TOP_SERVICES)),
+            "kinds": dict(kinds.top(len(KINDS))),
+            "top_sources": [{"src": s, "events": n} for s, n in sources.top(TOP_SOURCES)],
+            "approximate": services.pruned or kinds.pruned or sources.pruned}
 
 
 def open_log(path: Optional[Path]):

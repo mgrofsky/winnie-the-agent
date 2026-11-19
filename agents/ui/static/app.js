@@ -1964,7 +1964,8 @@
     const results = section("Events", { flush: true });
     main.append(pageHead("Activity"), lead, el("section", "section", form), notices, results.node);
 
-    const ctx = { f: f, query: activityQuery(f), newest: null, serviceField: serviceField, notices: notices };
+    const ctx = { f: f, query: activityQuery(f), newest: null, logId: null, logNotice: null,
+      serviceField: serviceField, notices: notices };
     return {
       refresh: (kind) => kind === "poll" ? checkNewActivity(ctx)
         : fill(results.body, () => {
@@ -1979,8 +1980,12 @@
     const gen = state.gen;
     let data;
     try {
-      data = obj(await apiGet(API.activity, Object.assign({}, ctx.query, { after: ctx.newest })));
+      data = obj(await apiGet(API.activity, Object.assign({}, ctx.query, { after: ctx.newest, log_id: ctx.logId })));
     } catch (err) {
+      if (gen === state.gen && err.status === 409) {
+        logChanged(ctx);
+        return true;
+      }
       return false;
     }
     if (gen !== state.gen) return true;
@@ -1991,6 +1996,15 @@
         button("Show", manualRefresh, "btn-small")));
     }
     return true;
+  }
+
+  // Cursors are byte offsets into one log. When the server says the log changed (rotated,
+  // truncated, or the console restarted), the list is reloaded from the top with a notice
+  // instead of mixing rows from two logs.
+  function logChanged(ctx) {
+    ctx.logNotice = "The event log was rotated or replaced (or the console restarted), so the list was reloaded from the newest events.";
+    ctx.newest = null;
+    manualRefresh();
   }
 
   function fillServices(ctx, facets) {
@@ -2006,7 +2020,12 @@
 
   function drawActivity(data, ctx, filtered) {
     ctx.newest = typeof data.newest === "number" ? data.newest : null;
+    ctx.logId = typeof data.log_id === "string" ? data.log_id : null;
     ctx.notices.replaceChildren();
+    if (ctx.logNotice) {
+      ctx.notices.append(notice("warn", ctx.logNotice));
+      ctx.logNotice = null;
+    }
     const facets = obj(data.facets);
     fillServices(ctx, facets);
     const win = obj(data.window);
@@ -2050,11 +2069,13 @@
     let cursor = typeof data.next_before === "number" ? data.next_before : null;
     let shown = tbody.childElementCount / 2;
 
-    function draw(s) {
+    function draw(s, readCut) {
       const parts = [el("span", { text: plural(shown, "event", "events") + " shown" })];
       if (s) {
         parts.push(el("span", null, s.complete === true ? " - searched the whole indexed window"
           : s.searched_back_to ? [" - searched back to ", timeNode(s.searched_back_to)] : " - search stopped at its read limit"));
+      } else if (readCut === true) {
+        parts.push(el("span", { text: " - this page stopped at the server's read limit (very long log lines); Load older continues" }));
       }
       parts.push(el("span", "spacer"));
       if (cursor !== null) {
@@ -2068,9 +2089,13 @@
       if (b) b.disabled = true;
       let next;
       try {
-        next = obj(await apiGet(API.activity, Object.assign({}, ctx.query, { before: cursor })));
+        next = obj(await apiGet(API.activity, Object.assign({}, ctx.query, { before: cursor, log_id: ctx.logId })));
       } catch (err) {
         if (gen !== state.gen || err.status === 401) return;
+        if (err.status === 409) {
+          logChanged(ctx);
+          return;
+        }
         setKids(foot, el("span", { cls: "state-error", text: errorMessage(err) }), el("span", "spacer"),
           button("Retry", more, "btn-small"));
         return;
@@ -2080,10 +2105,10 @@
       for (const it of items) addActivityRows(tbody, it);
       shown += items.length;
       cursor = typeof next.next_before === "number" ? next.next_before : null;
-      draw(next.search ? obj(next.search) : null);
+      draw(next.search ? obj(next.search) : null, next.read_cut);
     }
 
-    draw(search);
+    draw(search, data.read_cut);
     return foot;
   }
 
@@ -2202,7 +2227,10 @@
       fact("Started", timeNode(data.start)),
       fact("Ended", timeNode(data.end)),
       fact("Events", num(events.length)))));
-    const s = section("Everything in this session, in order");
+    // For SSH, logins and commands come from the transcript; connection, close and error
+    // lines only when the indexed window still holds them, and the heading says which.
+    const partial = data.from === "transcript" && data.connection_lines !== true;
+    const s = section(partial ? "Logins and commands in this session, in order" : "Everything in this session, in order");
     const term = el("div", { cls: "terminal", attrs: { tabindex: "0", role: "log", "aria-label": "Session events" } });
     for (const ev of events) {
       const sent = typeof ev.sent === "string" && ev.sent;
@@ -2219,10 +2247,12 @@
       }
     }
     append(s.body, [events.length ? term : empty("No events recorded for this session."),
-      data.events_cut === true ? el("p", { cls: "muted", text: "Only the first " + num(events.length) + " events are shown." }) : null,
-      el("p", { cls: "muted", text: data.from === "transcript"
-        ? "Replayed from the SSH transcript, as on the record page."
-        : "Read from the event log's indexed window. Where a service logs only a status or result, that is shown; no reply is made up." })]);
+      data.events_cut === true ? el("p", { cls: "muted", text: "Only the first " + num(events.length) + " events are shown" +
+        (data.read_cut === true ? ": the view stopped at the server's read limit for one request (very long log lines)." : ".") }) : null,
+      el("p", { cls: "muted", text: data.from !== "transcript"
+        ? "Read from the event log's indexed window. Where a service logs only a status or result, that is shown; no reply is made up."
+        : partial ? "Logins and commands replayed from the SSH transcript, as on the record page. Its connection and close lines are not in the indexed window."
+          : "Logins and commands replayed from the SSH transcript, as on the record page, with the connection, close and error lines from the indexed window." })]);
     return [head, facts, s.node];
   }
 
@@ -2243,12 +2273,23 @@
           el("pre", { cls: "command-text", text: str(it.command) }),
           it.recorded === true
             ? moreBlock(it.reply, it.truncated)
-            : el("div", { cls: "note-faint", text: "no reply recorded" })))));
+            : el("div", { cls: "note-faint", text: replyNote(it.status) })))));
+      if (obj(data).read_cut === true) {
+        box.append(el("p", { cls: "muted", text: "This session is longer than the server reads for one request; replies past that point are not shown." }));
+      }
     }).catch((err) => {
       if (gen !== state.gen || err.status === 401) return;
       box.replaceChildren(el("div", { cls: "muted", text: "Replies not available (" + err.message + ")." }));
     });
     return box;
+  }
+
+  // Why a command has no reply shown. The server checks each pairing: the paired input must
+  // start with the command, or it is not shown as its reply.
+  function replyNote(status) {
+    if (status === "unmatched") return "reply could not be matched to this command";
+    if (status === "not_read") return "not read (past the server's read limit for one request)";
+    return "no reply recorded";
   }
 
   // ---- screen: digests ------------------------------------------------------------------

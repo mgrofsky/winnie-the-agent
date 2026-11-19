@@ -242,8 +242,41 @@ def test_background_refresh_never_inserts_activity_rows():
 def test_replies_say_when_none_was_recorded():
     text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
     replies = _function(text, "commandReplies")
-    assert 'it.recorded === true' in replies and '"no reply recorded"' in replies
-    assert "API.replies(id)" in replies
+    assert 'it.recorded === true' in replies and "replyNote(it.status)" in replies
+    assert "API.replies(id)" in replies and "read_cut === true" in replies
+    note = _function(text, "replyNote")
+    assert '"no reply recorded"' in note
+    assert 'status === "unmatched"' in note and "could not be matched" in note
+    assert 'status === "not_read"' in note
+
+
+def test_activity_cursors_carry_the_log_id_and_reload_when_it_changes():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    check = _function(text, "checkNewActivity")
+    assert "after: ctx.newest, log_id: ctx.logId" in check
+    assert "err.status === 409" in check and "logChanged(ctx)" in check
+    foot = _function(text, "activityFoot")
+    assert "before: cursor, log_id: ctx.logId" in foot
+    assert "err.status === 409" in foot and "logChanged(ctx)" in foot
+    changed = _function(text, "logChanged")
+    assert "ctx.logNotice = " in changed and "manualRefresh()" in changed
+    draw = _function(text, "drawActivity")
+    assert "ctx.logId = " in draw and "ctx.logNotice" in draw
+
+
+def test_activity_says_when_a_read_stopped_at_the_limit():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "readCut === true" in _function(text, "activityFoot")
+    session = _function(text, "drawActivitySession")
+    assert "data.read_cut === true" in session and "data.events_cut === true" in session
+
+
+def test_ssh_session_heading_is_accurate():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    session = _function(text, "drawActivitySession")
+    assert 'data.connection_lines !== true' in session
+    assert '"Logins and commands in this session, in order"' in session
+    assert '"Everything in this session, in order"' in session
 
 
 def test_every_section_has_a_number_key():

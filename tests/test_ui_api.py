@@ -286,6 +286,20 @@ def test_transcript(api, tree):
     assert len(page["turns"]["items"]) == 2 and page["turns"]["page"] == 3
 
 
+def test_transcript_masks_honeytoken_values(api, tree):
+    # Masked as everywhere else in the console; only the honeytokens screen reveals one.
+    with open(tree.log, "a", encoding="utf-8") as f:
+        for line in ui_fixture.ssh_lines(tree.ids["session_a"], "198.51.100.7", tree.now,
+                                         [("root", HONEYTOKEN_VALUE, False)], []):
+            if line["message"].startswith("Auth"):
+                f.write(json.dumps(line) + "\n")
+    body = ok(api, f"/api/records/{tree.ids['session_a']}/transcript", per=200)
+    assert HONEYTOKEN_VALUE not in json.dumps(body)
+    inputs = [t["text"] for t in body["turns"]["items"] if t["role"] == "input"]
+    assert inputs[5] == "aws s3 ls --profile " + HONEYTOKEN_VALUE[:2] + "......"
+    assert body["auth_attempts"][-1]["password"] == HONEYTOKEN_VALUE[:2] + "......"
+
+
 def test_transcript_of_traversal_username_session(api, tree):
     body = ok(api, f"/api/records/{tree.ids['session_b']}/transcript")
     assert [a["username"] for a in body["auth_attempts"]] == [TRAVERSAL_USER] * 2

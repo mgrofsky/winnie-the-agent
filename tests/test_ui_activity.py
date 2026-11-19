@@ -124,6 +124,8 @@ def api(tree):
 
 
 def items(api, **query):
+    if ("before" in query or "after" in query) and "log_id" not in query:
+        query["log_id"] = api.events.snapshot()[1]["log_id"]
     status, body = api.get("/api/activity", {k: str(v) for k, v in query.items()})
     assert status == 200, body
     return body
@@ -256,7 +258,7 @@ def test_cursor_pagination_walks_every_event_once(api):
 
 def test_search_stops_at_its_byte_budget_and_continues(api, monkeypatch):
     line_bytes = max(len(json.dumps(line)) + 1 for line in LINES)
-    monkeypatch.setattr(activity, "SEARCH_BUDGET", line_bytes * 3)
+    monkeypatch.setattr(activity, "READ_BUDGET", line_bytes * 3)
     body = items(api, q="198.51.100")
     assert body["search"]["complete"] is False and body["next_before"] is not None
     assert body["search"]["searched_back_to"] is not None
@@ -270,7 +272,9 @@ def test_search_stops_at_its_byte_budget_and_continues(api, monkeypatch):
 
 def test_new_events_are_counted_after_an_offset(api, tree):
     newest = items(api)["newest"]
-    assert items(api, after=newest) == {"new": 0, "newest": newest, "approximate": False}
+    log_id = api.events.snapshot()[1]["log_id"]
+    assert items(api, after=newest) == {"new": 0, "newest": newest, "approximate": False,
+                                        "log_id": log_id}
     write_log(tree.log, [listener(20, "telnet", "telnet-9", "connection"),
                          listener(20.1, "http", "http-9", "command",
                                   data={"method": "GET", "path": "/", "status": 200})])
@@ -385,8 +389,10 @@ def test_an_ssh_session_uses_the_transcript(api):
     status, body = api.get(f"/api/activity/session/{SID}", {})
     assert status == 200 and body["from"] == "transcript"
     kinds = [e["kind"] for e in body["events"]]
-    assert kinds == ["login", "login", "input", "reply"]
-    assert body["events"][2]["sent"] == "cat /etc/passwd"
+    # Logins and turns from the transcript, connection and close lines from the index.
+    assert kinds == ["connection", "login", "login", "input", "reply", "close"]
+    assert body["events"][3]["sent"] == "cat /etc/passwd"
+    assert body["connection_lines"] is True and body["events_cut"] is False
 
 
 def test_a_listener_session_links_to_its_campaign(tree):
@@ -499,3 +505,255 @@ def test_a_large_log_is_indexed_within_its_bounds(tmp_path):
     body = items(api, q="no such text anywhere")
     assert time.monotonic() - started < 30
     assert body["search"]["complete"] is False and body["next_before"] is not None
+
+
+# ---- review fixes: masking at cut points ---------------------------------------------------
+
+TOKEN = HONEYTOKEN_VALUE
+SHOWN = TOKEN[:2] + "......"
+
+
+def straddle(cut: int, tail: str = "") -> str:
+    """Text where the token starts before ``cut`` and ends one character past it."""
+    return "x" * (cut - len(TOKEN) + 1) + TOKEN + tail
+
+
+def no_token_part(body) -> None:
+    text = json.dumps(body)
+    # The mask keeps the first two characters; anything longer would be a leak.
+    assert TOKEN[:3] not in text, text[text.find(TOKEN[:3]) - 20:text.find(TOKEN[:3]) + 40]
+
+
+@pytest.mark.parametrize("cut", [activity.SUMMARY_CAP, TEXT_CAP, 2 * TEXT_CAP])
+def test_a_token_across_a_text_cut_is_masked(api, tree, cut):
+    text = straddle(cut, "y" * 9_000)
+    write_log(tree.log, [listener(40, "telnet", "telnet-c", "command",
+                                  data={"input": text, "response": text})])
+    body = items(api, session="telnet-c")
+    assert body["items"][0]["sent_truncated"] is True
+    no_token_part(body)
+    no_token_part(api.get("/api/activity/session/telnet-c", {})[1])
+
+
+@pytest.mark.parametrize("field,cut", [("message", 300), ("password", activity.FIELD_CAP)])
+def test_a_token_across_a_field_cut_is_masked(api, tree, field, cut):
+    line = listener(41, "telnet", "telnet-f", "auth_attempt", username="u", success=False,
+                    password="p")
+    line[field] = straddle(cut)
+    write_log(tree.log, [line])
+    no_token_part(items(api, session="telnet-f"))
+
+
+def test_a_token_across_a_cut_in_an_ssh_turn_is_masked(api, tree):
+    sid = "session-000000000000000000000000000000c7"
+    write_log(tree.log, [ssh(42, sid, "User input", details=b64(straddle(TEXT_CAP))),
+                         ssh(42.1, sid, "LLM response",
+                             details=b64(straddle(activity.SUMMARY_CAP))),
+                         ssh(42.2, sid, "SSH connection closed")])
+    status, body = api.get(f"/api/activity/session/{sid}", {})
+    assert status == 200 and body["from"] == "transcript"
+    no_token_part(body)
+    no_token_part(items(api, session=sid))
+
+
+def test_a_token_as_a_session_or_source_is_masked(api, tree):
+    write_log(tree.log, [listener(43, "telnet", TOKEN, "connection", src=TOKEN),
+                         listener(43.1, "telnet", TOKEN, "connection", src=TOKEN)])
+    body = items(api)
+    no_token_part(body)
+    row = items(api, service="telnet", kind="connection")["items"][0]
+    assert row["session"] == SHOWN and row["src"] == SHOWN
+    assert {"src": SHOWN, "events": 2} in body["facets"]["top_sources"]
+
+
+def test_a_token_split_by_a_hidden_character_is_still_masked(api, tree):
+    hidden = TOKEN[:5] + "​" + TOKEN[5:]
+    write_log(tree.log, [listener(44, "telnet", "telnet-z", "command", data={"input": hidden})])
+    no_token_part(items(api, session="telnet-z"))
+
+
+# ---- review fixes: cursors carry the log's identity ---------------------------------------
+
+def test_a_cursor_needs_the_log_id_it_came_with(api):
+    body = items(api, per=4)
+    log_id = body["log_id"]
+    assert isinstance(log_id, str) and log_id
+    for query in ({"before": body["next_before"]}, {"after": body["newest"]}):
+        status, refused = api.get("/api/activity", {**{k: str(v) for k, v in query.items()}})
+        assert status == 409 and refused["log_id"] == log_id
+        status, refused = api.get("/api/activity", {**{k: str(v) for k, v in query.items()},
+                                                    "log_id": "00000000.0"})
+        assert status == 409
+        assert items(api, **query, log_id=log_id)
+
+
+def test_a_cursor_from_before_a_rotation_is_refused(api, tree):
+    body = items(api, per=4)
+    old_id, cursor, newest = body["log_id"], body["next_before"], body["newest"]
+    os.replace(tree.log, tree.log.with_suffix(".1"))
+    write_log(tree.log, LINES * 3)             # the new file outgrows the old offsets
+    for query in ({"before": cursor}, {"after": newest}):
+        status, refused = api.get("/api/activity", {**{k: str(v) for k, v in query.items()},
+                                                    "log_id": old_id})
+        assert status == 409 and refused["log_id"] != old_id
+    fresh = items(api)
+    assert fresh["log_id"] != old_id and len(fresh["items"]) == min(3 * len(LINES), 100)
+
+
+def test_another_process_hands_out_another_log_id(tree):
+    a = Api(tree.api_paths(), cache_seconds=0)
+    b = Api(tree.api_paths(), cache_seconds=0)
+    assert items(a)["log_id"] != items(b)["log_id"]
+
+
+# ---- review fixes: facets keep the busiest services ---------------------------------------
+
+def test_many_rare_services_do_not_crowd_out_real_ones(api, tree):
+    junk = [listener(50, f"aa{i:04d}", f"junk-{i}", "connection") for i in range(600)]
+    write_log(tree.log, junk)
+    facets = items(api)["facets"]
+    assert facets["services"]["ssh"] == 6 and facets["services"]["telnet"] == 5
+    assert len(facets["services"]) == activity.TOP_SERVICES
+
+
+def test_facet_counters_are_bounded():
+    c = activity.TopCounter(cap=64)
+    for i in range(10_000):
+        c.add("busy")
+        c.add(f"rare-{i}")
+        assert len(c.counts) <= 64
+    assert c.top(1) == [("busy", 10_000)] and c.pruned is True
+    entries = [(i, 1, None, f"203.0.113.{i % 250}-{i}", f"s{i}", "other", None, None, None)
+               for i in range(20_000)]
+    f = activity.facets(entries, cap=128)
+    assert f["approximate"] is True and len(f["services"]) <= activity.TOP_SERVICES
+
+
+# ---- review fixes: every read is under the byte budget ------------------------------------
+
+LONG = 200_000
+
+
+def long_lines(n: int, task: str = "telnet-l") -> list[dict]:
+    return [listener(60 + i / 10, "telnet", task, "command",
+                     data={"input": f"{i}:" + "L" * LONG}) for i in range(n)]
+
+
+def test_plain_listing_stops_at_the_read_budget_and_continues(api, tree, monkeypatch):
+    monkeypatch.setattr(activity, "READ_BUDGET", 3 * LONG)
+    write_log(tree.log, long_lines(8))
+    body = items(api, session="telnet-l")
+    assert body["read_cut"] is True and 0 < len(body["items"]) < 8
+    seen = [i["offset"] for i in body["items"]]
+    while body["next_before"] is not None:
+        body = items(api, session="telnet-l", before=body["next_before"])
+        seen += [i["offset"] for i in body["items"]]
+    assert len(seen) == len(set(seen)) == 8 and body["read_cut"] is False
+
+
+def test_session_view_stops_at_the_read_budget(api, tree, monkeypatch):
+    monkeypatch.setattr(activity, "READ_BUDGET", 3 * LONG)
+    write_log(tree.log, long_lines(8))
+    status, body = api.get("/api/activity/session/telnet-l", {})
+    assert status == 200 and body["events_cut"] is True and body["read_cut"] is True
+    assert 0 < len(body["events"]) < 8
+
+
+def test_ssh_session_view_and_replies_stop_at_the_read_budget(tmp_path, monkeypatch):
+    tree = build_tree(tmp_path / "own")
+    sid = tree.ids["session_a"]
+    api = Api(tree.api_paths(), cache_seconds=0)
+    full = api.get(f"/api/activity/session/{sid}", {})[1]
+    assert full["read_cut"] is False
+    monkeypatch.setattr(activity, "READ_BUDGET", 1500)
+    status, body = api.get(f"/api/activity/session/{sid}", {})
+    assert status == 200 and body["read_cut"] is True and body["events_cut"] is True
+    assert len(body["events"]) < len(full["events"])
+    status, body = api.get(f"/api/records/{sid}/replies", {})
+    assert status == 200 and body["read_cut"] is True
+    assert body["items"][-1]["status"] == "not_read"
+    assert body["items"][-1]["recorded"] is False
+
+
+# ---- review fixes: index memory ------------------------------------------------------------
+
+def test_entry_strings_are_capped():
+    _, src, _, _, session, user, _ = classify(
+        {"src_ip": "9" * 500, "task_name": "t" * 500, "username": "u" * 500,
+         "sensor_protocol": "telnet", "event": "connection"})
+    assert (len(src), len(session), len(user)) == (activity.SRC_CAP, activity.SESSION_CAP,
+                                                   activity.USER_CAP)
+
+
+def test_worst_case_entry_size_matches_the_documented_figure():
+    import sys
+
+    idx = EventIndex(None, max_entries=20_000)
+    for i in range(20_000):
+        idx._consume(10**12 + i * 10**6, 10**12 + i * 10**6 + 999_999 + i, {
+            "timestamp": at(i), "src_ip": f"{i:x}".ljust(500, "f"),
+            "task_name": f"s{i:x}".ljust(500, "a"), "username": f"u{i:x}".ljust(500, "b"),
+            "sensor_protocol": "http", "event": "command", "data": {}})
+    seen, total = set(), sys.getsizeof(idx._entries) + sys.getsizeof(idx._strings)
+    for e in idx._entries:
+        total += sys.getsizeof(e)
+        for x in e:
+            if x is not None and not isinstance(x, bool) and id(x) not in seen:
+                seen.add(id(x))
+                total += sys.getsizeof(x)
+    per_entry = total / len(idx._entries)
+    # Documented as about 0.55 KiB an entry (115 MiB at the default, 275 MiB at the most).
+    assert 400 < per_entry < 600, per_entry
+    assert activity.MAX_ENTRIES * per_entry < 300 * 1024 * 1024
+
+
+# ---- review fixes: SSH session order -------------------------------------------------------
+
+def test_ssh_turns_keep_transcript_order_and_untimed_lines_keep_file_order(api, tree):
+    sid = "session-0000000000000000000000000000000b"
+    # The reply's offset makes its text sort after later lines; untimed connection and
+    # close lines keep their place in the file.
+    write_log(tree.log, [
+        ssh(70, sid, "SSH connection received", timestamp=None),
+        ssh(70.1, sid, "Authentication success", username="root", password="x"),
+        ssh(70.2, sid, "User input", details=b64("first")),
+        ssh(70.3, sid, "LLM response", details=b64("one"),
+            timestamp=(T0 + datetime.timedelta(minutes=70.3)).astimezone(
+                datetime.timezone(datetime.timedelta(hours=9))).isoformat()),
+        ssh(70.4, sid, "User input", details=b64("second")),
+        ssh(70.5, sid, "LLM response", details=b64("two")),
+        ssh(70.7, sid, "SSH connection closed", timestamp=12345)])
+    status, body = api.get(f"/api/activity/session/{sid}", {})
+    assert status == 200 and body["from"] == "transcript"
+    shown = [(e["kind"], e.get("sent") or e.get("answered")) for e in body["events"]]
+    assert shown == [("connection", None), ("login", None), ("input", "first"),
+                     ("reply", "one"), ("input", "second"), ("reply", "two"),
+                     ("close", None)]
+
+
+def test_an_ssh_view_outside_the_window_says_it_has_only_logins_and_turns(tmp_path):
+    tree = build_tree(tmp_path / "own")
+    api = Api(tree.api_paths(), cache_seconds=0)
+    api.events = EventIndex(None)                      # nothing in the indexed window
+    status, body = api.get(f"/api/activity/session/{tree.ids['session_a']}", {})
+    assert status == 200 and body["connection_lines"] is False
+    assert {e["kind"] for e in body["events"]} <= {"login", "input", "reply"}
+
+
+# ---- review fixes: the reply pairing guard -------------------------------------------------
+
+def test_replies_that_do_not_pair_with_the_command_are_not_shown(tmp_path):
+    tree = build_tree(tmp_path / "own")
+    sid = tree.ids["session_a"]
+    path = next(p for p in (tree.reports / "sessions").glob("*.json") if sid in p.name)
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    rec["command_sample"] = rec["command_sample"][1:]   # not the session's first inputs
+    path.write_text(json.dumps(rec), encoding="utf-8")
+    api = Api(tree.api_paths(), cache_seconds=0)
+    status, body = api.get(f"/api/records/{sid}/replies", {})
+    assert status == 200
+    assert {i["status"] for i in body["items"]} == {"unmatched"}
+    assert all(i["reply"] is None and i["recorded"] is False for i in body["items"])
+    good = Api(build_tree(tmp_path / "again").api_paths(), cache_seconds=0)
+    first = good.get(f"/api/records/{sid}/replies", {})[1]["items"]
+    assert first[0]["status"] == "reply"

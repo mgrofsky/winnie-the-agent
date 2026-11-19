@@ -865,7 +865,7 @@ Filters live in the address, so a view can be bookmarked and the back button wor
 | Filter | Matches |
 |---|---|
 | Time | the last hour, 24 hours (default) or 7 days, everything indexed, or a custom range in UTC |
-| Service | the protocol (`ssh`, `telnet`, `http`, `s3`, `ftp`, `smtp`, `sip`, `redis`, `postgres`, `mysql`, `mssql`, `mllp`); the list shows the services in the window with counts |
+| Service | the protocol (`ssh`, `telnet`, `http`, `s3`, `ftp`, `smtp`, `sip`, `redis`, `postgres`, `mysql`, `mssql`, `mllp`); the list shows the 50 busiest services in the window with counts |
 | Event | connection, login attempt, input, reply, request, transfer, register, call attempt, error, close, other |
 | Outcome | success or failure (login attempts and SIP registrations carry one) |
 | Source | one exact address, or a network such as `198.51.100.0/24` |
@@ -890,24 +890,50 @@ no recorded reply says so.
 **The indexed window.** The console keeps one small entry per log line in memory (offset,
 time, source, service, event, session, username, outcome); nothing is written to disk. It
 starts at the last 64 MiB of the log and grows from there, up to `[ui] activity_entries`
-lines (default 200,000), dropping the oldest. When older lines exist outside the window,
-the screen says so and how far back it reaches; read those on the host. Each refresh reads
-at most 64 MiB of new log, and log rotation or truncation starts the index again. A
-search reads candidate lines from disk under a budget of 16 MiB per request; when it runs
-out, the screen says how far back it searched and offers to search further.
+lines (default 200,000, at most 500,000), dropping the oldest. The strings in an entry are
+cut (source at 46 characters, session id and username at 64) and shared between entries.
+Measured worst case, with every line carrying its own source, session id and username at
+those lengths: about 0.55 KiB an entry, so about 115 MiB of console memory at the default
+and 275 MiB at the maximum. Real logs repeat sources and sessions and use much less. When
+older lines exist outside the window, the screen says so and how far back it reaches; read
+those on the host. Each refresh reads at most 64 MiB of new log, and log rotation or
+truncation starts the index again.
+
+**Reads per request.** Every request reads lines back from disk under one budget of
+16 MiB: a page of events, a search, a session view and a record's replies. A page or a
+search that runs out returns what it read and says so, and "Load older" (or "Search
+further back") continues from there; a session view or replies list says it stopped at
+the read limit. Only lines with very long content (large HTTP bodies, long pasted
+scripts) get near it.
+
+**When the log changes underneath the page.** "Load older" and the new-events check carry
+the identity of the log they were loaded from. After the log is rotated or truncated, or
+the console restarts, the server refuses the old position, and the screen reloads the list
+from the newest events with a notice, instead of mixing rows from two files.
 
 The screen checks for new events every 30 seconds and offers them ("3 new events, Show")
 instead of inserting rows under what you are reading. Honeytoken values the sensor planted
-are masked as on the honeytokens screen; other passwords attackers typed are shown, as in
-the transcript.
+are masked everywhere in the console (event text, usernames, passwords, sources, session
+ids, the transcript and replies) as on the honeytokens screen, whose "reveal" is the only
+place a value is shown. Text is masked whole before it is cut, so a value across a cut is
+not shown in part. Other passwords attackers typed are shown. A search still finds lines
+by a planted value; it is masked in what is shown.
+
+A session view lists every event of one session in order. For SSH, the logins and
+commands are replayed from the transcript (as on the record page) and the connection,
+close and error lines come from the indexed window, merged by time; a line without a
+usable time keeps its place in the file. When the window no longer holds those lines, the
+heading says "Logins and commands" instead of "Everything".
 
 On a record's page, an SSH session's commands are listed with the decoy's reply under
 each, collapsed to its first lines. Replies are paired with commands by their place in the
 session (the third command gets the reply that followed the third input), never by text,
-so repeated identical commands keep their own replies. A command with no reply logged says
-"no reply recorded". Campaign records keep their command sample as before: it gathers
-commands from many connections and has no single sequence to pair (Telnet sessions are
-campaigns, so their replies are read on the session view instead).
+so repeated identical commands keep their own replies. As a check, the paired input must
+start with the record's command; when it does not, the command says "reply could not be
+matched" rather than showing a reply that may belong to another command. A command with
+no reply logged says "no reply recorded". Campaign records keep their command sample as
+before: it gathers commands from many connections and has no single sequence to pair
+(Telnet sessions are campaigns, so their replies are read on the session view instead).
 
 ### Decoy
 
