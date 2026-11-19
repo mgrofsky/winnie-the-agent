@@ -39,6 +39,7 @@ from . import bait as bait_mod
 from . import tokens as tokens_mod
 from .bait import Bait, BaitError, Pins
 from .schema import (
+    GPU_SPECS,
     BaitSpec,
     HoneytokenSpec,
     LoginPolicy,
@@ -165,6 +166,13 @@ class _Gen:
         return None
 
 
+def _hardware_line(hw) -> str:
+    gpu = (f"{hw.gpu_count} x {GPU_SPECS[hw.gpu].product} (nvidia-smi installed)" if hw.gpu
+           else "none (no NVIDIA driver, nvidia-smi is not installed)")
+    return (f"{hw.cpus} vCPU {hw.cpu_model}, {hw.memory_mb} MB RAM, {hw.disk_gb} GB root "
+            f"disk, GPU: {gpu}")
+
+
 @dataclass
 class LoadedScenario:
     scenario: Scenario
@@ -271,6 +279,7 @@ class LoadedScenario:
             f"- OS: {ident.os_pretty_name}",
             f"- uname -a: {ident.kernel}",
             f"- Timezone: {ident.timezone}",
+            f"- Hardware: {_hardware_line(ident.hardware)}",
         ]
         if ident.users:
             lines.append("- Local users (name:uid:home:shell):")

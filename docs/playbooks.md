@@ -65,8 +65,20 @@ All conditions given in `[when]` must hold. List values mean "any of".
 
 Signals: `redis_takeover`, `sql_exec_attempt`, `sql_cred_dump`, `smtp_relay_attempt`,
 `sip_dialed_number`, `quarantine_quota`, `http_proxy_attempt`, `ftp_upload`, `s3_upload`,
-`s3_bulk_download`, `s3_planted_key`, and the SSH
-session signals `download_execute`, `persistence`, `credential_file_read`.
+`s3_bulk_download`, `s3_planted_key`, the SSH
+session signals `download_execute`, `persistence`, `credential_file_read`, and
+`hardware_recon`, set on SSH sessions and on Telnet campaigns.
+
+`hardware_recon` means a logged-in shell sized the host for mining. It is judged on the
+command words of each line (after any path, `sudo` or `env`, and through `which` or
+`command -v`), never on substrings: running or looking up `nvidia-smi`; `lspci` piped to a
+`grep` for `VGA`, `3D` or `nvidia`, or run with a display-class or NVIDIA filter
+(`lspci -d ::0300`, `lspci -d 10de:`); or a CPU count taken from `/proc/cpuinfo` (`grep -c`
+or `wc -l` in the same pipeline, or `nproc` run elsewhere in the session). `uname`, `lscpu`,
+`nproc`, `lspci` or `cat /proc/cpuinfo` on their own do not count, and neither do
+`echo nvidia-smi`, `ls /usr/share/nvidia-smi.txt` or `lspci -s 00:3d.0 -v`. The value is the
+number of commands that matched. A Telnet campaign gets it from the lines typed after a
+successful login.
 
 There are no expressions and no free-text matching. Conditions read only enum and numeric
 fields of a validated triage record, plus the facts above, which code computes from it.
@@ -355,6 +367,7 @@ changes are snapshotted under `<state dir>/source-state-snapshots/`.
 | `database_takeover` (priority) | Redis takeover chain, SQL command execution or credential dump | tag, deepen, plant token, notify |
 | `sensitive_data_access` (priority) | patient or financial data touched on the `healthcare` or `bank` scenario | tag, plant token, deepen, notify |
 | `malware_drop` | FTP upload or download-and-execute in SSH | tag, capture more, notify, publish detection |
+| `miner_recon` | `hardware_recon`: GPU or CPU sizing after a login (SSH or Telnet) | tag, capture more, notify |
 | `toll_fraud` | SIP dialing to international or premium-rate numbers | tag, tarpit 2 s, notify, export blocklist |
 | `noisy_brute_force` | campaign with 50+ attempts and nothing novel | shallow for 48 h; export blocklist only above 5,000 attempts |
 

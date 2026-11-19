@@ -234,6 +234,7 @@ class DailyState:
 class _SessionState:
     ip: str
     commands: int = 0
+    answered_locally: int = 0   # commands counted without a model call
     tokens: int = 0
     history_chars: int = 0
     registered: bool = False
@@ -299,9 +300,20 @@ class Budget:
         return state
 
     def session_commands(self, session_id: str) -> Optional[int]:
-        """Model-backed commands so far, or None if the session was never admitted."""
+        """Commands counted so far (model and canned), or None if never admitted."""
         state = self._sessions.get(session_id)
         return state.commands if state is not None and state.registered else None
+
+    def model_commands(self, session_id: str) -> Optional[int]:
+        """Commands the model answered so far, or None if the session was never admitted."""
+        state = self._sessions.get(session_id)
+        return state.commands - state.answered_locally \
+            if state is not None and state.registered else None
+
+    def model_answered(self, session_id: str) -> bool:
+        """Whether the model has been asked to answer a command in this session."""
+        state = self._sessions.get(session_id)
+        return state is not None and state.commands > state.answered_locally
 
     # ---- model calls --------------------------------------------------------------------
 
@@ -364,7 +376,14 @@ class Budget:
         if state.commands >= self.config.max_commands_per_session * factor:
             return "max_commands_per_session"
         state.commands += 1
+        state.answered_locally += 1
         return None
+
+    def add_history(self, session_id: str, ip: str, input_text: str, output_text: str) -> None:
+        """A turn answered without the model that was still added to the chat history: it
+        is resent with every later model call, so the pre-call estimate counts it."""
+        state = self._session(session_id, ip)
+        state.history_chars += text_units(input_text) + text_units(output_text)
 
     def commit(self, res: Reservation, input_text: str, output_text: str,
                usage_tokens: Optional[int] = None) -> int:

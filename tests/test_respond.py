@@ -98,7 +98,7 @@ def test_schema_rejects_unknown_actions_conditions_and_tier_overrides(bad):
 
 def test_tiers_are_fixed_in_code_and_shipped_playbooks_validate():
     pbs, errors = load_playbooks()
-    assert errors == [] and len(pbs) == 6
+    assert errors == [] and len(pbs) == 7
     for p in pbs:
         for step in p.steps:
             assert tier_of(step) == ACTION_TIERS[step.action]
@@ -273,6 +273,26 @@ def test_sensitive_data_playbook_only_in_bank_or_healthcare(tmp_path):
     out = run(tmp_path / "b", [_shipped()["sensitive_data_access"]], scenario_name="bank")
     assert [s["action"] for s in out["runs"][0]["steps"]] == [
         "tag_source", "plant_token", "deepen", "notify"]
+
+
+def test_miner_recon_watches_and_never_enforces_or_deepens(tmp_path):
+    from agents.detect import record_reasons
+
+    pb = _shipped()["miner_recon"]
+    assert all(tier_of(s) != "enforce" for s in pb.steps)
+    gpu = rec(rid="gpu", kind="session", protocol="ssh", signals={"hardware_recon": 2},
+              judgement="MALICIOUS", ip="198.51.100.50")
+    telnet = rec(rid="tn", protocol="telnet", signals={"hardware_recon": 1},
+                 ip="198.51.100.51")
+    plain = rec(rid="plain", kind="session", protocol="ssh", signals={}, ip="198.51.100.52")
+    write(tmp_path / "reports", gpu, telnet, plain)
+    out = run(tmp_path, [pb])
+    assert sorted(r["trigger"]["record_id"] for r in out["runs"]) == ["gpu", "tn"]
+    assert [s["action"] for s in out["runs"][0]["steps"]] == [
+        "tag_source", "capture_more", "notify"]
+    entry = ss.load(tmp_path / "source_state.json").entries["198.51.100.50"]
+    assert "miner_recon" in entry.tags and entry.budget_mode == "normal"
+    assert "command" in record_reasons(gpu)
 
 
 # ---- per-source state ----------------------------------------------------------------------

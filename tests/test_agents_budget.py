@@ -122,7 +122,7 @@ async def test_failed_call_keeps_its_reserved_charge():
             raise RuntimeError("provider down")
 
     r = await _call(Boom())                       # degrades to a canned reply ...
-    assert r.content.startswith("-bash: ls: command not found")
+    assert r.content == "root@srv01:~# "          # (ls of an empty home directory)
     assert budget.global_tokens >= OUTPUT_ESTIMATE_TOKENS   # ... and the charge is kept
 
 
@@ -410,8 +410,10 @@ async def test_provider_error_keeps_session_alive_with_canned_replies(ssh_runtim
     finally:
         server.close()
         await server.wait_closed()
-    assert result.stdout == "-bash: wget: command not found\n"
-    assert "root@" in out and "-bash: whoami: command not found" in out
+    assert result.stdout.startswith("--") and result.stdout.endswith(
+        "--  http://198.51.100.9/x\nConnecting to 198.51.100.9:80... failed: "
+        "Network is unreachable.\n")
+    assert "root@" in out and "whoami\r\nroot\r" in out      # whoami from the host profile
     for h in ssh_module.logger.handlers:
         h.flush()
     events = _events(ssh_runtime)
@@ -435,7 +437,9 @@ async def test_offline_persona_never_calls_the_model():
     hooks.set_offline("no key")
     history = CountingHistory()
     r = await _call(history, text="cat /etc/passwd")
-    assert history.calls == [] and r.content.startswith("-bash: cat: command not found")
+    assert history.calls == [] and r.content.startswith("root:x:0:0:root:/root:/bin/bash\r\n")
+    r = await _call(history, text="frobnicate")
+    assert r.content.startswith("-bash: frobnicate: command not found")
     assert (await _call(history, text="exit")).content == "YYY-END-OF-SESSION-YYY"
 
 
