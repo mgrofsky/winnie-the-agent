@@ -120,6 +120,8 @@ services:
       - frontend:/data:ro
       - agentdata:/agents
       - overlay:/overlay
+      # [geoip] database files (optional, read only), e.g. city_db = /geoip/dbip-city-lite.mmdb:
+      # - ./geoip:/geoip:ro
 
   # Operator console (python -m agents ui), off unless asked for:
   #   docker compose --profile ui up -d ui
@@ -155,6 +157,8 @@ services:
       - frontend:/data:ro
       - agentdata:/agents:ro
       - overlay:/overlay:ro
+      # [geoip] database files (optional, read only); the same directory as agents.
+      # - ./geoip:/geoip:ro
 
   # One example sensor per scenario. Only the default stack above runs unless a profile
   # is chosen. Each needs its own host ports (or address) in a real deployment, and would

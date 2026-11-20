@@ -22,6 +22,9 @@ On top of that SSH honeypot this project adds:
 - **Budgets**: hard limits on model spend and concurrency, enforced in code before any
   model call.
 - **Triage**: one validated record per SSH session or per trap campaign, plus a daily digest.
+- **Where addresses are** (optional): country, city and network owner of each source,
+  read from GeoLite2 or DB-IP Lite database files on disk (no network call), stored on
+  the triage record and shown in the console and the digest.
 - **Tuning**: a fenced tuner that adds the fake accounts, SIP extensions and lure files
   attackers actually go for, writing only to a versioned overlay file.
 - **Detections**: Sigma rule drafts and blocklist candidates for human review.

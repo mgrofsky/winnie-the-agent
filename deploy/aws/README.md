@@ -937,3 +937,6 @@ Still unproven:
 - Models only on Amazon Bedrock in the sensor's own account and region, and only through
   `models.yaml` (see [Models on Bedrock](#models-on-bedrock-optional)); no other model
   provider has an egress path. `[listeners] llm` stays off.
+- No address locations (`[geoip]`, see the operations guide, "Where addresses are"). The
+  database files would have to reach the host, and the instance has no read path for that
+  by design (its role writes events and nothing else); this stack does not add one.

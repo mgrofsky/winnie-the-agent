@@ -22,7 +22,7 @@ import tempfile
 from collections import Counter
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Iterable, Optional
+from typing import Annotated, Callable, Iterable, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -130,6 +130,65 @@ class Technique(Strict):
 class Ioc(Strict):
     type: IocType
     value: str = Field(min_length=1, max_length=2048)
+
+
+# ---- where a source address is ---------------------------------------------------------------
+#
+# Country, region, city and network owner of a record's source address, from database files
+# on disk (``agents.enrich``; no network call). Everything here was read from a third-party
+# file, so it is data: cleaned and clipped before it is stored, and escaped by whatever
+# shows it. Stored on a record when it is written, so the record keeps what was true then.
+
+GEO_NOTE_MAX = 40
+GEO_NAME_MAX = 64
+GEO_ORG_MAX = 96
+GEO_SHORT_MAX = 160
+DAY_PATTERN = r"^(\d{4}-\d{2}-\d{2})?$"
+
+
+class GeoInfo(Strict):
+    # A non-global address (private, loopback, ...) is labelled here without a lookup.
+    note: str = Field(default="", max_length=GEO_NOTE_MAX)
+    country_code: str = Field(default="", pattern=r"^([A-Z]{2})?$")
+    country: str = Field(default="", max_length=GEO_NAME_MAX)
+    region: str = Field(default="", max_length=GEO_NAME_MAX)
+    city: str = Field(default="", max_length=GEO_NAME_MAX)
+    asn: Optional[int] = Field(default=None, ge=0, le=2 ** 32 - 1)
+    as_org: str = Field(default="", max_length=GEO_ORG_MAX)
+    # Build dates (UTC day) of the location and network database files, when they say.
+    location_built: str = Field(default="", pattern=DAY_PATTERN)
+    network_built: str = Field(default="", pattern=DAY_PATTERN)
+    # Reverse DNS name. Nothing sets it today (it needs a live query); left for later.
+    rdns: Optional[str] = Field(default=None, max_length=253)
+
+    @property
+    def empty(self) -> bool:
+        return not (self.note or self.country_code or self.country or self.region
+                    or self.city or self.asn is not None or self.as_org)
+
+
+def geo_short(g: Optional[GeoInfo]) -> str:
+    """The short form shown after an address: ``Frankfurt, Germany · AS14061 Owner``, a
+    label such as ``private address``, or empty."""
+    if g is None:
+        return ""
+    if g.note:
+        return g.note
+    place = [g.city or g.region, g.country or g.country_code]
+    parts = [", ".join(p for p in place if p)]
+    if g.asn is not None:
+        parts.append(f"AS{g.asn} {g.as_org}".strip())
+    elif g.as_org:
+        parts.append(g.as_org)
+    return " · ".join(p for p in parts if p)[:GEO_SHORT_MAX]
+
+
+def geo_view(g: Optional[GeoInfo]) -> Optional[dict]:
+    """What a reader shows: the short form, the country code and the stored fields."""
+    if g is None or g.empty:
+        return None
+    return {"short": geo_short(g), **g.model_dump(mode="json", exclude={"rdns"}
+                                                   if g.rdns is None else None)}
 
 
 # ---- the structured narrative -------------------------------------------------------------
@@ -266,6 +325,9 @@ class TriageRecord(Strict):
     # version), attacker text, for the "who" line.
     clients: list[Annotated[str, Field(max_length=CLIENT_MAX)]] = Field(
         default_factory=list, max_length=CLIENTS_MAX)
+    # Where src_ip was when the record was written (``GeoInfo``); absent on records written
+    # with the lookup off or before it existed.
+    src_geo: Optional[GeoInfo] = None
 
     @property
     def structured(self) -> bool:
@@ -641,13 +703,15 @@ def _rest(kept: int, shown: int, word: str) -> list[str]:
 def record_facts(r: TriageRecord) -> dict[str, list[str]]:
     """Who, volume and target, derived from the record's own fields (never from model
     text), so they are right for every record, old ones included. Each value is one short
-    phrase; phrases in ``who`` and ``target`` carry attacker text and must be escaped by
-    whatever shows them, ``volume`` is numbers and fixed words only."""
+    phrase; phrases in ``who`` and ``target`` carry attacker text (and database text, the
+    address's place) and must be escaped by whatever shows them, ``volume`` is numbers and
+    fixed words only."""
     who: list[str] = []
     if r.src_ip == UNVERIFIED_SOURCE:
         who.append("unverified UDP sources (aggregated)")
     else:
-        who.append(r.src_ip)
+        place = geo_short(r.src_geo)
+        who.append(f"{r.src_ip} · {place}" if place else r.src_ip)
         if r.unverified_source:
             who.append("address unverified")
     if r.src_address_count > 1:
@@ -1169,8 +1233,30 @@ def _safe_filename(record_id: str) -> str:
 def write_record(record: TriageRecord, reports_dir: Path) -> Path:
     sub = "sessions" if record.kind == "session" else "campaigns"
     path = reports_dir / sub / f"{_safe_filename(record.id)}.json"
-    _atomic_write(path, record.model_dump_json(indent=2))
+    # Without a lookup the file is exactly as before; rdns is left out until it is set.
+    if record.src_geo is None:
+        exclude: object = {"src_geo"}
+    else:
+        exclude = {"src_geo": {"rdns"}} if record.src_geo.rdns is None else None
+    _atomic_write(path, record.model_dump_json(indent=2, exclude=exclude))
     return path
+
+
+GeoLookupFn = Callable[[str], Optional[GeoInfo]]
+
+
+def with_geo(record: TriageRecord, geo: Optional[GeoLookupFn]) -> TriageRecord:
+    """``record`` with ``src_geo`` filled from ``geo`` when it has none and the lookup
+    answers (the aggregated unverified record has no one address). Never raises."""
+    if geo is None or record.src_geo is not None or record.src_ip == UNVERIFIED_SOURCE:
+        return record
+    try:
+        found = geo(record.src_ip)
+    except Exception:  # noqa: BLE001 - the lookup promises not to raise; belt and braces
+        found = None
+    if found is None or found.empty:
+        return record
+    return record.model_copy(update={"src_geo": found})
 
 
 def fold_unverified(campaigns: list[Campaign]) -> list[tuple[Campaign, list[str]]]:
@@ -1226,7 +1312,8 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
                now: Optional[datetime.datetime] = None,
                state_dir: Optional[os.PathLike | str] = None,
                max_records_per_run: int = MAX_RECORDS_PER_RUN,
-               retention_days: float = RECORD_RETENTION_DAYS) -> dict:
+               retention_days: float = RECORD_RETENTION_DAYS,
+               geo: Optional[GeoLookupFn] = None) -> dict:
     """Triage what finished since the last run.
 
     The cursor is saved after every item, so a crash or provider outage loses nothing.
@@ -1234,7 +1321,8 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
     those items stay unprocessed (retried next run) and deterministic work continues.
     At most ``max_records_per_run`` records are written; the rest wait for the next run.
     Unverified UDP sources are folded into one record per protocol and window. Records
-    older than ``retention_days`` are removed at the end of the run.
+    older than ``retention_days`` are removed at the end of the run. With ``geo`` (an
+    ``agents.enrich.GeoLookup``), each record stores where its source address was.
     """
     reports_dir = Path(reports_dir)
     state = Path(state_dir) if state_dir else reports_dir / "state"
@@ -1287,7 +1375,7 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
                 save()
             continue
         if not dry_run:
-            write_record(_attribute(record, ht_sources), reports_dir)
+            write_record(with_geo(_attribute(record, ht_sources), geo), reports_dir)
             cursor.mark(s.session_id, s.last_offset)
             save()
         written.append(record.id)
@@ -1315,7 +1403,7 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
             record, used = deterministic_campaign(c, tokens), False
         calls += int(used)
         if not dry_run:
-            write_record(_attribute(record, ht_sources), reports_dir)
+            write_record(with_geo(_attribute(record, ht_sources), geo), reports_dir)
             for cid in member_ids:
                 cursor.mark(cid, c.last_offset)
             save()
@@ -1368,7 +1456,7 @@ def _md_layout(r: TriageRecord) -> list[str]:
     out = []
     if r.headline:
         out.append(f"   - **{_md(r.headline, HEADLINE_MAX)}** ({r.judgement.value})")
-    out.append("   - Who: " + ", ".join(_md(v, 120) for v in facts["who"]))
+    out.append("   - Who: " + ", ".join(_md(v, 240) for v in facts["who"]))
     out.append("   - Volume: " + ", ".join(facts["volume"]))
     out.append("   - Target: " + ", ".join(_md(v, 120) for v in facts["target"]))
     for title, items in (("What they did", r.actions), ("What it means", r.assessment)):
@@ -1419,11 +1507,14 @@ def _day_of(r: TriageRecord) -> Optional[str]:
     return (r.first_seen or r.last_seen or "")[:10] or None
 
 
-def digest(reports_dir: os.PathLike | str, day: Optional[str] = None, dry_run: bool = False) -> str:
+def digest(reports_dir: os.PathLike | str, day: Optional[str] = None, dry_run: bool = False,
+           geo: Optional[GeoLookupFn] = None) -> str:
+    """The day's Markdown digest. With ``geo``, a record written without a place gets one
+    looked up now for its "Who" line (stored places are used as they are)."""
     reports_dir = Path(reports_dir)
     day = day or datetime.datetime.now(datetime.timezone.utc).date().isoformat()
     all_records = load_records(reports_dir)
-    records = [r for r in all_records if _day_of(r) == day]
+    records = [with_geo(r, geo) for r in all_records if _day_of(r) == day]
     by_j = Counter(r.judgement.value for r in records)
     by_p = Counter(r.protocol for r in records)
     lines = [f"# Honeypot digest {day}", "",

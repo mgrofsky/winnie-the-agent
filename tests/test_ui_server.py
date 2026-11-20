@@ -475,6 +475,13 @@ def test_session_endpoint(active):
     assert active.routes.gets == []  # answered by the shell
 
 
+def test_session_endpoint_carries_the_geoip_attribution(start):
+    c = start(attribution="IP Geolocation by DB-IP")
+    c.sign_in()
+    data = c.request("GET", "/api/session").json()
+    assert data["attribution"] == "IP Geolocation by DB-IP"
+
+
 def test_token_never_leaves_the_process(start, caplog):
     caplog.set_level(logging.DEBUG, logger="agents.ui")
     routes = FakeRoutes()

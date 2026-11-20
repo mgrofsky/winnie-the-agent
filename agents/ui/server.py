@@ -132,6 +132,7 @@ class UiSettings:
     allow_non_loopback: bool = False
     token: str = ""                # empty: generate one at start
     external_host: str = ""        # name[:port] a same-host HTTPS proxy is reached by
+    attribution: str = ""          # [geoip] credit line, shown in the footer as plain text
 
 
 class Routes(Protocol):
@@ -650,8 +651,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._send_static(path)
         elif path == "/api/session":
             settings = self.server.settings
-            self._send_json(200, {"csrf": self.server.csrf_for(session),
-                                  "actions": settings.actions, "operator": settings.operator})
+            body = {"csrf": self.server.csrf_for(session),
+                    "actions": settings.actions, "operator": settings.operator}
+            if settings.attribution:
+                body["attribution"] = settings.attribution
+            self._send_json(200, body)
         elif path.startswith("/api/"):
             routes = self.server.routes
             self._call_route(path, lambda: routes.get(path, query))

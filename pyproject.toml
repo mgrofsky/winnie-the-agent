@@ -20,6 +20,11 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
+[project.optional-dependencies]
+# Country, city and network owner of source addresses, read from .mmdb files on disk
+# ([geoip] in config.ini). Without it the lookup is off and nothing else changes.
+geoip = ["maxminddb>=2.6"]
+
 [dependency-groups]
 dev = [
     "pytest",
