@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Literal, Optional, Union
+from typing import Literal, NamedTuple, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -61,6 +61,54 @@ class FakeUser(Strict):
     shell: str = Field(default="/bin/bash", pattern=LURE_PATH_RE)
 
 
+GpuModel = Literal["rtx3060", "rtx3090", "rtx4090", "t4", "a10g", "a100", "l4", "h100"]
+
+
+class GpuSpec(NamedTuple):
+    pci_class: str        # lspci class: a display card or a compute card
+    pci_name: str         # lspci device text after the class
+    product: str          # nvidia-smi "Product Name"
+    brand: str
+    architecture: str
+    memory_mib: int
+    power_cap_w: int
+
+
+GPU_SPECS: dict[str, GpuSpec] = {
+    "rtx3060": GpuSpec("VGA compatible controller", "NVIDIA Corporation GA106 [GeForce RTX 3060] (rev a1)",
+                       "NVIDIA GeForce RTX 3060", "GeForce", "Ampere", 12288, 170),
+    "rtx3090": GpuSpec("VGA compatible controller", "NVIDIA Corporation GA102 [GeForce RTX 3090] (rev a1)",
+                       "NVIDIA GeForce RTX 3090", "GeForce", "Ampere", 24576, 350),
+    "rtx4090": GpuSpec("VGA compatible controller", "NVIDIA Corporation AD102 [GeForce RTX 4090] (rev a1)",
+                       "NVIDIA GeForce RTX 4090", "GeForce", "Ada Lovelace", 24564, 450),
+    "t4": GpuSpec("3D controller", "NVIDIA Corporation TU104GL [Tesla T4] (rev a1)",
+                  "Tesla T4", "NVIDIA", "Turing", 15360, 70),
+    "a10g": GpuSpec("3D controller", "NVIDIA Corporation GA102GL [A10G] (rev a1)",
+                    "NVIDIA A10G", "NVIDIA", "Ampere", 23028, 300),
+    "a100": GpuSpec("3D controller", "NVIDIA Corporation GA100 [A100 PCIe 40GB] (rev a1)",
+                    "NVIDIA A100-PCIE-40GB", "NVIDIA", "Ampere", 40960, 250),
+    "l4": GpuSpec("3D controller", "NVIDIA Corporation AD104GL [L4] (rev a1)",
+                  "NVIDIA L4", "NVIDIA", "Ada Lovelace", 23034, 72),
+    "h100": GpuSpec("3D controller", "NVIDIA Corporation GH100 [H100 PCIe] (rev a1)",
+                    "NVIDIA H100 PCIe", "NVIDIA", "Hopper", 81559, 350),
+}
+CPU_MODEL_RE = r"^[A-Za-z0-9 .,()@_/+-]+$"
+
+
+class Hardware(Strict):
+    """What the deterministic shell reports (``agents.shell``): ``nproc``, ``free``, ``df``,
+    ``/proc``, ``lscpu``, ``lspci`` and ``nvidia-smi`` all agree with these values. The
+    default is a small cloud VM with no GPU."""
+
+    cpu_model: str = Field(default="Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz",
+                           min_length=4, max_length=64, pattern=CPU_MODEL_RE)
+    cpus: int = Field(default=2, ge=1, le=64)
+    memory_mb: int = Field(default=4096, ge=512, le=1_048_576)
+    disk_gb: int = Field(default=40, ge=8, le=65_536)
+    gpu: Optional[GpuModel] = None
+    gpu_count: int = Field(default=1, ge=1, le=8)
+
+
 class Identity(Strict):
     org_name: str = Field(min_length=2, max_length=80, pattern=SAFE_TEXT_RE)
     hostname: str = Field(pattern=HOSTNAME_RE)
@@ -71,6 +119,7 @@ class Identity(Strict):
     timezone: str = Field(default="UTC", pattern=r"^[A-Za-z_]+(/[A-Za-z_]+)?$")
     users: list[FakeUser] = Field(default_factory=list, max_length=16)
     lures: list[str] = Field(default_factory=list, max_length=25)
+    hardware: Hardware = Field(default_factory=Hardware)
 
     @field_validator("internal_ips")
     @classmethod

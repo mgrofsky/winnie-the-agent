@@ -89,6 +89,14 @@ model_name = gpt-4o
 # to test this with your model.
 trimmer_max_tokens = 64000
 
+# Answer host facts (uname, hostname, uptime, id, nproc, free, df, /proc/cpuinfo,
+# /etc/os-release, lscpu, lspci, nvidia-smi, which, ...) from the scenario's host profile
+# instead of the model, until the model has handled a command in the session; after that
+# the model answers everything. No tokens, and the same answers a sensor without a model
+# gives. The answers are added to the session history so the model stays consistent. Set
+# to false to send every command to the model.
+local_shell_replies = true
+
 # Description of the emulated system for the telnet persona, relative to this file. The
 # SSH server takes it from --prompt-file instead (default: prompt.txt).
 #prompt_file = prompt.txt

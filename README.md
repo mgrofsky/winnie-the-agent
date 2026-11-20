@@ -67,8 +67,10 @@ Edit `SSH/config.ini`:
 - In `[scenario]`, pick `active` (default `sip_provider`; see [Scenarios](#scenarios)).
 - Optionally change the persona model in `[llm]` (the template selects OpenAI `gpt-4o`).
   Without that provider's API key in the environment, everything still runs: the SSH and
-  Telnet shells answer with canned replies (a prompt and `command not found`), and triage
-  writes deterministic records.
+  Telnet shells answer the usual host-sizing commands (`uname`, `uptime`, `free`, `lspci`,
+  `nvidia-smi`, `/proc/cpuinfo` and more) from the scenario's host profile, a known tool's
+  own error (or nothing) when it is used in a way the shell does not reproduce, and
+  `command not found` only for unknown commands, and triage writes deterministic records.
 
 Then start the stack with the lab override, which binds every port to 127.0.0.1 on a high
 port:

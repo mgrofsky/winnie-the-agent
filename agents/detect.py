@@ -218,7 +218,7 @@ DEFAULT_ACCESS_EXPIRY_DAYS = 30.0   # sources that logged in or used a planted c
 UPLOAD_SIGNALS = {"s3_upload", "ftp_upload", "quarantine_quota"}
 RELAY_SIGNALS = {"smtp_relay_attempt", "http_proxy_attempt"}
 COMMAND_SIGNALS = {"redis_takeover", "sql_exec_attempt", "sql_cred_dump", "download_execute",
-                   "persistence", "credential_file_read"}
+                   "persistence", "credential_file_read", "hardware_recon"}
 S3_READ_RE = re.compile(r"^GetObject /\S+ -> 20[06]$")
 SAFE_PROTOCOL_RE = re.compile(r"^[a-z0-9_]{1,16}$")
 CSV_UNSAFE_FIRST = tuple("=+-@\t\r\n'")

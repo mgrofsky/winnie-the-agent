@@ -193,13 +193,20 @@ count; leave some headroom below the model's context window.
 
 Everything runs without any model configured:
 
-- The SSH and Telnet shells answer with plausible canned replies (`command not found` and a
-  prompt; `exit` and `logout` end the session). If the persona's provider needs an API key
-  and it is not set, no network attempt is made.
+- The SSH and Telnet shells answer from the deterministic shell: `uname`, `uptime`, `id`,
+  `nproc`, `free`, `df`, `ps`, `/proc` and `/etc` files, `lscpu`, `lspci`, `nvidia-smi`,
+  `which`, `ls` of standard directories, the IoT botnet openers and `busybox` probes, with
+  `wget` and `curl` failing, all consistent with the scenario's host profile. A known
+  command used with an option or file the shell does not handle gets that tool's own error
+  (`invalid option`, `No such file or directory`) or no output; only an unknown command
+  gets `command not found`. Then a prompt (see
+  [architecture.md](architecture.md#deterministic-shell)). `exit` and `logout` end the
+  session. If the persona's provider needs an API key and it is not set, no network attempt
+  is made.
 - Unknown SQL and API requests get protocol errors instead of model answers.
 - Triage writes deterministic records for every SSH session and campaign. Download-and-
-  execute, persistence, credential-file reads and honeytoken use still mark a session
-  `MALICIOUS`.
+  execute, persistence, credential-file reads, hardware sizing for mining and honeytoken
+  use still mark a session `MALICIOUS`.
 - The tuner ranks candidates by frequency; detect uses its default titles.
 
 ## Data and retention
@@ -1085,7 +1092,7 @@ label whatever its style, and `{{sha1:LABEL}}` hashes the pinned value.
 | Symptom | Likely cause |
 |---|---|
 | Every source in the log is a 172.x or similar gateway address; a "proxy may be hiding client addresses" warning | Docker userland proxy is on. See [Client addresses](#client-addresses). |
-| SSH shell answers only `command not found` | No persona model: the provider's API key is not set in the container's environment, or the model call failed (look for `Model error` events and the startup warning). |
+| SSH shell answers host facts (`uname`, `free`, `lspci`) but `command not found` to everything else | No persona model: the provider's API key is not set in the container's environment, or the model call failed (look for `Model error` events and the startup warning). |
 | SSH sessions close with `fork: Resource temporarily unavailable` | A budget limit was reached; the `Budget exceeded` event names which one. |
 | FTP `LIST` or `RETR` hangs or connects to a private address | `ftp_pasv_address` not set to the address clients reach, or the passive port range is not published. |
 | A MySQL, PostgreSQL or MSSQL client fails right after connecting | The client requires TLS, which the traps do not offer (for `sqlcmd` with ODBC 18, encryption is required by default). The attempt is logged. |

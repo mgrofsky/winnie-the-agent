@@ -2,7 +2,7 @@
 
 After login every line goes through ``agents.hooks.persona_invoke`` when
 ``ctx.persona_history`` is set (budgets enforced there); otherwise a deterministic minimal
-shell answers. Nothing is ever executed.
+shell answers (``agents.shell``, shared with the SSH fallback). Nothing is ever executed.
 """
 
 from __future__ import annotations
@@ -82,39 +82,26 @@ def _identity(ctx: ListenerContext) -> tuple[str, str, str]:
     if ctx.scenario is not None:
         ident = ctx.scenario.scenario.identity
         return ctx.scenario.hostname, ident.os_pretty_name, ident.kernel
-    return ("srv01", "Ubuntu 22.04.4 LTS",
-            "Linux srv01 5.15.0-105-generic #115-Ubuntu SMP x86_64 GNU/Linux")
+    from agents.shell import Host
+
+    host = Host()
+    return host.hostname, host.os_pretty_name, host.kernel
 
 
-def canned_shell(ctx: ListenerContext, user: str, line: str, cwd: str) -> tuple[str, bool]:
-    """Deterministic minimal shell. Returns (output, close)."""
-    host, os_name, kernel = _identity(ctx)
+def canned_shell(ctx: ListenerContext, user: str, line: str, cwd: str,
+                 src_ip: Optional[str] = None) -> tuple[str, bool]:
+    """Deterministic shell (``agents.shell``, the same answers as the SSH fallback).
+    Returns (output, close)."""
+    from agents import shell
+
     parts = line.split()
     if not parts:
         return "", False
-    cmd, args = parts[0], parts[1:]
-    uid = 0 if user == "root" else 1000
-    if cmd in ("exit", "logout", "quit"):
+    if parts[0] in ("exit", "logout", "quit"):
         return "logout\r\n", True
-    if cmd == "whoami":
-        return f"{user}\r\n", False
-    if cmd == "id":
-        return f"uid={uid}({user}) gid={uid}({user}) groups={uid}({user})\r\n", False
-    if cmd == "uname":
-        return (f"{kernel}\r\n" if "-a" in args else "Linux\r\n"), False
-    if cmd == "hostname":
-        return f"{host}\r\n", False
-    if cmd == "pwd":
-        return f"{cwd}\r\n", False
-    if cmd == "echo":
-        return " ".join(args)[:512] + "\r\n", False
-    if cmd in ("cd", "true", ":", "export", "unset", "history"):
-        return "", False
-    if cmd == "ls":
-        return "\r\n", False
-    if cmd == "cat" and args and args[0] in ("/etc/os-release", "/etc/issue"):
-        return f'PRETTY_NAME="{os_name}"\r\n', False
-    return f"-bash: {cmd[:64]}: command not found\r\n", False
+    out = shell.reply(shell.host_for(ctx.scenario, ctx.seed), line, user=user,
+                      interactive=True, cwd=cwd, src_ip=src_ip)
+    return _crlf(out), False
 
 
 async def _login(conn: Conn, reader: TelnetReader, host: str) -> Optional[str]:
@@ -153,7 +140,7 @@ async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:
             return await hooks.persona_invoke(
                 ctx.persona_history, session_id=conn.task_name, src_ip=conn.src_ip,
                 username=user, text=text, interactive=True, llm_config=llm_config,
-                counts_as_command=counts)
+                counts_as_command=counts, scenario=ctx.scenario)
 
         first = await ask("", counts=False)
         content = str(getattr(first, "content", ""))
@@ -191,7 +178,7 @@ async def _canned_session(conn: Conn, reader: TelnetReader, user: str) -> None:
         line = await reader.readline()
         if not conn.command():
             return
-        out, close = canned_shell(conn.ctx, user, line.strip(), cwd)
+        out, close = canned_shell(conn.ctx, user, line.strip(), cwd, conn.src_ip)
         conn.emit("command", "Telnet input", username=user,
                   data={"input": line, "response": out[:RESPONSE_LOG_CAP], "persona": False})
         conn.capture("telnet_input", line)
