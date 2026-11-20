@@ -3650,6 +3650,12 @@ def _chmod(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     for word in files[:MAX_FILES]:
         path = sh.path(word)
         entry = sh.session.files.get(path)
+        if "-R" in flags:                   # and what the session wrote below it
+            below = path.rstrip("/") + "/"
+            for name, inner in sh.session.files.items():
+                if name.startswith(below):
+                    inner.mode = _parse_mode(spec, inner.mode)
+                    sh.session.version += 1
         if entry is not None:
             entry.mode = _parse_mode(spec, entry.mode)
             sh.session.version += 1

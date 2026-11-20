@@ -894,3 +894,11 @@ def test_the_fallback_session_keeps_its_directory_under_a_model_prompt():
         assert out.endswith("/tmp# ")
     finally:
         hooks.session_close(sid, None)
+
+
+def test_recursive_chmod_reaches_files_in_a_session_directory():
+    out = run(["mkdir /tmp/d; cp /bin/echo /tmp/d/e; chmod 644 /tmp/d/e", "/tmp/d/e hi",
+               "chmod -R 755 /tmp/d", "/tmp/d/e hi"])
+    assert "Permission denied" in out[1]
+    assert out[2] == ""
+    assert out[3] == "hi\n"
