@@ -179,6 +179,33 @@ def _sql_result(value) -> Optional[str]:
     return value
 
 
+def _line_breaks(text: str) -> str:
+    """A logged reply with its line endings back as line breaks. The event log writes a
+    control character as the text ``\\xNN`` and a backslash as ``\\\\``
+    (``listeners.events.clean``); this undoes only ``\\x0d\\x0a``, ``\\x0a`` and ``\\x0d``
+    (CRLF, LF, CR become one line break) and the doubled backslash, so a backslash the reply
+    really held is not read as the start of an escape. Every other escape stays as text."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c != "\\" or i + 1 == n:
+            out.append(c)
+            i += 1
+        elif text[i + 1] == "\\":
+            out.append("\\")
+            i += 2
+        elif text.startswith("\\x0d\\x0a", i):
+            out.append("\n")
+            i += 8
+        elif text.startswith(("\\x0a", "\\x0d"), i):
+            out.append("\n")
+            i += 4
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _join(*parts) -> Optional[str]:
     out = [p for p in parts if isinstance(p, str) and p]
     return " ".join(out) if out else None
@@ -244,11 +271,13 @@ def describe(rec: dict, service: str, kind: str, cap: int,
     else:
         for key in ("input", "statement", "text", "copy", "command"):
             value = data.get(key)
-            if isinstance(value, str) and value:
-                sent = c(value, limit)
-                break
+            if isinstance(value, str) and (value or sent is None):
+                sent = c(value, limit)      # "" for an empty line, told apart from none
+                if value:
+                    break
         if service == "telnet" and isinstance(data.get("response"), str):
-            answered = c(data["response"], limit)
+            # "" when the shell answered with nothing; None when no reply is logged
+            answered = c(_line_breaks(data["response"]), limit)
         if service in SQL_SERVICES:
             result = _sql_result(c(data.get("result"), 200))
     out = {"message": message, "sent": sent, "answered": answered, "result": result}

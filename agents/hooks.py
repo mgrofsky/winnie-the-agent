@@ -348,7 +348,9 @@ def get_scenario():
 # ---- input / sessions -------------------------------------------------------------------
 
 def clip_input(text: str) -> str:
+    """An input line within the line cap, any undecodable byte (a surrogate escape) replaced."""
     budget = _budget
+    text = text.encode("utf-8", "replace").decode("utf-8") if not text.isascii() else text
     return (budget or Budget(BudgetConfig())).clip(text)  # clipping never needs state
 
 
@@ -765,7 +767,7 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         def shown(output: str) -> str:
             return (output.replace("\n", "\r\n") if interactive else output) + prompt
 
-        kept = shown(_clip_local(local.output))
+        kept = shown(_clip_local(shell.printable(local.output)))   # binary bytes as \xNN
         stored = _remember(history, session_id, text, kept)
         if stored is not None:
             budget.add_history(session_id, src_ip, text, stored)
@@ -792,7 +794,7 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         _leave(session_id)
         sent = fallback_reply(text, interactive, username, host, src_ip, shown_prompt)
         if sent != "YYY-END-OF-SESSION-YYY":
-            stored = _remember(history, session_id, text, _clip_local(sent))
+            stored = _remember(history, session_id, text, _clip_local(shell.printable(sent)))
             if stored is not None:
                 budget.add_history(session_id, src_ip, text, stored)
         return SimpleNamespace(content=sent, model_capped=True)
