@@ -1,0 +1,6 @@
+[Unit]
+Description=Renew the model credentials and firewall rules (sensor-model.sh)
+After=network-online.target docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sensor-model.sh

@@ -2,8 +2,8 @@
 
     uv run python deploy/aws/check.py            # prints "ok" or one problem per line
 
-``check_sensor`` and ``check_bucket`` take a parsed template and return a list of problems,
-so tests can feed them altered copies and see each rule fire.
+``check_sensor``, ``check_bucket`` and ``check_models`` take a parsed template and return a
+list of problems, so tests can feed them altered copies and see each rule fire.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 SENSOR = HERE / "sensor.yaml"
 BUCKET = HERE / "events-bucket.yaml"
+MODELS = HERE / "models.yaml"
 
 _spec = importlib.util.spec_from_file_location("strip_comments", HERE / "strip_comments.py")
 strip_comments = importlib.util.module_from_spec(_spec)
@@ -239,6 +240,7 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
         if (params.get(switch) or {}).get("Default") != "false":
             errors.append(f"parameter {switch} is not off by default")
     errors += check_tailscale_switches(doc)
+    errors += check_model_switches(doc)
     if (params.get("TrackedExport") or {}).get("Default") != "false":
         errors.append("parameter TrackedExport is not off by default")
     tracked_key = params.get("TrackedKey") or {}
@@ -657,6 +659,7 @@ def check_host_files(egress: Optional[str] = None, units: Optional[dict] = None,
         lines = units.get(name, "").splitlines()
         if any(n not in lines for n in needed):
             errors.append(f"{name} does not refresh the prefix list as required")
+    errors += check_model_host()
     lines = tailscaled.splitlines()
     for needed in TAILSCALED_LINES:
         if needed not in lines:
@@ -724,16 +727,17 @@ def check_user_data_steps(doc: dict, base64_value) -> list[str]:
         return ["the user data is not a !Sub with variables"]
     variables = sub[1]
     steps = {"EgressStep": "TailscaleOn", "ConsoleStep": "ConsoleStepOn",
-             "TailscaleNodeStep": "TailscaleOn"}
+             "TailscaleNodeStep": "TailscaleOn", "ModelStep": "ModelOn"}
     for step, cond in steps.items():
         value = variables.get(step)
         if not (isinstance(value, dict) and "Fn::If" in value
                 and value["Fn::If"][0] == cond and value["Fn::If"][2] == ""):
             errors.append(f"step {step} is not empty unless {cond}")
     lines = sub[0].splitlines()
-    if "${EgressStep}${ConsoleStep}cat > /etc/systemd/system/sensor.service <<'EOF'" not in lines:
-        errors.append("the egress and console steps do not run right before the stack is "
-                      "started")
+    if "${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service <<'EOF'" \
+            not in lines:
+        errors.append("the egress, console and model steps do not run, in that order, right "
+                      "before the stack is started")
     if '${TailscaleNodeStep}echo "bootstrap complete"' not in lines:
         errors.append("the node step does not run after the stack is up")
     errors += check_egress_step(_step_body(variables, "EgressStep"))
@@ -744,6 +748,10 @@ def check_user_data_steps(doc: dict, base64_value) -> list[str]:
         errors.append("the node step does not write the state ARN and the unit exactly as "
                       "required")
     errors += check_console_step(_step_body(variables, "ConsoleStep"))
+    if [line for line in _step_body(variables, "ModelStep").splitlines() if line.strip()] \
+            != MODEL_STEP_LINES:
+        errors.append("the model step is not exactly its settings, the script from the image "
+                      "and the setup run")
     size, problems = user_data_size(doc, base64_value)
     errors += problems
     if size > USER_DATA_LIMIT:
@@ -1067,6 +1075,370 @@ def check_repository(doc: dict) -> list[str]:
     return errors
 
 
+# ---- models on Bedrock --------------------------------------------------------------------
+
+# The two model switches, the same in sensor.yaml and models.yaml. A model id is
+# provider.name[:version] with an optional geographic inference profile prefix; names hold
+# no dots, so a profile's foundation model is its second and third parts.
+MODEL_PARAMS = ("PersonaModelId", "AnalystModelId")
+PROFILE_PREFIXES = ("us", "us-gov", "eu", "apac", "jp", "au", "global")
+MODEL_ID = r"^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$"
+MODEL_IDS_GOOD = ("", "anthropic.claude-haiku-5-5", "amazon.nova-pro-v1:0",
+                  "anthropic.claude-3-5-sonnet-20240620-v1:0") + tuple(
+    f"{p}.anthropic.claude-haiku-5-5" for p in PROFILE_PREFIXES)
+# Ids the pattern must refuse: wildcards, ARNs, paths, another name hidden behind a dot (the
+# grant would name a different model), spaces and newlines (they reach config.ini and a
+# shell variable).
+MODEL_IDS_BAD = ("*", "anthropic.*", "anthropic.claude*", "us.*", "us.anthropic.claude.x",
+                 "anthropic.claude.x", "arn:aws:bedrock:us-east-1::foundation-model/a.b",
+                 "anthropic/claude", "a.b/../c", "a.b c", "a.b\nc", "a.b;c", "A.B", ".a.b",
+                 "us.", "xx.anthropic.claude-x", "usgov.anthropic.claude-x",
+                 "us-east-1.anthropic.claude-x", "ca.anthropic.claude-x", "eu.*",
+                 "us-gov.anthropic.claude.x", "anthropic")
+MODEL_CONDITIONS = {
+    "PersonaOn": {"Fn::Not": [{"Fn::Equals": [{"Ref": "PersonaModelId"}, ""]}]},
+    "AnalystOn": {"Fn::Not": [{"Fn::Equals": [{"Ref": "AnalystModelId"}, ""]}]},
+    "ModelOn": {"Fn::Or": [{"Condition": "PersonaOn"}, {"Condition": "AnalystOn"}]},
+}
+# The base of the callers' role names; sensor-model.sh appends -persona or -analyst.
+MODEL_ROLE = "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-model"
+# The sensor's model step: settings, the script out of the image, the setup run. Nothing
+# else; everything it does is in deploy/aws/host/sensor-model.sh.
+MODEL_STEP_LINES = [
+    "printf 'REGION=%s\\nSUFFIX=%s\\nVPC_CIDR=%s\\nROLE_ARN=%s\\nPERSONA_MODEL=%s\\n"
+    "ANALYST_MODEL=%s\\n' ${AWS::Region} ${AWS::URLSuffix} ${VpcCidr} " + MODEL_ROLE
+    + ' "${PersonaModelId}" "${AnalystModelId}" > /etc/sensor-model.env',
+    'docker run --rm --network none --entrypoint cat "$IMAGE" '
+    "/app/deploy/aws/host/sensor-model.sh | install -m 0700 /dev/stdin "
+    "/usr/local/sbin/sensor-model.sh",
+    '/usr/local/sbin/sensor-model.sh setup "$IMAGE" || echo "model: FAILED ($?)"',
+]
+
+
+def check_model_param(name: str, param: dict) -> list[str]:
+    errors: list[str] = []
+    if param.get("Default") != "":
+        errors.append(f"parameter {name} is not empty (off) by default")
+    if param.get("AllowedPattern") != MODEL_ID:
+        errors.append(f"parameter {name} does not use the model id pattern")
+    pattern = param.get("AllowedPattern") if isinstance(param.get("AllowedPattern"), str) else ""
+    loose = [b for b in MODEL_IDS_BAD if not pattern or re.fullmatch(pattern, b)]
+    if loose:
+        errors.append(f"parameter {name} accepts {loose[0]!r}")
+    if pattern and any(not re.fullmatch(pattern, g) for g in MODEL_IDS_GOOD):
+        errors.append(f"parameter {name} refuses a valid model id")
+    if "MaxLength" not in param:
+        errors.append(f"parameter {name} has no MaxLength")
+    return errors
+
+
+def check_model_switches(doc: dict) -> list[str]:
+    """sensor.yaml: the model switches are off by default and add no resource here; the
+    endpoints and the role are models.yaml's."""
+    errors: list[str] = []
+    params = doc.get("Parameters") or {}
+    for name in MODEL_PARAMS:
+        errors += check_model_param(name, params.get(name) or {})
+    conditions = doc.get("Conditions") or {}
+    for name, want in MODEL_CONDITIONS.items():
+        if conditions.get(name) != want:
+            errors.append(f"condition {name} is not as required")
+    switches = set(MODEL_PARAMS) | set(MODEL_CONDITIONS)
+    for name, res in (doc.get("Resources") or {}).items():
+        if name == "LaunchTemplate":
+            continue
+        blob = json.dumps(res)
+        if any(f'"{s}"' in blob or "${" + s + "}" in blob for s in switches) \
+                or "bedrock" in blob.lower():
+            errors.append(f"resource {name} depends on a model switch (sensor.yaml adds no "
+                          "resource for models)")
+    return errors
+
+
+# The host script's rules: one accept per caller, from its fixed address to the endpoint's
+# one address on tcp 443; the removal of caller accepts to any other address; nothing else.
+MODEL_SCRIPT = HOST_DIR / "sensor-model.sh"
+MODEL_CALLERS = ['[ -z "$PERSONA_MODEL" ] || callers+=(persona:172.30.0.10)',
+                 '[ -z "$ANALYST_MODEL" ] || callers+=(analyst:172.30.1.10)']
+MODEL_RULES = [
+    '  iptables -w -C DOCKER-USER -s "${c#*:}" -d "$EP" -p tcp --dport 443 -j ACCEPT 2>/dev/null \\',
+    '    || iptables -w -I DOCKER-USER 1 -s "${c#*:}" -d "$EP" -p tcp --dport 443 -j ACCEPT',
+    "rules=$(iptables -w -S DOCKER-USER)",
+    '  iptables -w -D DOCKER-USER -s "${BASH_REMATCH[1]}" -d "${BASH_REMATCH[2]}" -p tcp '
+    '--dport 443 -j ACCEPT',
+]
+# Each caller's overlay names its own credentials directory, which holds its own role's
+# credentials only: ssh (the persona) persona, agents (the analyst) analyst.
+MODEL_SERVICES = ['    [ -z "$PERSONA_MODEL" ] || svc ssh frontend 172.30.0.10 persona',
+                  '    [ -z "$ANALYST_MODEL" ] || svc agents backend 172.30.1.10 analyst']
+MODEL_SCRIPT_FACTS = {
+    "does not stop on errors": "set -euo pipefail",
+    "does not use the model id pattern": "id='" + MODEL_ID + "'",
+    "does not check the VPC range":
+        "&& python3 -c 'import ipaddress as i,sys; n=i.ip_network(sys.argv[1]); "
+        "sys.exit(not (n.is_private and 8 <= n.prefixlen <= 28))' \"$VPC_CIDR\" 2>/dev/null \\",
+    "does not test addresses against the VPC":
+        "inside() { python3 -c 'import ipaddress as i,sys; sys.exit(i.ip_address(sys.argv[1]) "
+        "not in i.ip_network(sys.argv[2]))' \"$1\" \"$VPC_CIDR\" 2>/dev/null; }",
+    "does not check the looked-up address is inside the VPC":
+        'if [[ $a =~ ^[0-9]{1,3}(\\.[0-9]{1,3}){3}$ ]] && inside "$a"; then echo "$a" > '
+        '"$S/endpoint"; break; fi',
+    "does not check the endpoint address is inside the VPC":
+        '[[ $EP =~ ^[0-9]{1,3}(\\.[0-9]{1,3}){3}$ ]] && inside "$EP" \\',
+    "does not start its timer": "systemctl enable --now sensor-model.timer",
+    "does not remove accepts to an old address":
+        "stale='^-A DOCKER-USER -s (172\\.30\\.[01]\\.10)/32 -d ([0-9.]+)/32 -p tcp -m tcp "
+        "--dport 443 -j ACCEPT$'",
+    "removes more than caller accepts to an old address":
+        '[[ $line =~ $stale ]] && [ "${BASH_REMATCH[2]}" != "$EP" ] || continue',
+    "does not recreate only the callers when the address changed":
+        '[ -z "$(docker compose ps -q --status running "$s" 2>/dev/null || :)" ] \\',
+    "does not ask for one-hour credentials of the caller's own role":
+        '--role-arn "$ROLE_ARN-$1" --role-session-name "sensor-$1" --duration-seconds 3600 \\',
+    "does not write a caller's credentials into its own directory": '> "$D/$1/creds.new"; then',
+    "does not make the credentials readable by uid 10001 only":
+        'chmod 0400 "$D/$1/creds.new" "$D/$1/config.new"',
+    "does not replace the credentials in one rename": 'mv -f "$D/$1/creds.new" "$D/$1/creds.json"',
+    "does not keep each credentials directory for uid 10001 only":
+        'install -d -m 0500 -o 10001 -g 10001 "$D/$1"',
+    "does not keep the credentials root for root only": 'install -d -m 0700 "$D"',
+    "does not check the overlay before it uses it":
+        "COMPOSE_FILE=$f:docker-compose.model.new.yml docker compose config --quiet",
+}
+# The only modes the script sets: config.ini and the credentials, both 0400.
+MODEL_CHMODS = ["chmod 0400 config.ini", 'chmod 0400 "$D/$1/creds.new" "$D/$1/config.new"']
+MODEL_UNITS = {
+    "sensor-model.service": ["Type=oneshot", "ExecStart=/usr/local/sbin/sensor-model.sh"],
+    "sensor-model.timer": ["OnUnitActiveSec=15min", "WantedBy=timers.target"],
+}
+# Each caller's overlay: its fixed address, the endpoint's name, its own credentials
+# directory read-only and two variables. Exactly this; nothing else of the service changes.
+MODEL_OVERLAY = ("svc() { printf '  %s:\\n    networks: {%s: {ipv4_address: %s}}\\n    "
+                 "extra_hosts: [\"%s:%s\"]\\n    environment: {AWS_CONFIG_FILE: /model/config, "
+                 "AWS_EC2_METADATA_DISABLED: \"true\"}\\n    volumes: [\"%s/%s:/model:ro\"]\\n' "
+                 "\"$1\" \"$2\" \"$3\" \"$NAME\" \"$EP\" \"$D\" \"$4\"; }")
+
+
+def check_model_host(script: Optional[str] = None, units: Optional[dict] = None) -> list[str]:
+    script = MODEL_SCRIPT.read_text(encoding="utf-8") if script is None else script
+    units = units if units is not None else {
+        n: (HOST_DIR / n).read_text(encoding="utf-8") for n in MODEL_UNITS}
+    lines = script.splitlines()
+    code = [x for x in lines if not x.lstrip().startswith("#")]
+    errors = [f"sensor-model.sh {msg}" for msg, line in MODEL_SCRIPT_FACTS.items()
+              if line.strip() not in [x.strip() for x in lines]]
+    for line in code:
+        if "iptables" in line and line not in MODEL_RULES:
+            errors.append(f"sensor-model.sh has an extra rule: {line.strip()[:70]}")
+        if re.search(r"\bchmod\b", line) and line.strip() not in MODEL_CHMODS:
+            errors.append(f"sensor-model.sh sets another mode: {line.strip()[:70]}")
+    if any(rule not in lines for rule in MODEL_RULES):
+        errors.append("sensor-model.sh lacks its accept rule or its stale-accept removal")
+    # One definition of each function the checks rely on (a later one would replace it).
+    for fn in ("inside", "svc", "renew", "overlay"):
+        if len([x for x in code if re.search(rf"(^|[;\s]|function\s+){fn}\s*\(\)", x)]) != 1:
+            errors.append(f"sensor-model.sh defines {fn}() more than once")
+    if [x for x in lines if "callers+=" in x] != MODEL_CALLERS:
+        errors.append("sensor-model.sh opens the endpoint to callers other than the ssh and "
+                      "agents containers' fixed addresses")
+    if [x for x in lines if re.search(r"\bsvc \w", x)] != MODEL_SERVICES \
+            or MODEL_OVERLAY not in [x.strip() for x in lines]:
+        errors.append("sensor-model.sh's overlay changes more than the ssh and agents "
+                      "containers' address, endpoint name, own credentials mount and variables")
+    for name, needed in MODEL_UNITS.items():
+        if any(n not in units.get(name, "").splitlines() for n in needed):
+            errors.append(f"{name} does not renew the credentials as required")
+    return errors
+
+
+# ---- models.yaml: the grant, evaluated for sample ids ----
+
+SAMPLE_ACCOUNT, SAMPLE_REGION = "123456789012", "us-east-1"
+MODEL_RESOURCES = {"BedrockEndpoint": "AWS::EC2::VPCEndpoint",
+                   "StsEndpoint": "AWS::EC2::VPCEndpoint", "PersonaRole": "AWS::IAM::Role",
+                   "AnalystRole": "AWS::IAM::Role",
+                   "InstanceAssumeModelRole": "AWS::IAM::RolePolicy"}
+# Each caller's role: its condition, its name (sensor-model.sh assumes MODEL_ROLE-<who>
+# into the directory only that caller mounts) and the parameter it may invoke.
+MODEL_CALLER_ROLES = {"PersonaRole": ("PersonaOn", "persona", "PersonaModelId"),
+                      "AnalystRole": ("AnalystOn", "analyst", "AnalystModelId")}
+MODEL_SAMPLES = [("us.anthropic.claude-haiku-5-5", ""), ("", "eu.anthropic.claude-haiku-5-5"),
+                 ("global.anthropic.claude-sonnet-5-5", "amazon.nova-pro-v1:0"),
+                 ("us.anthropic.claude-haiku-5-5", "us.anthropic.claude-sonnet-5-5"),
+                 ("apac.anthropic.claude-haiku-5-5", "us-gov.anthropic.claude-haiku-5-5"),
+                 ("jp.anthropic.claude-haiku-5-5", "au.anthropic.claude-haiku-5-5")]
+_IF = lambda cond, role: {"Fn::If": [cond, {"Fn::GetAtt": [role, "Arn"]}, {"Ref": "AWS::NoValue"}]}
+MODEL_ROLE_ARNS = [_IF("PersonaOn", "PersonaRole"), _IF("AnalystOn", "AnalystRole")]
+_NO_VALUE = object()
+
+
+def expected_grant(model: str) -> set[str]:
+    """What one model id may be invoked as: a plain id, its foundation model in this region;
+    a profile id, the profile here and its foundation model in any region."""
+    if not model:
+        return set()
+    parts = model.split(".")
+    if parts[0] in PROFILE_PREFIXES and len(parts) == 3:
+        return {f"arn:aws:bedrock:{SAMPLE_REGION}:{SAMPLE_ACCOUNT}:inference-profile/{model}",
+                f"arn:aws:bedrock:*::foundation-model/{'.'.join(parts[1:])}"}
+    return {f"arn:aws:bedrock:{SAMPLE_REGION}::foundation-model/{model}"}
+
+
+def evaluate(node, doc: dict, values: dict):
+    """CloudFormation's intrinsic functions, as far as models.yaml uses them."""
+    if isinstance(node, list):
+        out = [evaluate(n, doc, values) for n in node]
+        return [o for o in out if o is not _NO_VALUE]
+    if not isinstance(node, dict):
+        return node
+    if len(node) == 1:
+        (key, arg), = node.items()
+        if key == "Ref":
+            return _NO_VALUE if arg == "AWS::NoValue" else values[arg]
+        if key == "Condition":
+            return evaluate(doc["Conditions"][arg], doc, values)
+        if key == "Fn::If":
+            cond = evaluate(doc["Conditions"][arg[0]], doc, values)
+            return evaluate(arg[1] if cond else arg[2], doc, values)
+        if key == "Fn::Equals":
+            a, b = (evaluate(x, doc, values) for x in arg)
+            return a == b
+        if key == "Fn::Not":
+            return not evaluate(arg[0], doc, values)
+        if key == "Fn::Or":
+            return any(evaluate(x, doc, values) for x in arg)
+        if key == "Fn::And":
+            return all(evaluate(x, doc, values) for x in arg)
+        if key == "Fn::Split":
+            return evaluate(arg[1], doc, values).split(arg[0])
+        if key == "Fn::Select":
+            return evaluate(arg[1], doc, values)[int(arg[0])]
+        if key == "Fn::Join":
+            return arg[0].join(evaluate(arg[1], doc, values))
+        if key == "Fn::GetAtt":
+            return values[".".join(arg)]
+        if key == "Fn::Sub":
+            template, local = (arg, {}) if isinstance(arg, str) else arg
+            local = {k: evaluate(v, doc, values) for k, v in local.items()}
+            return re.sub(r"\$\{([^}]*)\}",
+                          lambda m: str(local.get(m.group(1), values.get(m.group(1)))), template)
+    return {k: evaluate(v, doc, values) for k, v in node.items()}
+
+
+def model_values(persona: str, analyst: str) -> dict:
+    return {"AWS::Partition": "aws", "AWS::Region": SAMPLE_REGION,
+            "AWS::AccountId": SAMPLE_ACCOUNT, "NamePrefix": "winnie-sensor",
+            "PersonaModelId": persona, "AnalystModelId": analyst,
+            "VpcId": "vpc-0example", "SubnetId": "subnet-0example",
+            "EndpointSecurityGroupId": "sg-0example", "BedrockEndpoint": "vpce-0bedrock",
+            "PersonaRole.Arn": f"arn:aws:iam::{SAMPLE_ACCOUNT}:role/winnie-sensor-model-persona",
+            "AnalystRole.Arn": f"arn:aws:iam::{SAMPLE_ACCOUNT}:role/winnie-sensor-model-analyst"}
+
+
+def _grant_problems(label: str, statements: list, want: set, role: bool) -> list[str]:
+    errors: list[str] = []
+    got: set[str] = set()
+    for st in statements:
+        if not isinstance(st, dict) or st.get("Effect") != "Allow" or "NotAction" in st \
+                or "NotResource" in st or "NotPrincipal" in st:
+            errors.append(f"{label} has a statement that is not a plain Allow")
+            continue
+        if as_list(st.get("Action")) != ["bedrock:InvokeModel"]:
+            errors.append(f"{label} allows {', '.join(map(str, as_list(st.get('Action'))))}")
+        if role and st.get("Condition") != {"StringEquals": {"aws:SourceVpce": "vpce-0bedrock"}}:
+            errors.append(f"{label} is not limited to the bedrock-runtime endpoint")
+        if not role and "Condition" in st:
+            errors.append(f"{label} has a condition")
+        got |= set(as_list(st.get("Resource")))
+    if got - want:
+        errors.append(f"{label} grants {', '.join(sorted(got - want))} beyond the configured "
+                      "models")
+    if want - got:
+        errors.append(f"{label} lacks {', '.join(sorted(want - got))}")
+    return errors
+
+
+def check_models(doc: dict, raw: str = "") -> list[str]:
+    """models.yaml: two endpoints and a role per caller, each passing bedrock:InvokeModel on
+    exactly the configured models (each role: its own caller's model only), or assuming
+    those roles, and nothing else."""
+    errors: list[str] = []
+    params = doc.get("Parameters") or {}
+    for name in MODEL_PARAMS:
+        errors += check_model_param(name, params.get(name) or {})
+    res = doc.get("Resources") or {}
+    for name, kind in MODEL_RESOURCES.items():
+        if (res.get(name) or {}).get("Type") != kind:
+            errors.append(f"no {kind} {name}")
+    for name in res:
+        if name not in MODEL_RESOURCES:
+            errors.append(f"resource {name} is not one of the five the option needs")
+        want_cond = MODEL_CALLER_ROLES.get(name, (None,))[0]
+        if (res.get(name) or {}).get("Condition") != want_cond:
+            errors.append(f"resource {name} has a condition other than "
+                          f"{want_cond or 'none (the stack is the switch)'}")
+    if errors:
+        return ["models: " + e for e in errors]
+    bedrock, sts = res["BedrockEndpoint"]["Properties"], res["StsEndpoint"]["Properties"]
+    assume = res["InstanceAssumeModelRole"]["Properties"]
+    for name, props, service in (("BedrockEndpoint", bedrock, "bedrock-runtime"),
+                                 ("StsEndpoint", sts, "sts")):
+        if props.get("ServiceName") != {"Fn::Sub": "com.amazonaws.${AWS::Region}." + service}:
+            errors.append(f"endpoint {name} is not the {service} endpoint")
+        if props.get("SecurityGroupIds") != [{"Ref": "EndpointSecurityGroupId"}]:
+            errors.append(f"endpoint {name} is not behind the sensor's endpoint security group")
+    # GetCallerIdentity needs no permission and only names the caller; the endpoint's private
+    # name covers the whole VPC, so it is allowed for operators' sessions on the host.
+    if sts.get("PolicyDocument") != {"Version": "2012-10-17", "Statement": [
+            {"Sid": "AssumeModelRoles", "Effect": "Allow", "Principal": "*",
+             "Action": "sts:AssumeRole", "Resource": MODEL_ROLE_ARNS},
+            {"Sid": "WhoAmI", "Effect": "Allow", "Principal": "*",
+             "Action": "sts:GetCallerIdentity", "Resource": "*"}]}:
+        errors.append("endpoint StsEndpoint policy allows more than assuming the callers' "
+                      "roles and GetCallerIdentity")
+    host = {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-host"}
+    for name, (_, who, _) in MODEL_CALLER_ROLES.items():
+        role = res[name]["Properties"]
+        if role.get("RoleName") != {"Fn::Sub": "${NamePrefix}-model-" + who}:
+            errors.append(f"{name} is not named {MODEL_ROLE.rsplit('/', 1)[1]}-{who}, the "
+                          f"role whose credentials only the {who} caller mounts")
+        if role.get("AssumeRolePolicyDocument") != {"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Principal": {"AWS": host}, "Action": "sts:AssumeRole"}]}:
+            errors.append(f"{name} can be assumed by more than the sensor's instance role")
+        if "ManagedPolicyArns" in role or "PermissionsBoundary" in role \
+                or len(role.get("Policies") or []) != 1:
+            errors.append(f"{name} has policies other than its one inline policy")
+        if int(role.get("MaxSessionDuration", 3600)) > 3600:
+            errors.append(f"{name} sessions may last more than an hour")
+    if assume.get("RoleName") != {"Fn::Sub": "${NamePrefix}-host"} or \
+            assume.get("PolicyDocument") != {"Version": "2012-10-17", "Statement": [
+                {"Sid": "AssumeModelRoles", "Effect": "Allow", "Action": "sts:AssumeRole",
+                 "Resource": MODEL_ROLE_ARNS}]}:
+        errors.append("InstanceAssumeModelRole gives the instance role more than assuming "
+                      "the callers' roles")
+    for persona, analyst in MODEL_SAMPLES:
+        values = model_values(persona, analyst)
+        label = f"with {persona or '-'} / {analyst or '-'}"
+        try:
+            ep = evaluate(bedrock.get("PolicyDocument"), doc, values)["Statement"]
+            errors += _grant_problems(f"{label} the endpoint policy", ep,
+                                      expected_grant(persona) | expected_grant(analyst),
+                                      role=False)
+            for name, (cond, _, param) in MODEL_CALLER_ROLES.items():
+                if not evaluate(doc["Conditions"][cond], doc, values):
+                    continue
+                rp = evaluate(res[name]["Properties"]["Policies"][0]["PolicyDocument"], doc,
+                              values)["Statement"]
+                errors += _grant_problems(f"{label} the {name} policy", as_list(rp),
+                                          expected_grant(values[param]), role=True)
+        except (KeyError, IndexError, TypeError, AttributeError, ValueError) as exc:
+            errors.append(f"{label} the policies cannot be evaluated ({type(exc).__name__})")
+    rules = doc.get("Rules") or {}
+    if "NeedsAModel" not in rules:
+        errors.append("no rule refuses a deploy with neither model set")
+    return ["models: " + e for e in errors]
+
+
 # ---- bucket -------------------------------------------------------------------------------
 
 def _statements(doc: dict) -> list[dict]:
@@ -1129,7 +1501,7 @@ def check_bucket(doc: dict, raw: str = "") -> list[str]:
 
 def run() -> list[str]:
     errors = []
-    for path, fn in ((SENSOR, check_sensor), (BUCKET, check_bucket)):
+    for path, fn in ((SENSOR, check_sensor), (BUCKET, check_bucket), (MODELS, check_models)):
         raw = path.read_text(encoding="utf-8")
         doc = load(path)
         errors += fn(doc, raw) + check_names(doc, raw, path.name)

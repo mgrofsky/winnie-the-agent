@@ -263,7 +263,10 @@ The full threat model is in [docs/security-model.md](docs/security-model.md).
 Read [docs/operations.md](docs/operations.md) before deploying. For AWS,
 [deploy/aws/README.md](deploy/aws/README.md) is a worked example: CloudFormation templates
 for one sensor host with no outbound route and a write-only events bucket in another
-account, with a containment checklist (and an optional tailnet for the operator console). In short:
+account, with a containment checklist (and an optional tailnet for the operator console). Its
+optional model access on Amazon Bedrock for the persona and the analyst (a second stack,
+`deploy/aws/models.yaml`) has been run once on a real account; the guide says what was
+seen and what is still unproven. In short:
 
 - **Run it isolated.** Put the sensor on a dedicated host or VM in its own network segment
   with no route to anything you care about. Block outbound traffic from the front-ends at

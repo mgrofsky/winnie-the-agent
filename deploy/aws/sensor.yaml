@@ -212,6 +212,22 @@ Parameters:
     Description: >-
       Also serve /go on the tailnet name, a page that signs the visitor in with the console
       token. The tailnet's access rules are then the only gate. Needs TailscaleEnabled=true.
+  # Models on Amazon Bedrock: both empty (the default) adds nothing here. Deploy models.yaml
+  # with the same two values first; see the README, "Models on Bedrock". A model id is
+  # provider.name[:version]; an inference profile id adds a geographic prefix (us., us-gov.,
+  # eu., apac., jp., au. or global.). Current Anthropic models need the profile id.
+  PersonaModelId:
+    Type: String
+    Default: ""
+    MaxLength: 100
+    AllowedPattern: '^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
+    Description: Bedrock model or inference profile id for the SSH persona; empty for none.
+  AnalystModelId:
+    Type: String
+    Default: ""
+    MaxLength: 100
+    AllowedPattern: '^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
+    Description: Bedrock model or inference profile id for the analyst; empty for none.
 
 Mappings:
   # Listener services per scenario ("python -m listeners --list-scenarios"). SSH is always on.
@@ -232,6 +248,9 @@ Conditions:
   UiActionsOn: !Equals [!Ref UiActions, "true"]
   TailscaleOn: !Equals [!Ref TailscaleEnabled, "true"]
   ConsoleStepOn: !Or [!Condition TailscaleOn, !Condition UiActionsOn]
+  PersonaOn: !Not [!Equals [!Ref PersonaModelId, ""]]
+  AnalystOn: !Not [!Equals [!Ref AnalystModelId, ""]]
+  ModelOn: !Or [!Condition PersonaOn, !Condition AnalystOn]
   SipOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Sip], "true"]
   FtpOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Ftp], "true"]
   TelnetOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Telnet], "true"]
@@ -1134,7 +1153,7 @@ Resources:
                 for p in $PORTS; do echo "      - \"$p\""; done
               } > docker-compose.override.yml
 
-              ${EgressStep}${ConsoleStep}cat > /etc/systemd/system/sensor.service <<'EOF'
+              ${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service <<'EOF'
               [Unit]
               Description=Winnie the Agent sensor stack
               After=docker.service sensor-firewall.service
@@ -1233,6 +1252,25 @@ Resources:
                   chmod 0400 config.ini
                   EOF
                   /usr/local/sbin/sensor-console.sh || echo "console: FAILED ($?)"
+                - ""
+              # ModelOn only (PersonaModelId or AnalystModelId set), after the console step (it
+              # adds its overlay to the COMPOSE_FILE that step wrote) and before the stack starts.
+              # The endpoints and the model roles it uses are the models stack's (models.yaml).
+              # sensor-model.sh comes from the image (deploy/aws/host; its header explains it).
+              # Its setup run installs and starts its timer (every 15 minutes: credentials,
+              # firewall rules, and the endpoint's address) and adds its line to
+              # sensor-firewall.sh (so it runs again at every boot), writes the [llm] and
+              # [agents] settings into config.ini with render_config.py, writes the overlay
+              # that gives the ssh and agents containers their fixed addresses, the endpoint's
+              # name and each its own credentials directory, and then the first firewall rules
+              # and credentials. A failure is logged and the sensor starts with canned replies;
+              # the timer retries the credentials.
+              ModelStep: !If
+                - ModelOn
+                - !Sub |
+                  printf 'REGION=%s\nSUFFIX=%s\nVPC_CIDR=%s\nROLE_ARN=%s\nPERSONA_MODEL=%s\nANALYST_MODEL=%s\n' ${AWS::Region} ${AWS::URLSuffix} ${VpcCidr} arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-model "${PersonaModelId}" "${AnalystModelId}" > /etc/sensor-model.env
+                  docker run --rm --network none --entrypoint cat "$IMAGE" /app/deploy/aws/host/sensor-model.sh | install -m 0700 /dev/stdin /usr/local/sbin/sensor-model.sh
+                  /usr/local/sbin/sensor-model.sh setup "$IMAGE" || echo "model: FAILED ($?)"
                 - ""
               # TailscaleEnabled only, after the stack is up so it cannot hold it back.
               # a. --netfilter-mode=off keeps tailscaled's own chains out: it would insert them
@@ -1347,6 +1385,13 @@ Outputs:
   TrailArn:
     Condition: TrailOn
     Value: !GetAtt AuditTrail.Arn
+  # For models.yaml, which puts its endpoints in this network.
+  VpcId:
+    Value: !Ref Vpc
+  SubnetId:
+    Value: !Ref PublicSubnet
+  EndpointSecurityGroupId:
+    Value: !Ref EndpointSecurityGroup
   TailnetConsoleUrl:
     Condition: TailscaleOn
     Description: The console over the tailnet (sign in with the token in /NamePrefix/ui-token, or /go).

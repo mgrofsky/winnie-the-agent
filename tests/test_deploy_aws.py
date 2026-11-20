@@ -501,8 +501,8 @@ def _egress_step_skipped(d):
 
 
 def _egress_after_stack(d):
-    _user_data_edit(d, "${EgressStep}${ConsoleStep}cat > /etc/systemd/system/sensor.service",
-                    "${ConsoleStep}cat > /etc/systemd/system/sensor.service")
+    _user_data_edit(d, "${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service",
+                    "${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service")
     _user_data_edit(d, '${TailscaleNodeStep}echo "bootstrap complete"',
                     '${TailscaleNodeStep}${EgressStep}echo "bootstrap complete"')
 
@@ -586,7 +586,7 @@ TAILNET_BREAKS = {
         _boot_unit_not_enabled,
     "the egress step lacks the line: for u in sensor-egress.service sensor-egress.timer sensor-egress-b":
         _boot_unit_not_copied,
-    "the egress and console steps do not run right before the stack is started":
+    "the egress, console and model steps do not run, in that order, right before the stack":
         _egress_after_stack,
     "the node's name is not compared with the expected one": _no_name_check,
     "a rerun appends another COMPOSE_FILE line instead of rewriting it": _compose_file_appended,
@@ -919,11 +919,12 @@ SAMPLE = {"AWS::Region": "us-east-1", "AWS::AccountId": "123456789012",
           "VpcCidr": "10.64.0.0/16"}
 
 
-def _rendered(sensor, tailscale, actions, sign_in):
+def _rendered(sensor, tailscale, actions, sign_in, persona="", analyst=""):
     """The user data CloudFormation would produce for these switches and SAMPLE values."""
-    values = dict(SAMPLE, TailscaleEnabled=tailscale, UiActions=actions, UiTailnetSignIn=sign_in)
+    values = dict(SAMPLE, TailscaleEnabled=tailscale, UiActions=actions, UiTailnetSignIn=sign_in,
+                  PersonaModelId=persona, AnalystModelId=analyst)
     on = {"TailscaleOn": tailscale == "true", "UiActionsOn": actions == "true",
-          "ConsoleStepOn": "true" in (tailscale, actions)}
+          "ConsoleStepOn": "true" in (tailscale, actions), "ModelOn": bool(persona or analyst)}
 
     def render(v):
         if isinstance(v, str):
@@ -1311,3 +1312,808 @@ def test_with_every_switch_off_no_egress_step_runs(sensor):
                    "sensor-tailscale.env", "ec2 get-managed-prefix-list-entries"):
         assert needle not in user_data, needle
     assert check.RENDER_COPY in user_data.splitlines()
+
+
+# ---- models on Bedrock (models.yaml, the model step, host/sensor-model.sh) -----------------
+
+@pytest.fixture(scope="module")
+def models():
+    return check.load(check.MODELS)
+
+
+def test_models_template_passes_and_fits(models):
+    raw = check.MODELS.read_text()
+    assert check.check_models(models, raw) == []
+    assert check.check_names(models, raw, "m") == []
+    assert check.deploy_copy_problems(raw) == []
+
+
+@pytest.mark.parametrize("persona, analyst", check.MODEL_SAMPLES + [("anthropic.claude-x", "")])
+def test_the_grant_is_exactly_the_configured_models(models, persona, analyst):
+    values = check.model_values(persona, analyst)
+    res = models["Resources"]
+    endpoint = check.evaluate(res["BedrockEndpoint"]["Properties"]["PolicyDocument"], models,
+                              values)["Statement"]
+    assert {r for st in endpoint for r in check.as_list(st["Resource"])} == (
+        check.expected_grant(persona) | check.expected_grant(analyst))
+    assert all(st["Action"] == "bedrock:InvokeModel" for st in endpoint)
+    assert len(endpoint) == (persona != "") + (analyst != "")
+    # Each caller's role: its own model, nothing of the other caller's.
+    for name, model in (("PersonaRole", persona), ("AnalystRole", analyst)):
+        if not model:
+            continue
+        role = check.evaluate(res[name]["Properties"]["Policies"][0]["PolicyDocument"],
+                              models, values)["Statement"]
+        assert {r for st in role for r in check.as_list(st["Resource"])} == \
+            check.expected_grant(model)
+        assert all(st["Action"] == "bedrock:InvokeModel" for st in role)
+
+
+@pytest.mark.parametrize("prefix", check.PROFILE_PREFIXES)
+def test_every_geographic_prefix_is_a_profile(prefix):
+    model = f"{prefix}.anthropic.claude-haiku-5-5"
+    assert re.fullmatch(check.MODEL_ID, model)
+    assert check.expected_grant(model) == {
+        f"arn:aws:bedrock:us-east-1:123456789012:inference-profile/{model}",
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5-5"}
+
+
+def test_callers_roles_never_cover_each_other(models):
+    # Different models for the two callers: neither role's grant names the other's model.
+    persona, analyst = "us.anthropic.claude-haiku-5-5", "eu.anthropic.claude-sonnet-5-5"
+    values = check.model_values(persona, analyst)
+    res = models["Resources"]
+    got = {}
+    for name in ("PersonaRole", "AnalystRole"):
+        st = check.evaluate(res[name]["Properties"]["Policies"][0]["PolicyDocument"], models,
+                            values)["Statement"]
+        got[name] = {r for s in st for r in check.as_list(s["Resource"])}
+    assert not got["PersonaRole"] & check.expected_grant(analyst)
+    assert not got["AnalystRole"] & check.expected_grant(persona)
+    assert res["PersonaRole"]["Condition"] == "PersonaOn"
+    assert res["AnalystRole"]["Condition"] == "AnalystOn"
+
+
+def test_a_profile_grants_its_own_model_and_nothing_else():
+    assert check.expected_grant("us.anthropic.claude-haiku-5-5") == {
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-haiku-5-5",
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5-5"}
+    assert check.expected_grant("anthropic.claude-haiku-5-5") == {
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-5-5"}
+
+
+def test_model_id_pattern_is_the_same_in_both_templates(sensor, models):
+    for name in check.MODEL_PARAMS:
+        assert sensor["Parameters"][name] == models["Parameters"][name]
+    pattern = check.MODEL_ID
+    for good in check.MODEL_IDS_GOOD:
+        assert re.fullmatch(pattern, good)
+    for bad in check.MODEL_IDS_BAD:
+        assert not re.fullmatch(pattern, bad)
+
+
+def _model_statement(d, where, who):
+    res = d["Resources"]
+    if where == "endpoint":
+        doc = res["BedrockEndpoint"]["Properties"]["PolicyDocument"]
+        return doc["Statement"][0 if who == "Persona" else 1]["Fn::If"][1]
+    return res[f"{who}Role"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"][0]
+
+
+def _endpoint_any_bedrock(d):
+    _model_statement(d, "endpoint", "Persona")["Action"] = "bedrock:*"
+
+
+def _endpoint_streams(d):
+    _model_statement(d, "endpoint", "Persona")["Action"] = [
+        "bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+
+
+def _endpoint_any_model(d):
+    _model_statement(d, "endpoint", "Analyst")["Resource"] = "*"
+
+
+def _endpoint_any_foundation_model(d):
+    st = _model_statement(d, "endpoint", "Persona")
+    st["Resource"]["Fn::If"][1][1] = {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*::foundation-model/*"}
+
+
+def _endpoint_profile_any_region(d):
+    st = _model_statement(d, "endpoint", "Persona")
+    st["Resource"]["Fn::If"][1][0] = {"Fn::Sub": "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:"
+                                                 "inference-profile/${PersonaModelId}"}
+
+
+def _endpoint_persona_always(d):
+    sts = d["Resources"]["BedrockEndpoint"]["Properties"]["PolicyDocument"]["Statement"]
+    sts[0] = sts[0]["Fn::If"][1]
+
+
+def json_swap(node, old, new):
+    import json
+    return json.loads(json.dumps(node).replace(old, new))
+
+
+def _persona_role_grants_analyst_model(d):
+    st = _model_statement(d, "role", "Persona")
+    st["Resource"] = json_swap(st["Resource"], "PersonaModelId", "AnalystModelId")
+
+
+def _analyst_role_grants_persona_model(d):
+    st = _model_statement(d, "role", "Analyst")
+    st["Resource"] = json_swap(st["Resource"], "AnalystModelId", "PersonaModelId")
+
+
+def _persona_role_grants_both(d):
+    statements = d["Resources"]["PersonaRole"]["Properties"]["Policies"][0]["PolicyDocument"][
+        "Statement"]
+    statements.append(json_swap(statements[0], "PersonaModelId", "AnalystModelId"))
+
+
+def _persona_role_named_analyst(d):
+    d["Resources"]["PersonaRole"]["Properties"]["RoleName"] = {
+        "Fn::Sub": "${NamePrefix}-model-analyst"}
+
+
+def _one_shared_role(d):
+    del d["Resources"]["AnalystRole"]
+
+
+def _persona_role_always(d):
+    del d["Resources"]["PersonaRole"]["Condition"]
+
+
+def _role_without_endpoint_condition(d):
+    del _model_statement(d, "role", "Persona")["Condition"]
+
+
+def _role_lists_models(d):
+    _model_statement(d, "role", "Analyst")["Action"] = ["bedrock:InvokeModel",
+                                                        "bedrock:ListFoundationModels"]
+
+
+def _role_not_action(d):
+    st = _model_statement(d, "role", "Persona")
+    st["NotAction"] = st.pop("Action")
+
+
+def _sts_any_call(d):
+    d["Resources"]["StsEndpoint"]["Properties"]["PolicyDocument"]["Statement"][1]["Action"] = "sts:*"
+
+
+def _sts_assume_anything(d):
+    d["Resources"]["StsEndpoint"]["Properties"]["PolicyDocument"]["Statement"][0]["Resource"] = "*"
+
+
+def _trust_whole_account(d):
+    d["Resources"]["AnalystRole"]["Properties"]["AssumeRolePolicyDocument"]["Statement"][0][
+        "Principal"]["AWS"] = {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}
+
+
+def _role_managed_policy(d):
+    d["Resources"]["PersonaRole"]["Properties"]["ManagedPolicyArns"] = [
+        "arn:aws:iam::aws:policy/AmazonBedrockFullAccess"]
+
+
+def _role_long_sessions(d):
+    d["Resources"]["PersonaRole"]["Properties"]["MaxSessionDuration"] = 43200
+
+
+def _instance_assumes_anything(d):
+    d["Resources"]["InstanceAssumeModelRole"]["Properties"]["PolicyDocument"]["Statement"][0][
+        "Resource"] = "*"
+
+
+def _extra_model_resource(d):
+    d["Resources"]["OpenEgress"] = {"Type": "AWS::EC2::SecurityGroupEgress", "Properties": {}}
+
+
+def _conditional_endpoint(d):
+    d["Resources"]["StsEndpoint"]["Condition"] = "PersonaOn"
+
+
+def _endpoint_own_group(d):
+    d["Resources"]["BedrockEndpoint"]["Properties"]["SecurityGroupIds"] = ["sg-0other"]
+
+
+def _control_plane_endpoint(d):
+    d["Resources"]["BedrockEndpoint"]["Properties"]["ServiceName"] = {
+        "Fn::Sub": "com.amazonaws.${AWS::Region}.bedrock"}
+
+
+def _model_pattern_open(d):
+    d["Parameters"]["AnalystModelId"]["AllowedPattern"] = "^.*$"
+
+
+def _model_pattern_dots(d):
+    d["Parameters"]["PersonaModelId"]["AllowedPattern"] = r"^[a-z0-9.:-]*$"
+
+
+def _model_pattern_any_prefix(d):
+    d["Parameters"]["PersonaModelId"]["AllowedPattern"] = check.MODEL_ID.replace(
+        "|global)", "|global|xx)")
+
+
+def _model_pattern_no_global(d):
+    d["Parameters"]["PersonaModelId"]["AllowedPattern"] = check.MODEL_ID.replace("|global", "")
+
+
+def _model_pattern_no_eu(d):
+    d["Parameters"]["AnalystModelId"]["AllowedPattern"] = check.MODEL_ID.replace("|eu", "")
+
+
+def _profile_condition_misses_jp(d):
+    d["Conditions"]["PersonaProfile"]["Fn::Or"] = [
+        c for c in d["Conditions"]["PersonaProfile"]["Fn::Or"] if "jp" not in str(c)]
+
+
+def _model_default_on(d):
+    d["Parameters"]["PersonaModelId"]["Default"] = "us.anthropic.claude-haiku-5-5"
+
+
+def _no_model_rule(d):
+    del d["Rules"]["NeedsAModel"]
+
+
+MODEL_BREAKS = {
+    "the endpoint policy allows bedrock:*": _endpoint_any_bedrock,
+    "the endpoint policy allows bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream":
+        _endpoint_streams,
+    "the endpoint policy grants * beyond the configured models": _endpoint_any_model,
+    "foundation-model/* beyond the configured models": _endpoint_any_foundation_model,
+    "arn:aws:bedrock:*:123456789012:inference-profile/us.anthropic.claude-haiku-5-5 beyond":
+        _endpoint_profile_any_region,
+    "with - / eu.anthropic.claude-haiku-5-5 the endpoint policy grants": _endpoint_persona_always,
+    # Each caller's role never covers the other caller's model.
+    "with jp.anthropic.claude-haiku-5-5 / au.anthropic.claude-haiku-5-5 the PersonaRole policy "
+    "grants arn:aws:bedrock:us-east-1:123456789012:inference-profile/au.anthropic.claude-haiku-5-5":
+        _persona_role_grants_analyst_model,
+    "with us.anthropic.claude-haiku-5-5 / us.anthropic.claude-sonnet-5-5 the AnalystRole "
+    "policy grants arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5-5":
+        _analyst_role_grants_persona_model,
+    "with us.anthropic.claude-haiku-5-5 / us.anthropic.claude-sonnet-5-5 the PersonaRole "
+    "policy grants arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5-5":
+        _persona_role_grants_both,
+    "PersonaRole is not named ${NamePrefix}-model-persona": _persona_role_named_analyst,
+    "no AWS::IAM::Role AnalystRole": _one_shared_role,
+    "resource PersonaRole has a condition other than PersonaOn": _persona_role_always,
+    "the PersonaRole policy is not limited to the bedrock-runtime endpoint":
+        _role_without_endpoint_condition,
+    "the AnalystRole policy allows bedrock:InvokeModel, bedrock:ListFoundationModels":
+        _role_lists_models,
+    "the PersonaRole policy has a statement that is not a plain Allow": _role_not_action,
+    "StsEndpoint policy allows more than assuming the callers' roles and GetCallerIdentity":
+        _sts_any_call,
+    "StsEndpoint policy allows more than assuming": _sts_assume_anything,
+    "AnalystRole can be assumed by more than the sensor's instance role": _trust_whole_account,
+    "PersonaRole has policies other than its one inline policy": _role_managed_policy,
+    "PersonaRole sessions may last more than an hour": _role_long_sessions,
+    "InstanceAssumeModelRole gives the instance role more than assuming": _instance_assumes_anything,
+    "resource OpenEgress is not one of the five": _extra_model_resource,
+    "resource StsEndpoint has a condition other than none": _conditional_endpoint,
+    "endpoint BedrockEndpoint is not behind the sensor's endpoint security group":
+        _endpoint_own_group,
+    "endpoint BedrockEndpoint is not the bedrock-runtime endpoint": _control_plane_endpoint,
+    "parameter AnalystModelId accepts '*'": _model_pattern_open,
+    "parameter PersonaModelId accepts 'us.anthropic.claude.x'": _model_pattern_dots,
+    "parameter PersonaModelId accepts 'xx.anthropic.claude-x'": _model_pattern_any_prefix,
+    "parameter PersonaModelId refuses a valid model id": _model_pattern_no_global,
+    "parameter AnalystModelId refuses a valid model id": _model_pattern_no_eu,
+    "with jp.anthropic.claude-haiku-5-5 / au.anthropic.claude-haiku-5-5 the endpoint policy grants arn:aws:bedrock:us-east-1::foundation-model/jp.anthropic.claude-haiku-5-5":
+        _profile_condition_misses_jp,
+    "parameter PersonaModelId is not empty (off) by default": _model_default_on,
+    "no rule refuses a deploy with neither model set": _no_model_rule,
+}
+
+
+@pytest.mark.parametrize("expected", sorted(MODEL_BREAKS))
+def test_each_models_rule_fires(models, expected):
+    doc = copy.deepcopy(models)
+    MODEL_BREAKS[expected](doc)
+    errors = check.check_models(doc)
+    assert any(expected in e for e in errors), errors
+
+
+# sensor.yaml: the option adds no resource, and its step is exactly the three lines.
+
+def _sensor_model_default_on(d):
+    d["Parameters"]["AnalystModelId"]["Default"] = "anthropic.claude-haiku-5-5"
+
+
+def _sensor_bedrock_endpoint(d):
+    d["Resources"]["BedrockEndpoint"] = copy.deepcopy(d["Resources"]["Ec2Endpoint"])
+    d["Resources"]["BedrockEndpoint"]["Condition"] = "ModelOn"
+
+
+def _sensor_role_invokes(d):
+    _role_statements(d).append({"Effect": "Allow", "Action": "bedrock:InvokeModel",
+                                "Resource": "*"})
+
+
+def _model_on_always(d):
+    d["Conditions"]["ModelOn"] = {"Fn::Equals": ["a", "a"]}
+
+
+def _model_step_always(d):
+    variables = _lt(d)["UserData"]["Fn::Base64"]["Fn::Sub"][1]
+    variables["ModelStep"] = variables["ModelStep"]["Fn::If"][1]
+
+
+def _model_step_opens_metadata(d):
+    variables = _lt(d)["UserData"]["Fn::Base64"]["Fn::Sub"][1]
+    step = variables["ModelStep"]["Fn::If"][1]
+    step["Fn::Sub"] = step["Fn::Sub"] + "iptables -D DOCKER-USER -i br-+ -d 169.254.169.254/32 -j DROP\n"
+
+
+def _model_step_before_console(d):
+    _user_data_edit(d, "${EgressStep}${ConsoleStep}${ModelStep}cat",
+                    "${EgressStep}${ModelStep}${ConsoleStep}cat")
+
+
+SENSOR_MODEL_BREAKS = {
+    "parameter AnalystModelId is not empty (off) by default": _sensor_model_default_on,
+    "resource BedrockEndpoint depends on a model switch": _sensor_bedrock_endpoint,
+    "instance role InstanceRole allows bedrock:InvokeModel": _sensor_role_invokes,
+    "condition ModelOn is not as required": _model_on_always,
+    "step ModelStep is not empty unless ModelOn": _model_step_always,
+    "the model step is not exactly its settings": _model_step_opens_metadata,
+    "the egress, console and model steps do not run, in that order": _model_step_before_console,
+}
+
+
+@pytest.mark.parametrize("expected", sorted(SENSOR_MODEL_BREAKS))
+def test_each_sensor_model_rule_fires(sensor, expected):
+    doc = copy.deepcopy(sensor)
+    SENSOR_MODEL_BREAKS[expected](doc)
+    errors = check.check_sensor(doc)
+    assert any(expected in e for e in errors), errors
+
+
+def test_with_both_models_off_the_bootstrap_has_no_model_step(sensor):
+    for switches in SWITCHES:
+        user_data = _rendered(sensor, *switches)
+        for needle in ("sensor-model", "bedrock", "PERSONA_MODEL", "AWS_CONFIG_FILE"):
+            assert needle not in user_data, needle
+
+
+@pytest.mark.parametrize("persona, analyst", [("us.anthropic.claude-haiku-5-5", ""),
+                                              ("", "anthropic.claude-haiku-5-5"),
+                                              ("global.anthropic.claude-sonnet-5-5",
+                                               "us.anthropic.claude-haiku-5-5")])
+def test_model_step_renders_valid_shell_and_names_the_model_role(sensor, tmp_path, persona,
+                                                                 analyst):
+    user_data = _rendered(sensor, "true", "true", "true", persona, analyst)
+    path = tmp_path / "user-data"
+    path.write_text(user_data)
+    assert subprocess.run(["bash", "-n", str(path)]).returncode == 0
+    settings = re.search(r"^printf 'REGION=.*> /etc/sensor-model\.env$", user_data, re.M).group(0)
+    assert "arn:aws:iam::123456789012:role/winnie-sensor-model" in settings
+    assert f'"{persona}" "{analyst}"' in settings
+    # After the console step, which writes COMPOSE_FILE first; before the stack starts.
+    lines = user_data.splitlines()
+    setup = lines.index('/usr/local/sbin/sensor-model.sh setup "$IMAGE" || echo "model: FAILED ($?)"')
+    assert lines.index('/usr/local/sbin/sensor-console.sh || echo "console: FAILED ($?)"') < setup
+    assert setup < lines.index("cat > /etc/systemd/system/sensor.service <<'EOF'")
+
+
+def test_fixed_caller_addresses_are_on_their_networks(sensor):
+    compose = check.embedded_compose(_rendered(sensor, "false", "false", "false"))
+    import ipaddress
+    nets = {n: ipaddress.ip_network(c["ipam"]["config"][0]["subnet"])
+            for n, c in compose["networks"].items()}
+    assert ipaddress.ip_address("172.30.0.10") in nets["frontend"]
+    assert ipaddress.ip_address("172.30.1.10") in nets["backend"]
+    assert compose["services"]["ssh"]["networks"] == ["frontend"]
+    assert compose["services"]["agents"]["networks"] == ["backend"]
+
+
+def _model_host_edit(old, new, name="sensor-model.sh"):
+    script = check.MODEL_SCRIPT.read_text()
+    units = {n: (check.HOST_DIR / n).read_text() for n in check.MODEL_UNITS}
+    if name == "sensor-model.sh":
+        assert old in script, old
+        script = script.replace(old, new)
+    else:
+        assert old in units[name], old
+        units[name] = units[name].replace(old, new)
+    return check.check_model_host(script, units)
+
+
+MODEL_HOST_BREAKS = {
+    "sensor-model.sh has an extra rule": ("for c in", "iptables -w -I DOCKER-USER 1 -s 172.30.0.0/24 -j ACCEPT\nfor c in"),
+    "callers other than the ssh and agents containers' fixed addresses":
+        ("callers+=(persona:172.30.0.10)", "callers+=(persona:172.30.0.0/24)"),
+    "overlay changes more than": ('extra_hosts: ["%s:%s"]', 'network_mode: host\\n    extra_hosts: ["%s:%s"]'),
+    # ssh's mount must be the persona's directory, and only it.
+    "overlay changes more than the ssh and agents containers' address, endpoint name, own":
+        ("svc ssh frontend 172.30.0.10 persona", "svc ssh frontend 172.30.0.10 analyst"),
+    "own credentials mount": ('volumes: ["%s/%s:/model:ro"]', 'volumes: ["%s:/model:ro"]'),
+    "does not ask for one-hour credentials of the caller's own role":
+        ('--role-arn "$ROLE_ARN-$1"', '--role-arn "$ROLE_ARN-analyst"'),
+    "does not write a caller's credentials into its own directory":
+        ('> "$D/$1/creds.new"; then', '> "$D/analyst/creds.new"; then'),
+    "does not check the endpoint address is inside the VPC": ('&& inside "$EP" \\', '\\'),
+    "does not check the looked-up address is inside the VPC": ('&& inside "$a"; then', '; then'),
+    "does not test addresses against the VPC":
+        ("inside() { python3 -c 'import ipaddress as i,sys; sys.exit(i.ip_address(sys.argv[1]) "
+         "not in i.ip_network(sys.argv[2]))' \"$1\" \"$VPC_CIDR\" 2>/dev/null; }",
+         "inside() { true; }"),
+    "defines inside() more than once": ("\n# One run at a time", "\ninside() { true; }\n# One run at a time"),
+    "does not use the model id pattern": ("(us|us-gov|eu|apac|jp|au|global)", "[a-z-]+"),
+    "does not check the VPC range": ("8 <= n.prefixlen <= 28", "0 <= n.prefixlen <= 32"),
+    "does not start its timer": ("systemctl enable --now sensor-model.timer",
+                                 "systemctl enable sensor-model.timer"),
+    "does not remove accepts to an old address": ("-j ACCEPT$'\nrules=", "-j NOTHING$'\nrules="),
+    "removes more than caller accepts to an old address":
+        ('[ "${BASH_REMATCH[2]}" != "$EP" ] || continue', 'true || continue'),
+    "does not recreate only the callers when the address changed":
+        ('[ -z "$(docker compose ps -q --status running "$s" 2>/dev/null || :)" ] \\', 'false \\'),
+    "does not ask for one-hour credentials": ("--duration-seconds 3600", "--duration-seconds 43200"),
+    "does not make the credentials readable by uid 10001 only":
+        ('chmod 0400 "$D/$1/creds.new"', 'chmod 0444 "$D/$1/creds.new"'),
+    "sets another mode": ("      mv -f \"$D/$1/creds.new\"",
+                          "      chmod a+r \"$D/$1/creds.new\"\n      mv -f \"$D/$1/creds.new\""),
+    "does not keep each credentials directory for uid 10001 only": ("-m 0500 -o 10001", "-m 0755 -o 10001"),
+    "does not keep the credentials root for root only": ('install -d -m 0700 "$D"', 'install -d -m 0755 "$D"'),
+    "does not check the overlay before it uses it":
+        ("  COMPOSE_FILE=$f:docker-compose.model.new.yml docker compose config --quiet\n", ""),
+}
+
+
+@pytest.mark.parametrize("expected", sorted(MODEL_HOST_BREAKS))
+def test_each_model_host_rule_fires(expected):
+    old, new = MODEL_HOST_BREAKS[expected]
+    assert any(expected in e for e in _model_host_edit(old, new)), expected
+
+
+def test_model_timer_must_renew():
+    errors = _model_host_edit("OnUnitActiveSec=15min", "OnUnitActiveSec=2h", "sensor-model.timer")
+    assert any("sensor-model.timer does not renew" in e for e in errors)
+
+
+# ---- sensor-model.sh, run against fake aws, getent, iptables and docker ----
+
+CREDS = ('{"AccessKeyId": "ASIA%s", "SecretAccessKey": "example-secret", '
+         '"SessionToken": "example-token", "Expiration": "2026-11-19T13:00:00+00:00"}')
+
+# DOCKER-USER as a list in $RULES: -C, -I, -D and -S behave as iptables does for these
+# rules (-S prints the /32 and -m tcp forms), and every call is logged.
+FAKE_IPTABLES_STATEFUL = r'''#!/usr/bin/env python3
+import os, sys
+args = [a for a in sys.argv[1:] if a != "-w"]
+open(os.environ["LOG"], "a").write("iptables -w " + " ".join(args) + "\n")
+path = os.environ["RULES"]
+rules = open(path).read().splitlines() if os.path.exists(path) else []
+op, chain = args[0], args[1]
+assert chain == "DOCKER-USER", args
+def rule(spec):
+    return ("-s %s/32 -d %s/32 -p tcp -m tcp --dport 443 -j ACCEPT"
+            % (spec[spec.index("-s") + 1], spec[spec.index("-d") + 1]))
+if op == "-S":
+    print("-N DOCKER-USER")
+    for r in rules:
+        print("-A DOCKER-USER " + r)
+    print("-A DOCKER-USER -s 172.30.0.0/16 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN")
+    print("-A DOCKER-USER -s 172.30.0.0/16 -j DROP")
+    sys.exit(0)
+if op == "-C":
+    sys.exit(0 if rule(args[2:]) in rules else 1)
+if op == "-I":
+    rules.insert(0, rule(args[3:]))
+elif op == "-D":
+    if rule(args[2:]) not in rules:
+        sys.exit(1)
+    rules.remove(rule(args[2:]))
+open(path, "w").write("".join(r + "\n" for r in rules))
+'''
+
+
+def _run_model(tmp_path, *, persona="us.anthropic.claude-haiku-5-5", analyst="",
+               answer="10.64.0.37", saved=None, aws_fails=False, compose_fails=False,
+               setup=True, env_text=None, running=False, script=None, up_fails=False):
+    """Run host/sensor-model.sh with fakes on PATH. Returns (exit code, stderr, accept
+    rules added as (source, destination), the home directory, the credentials directory,
+    the log). The fake DOCKER-USER chain persists in tmp_path across runs."""
+    import os
+    bin_ = tmp_path / "bin"
+    bin_.mkdir(exist_ok=True)
+    log = tmp_path / "log"
+    log.write_text("")
+    fakes = {
+        "iptables": FAKE_IPTABLES_STATEFUL,
+        "getent": f"#!/bin/bash\n[ -n '{answer}' ] && echo '{answer}       STREAM $2'\n",
+        # The access key id names the role assumed, so each caller's file shows whose it is.
+        "aws": "#!/bin/bash\necho \"aws $*\" >> \"$LOG\"\n" + (
+            "exit 255\n" if aws_fails else
+            "a=\"$*\"; r=\"${a##*--role-arn }\"; r=\"${r%% *}\"; r=\"${r##*/}\"\n"
+            f"printf '%s\\n' '{CREDS}' | sed \"s/ASIA%s/ASIA-$r/\"\n"),
+        "docker": "#!/bin/bash\necho \"docker $*\" >> \"$LOG\"\n" + (
+            "case \"$*\" in *'compose config'*) exit 1 ;; esac\n" if compose_fails else "")
+            + "case \"$*\" in *' run '*|run*) echo '[Unit]' ;; esac\n"
+            + ("case \"$*\" in *'compose ps'*) echo 0123abcd ;; esac\n" if running else "")
+            + ("case \"$*\" in *'compose up'*) exit 1 ;; esac\n" if up_fails else ""),
+        "systemctl": "#!/bin/bash\necho \"systemctl $*\" >> \"$LOG\"\n",
+        "chown": "#!/bin/bash\n",
+        "flock": "#!/bin/bash\necho \"flock $*\" >> \"$LOG\"\n",
+        # Records the requested mode and owner; a test cannot write into a 0500 directory
+        # it does not own as root does.
+        "install": "#!/bin/bash\necho \"install $*\" >> \"$LOG\"\nmkdir -p \"${@: -1}\"\n",
+    }
+    for name, body in fakes.items():
+        (bin_ / name).write_text(body)
+        (bin_ / name).chmod(0o755)
+    home, creds, state, units = (tmp_path / d for d in ("home", "creds", "state", "units"))
+    for d in (home, state, units):
+        d.mkdir(exist_ok=True)
+    if saved is not None:
+        (state / "endpoint").write_text(saved + "\n")
+    firewall = tmp_path / "sensor-firewall.sh"
+    if not (home / "config.ini").exists():       # a second run on the same host keeps its files
+        _render(None, tmp_path, home / "config.ini", "false", "false")
+        (home / "render_config.py").write_text((AWS / "render_config.py").read_text())
+        (home / ".env").write_text("COMPOSE_PROFILES=ui\nCOMPOSE_FILE=docker-compose.yml:"
+                                   "docker-compose.override.yml:docker-compose.tailnet.yml\n")
+        firewall.write_text("#!/bin/bash\n")
+    env_file = tmp_path / "model.env"
+    env_file.write_text(env_text if env_text is not None else
+                        "REGION=us-east-1\nSUFFIX=amazonaws.com\nVPC_CIDR=10.64.0.0/16\n"
+                        "ROLE_ARN=arn:aws:iam::123456789012:role/winnie-sensor-model\n"
+                        f"PERSONA_MODEL={persona}\nANALYST_MODEL={analyst}\n")
+    env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", LOG=str(log),
+               RULES=str(tmp_path / "rules"),
+               SENSOR_MODEL_ENV=str(env_file), SENSOR_MODEL_DIR=str(creds),
+               SENSOR_MODEL_STATE=str(state), SENSOR_HOME=str(home),
+               SENSOR_FIREWALL=str(firewall), SENSOR_UNIT_DIR=str(units),
+               SENSOR_MODEL_RETRY_SECONDS="0")
+    path = check.MODEL_SCRIPT
+    if script is not None:
+        path = tmp_path / "sensor-model.sh"
+        path.write_text(script)
+    args = ["bash", str(path)] + (
+        ["setup", "123456789012.dkr.ecr.us-east-1.amazonaws.com/winnie-sensor:abc123"]
+        if setup else [])
+    result = subprocess.run(args, env=env, capture_output=True, text=True)
+    accepts = []
+    for line in log.read_text().splitlines():
+        words = line.split()
+        if words[:4] == ["iptables", "-w", "-I", "DOCKER-USER"]:
+            assert words[5:] == ["-s", words[6], "-d", words[8], "-p", "tcp", "--dport", "443",
+                                 "-j", "ACCEPT"], line
+            accepts.append((words[6], words[8]))
+        if words[:4] == ["iptables", "-w", "-D", "DOCKER-USER"]:
+            assert words[4:] == ["-s", words[5], "-d", words[7], "-p", "tcp", "--dport", "443",
+                                 "-j", "ACCEPT"], line
+        assert not (words[0] == "iptables" and "DOCKER-USER" not in words), line
+        assert not (words[0] == "iptables" and words[2] not in ("-C", "-I", "-D", "-S")), line
+    return result.returncode, result.stderr, accepts, home, creds, log.read_text()
+
+
+def _chain(tmp_path):
+    """The fake DOCKER-USER chain's caller accepts, as (source, destination)."""
+    path = tmp_path / "rules"
+    return sorted((r.split()[1].split("/")[0], r.split()[3].split("/")[0])
+                  for r in (path.read_text().splitlines() if path.exists() else []))
+
+
+def _cred_modes(creds, who):
+    return {n: (creds / who / n).stat().st_mode & 0o777 for n in ("creds.json", "config")}
+
+
+def _cfg(home):
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.read(home / "config.ini")
+    return cp
+
+
+def test_setup_gives_only_the_persona_a_path_and_credentials(tmp_path):
+    import json
+    import yaml
+    code, err, accepts, home, creds, log = _run_model(tmp_path)
+    assert code == 0, err
+    assert accepts == [("172.30.0.10", "10.64.0.37")]
+    assert _chain(tmp_path) == [("172.30.0.10", "10.64.0.37")]
+    overlay = yaml.safe_load((home / "docker-compose.model.yml").read_text())
+    assert overlay == {"services": {"ssh": {
+        "networks": {"frontend": {"ipv4_address": "172.30.0.10"}},
+        "extra_hosts": ["bedrock-runtime.us-east-1.amazonaws.com:10.64.0.37"],
+        "environment": {"AWS_CONFIG_FILE": "/model/config", "AWS_EC2_METADATA_DISABLED": "true"},
+        "volumes": [f"{creds}/persona:/model:ro"]}}}
+    assert not (home / "docker-compose.model.new.yml").exists()
+    cp = _cfg(home)
+    assert (cp.get("llm", "llm_provider"), cp.get("llm", "model_name"),
+            cp.get("llm", "aws_region")) == ("AWS", "us.anthropic.claude-haiku-5-5", "us-east-1")
+    assert cp.get("agents", "provider") == "anthropic"          # analyst left without a model
+    assert (home / ".env").read_text().splitlines() == [
+        "COMPOSE_PROFILES=ui",
+        "COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:"
+        "docker-compose.tailnet.yml:docker-compose.model.yml"]
+    got = json.loads((creds / "persona" / "creds.json").read_text())
+    assert got == {"Version": 1, **json.loads(CREDS % "-winnie-sensor-model-persona")}
+    assert (creds / "persona" / "config").read_text() == (
+        "[default]\ncredential_process = cat /model/creds.json\n")
+    assert _cred_modes(creds, "persona") == {"creds.json": 0o400, "config": 0o400}
+    assert sorted(p.name for p in creds.iterdir()) == ["persona"]   # no analyst directory
+    assert not list(creds.rglob("*.new"))
+    assert f"install -d -m 0500 -o 10001 -g 10001 {creds}/persona" in log
+    assert f"install -d -m 0700 {creds}" in log
+    assert "--role-arn arn:aws:iam::123456789012:role/winnie-sensor-model-persona " in log
+    assert "--duration-seconds 3600" in log and "--endpoint-url https://sts.us-east-1.amazonaws.com" in log
+    assert "sensor-model.sh" in (tmp_path / "sensor-firewall.sh").read_text()
+    # Started now, not at the next boot: set-up runs after timers.target.
+    assert "systemctl enable --now sensor-model.timer" in log
+    assert "flock -w 600 9" in log
+    # A second setup run adds nothing twice.
+    _run_model(tmp_path)
+    assert (home / ".env").read_text().count("docker-compose.model.yml") == 1
+    assert (tmp_path / "sensor-firewall.sh").read_text().count("sensor-model") == 1
+    assert _chain(tmp_path) == [("172.30.0.10", "10.64.0.37")]
+
+
+def test_setup_with_both_models_gives_each_caller_its_own_role_and_mount(tmp_path):
+    import json
+    import yaml
+    code, err, accepts, home, creds, log = _run_model(
+        tmp_path, persona="us.anthropic.claude-haiku-5-5", analyst="global.anthropic.claude-x")
+    assert code == 0, err
+    assert sorted(accepts) == [("172.30.0.10", "10.64.0.37"), ("172.30.1.10", "10.64.0.37")]
+    overlay = yaml.safe_load((home / "docker-compose.model.yml").read_text())
+    assert set(overlay["services"]) == {"ssh", "agents"}
+    assert overlay["services"]["agents"]["networks"] == {"backend": {"ipv4_address": "172.30.1.10"}}
+    # Each container mounts its own directory and nothing else of the credentials root.
+    assert overlay["services"]["ssh"]["volumes"] == [f"{creds}/persona:/model:ro"]
+    assert overlay["services"]["agents"]["volumes"] == [f"{creds}/analyst:/model:ro"]
+    # Each directory holds its own role's credentials.
+    for who in ("persona", "analyst"):
+        got = json.loads((creds / who / "creds.json").read_text())
+        assert got["AccessKeyId"] == f"ASIA-winnie-sensor-model-{who}"
+        assert _cred_modes(creds, who) == {"creds.json": 0o400, "config": 0o400}
+        assert f"--role-session-name sensor-{who} " in log
+    cp = _cfg(home)
+    assert (cp.get("agents", "provider"), cp.get("agents", "model")) == (
+        "bedrock", "global.anthropic.claude-x")
+
+
+def test_readable_credentials_are_caught(tmp_path):
+    # The mode test above would catch a script that leaves the files world-readable.
+    script = check.MODEL_SCRIPT.read_text().replace('chmod 0400 "$D/$1/creds.new"',
+                                                    'chmod 0444 "$D/$1/creds.new"')
+    code, err, _, _, creds, _ = _run_model(tmp_path, script=script)
+    assert code == 0, err
+    assert _cred_modes(creds, "persona") != {"creds.json": 0o400, "config": 0o400}
+
+
+@pytest.mark.parametrize("answer", ["192.0.2.10", "", "10.64.0.999", "10.65.0.1"])
+def test_an_address_outside_the_vpc_changes_nothing(tmp_path, answer):
+    code, err, accepts, home, creds, _ = _run_model(tmp_path, answer=answer)
+    assert code == 1 and "no address inside the VPC" in err
+    assert accepts == []
+    assert not (home / "docker-compose.model.yml").exists()
+    assert _cfg(home).get("llm", "llm_provider") == "openai"
+    assert not creds.exists()
+
+
+def test_a_failed_lookup_keeps_the_saved_address(tmp_path):
+    code, err, accepts, _, _, _ = _run_model(tmp_path, answer="", saved="10.64.0.37",
+                                             setup=False)
+    assert code == 0, err
+    assert accepts == [("172.30.0.10", "10.64.0.37")]
+
+
+def test_the_same_address_again_changes_nothing(tmp_path):
+    _run_model(tmp_path, persona="us.anthropic.claude-haiku-5-5", analyst="eu.anthropic.claude-x")
+    code, err, accepts, _, _, log = _run_model(
+        tmp_path, persona="us.anthropic.claude-haiku-5-5", analyst="eu.anthropic.claude-x",
+        setup=False, running=True)
+    assert code == 0, err
+    assert accepts == [] and " -D " not in log and "compose" not in log
+
+
+def test_a_new_address_moves_the_accepts_and_the_pin(tmp_path):
+    import yaml
+    _run_model(tmp_path, persona="us.anthropic.claude-haiku-5-5", analyst="eu.anthropic.claude-x")
+    # Some other accept already in the chain, not a caller's: left alone.
+    (tmp_path / "rules").write_text((tmp_path / "rules").read_text()
+                                    + "-s 172.30.2.10/32 -d 10.64.0.37/32 -p tcp -m tcp "
+                                      "--dport 443 -j ACCEPT\n")
+    code, err, accepts, home, _, log = _run_model(
+        tmp_path, persona="us.anthropic.claude-haiku-5-5", analyst="eu.anthropic.claude-x",
+        answer="10.64.0.52", setup=False, running=True)
+    assert code == 0, err
+    assert sorted(accepts) == [("172.30.0.10", "10.64.0.52"), ("172.30.1.10", "10.64.0.52")]
+    assert _chain(tmp_path) == [("172.30.0.10", "10.64.0.52"), ("172.30.1.10", "10.64.0.52"),
+                                ("172.30.2.10", "10.64.0.37")]
+    overlay = yaml.safe_load((home / "docker-compose.model.yml").read_text())
+    for s in ("ssh", "agents"):
+        assert overlay["services"][s]["extra_hosts"] == [
+            "bedrock-runtime.us-east-1.amazonaws.com:10.64.0.52"]
+    ups = [l for l in log.splitlines() if " up " in l]
+    assert ups == ["docker compose up -d --no-deps ssh", "docker compose up -d --no-deps agents"]
+    # The new accept goes in before the old ones go, and the pin after both.
+    lines = log.splitlines()
+    first_delete = next(i for i, l in enumerate(lines) if " -D " in l)
+    assert max(i for i, l in enumerate(lines) if " -I " in l) < first_delete
+    assert first_delete < next(i for i, l in enumerate(lines) if "compose config" in l)
+
+
+def test_a_failed_recreate_is_done_again_on_the_next_run(tmp_path):
+    _run_model(tmp_path)                                          # persona only
+    code, _, _, _, _, log = _run_model(tmp_path, answer="10.64.0.52", setup=False,
+                                       running=True, up_fails=True)
+    assert code != 0 and "docker compose up -d --no-deps ssh" in log
+    # The overlay already names the new address; the caller is still brought up again.
+    code, err, _, _, _, log = _run_model(tmp_path, answer="10.64.0.52", setup=False,
+                                         running=True)
+    assert code == 0, err
+    assert [l for l in log.splitlines() if " up " in l] == ["docker compose up -d --no-deps ssh"]
+    code, err, _, _, _, log = _run_model(tmp_path, answer="10.64.0.52", setup=False,
+                                         running=True)
+    assert code == 0, err
+    assert "compose" not in log
+
+
+def test_a_new_address_recreates_only_the_configured_running_callers(tmp_path):
+    _run_model(tmp_path)                                          # persona only
+    code, err, _, _, _, log = _run_model(tmp_path, answer="10.64.0.52", setup=False,
+                                         running=True)
+    assert code == 0, err
+    assert [l for l in log.splitlines() if " up " in l] == ["docker compose up -d --no-deps ssh"]
+    # Not running (a boot before the stack starts): the overlay alone, sensor.service does the rest.
+    code, err, _, home, _, log = _run_model(tmp_path, answer="10.64.0.61", setup=False)
+    assert code == 0, err
+    assert " up " not in log and "10.64.0.61" in (home / "docker-compose.model.yml").read_text()
+
+
+def test_a_refused_new_pin_still_removes_the_old_accepts(tmp_path):
+    _run_model(tmp_path)
+    before = (tmp_path / "home" / "docker-compose.model.yml").read_text()
+    code, _, _, home, _, log = _run_model(tmp_path, answer="10.64.0.52", setup=False,
+                                          compose_fails=True, running=True)
+    assert code != 0
+    # Fails closed: the containers keep the old name pin, which no rule lets them reach.
+    assert _chain(tmp_path) == [("172.30.0.10", "10.64.0.52")]
+    assert (home / "docker-compose.model.yml").read_text() == before
+    assert " up " not in log
+    # The next run tries the pin again.
+    code, err, _, home, _, _ = _run_model(tmp_path, answer="10.64.0.52", setup=False)
+    assert code == 0, err
+    assert "10.64.0.52" in (home / "docker-compose.model.yml").read_text()
+
+
+def test_a_refused_overlay_leaves_the_config_alone(tmp_path):
+    code, _, accepts, home, _, _ = _run_model(tmp_path, compose_fails=True)
+    assert code != 0 and accepts == []
+    assert _cfg(home).get("llm", "llm_provider") == "openai"
+    assert "docker-compose.model.yml" not in (home / ".env").read_text()
+    assert not (home / "docker-compose.model.yml").exists()
+
+
+def test_failed_credentials_leave_no_partial_file(tmp_path):
+    code, err, accepts, _, creds, _ = _run_model(tmp_path, aws_fails=True)
+    assert code == 1 and "could not assume the persona model role" in err
+    assert accepts == [("172.30.0.10", "10.64.0.37")]       # the path is useless without them
+    assert [p.relative_to(creds).as_posix() for p in creds.rglob("*")] == ["persona"]
+
+
+@pytest.mark.parametrize("bad", ["PERSONA_MODEL=*", "PERSONA_MODEL='a.b;id'",
+                                 "ANALYST_MODEL=anthropic.claude.x",
+                                 "PERSONA_MODEL=ca.anthropic.claude-x",
+                                 "ANALYST_MODEL=usgov.anthropic.claude-x",
+                                 "ROLE_ARN=arn:aws:iam::123456789012:role/*",
+                                 "VPC_CIDR=0.0.0.0/0", "VPC_CIDR=100.64.0.0/10",
+                                 "REGION='us-east-1 x'", "SUFFIX=amazonaws.com/x"])
+def test_bad_settings_stop_before_anything(tmp_path, bad):
+    good = ("REGION=us-east-1\nSUFFIX=amazonaws.com\nVPC_CIDR=10.64.0.0/16\n"
+            "ROLE_ARN=arn:aws:iam::123456789012:role/winnie-sensor-model\n"
+            "PERSONA_MODEL=us.anthropic.claude-x\nANALYST_MODEL=\n")
+    key = bad.split("=")[0]
+    text = re.sub(rf"^{key}=.*$", lambda m: bad, good, flags=re.M)
+    code, err, accepts, home, _, log = _run_model(tmp_path, env_text=text)
+    assert code == 1 and "bad settings" in err
+    assert accepts == [] and "docker" not in log and "aws" not in log
+
+
+@pytest.mark.parametrize("prefix", check.PROFILE_PREFIXES)
+def test_every_geographic_prefix_passes_the_host_script(tmp_path, prefix):
+    code, err, _, home, _, _ = _run_model(tmp_path, persona=f"{prefix}.anthropic.claude-x")
+    assert code == 0, err
+    assert _cfg(home).get("llm", "model_name") == f"{prefix}.anthropic.claude-x"
