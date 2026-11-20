@@ -237,3 +237,21 @@ async def test_redis_integer_arguments_out_of_range(redis_server):
     assert await c("SET", "n", "9223372036854775807") == "+OK"
     assert await c("INCR", "n") == "-ERR increment or decrement would overflow"
     assert await c("PING") == "+PONG"                      # connection still alive
+
+
+async def test_redis_http_probe_gets_arity_error_then_silent_close(redis_server):
+    writer, c, port = await redis_server(accept="all")
+    reader, w = await asyncio.open_connection("127.0.0.1", port)
+    w.write(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:6379\r\nUser-Agent: curl/8.5.0\r\n\r\n")
+    await w.drain()
+    assert await read_reply(reader) == "-ERR wrong number of arguments for 'get' command"
+    assert await asyncio.wait_for(reader.read(10), 2) == b""
+    w.close()
+    reader, w = await asyncio.open_connection("127.0.0.1", port)
+    w.write(b"POST / HTTP/1.1\r\n")
+    await w.drain()
+    assert await asyncio.wait_for(reader.read(10), 2) == b""
+    w.close()
+    assert await c("GET", "session:9f1c") == '{"uid": 7}'
+    cmds = [e["data"]["cmd"] for e in events(writer, "command")]
+    assert "HOST:" in cmds and "POST" in cmds

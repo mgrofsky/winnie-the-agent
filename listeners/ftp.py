@@ -216,6 +216,12 @@ def _mtime_parts(mtime: str) -> tuple[str, str]:
     return (f"{months[int(mo) - 1]} {d} {clock}", f"{y}{mo}{d}{clock.replace(':', '')}00")
 
 
+def _mlst_facts(is_dir: bool, size: int, mtime: str) -> str:
+    """RFC 3659 facts for MLSD/MLST, as advertised in FEAT."""
+    kind, perm = ("dir", "flcdmpe") if is_dir else ("file", "adfrw")
+    return f"type={kind};size={size};modify={_mtime_parts(mtime)[1]};perm={perm};"
+
+
 def _plain_ip(value: str) -> str:
     """Normalise an address for comparison (IPv4-mapped IPv6 -> IPv4, scope dropped)."""
     try:
@@ -502,6 +508,18 @@ class FtpSession:
                 tree.dirs.discard(src)
                 tree.dirs.add(dst)
             await self.reply("250 Rename successful.")
+        elif cmd == "MLST":
+            p = self.path(arg)
+            if p in tree.files:
+                facts = _mlst_facts(False, tree.files[p].size, tree.files[p].mtime)
+            elif p in tree.dirs:
+                facts = _mlst_facts(True, 4096, DEFAULT_MTIME)
+            else:
+                await self.reply("550 Permission denied.")
+                return
+            await self.conn.write(f"250-Listing {p}\r\n {facts} {p}\r\n250 End\r\n")
+        elif cmd == "SITE":
+            await self.site(arg)
         elif cmd in ("STAT",):
             await self.reply("211 FTP server status: connected, logged in as " + (self.user or ""))
         elif cmd in ("AUTH", "PBSZ", "PROT"):
@@ -564,6 +582,31 @@ class FtpSession:
         finally:
             writer.close()
 
+    async def site(self, arg: str) -> None:
+        """vsftpd's SITE subcommands: CHMOD (nothing changes), UMASK and HELP."""
+        sub, _, rest = arg.partition(" ")
+        sub, rest = sub.upper(), rest.strip()
+        if sub == "HELP":
+            await self.reply("214 CHMOD UMASK HELP")
+        elif sub == "CHMOD":
+            target = rest.partition(" ")[2].strip()
+            tree = self.tree
+            assert tree is not None
+            if not target:
+                await self.reply("501 SITE CHMOD needs 2 arguments.")
+            elif self.path(target) in tree.files or self.path(target) in tree.dirs:
+                await self.reply("200 SITE CHMOD command ok.")
+            else:
+                await self.reply("550 SITE CHMOD command failed.")
+        elif sub == "UMASK":
+            if not rest:
+                await self.reply("200 Your current UMASK is 0077")
+            else:
+                digits = rest[:len(rest) - len(rest.lstrip("01234567"))][-4:] or "0"
+                await self.reply(f"200 UMASK set to {int(digits, 8):04o}")
+        else:
+            await self.reply("500 Unknown SITE command.")
+
     async def send_listing(self, cmd: str, arg: str) -> None:
         args = [a for a in arg.split() if not a.startswith("-")]
         target = self.path(args[0]) if args else self.cwd
@@ -586,13 +629,11 @@ class FtpSession:
         for name, is_dir, entry in entries:
             size = 4096 if is_dir else entry.size  # type: ignore[union-attr]
             mtime = DEFAULT_MTIME if is_dir else entry.mtime  # type: ignore[union-attr]
-            ls_time, mlsd_time = _mtime_parts(mtime)
+            ls_time = _mtime_parts(mtime)[0]
             if cmd == "NLST":
                 rows.append(name)
             elif cmd == "MLSD":
-                kind = "dir" if is_dir else "file"
-                perm = "flcdmpe" if is_dir else "adfrw"
-                rows.append(f"type={kind};size={size};modify={mlsd_time};perm={perm}; {name}")
+                rows.append(f"{_mlst_facts(is_dir, size, mtime)} {name}")
             else:
                 mode = "drwxr-xr-x" if is_dir else "-rw-r--r--"
                 links = 2 if is_dir else 1

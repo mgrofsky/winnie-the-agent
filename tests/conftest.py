@@ -26,7 +26,12 @@ def default_budget():
     from agents import hooks
     from agents.budget import Budget, BudgetConfig
 
+    from agents.replycache import ReplyCache
+
     hooks.set_budget(Budget(BudgetConfig()))
+    # The reply cache is off unless a test turns it on: most tests replay the same lines
+    # in several sessions and expect the model to be asked each time.
+    hooks.set_reply_cache(ReplyCache(max_entries=0))
     yield
     hooks.reset()
 

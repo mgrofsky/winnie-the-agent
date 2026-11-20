@@ -165,8 +165,12 @@ description = """..."""          # max 2000 characters
 The deterministic shell (`agents/shell.py`) answers the commands bots use to size a host
 from this table plus the rest of `[identity]`, so `nproc`, `free`, `df`, `/proc/cpuinfo`,
 `/proc/meminfo`, `lscpu`, `lspci` and `nvidia-smi` agree with each other. Leave it out for
-the default: a small cloud VM with no GPU (`lspci` shows a plain VGA device and
-`nvidia-smi` is not installed), which is what most real targets look like.
+a small cloud VM with no GPU (`lspci` shows a plain VGA device and `nvidia-smi` is not
+installed), which is what most real targets look like. Which VM is chosen by the sensor
+seed from six shapes (2 to 8 vCPUs, 4 to 32 GB, Xeon 8259CL or 8275CL, or EPYC 7R13;
+`HARDWARE_PRESETS` in `scenarios/schema.py`), so two sensors running the same scenario do
+not report the same machine. The persona block shows the model the same shape. Set the
+table to pin it; a key left out of a table you do set takes the default below.
 
 | Key | Default | Notes |
 |---|---|---|
@@ -187,7 +191,14 @@ gpu_count = 2
 ```
 
 Uptime, load and memory use are derived from the sensor seed and the clock: stable for one
-sensor (the boot time does not move between commands), different between sensors.
+sensor (the boot time does not move between commands), different between sensors. So are
+how busy the host is (its load level), which optional services show in `ps` (multipathd,
+snapd, irqbalance, qemu-ga and the like for the distribution) and whether one of the
+scenario's login users has an idle SSH session open from the internal network (`w`, `who`,
+`uptime` and `ps` all show it). The persona block names that login and those services, so
+the model's own `ps`, `w` and `last` agree with the local answers. The kernel string is the
+scenario's `kernel`, as written; with no scenario it is one Ubuntu 22.04 build
+(`5.15.0-105-generic`).
 
 ### `[ssh]`
 

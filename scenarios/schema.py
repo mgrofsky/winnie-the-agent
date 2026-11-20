@@ -109,6 +109,22 @@ class Hardware(Strict):
     gpu_count: int = Field(default=1, ge=1, le=8)
 
 
+# Cloud VM shapes a scenario without an ``[identity.hardware]`` table is given, one per
+# sensor by its seed (``LoadedScenario.hardware``), so two sensors do not report the same
+# machine. CPU models are ones whose family, model and stepping ``agents.shell`` reports
+# correctly (Cascade Lake Xeon, Zen 3 EPYC).
+HARDWARE_PRESETS: tuple[Hardware, ...] = (
+    Hardware(),
+    Hardware(cpus=4, memory_mb=16384, disk_gb=80),
+    Hardware(cpu_model="Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz", cpus=2,
+             memory_mb=8192, disk_gb=50),
+    Hardware(cpu_model="Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz", cpus=8,
+             memory_mb=32768, disk_gb=160),
+    Hardware(cpu_model="AMD EPYC 7R13 Processor", cpus=2, memory_mb=4096, disk_gb=60),
+    Hardware(cpu_model="AMD EPYC 7R13 Processor", cpus=4, memory_mb=8192, disk_gb=100),
+)
+
+
 class Identity(Strict):
     org_name: str = Field(min_length=2, max_length=80, pattern=SAFE_TEXT_RE)
     hostname: str = Field(pattern=HOSTNAME_RE)

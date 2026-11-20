@@ -77,6 +77,10 @@ def test_choose_llm_anthropic_branch(monkeypatch, ssh_module):
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
+        def bind(self, **kwargs):
+            captured["bound"] = kwargs
+            return self
+
     monkeypatch.setattr(ssh_module, "ChatAnthropic", FakeChatAnthropic)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     ssh_module.config = ConfigParser()
@@ -85,6 +89,91 @@ def test_choose_llm_anthropic_branch(monkeypatch, ssh_module):
     ssh_module.choose_llm()
     assert captured["model"] == "claude-haiku-5-5"
     assert "temperature" not in captured and "api_key" not in captured
+    # the persona prompt is marked for the provider's prompt cache, unless switched off
+    assert captured.pop("bound") == {"cache_control": {"type": "ephemeral"}}
+    ssh_module.config["llm"]["prompt_caching"] = "false"
+    ssh_module.choose_llm()
+    assert "bound" not in captured
+
+
+def test_prompt_caching_only_where_the_provider_supports_it(ssh_module):
+    supported = ssh_module.prompt_cache_supported
+    assert supported("anthropic", "claude-haiku-5-5")
+    assert supported("aws", "us.anthropic.claude-sonnet-5-5-v1:0")
+    assert supported("aws", "amazon.nova-pro-v1:0")
+    assert not supported("aws", "meta.llama3-70b-instruct-v1:0")
+    for provider in ("openai", "azure", "ollama", "gemini"):
+        assert not supported(provider, "claude-like-name")
+
+
+def test_prompt_caching_defaults_on_for_anthropic_and_off_for_aws(ssh_module):
+    enabled = ssh_module.prompt_caching_enabled
+    claude_on_bedrock = "us.anthropic.claude-sonnet-5-5-v1:0"
+    assert enabled("anthropic", "claude-haiku-5-5", None)
+    assert not enabled("aws", claude_on_bedrock, None)
+    assert enabled("aws", claude_on_bedrock, True)
+    assert not enabled("aws", "meta.llama3-70b-instruct-v1:0", True)
+    assert not enabled("anthropic", "claude-haiku-5-5", False)
+
+
+class _Rejected(Exception):
+    def __init__(self):
+        super().__init__("cachePoint is not supported for this model")
+        self.response = {"Error": {"Code": "ValidationException"}}
+
+
+class _Model:
+    def __init__(self, fail=None):
+        self.fail, self.calls = fail, 0
+
+    async def ainvoke(self, value, config=None):
+        self.calls += 1
+        if self.fail is not None:
+            raise self.fail
+        return f"reply to {value}"
+
+    def invoke(self, value, config=None):
+        self.calls += 1
+        if self.fail is not None:
+            raise self.fail
+        return f"reply to {value}"
+
+
+async def test_a_refused_cache_point_is_retried_without_it_and_turned_off(ssh_module, caplog):
+    caplog.set_level("WARNING")
+    cached, plain = _Model(fail=_Rejected()), _Model()
+    model = ssh_module.with_cache_point_fallback(cached, plain)
+    assert await model.ainvoke("uname") == "reply to uname"
+    assert await model.ainvoke("id") == "reply to id"
+    assert model.invoke("w") == "reply to w"
+    assert (cached.calls, plain.calls) == (1, 3)
+    assert [r.getMessage() for r in caplog.records].count("Prompt caching disabled") == 1
+
+
+async def test_errors_after_an_accepted_cache_point_pass_through(ssh_module):
+    cached, plain = _Model(), _Model()
+    model = ssh_module.with_cache_point_fallback(cached, plain)
+    assert await model.ainvoke("uname") == "reply to uname"
+    cached.fail = _Rejected()             # e.g. a request too long: not the cache point
+    with pytest.raises(_Rejected):
+        await model.ainvoke("id")
+    other = ssh_module.with_cache_point_fallback(_Model(fail=RuntimeError("throttled")), plain)
+    with pytest.raises(RuntimeError):
+        await other.ainvoke("id")         # not a validation error: no retry, stays on
+    assert plain.calls == 0 and other.cache_state["cache"]
+
+
+def test_anthropic_request_carries_the_cache_marker():
+    """The pinned langchain-anthropic sends a bound ``cache_control`` as the request's
+    top-level option, which places one breakpoint on the last message."""
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    llm = ChatAnthropic(model="claude-haiku-5-5", api_key="test-key", max_tokens=16)
+    payload = llm._get_request_payload([SystemMessage(content="persona"),
+                                        HumanMessage(content="uname -a")],
+                                       cache_control={"type": "ephemeral"})
+    assert payload["cache_control"] == {"type": "ephemeral"}
 
 
 def test_account_reload_on_config_mtime(tmp_path, ssh_module, monkeypatch):
@@ -419,3 +508,19 @@ async def test_literal_echo_gets_its_real_output_when_the_model_omits_it(tmp_pat
     assert r.content == "as an ai\r\nroot@srv01:~# "
     r = await _persona_reply(tmp_path, "hello\r\nroot@srv01:~# ", "echo hello")
     assert r.content == "hello\r\nroot@srv01:~# "
+
+
+def test_bedrock_converse_turns_the_marker_into_cache_points(monkeypatch):
+    """The pinned langchain-aws turns the same option into Converse ``cachePoint`` blocks
+    after the system prompt and the last message."""
+    from langchain_aws import ChatBedrockConverse
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    llm = ChatBedrockConverse(model="us.anthropic.claude-haiku-5-5-v1:0",
+                              region_name="us-east-1")
+    system = [{"text": "persona"}]
+    messages = [{"role": "user", "content": [{"text": "uname -a"}]}]
+    llm._apply_cache_points({"type": "ephemeral"}, system, messages)
+    assert system[-1] == {"cachePoint": {"type": "default"}}
+    assert messages[-1]["content"][-1] == {"cachePoint": {"type": "default"}}

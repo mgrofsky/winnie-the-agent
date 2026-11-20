@@ -196,6 +196,8 @@ class RedisSession:
                 data.update(high_signal=True, signal="redis_takeover")
             if name != "AUTH":
                 self.conn.emit("command", "Redis command", username=self.user, data=data)
+            if name in ("POST", "HOST:"):
+                return      # HTTP sent to Redis: the real server closes without a reply
             reply, close = self.execute(name, args)
             await self.conn.write(enc(reply))
             if close:
@@ -301,6 +303,8 @@ class RedisSession:
             match = matcher(pattern)
             return ["0", [k for k in ks if match(k)][:1000]]
         if name == "GET":
+            if len(a) != 2:
+                raise IndexError
             return self._get(a[1], "string")
         if name == "SET":
             if len(a) < 3:

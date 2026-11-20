@@ -89,13 +89,29 @@ model_name = gpt-4o
 # to test this with your model.
 trimmer_max_tokens = 64000
 
-# Answer host facts (uname, hostname, uptime, id, nproc, free, df, /proc/cpuinfo,
-# /etc/os-release, lscpu, lspci, nvidia-smi, which, ...) from the scenario's host profile
-# instead of the model, until the model has handled a command in the session; after that
-# the model answers everything. No tokens, and the same answers a sensor without a model
-# gives. The answers are added to the session history so the model stays consistent. Set
-# to false to send every command to the model.
+# Answer known commands from the scenario's host profile instead of the model. Facts no
+# command can change (uname -r, uptime, nproc, free, /proc/cpuinfo, lscpu, lspci,
+# nvidia-smi, the IoT openers, busybox probes) are answered locally for the whole session;
+# facts a session can change (hostname, id, whoami, which, ls, pwd, ps, df, /etc files,
+# paths that do not exist yet) only until a model reply has answered a command. cd, export
+# and downloads always go to the model. A local answer ends with the prompt the model
+# showed last; if that prompt does not show the working directory, local answers stop for
+# the session. No tokens, and the same answers a sensor without a model gives. The answers
+# are added to the session history so the model stays consistent. Set to false to send
+# every command to the model.
 local_shell_replies = true
+
+# Wait this many milliseconds (a random half to all of it, at most 2000) before a reply
+# made without a model call (local, cached or past the model cap), so it is not instant
+# next to model replies. 0 answers at once.
+local_reply_delay_ms = 0
+
+# Mark the persona prompt for the provider's prompt cache. Default: on for anthropic; off
+# for aws, because not every Claude or Nova model on Bedrock accepts cache points. Set to
+# true to use it on aws (Claude and Nova model ids only). If the first request with a
+# cache point is refused as invalid, it is retried without one and caching stays off until
+# restart ("Prompt caching disabled" in the log). Ignored for other providers.
+#prompt_caching = true
 
 # Description of the emulated system for the telnet persona, relative to this file. The
 # SSH server takes it from --prompt-file instead (default: prompt.txt).
@@ -157,11 +173,23 @@ root = *
 # session default allows on the order of 50 commands.
 max_line_bytes = 2048
 max_commands_per_session = 200
+# Commands per session the model may be asked, failed calls included. Local answers and
+# cached replies do not count, and cached replies are still served past it. Past it the session stays open and the deterministic shell answers (unknown
+# commands get "command not found"); a "Model cap reached" event is logged once.
+max_model_commands_per_session = 50
 max_tokens_per_session = 400000
 max_tokens_per_ip_per_day = 1000000
 max_tokens_per_day = 3000000
 max_concurrent_sessions = 20
 max_concurrent_sessions_per_ip = 3
+# Model replies kept in memory and served again, without a model call, to a session whose
+# history so far is identical, inputs and replies (bots replaying one script). A session
+# stops using the cache once its history holds anything another session could not share:
+# a local answer showing the clock or its own address (w, who, uptime, ps), a model error
+# or fallback, or a reply that was not stored. Not kept across restarts, never for a
+# source with a planted token or a deep/shallow mode. 0 turns the cache off.
+reply_cache_entries = 2000
+reply_cache_max_age = 21600
 # Daily counters (global and per source; IPv6 sources count per /64) persist here, shared
 # by the SSH server and the listeners on the same host through a file lock, so a restart
 # does not reset the day. Relative paths resolve inside the data directory.

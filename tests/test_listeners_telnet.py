@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agents import hooks
+from agents import hooks, shell
 from agents.budget import CANNED_INTERACTIVE, Budget, BudgetConfig
 from listeners import telnet
 from listeners.base import ListenerContext, ServiceSettings
@@ -213,7 +213,8 @@ async def test_telnet_iot_botnet_opener_gets_what_it_expects(telnet_server):
     assert replies[0].endswith(b"enable wait\r\nroot@srv01:~# ")
     assert replies[1:4] == [b"root@srv01:~# "] * 3
     assert replies[4] == b"ECCHI: applet not found\r\nroot@srv01:~# "
-    assert replies[5] == b"2\r\nroot@srv01:~# "
+    cpus = shell.host_for(None, "test").hardware.cpus   # the sensor's own VM shape
+    assert replies[5] == f"{cpus}\r\nroot@srv01:~# ".encode()
     cmds = events(writer, "command")
     assert [c["data"]["input"] for c in cmds][:2] == ["enable", "system"]
     assert cmds[4]["data"]["response"].startswith("ECCHI: applet not found")

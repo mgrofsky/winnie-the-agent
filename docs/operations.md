@@ -1094,6 +1094,8 @@ label whatever its style, and `{{sha1:LABEL}}` hashes the pinned value.
 | Every source in the log is a 172.x or similar gateway address; a "proxy may be hiding client addresses" warning | Docker userland proxy is on. See [Client addresses](#client-addresses). |
 | SSH shell answers host facts (`uname`, `free`, `lspci`) but `command not found` to everything else | No persona model: the provider's API key is not set in the container's environment, or the model call failed (look for `Model error` events and the startup warning). |
 | SSH sessions close with `fork: Resource temporarily unavailable` | A budget limit was reached; the `Budget exceeded` event names which one. |
+| A long session starts answering `command not found` for things the model used to answer | It reached `[budget] max_model_commands_per_session`; look for its `Model cap reached` event. The session stays open on the deterministic shell. |
+| `Prompt caching disabled` in the SSH log | The provider refused the first request that carried a cache point (the model does not take them). Requests are retried without one and caching stays off until restart. Remove `[llm] prompt_caching = true` for that model. |
 | FTP `LIST` or `RETR` hangs or connects to a private address | `ftp_pasv_address` not set to the address clients reach, or the passive port range is not published. |
 | A MySQL, PostgreSQL or MSSQL client fails right after connecting | The client requires TLS, which the traps do not offer (for `sqlcmd` with ODBC 18, encryption is required by default). The attempt is logged. |
 | `sipsak` REGISTER gets no reply over UDP | Its request is smaller than the 401 challenge. Set `[listeners] sip_udp_slack_bytes` (for example 128) if you need to answer it. |

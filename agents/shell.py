@@ -1,9 +1,9 @@
 """Deterministic shell answers for the commands bots use to size up a host.
 
-One answerer for the SSH fallback (no model, model error) and the Telnet trap's canned
-shell, so the two cannot disagree; with a model, host facts are answered here first until
-the model has handled a command in the session (``[llm] local_shell_replies``, see
-``agents.hooks``).
+One answerer for the SSH fallback (no model, model error, model cap) and the Telnet trap's
+canned shell, so the two cannot disagree; with a model, known commands are answered here
+first by how far a session could have changed what they report (``Answer.scope``, ``[llm]
+local_shell_replies``, see ``agents.hooks``).
 
 Every answer is computed in Python from one host profile: the scenario's identity, its
 ``[identity.hardware]`` table, the sensor seed and the clock. Nothing is executed, nothing
@@ -32,7 +32,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from scenarios.schema import GPU_SPECS, Hardware
+from scenarios.schema import GPU_SPECS, HARDWARE_PRESETS, Hardware
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +67,16 @@ OPENERS = frozenset(("enable", "system", "shell", "linuxshell", "sh", "bash"))
 DEFAULT_KERNEL = ("Linux srv01 5.15.0-105-generic #115-Ubuntu SMP Mon Apr 15 09:52:04 UTC "
                   "2024 x86_64 x86_64 x86_64 GNU/Linux")
 MACHINES = frozenset(("x86_64", "aarch64", "i686", "armv7l"))
+
+# How far ahead of a model an answer may be given (``Answer.scope``; a line takes the
+# highest of its commands):
+FIXED = 0     # facts no command can change: kernel, CPU, memory, /proc hardware files,
+#               uptime, the openers. Always answered here.
+SESSION = 1   # facts a session can change (hostname, users, any file or path, mounts and
+#               disk use, processes, the working directory): answered here only until the
+#               model has answered a command.
+STATE = 2     # commands that change the session (cd, export, downloads): never answered
+#               ahead of a model, which then owns the change.
 
 
 # ---- literal echo / printf (also used by agents.hooks for the model path) ---------------
@@ -220,9 +230,40 @@ class Host:
 
     def loadavg(self, now: float) -> tuple[float, float, float]:
         r = self.rng("load", int(now // 300))
-        base = 0.02 * self.hardware.cpus
+        base = 0.02 * self.hardware.cpus * self.rng("load-level").uniform(0.4, 3.0)
         return (round(r.uniform(0, base * 4), 2), round(r.uniform(0, base * 2), 2),
                 round(r.uniform(0, base), 2))
+
+    def other_login(self) -> Optional[tuple[str, str]]:
+        """(user, from) of the one login other than the attacker's, or None: on some
+        sensors one of the scenario's login users has an idle SSH session open from the
+        internal network. Stable per sensor; the persona block names it too."""
+        r = self.rng("who")
+        people = [u for u in self.users if u.shell.endswith(("/bash", "/sh", "/zsh"))]
+        if not people or r.random() >= 0.4:
+            return None
+        user = r.choice(people)
+        net = self.internal_ips[0].rsplit(".", 1)[0] if "." in self.internal_ips[0] \
+            else "10.0.0"
+        return user.name, f"{net}.{r.randrange(2, 250)}"
+
+    def other_sessions(self, now: float) -> list[tuple[str, str, float, int]]:
+        """Logins other than the attacker's (``other_login``) at ``now``: (user, from,
+        login time, idle seconds); the attacker's session takes the next pts."""
+        login_of = self.other_login()
+        if login_of is None:
+            return []
+        r = self.rng("who-times")
+        period = 2 * 86400            # logs in again every two days at the same time
+        login = now - (now - r.randrange(period)) % period
+        idle = int(min(now - login, (now - r.randrange(3600)) % 3600 + 120))
+        return [(login_of[0], login_of[1], login, idle)]
+
+    def daemons(self) -> list[tuple[str, str, str]]:
+        """The optional services this sensor runs, (user, command, stat), as ``ps`` shows
+        them; the persona block names them too."""
+        return [d for d in _DAEMONS.get(self.family, ())
+                if self.rng("daemon", d[1]).random() < 0.6]
 
     def local(self, ts: float) -> datetime.datetime:
         try:
@@ -362,7 +403,10 @@ def host_for(scenario=None, seed: Optional[str] = None) -> Host:
     """The host profile of a loaded scenario (``scenarios.loader.LoadedScenario``), or the
     neutral default host when no scenario is active."""
     if scenario is None:
-        return Host(seed=seed or "winnie")
+        seed = seed or "winnie"
+        r = random.Random(int.from_bytes(hashlib.sha256(f"default-host|{seed}".encode())
+                                         .digest()[:8], "big"))
+        return Host(hardware=r.choice(HARDWARE_PRESETS), seed=seed)
     ident = scenario.scenario.identity
     hostname = scenario.hostname
     kernel_words = ident.kernel.split()
@@ -373,7 +417,7 @@ def host_for(scenario=None, seed: Optional[str] = None) -> Host:
         kernel=" ".join(kernel_words), timezone=ident.timezone,
         internal_ips=tuple(ident.internal_ips),
         users=tuple(User(u.name, u.uid, u.gecos, u.home, u.shell) for u in ident.users),
-        lures=tuple(scenario.lures()), hardware=ident.hardware,
+        lures=tuple(scenario.lures()), hardware=scenario.hardware,
         seed=seed or scenario.seed or "winnie")
 
 
@@ -488,7 +532,16 @@ def _parse(line: str) -> list[tuple[str, list[list[str]]]]:
 class Answer:
     output: str              # "\n" line endings; callers convert for the terminal
     status: int = 0
-    stateless: bool = True   # only host facts: safe to answer ahead of a model
+    scope: int = 0           # FIXED, SESSION or STATE: when it may be answered ahead of a model
+    # False when the answer read the clock or the source address (``Shell.now``,
+    # ``Shell.src_ip``): it then differs between two sessions that sent the same lines, so a
+    # session that showed it can no longer share model replies (``agents.hooks``).
+    shareable: bool = True
+
+    @property
+    def stateless(self) -> bool:
+        """Only facts no session command can change (``FIXED``)."""
+        return self.scope == FIXED
 
 
 @dataclass
@@ -496,17 +549,17 @@ class _Result:
     out: str = ""
     err: str = ""
     status: int = 0
-    stateless: bool = True
+    scope: int = 0
 
 
 Handler = Callable[["Shell", list[str], Optional[str]], Optional[_Result]]
-_COMMANDS: dict[str, tuple[Handler, bool]] = {}   # name -> (handler, stateless)
+_COMMANDS: dict[str, tuple[Handler, int]] = {}   # name -> (handler, scope)
 
 
-def _command(*names: str, stateless: bool = True):
+def _command(*names: str, scope: int = 0):
     def register(fn: Handler) -> Handler:
         for name in names:
-            _COMMANDS[name] = (fn, stateless)
+            _COMMANDS[name] = (fn, scope)
         return fn
     return register
 
@@ -523,14 +576,27 @@ class Shell:
         self.interactive = interactive
         self.home = "/root" if user == "root" else host.user(user).home
         self.cwd = cwd or self.home
-        self.now = now
-        self.src_ip = src_ip
+        self._now = now
+        self._src_ip = src_ip
+        self.private = False                # the answer read the clock or the source address
         self.argv0 = ""
         self.work = 0                       # see MAX_WORK
         self.stage_out = 0                  # characters the current command produced
         self.failed: Optional[list[str]] = None   # the command that could not be evaluated
         self._files: dict[str, Optional[str]] = {}
         self.memo: dict = {}                # seeded values reused within the line
+
+    @property
+    def now(self) -> float:
+        """The clock. Reading it makes the answer private (``Answer.shareable``)."""
+        self.private = True
+        return self._now
+
+    @property
+    def src_ip(self) -> Optional[str]:
+        """The client's address. Reading it makes the answer private."""
+        self.private = True
+        return self._src_ip
 
     @property
     def prefix(self) -> str:
@@ -556,7 +622,7 @@ class Shell:
         try:
             self.charge(len(line) * STEP)
             items = _parse(line)
-            out, size, status, stateless = [], 0, 0, True
+            out, size, status, scope = [], 0, 0, FIXED
             for joiner, pipeline in items:
                 if (joiner == "&&" and status != 0) or (joiner == "||" and status == 0):
                     continue
@@ -566,7 +632,7 @@ class Shell:
                 if size > MAX_OUTPUT:
                     raise _OverBudget
                 status = result.status
-                stateless = stateless and result.stateless
+                scope = max(scope, result.scope)
         except _OverBudget:
             self.failed = None
             return None
@@ -576,17 +642,17 @@ class Shell:
             log.exception("canned shell failed on a line; falling back")
             self.failed = None
             return None
-        return Answer("".join(out), status, stateless)
+        return Answer("".join(out), status, scope, shareable=not self.private)
 
     def _pipeline(self, pipeline: list[list[str]]) -> _Result:
         stdin: Optional[str] = None
-        errors, stateless, result = [], True, _Result()
+        errors, scope, result = [], FIXED, _Result()
         for index, argv in enumerate(pipeline):
             result = self._command(argv, stdin if index else None)
             errors.append(result.err)
-            stateless = stateless and result.stateless
+            scope = max(scope, result.scope)
             stdin = result.out
-        return _Result(result.out, "".join(errors), result.status, stateless)
+        return _Result(result.out, "".join(errors), result.status, scope)
 
     def resolve(self, word: str) -> Optional[str]:
         """The command a word runs: its name, or None for a path outside the bin dirs."""
@@ -610,16 +676,18 @@ class Shell:
         if name is None:
             raise _Unsupported
         if not self.installed(name):
+            # a download can put a program there, so these hold only until the model answers
             if "/" in word:
                 return _Result(err=f"{self.prefix}: {word}: No such file or directory\n",
-                               status=127)
+                               status=127, scope=SESSION)
             if name in ("nvidia-smi", "busybox"):
-                return _Result(err=f"{self.prefix}: {word}: command not found\n", status=127)
+                return _Result(err=f"{self.prefix}: {word}: command not found\n", status=127,
+                               scope=SESSION)
         entry = _COMMANDS.get(name)
         if entry is None:
             self.failed = argv
             raise _Unsupported
-        handler, stateless = entry
+        handler, scope = entry
         self.argv0 = name
         result = handler(self, argv[1:], stdin)
         if result is None:
@@ -629,7 +697,7 @@ class Shell:
         if produced > MAX_STAGE_OUTPUT:
             raise _OverBudget
         self.charge(max(0, produced - self.stage_out))   # what grow() has not charged yet
-        result.stateless = result.stateless and stateless
+        result.scope = max(result.scope, scope)
         return result
 
     # -- helpers --
@@ -642,9 +710,10 @@ class Shell:
             self._files[path] = maker(self) if maker is not None else None
         text = self._files[path]
         if text is not None:
-            return _Result(text, stateless=path != "/etc/passwd")
+            return _Result(text, scope=FIXED if path in _FIXED_FILES else SESSION)
         if path in _ABSENT.get(self.host.family, ()):
-            return _Result(status=1, err=f"{{cmd}}: {path}: No such file or directory\n")
+            return _Result(status=1, err=f"{{cmd}}: {path}: No such file or directory\n",
+                           scope=SESSION)
         return None
 
     def unhandled(self, line: str) -> str:
@@ -676,6 +745,30 @@ def _shell(host: Host, user: str, interactive: bool, cwd: Optional[str], now: Op
     user = "".join(c for c in (user or "root") if c.isprintable() and c not in ":/ ")[:32] \
         or "root"
     return Shell(host, user, interactive, cwd, time.time() if now is None else now, src_ip)
+
+
+def persona_facts(host: Host) -> str:
+    """Persona lines for what this sensor's ``w``, ``who``, ``uptime`` and ``ps`` show
+    locally, so the model's own ``ps``, ``last`` and ``w`` agree with them. Stable per
+    sensor (no clock)."""
+    lines = []
+    other = host.other_login()
+    if other is not None:
+        lines.append(f"- One other login is open: {other[0]} on pts/0 over SSH from "
+                     f"{other[1]}, idle; w, who and last show it, and ps shows its sshd "
+                     f"and -bash")
+    else:
+        lines.append("- No other user is logged in; last shows only earlier logins")
+    daemons = [cmd.split()[0] for _, cmd, _ in host.daemons()]
+    if daemons:
+        lines.append("- Optional services running (ps shows these and the base system "
+                     "services, nothing else long-running): " + ", ".join(daemons))
+    return "\n" + "\n".join(lines)
+
+
+def not_found(host: Host, interactive: bool, word: str) -> str:
+    """bash's ``command not found`` line for ``word`` in this kind of session."""
+    return f"{_shell(host, 'root', interactive, None, 0.0, None).prefix}: {word}: command not found"
 
 
 def reply(host: Host, text: str, *, user: str = "root", interactive: bool = True,
@@ -794,10 +887,11 @@ def _uname(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         wanted |= set("snrvmo") | (set("pi") if h.platform_known else set())
     if not wanted:
         wanted = {"s"}
-    return _Result(" ".join(values[k] for k in "snrvmpio" if k in wanted) + "\n")
+    return _Result(" ".join(values[k] for k in "snrvmpio" if k in wanted) + "\n",
+                   scope=SESSION if "n" in wanted else FIXED)   # the nodename can change
 
 
-@_command("hostname")
+@_command("hostname", scope=SESSION)
 def _hostname(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     h = sh.host
     if not args or args in (["-s"], ["--short"]):
@@ -814,12 +908,12 @@ def _hostname(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return None
 
 
-@_command("whoami")
+@_command("whoami", scope=SESSION)
 def _whoami(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return None if args else _Result(sh.user + "\n")
 
 
-@_command("id")
+@_command("id", scope=SESSION)
 def _id(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     names = [a for a in args if not a.startswith("-")]
     flags = "".join(a[1:] for a in args if a.startswith("-") and not a.startswith("--"))
@@ -859,7 +953,9 @@ def _uptime_line(sh: Shell) -> str:
     span += f"{hours:2d}:{minutes:02d}" if hours else f"{minutes} min"
     l1, l5, l15 = h.loadavg(sh.now)
     clock = h.local(sh.now).strftime("%H:%M:%S")
-    return f" {clock} up {span},  1 user,  load average: {l1:.2f}, {l5:.2f}, {l15:.2f}\n"
+    users = 1 + len(h.other_sessions(sh.now))
+    return (f" {clock} up {span},  {users} user{'s' if users != 1 else ''},  load average: "
+            f"{l1:.2f}, {l5:.2f}, {l15:.2f}\n")
 
 
 @_command("uptime")
@@ -874,16 +970,54 @@ def _uptime(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return None
 
 
+def _idle(seconds: int) -> str:
+    """``w``'s IDLE column, as procps prints it."""
+    if seconds < 60:
+        return f"{seconds}.00s"
+    if seconds < 3600:
+        return f"{seconds // 60}:{seconds % 60:02d}"
+    if seconds < 86400:
+        return f"{seconds // 3600}:{seconds % 3600 // 60:02d}m"
+    return f"{seconds // 86400}days"
+
+
+def _login_at(sh: Shell, ts: float) -> str:
+    """``w``'s LOGIN@ column: the time today, else the weekday and hour."""
+    when, today = sh.host.local(ts), sh.host.local(sh.now)
+    return when.strftime("%H:%M") if when.date() == today.date() else when.strftime("%a%H")
+
+
+def _sessions(sh: Shell) -> list[tuple[str, str, str, float, int, str]]:
+    """(user, tty, from, login time, idle seconds, what) for every login, the attacker's
+    last."""
+    others = sh.host.other_sessions(sh.now)
+    out = [(user, f"pts/{n}", src, login, idle, "-bash")
+           for n, (user, src, login, idle) in enumerate(others)]
+    out.append((sh.user, f"pts/{len(others)}", (sh.src_ip or "-")[:16], sh.now - 60, 0, ""))
+    return out
+
+
 @_command("w")
 def _w(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     if args:
         return None
-    login = sh.host.local(sh.now - 60).strftime("%H:%M")
-    src = (sh.src_ip or "-")[:16]
+    rows = []
+    for user, tty, src, login, idle, what in _sessions(sh):
+        cpu = ("0.02s", "0.00s") if not what else ("0.05s", "0.05s")
+        rows.append(f"{user[:8]:<9}{tty:<9}{src:<17}{_login_at(sh, login):<8}"
+                    f"{_idle(idle):>6}{cpu[0]:>7}{cpu[1]:>7} {what or 'w'}\n")
     return _Result(_uptime_line(sh)
                    + "USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n"
-                   + f"{sh.user[:8]:<9}{'pts/0':<9}{src:<17}{login:<8}{'0.00s':>6}"
-                     f"{'0.02s':>7}{'0.00s':>7} w\n")
+                   + "".join(rows))
+
+
+@_command("who")
+def _who(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    if args:
+        return None
+    return _Result("".join(
+        f"{user:<8} {tty:<12} {sh.host.local(login).strftime('%Y-%m-%d %H:%M')} ({src})\n"
+        for user, tty, src, login, _, _ in _sessions(sh)))
 
 
 @_command("nproc")
@@ -949,7 +1083,7 @@ def _table(rows: list[list[str]], left: set[int], minimum: tuple = ()) -> str:
     return "\n".join(out) + "\n"
 
 
-@_command("df")
+@_command("df", scope=SESSION)   # a download or a mount changes it
 def _df(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     human = False
     paths = []
@@ -991,7 +1125,6 @@ def _processes(sh: Shell) -> list[tuple]:
     r = h.rng("ps")
     boot = h.local(h.boot_time(sh.now))
     start_boot = boot.strftime("%b%d")
-    login = h.local(sh.now - 60).strftime("%H:%M")
     ubuntu = h.family in ("ubuntu", "debian")
     names = [
         ("root", "/sbin/init" if ubuntu else
@@ -1007,6 +1140,7 @@ def _processes(sh: Shell) -> list[tuple]:
     if h.family == "ubuntu":
         names += [("systemd+", "/lib/systemd/systemd-networkd", "Ss"),
                   ("systemd+", "/lib/systemd/systemd-resolved", "Ss")]
+    names += h.daemons()
     names += [
         ("root", "/usr/sbin/cron -f -P" if ubuntu else "/usr/sbin/crond -n", "Ss"),
         ("message+" if ubuntu else "dbus", "@dbus-daemon --system --address=systemd: --nofork "
@@ -1029,23 +1163,48 @@ def _processes(sh: Shell) -> list[tuple]:
         out.append((user, pid, 0 if pid == 1 else 1, 0.0, round(rss * 100 / total_kib, 1), vsz,
                     rss, "tty1" if "agetty" in cmd else "?", stat, start_boot,
                     f"0:{r.randrange(0, 40):02d}", cmd))
+    listener = next(p[1] for p in out if p[11].startswith("sshd: /usr/sbin/sshd"))
     base = pid + 5000 + r.randrange(5000)
-    tty = "pts/0"
-    user = sh.user[:8] if len(sh.user) <= 8 else sh.user[:7] + "+"
-    out += [("root", base, out[-1][1], 0.0, 0.2, 17000, 10900, "?", "Ss", login, "0:00",
-             f"sshd: {sh.user} [priv]"),
-            (user, base + 99, base, 0.0, 0.1, 9100, 5400, tty, "Ss", login, "0:00", "-bash")]
+    for name, tty, _, since, _, _ in _sessions(sh):
+        user = name[:8] if len(name) <= 8 else name[:7] + "+"
+        start = h.local(since).strftime("%H:%M" if sh.now - since < 86400 else "%b%d")
+        out += [("root", base, listener, 0.0, 0.2, 17000, 10900, "?", "Ss", start, "0:00",
+                 f"sshd: {name} [priv]"),
+                (user, base + 99, base, 0.0, 0.1, 9100, 5400, tty, "Ss", start, "0:00",
+                 "-bash")]
+        base += 200 + r.randrange(2000)
     return out
 
 
-@_command("ps")
+# Services some installs run and others do not; each sensor shows its own subset.
+_DAEMONS = {
+    "ubuntu": (("root", "/sbin/multipathd -d -s", "SLsl"),
+               ("root", "/usr/sbin/irqbalance --foreground", "Ssl"),
+               ("root", "/usr/libexec/polkitd --no-debug", "Ssl"),
+               ("root", "/usr/lib/snapd/snapd", "Ssl"),
+               ("root", "/usr/sbin/qemu-ga", "Ssl"),
+               ("root", "/usr/bin/python3 /usr/share/unattended-upgrades/"
+                        "unattended-upgrade-shutdown --wait-for-signal", "Ssl")),
+    "debian": (("root", "/usr/sbin/qemu-ga", "Ssl"),
+               ("root", "/usr/sbin/irqbalance --foreground", "Ssl"),
+               ("root", "/usr/sbin/atd -f", "Ss")),
+    "rhel": (("chrony", "/usr/sbin/chronyd -F 2", "S"),
+             ("root", "/usr/sbin/irqbalance --foreground", "Ss"),
+             ("root", "/usr/sbin/NetworkManager --no-daemon", "Ssl"),
+             ("root", "/usr/bin/python3 -Es /usr/sbin/tuned -l -P", "Ssl"),
+             ("root", "/usr/sbin/qemu-ga --method=virtio-serial --path=/dev/virtio-ports/"
+                      "org.qemu.guest_agent.0", "Ssl")),
+}
+
+
+@_command("ps", scope=SESSION)
 def _ps(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     procs = _processes(sh)
     mine = procs[-1]
     joined = "".join(args)
     if not args:
         return _Result(f"    PID TTY          TIME CMD\n{mine[1]:>7} {mine[7]:<8} 00:00:00 bash\n"
-                       f"{mine[1] + 50:>7} {mine[7]:<8} 00:00:00 ps\n", stateless=False)
+                       f"{mine[1] + 50:>7} {mine[7]:<8} 00:00:00 ps\n")
     rows = procs + [(mine[0], mine[1] + 50, mine[1], 0.0, 0.0, 11300, 4600, mine[7], "R+",
                      mine[9], "0:00", "ps " + " ".join(args))]
     if len(args) == 1 and joined.lstrip("-") in ("aux", "auxw", "auxww", "axu"):
@@ -1053,14 +1212,14 @@ def _ps(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         for p in rows:
             out.append(f"{p[0]:<8} {p[1]:>7} {p[3]:>4.1f} {p[4]:>4.1f} {p[5]:>6} {p[6]:>5} "
                        f"{p[7]:<8} {p[8]:<4} {p[9]:>5} {p[10]:>6} {p[11]}")
-        return _Result("\n".join(out) + "\n", stateless=False)
+        return _Result("\n".join(out) + "\n")
     if args in (["-ef"], ["-e", "-f"], ["-aef"]):
         out = ["UID          PID    PPID  C STIME TTY          TIME CMD"]
         for p in rows:
             minutes = int(p[10].split(":")[0]) * 60 + int(p[10].split(":")[1])
             out.append(f"{p[0]:<8} {p[1]:>7} {p[2]:>7} {0:>2} {p[9]:<5} {p[7]:<8} "
                        f"{'00:%02d:%02d' % divmod(minutes, 60):>8} {p[11]}")
-        return _Result("\n".join(out) + "\n", stateless=False)
+        return _Result("\n".join(out) + "\n")
     return None
 
 
@@ -1473,6 +1632,10 @@ _FILES: dict[str, Callable[[Shell], Optional[str]]] = {
     "/etc/timezone": lambda sh: None if sh.host.family not in ("debian", "ubuntu") else
     sh.host.timezone + "\n",
 }
+# Files no command can change (kernel and hardware views). Every other file, including the
+# release files under /etc and the mount table, is ``SESSION``: root can write or mount.
+_FIXED_FILES = frozenset(("/proc/cpuinfo", "/proc/meminfo", "/proc/version", "/proc/uptime",
+                          "/proc/loadavg"))
 _ABSENT = {"ubuntu": ("/etc/redhat-release", "/etc/centos-release"),
            "debian": ("/etc/redhat-release", "/etc/centos-release", "/etc/lsb-release"),
            "rhel": ("/etc/debian_version", "/etc/lsb-release", "/etc/timezone")}
@@ -1503,23 +1666,23 @@ _FILES["/etc/lsb-release"] = _lsb_release
 
 
 def _files(sh: Shell, args: list[str], command: str) -> Optional[tuple]:
-    """Read file operands: ([(name, text)], errors, status, stateless); None if unknown."""
+    """Read file operands: ([(name, text)], errors, status, scope); None if unknown."""
     if len(args) > MAX_FILES:
         return None
-    out, errors, status, stateless = [], "", 0, True
+    out, errors, status, scope = [], "", 0, FIXED
     for name in args:
         result = sh.read_file(name)
         if result is None:
             return None
         sh.charge(len(result.out) + STEP)
+        scope = max(scope, result.scope)
         if result.err:
             errors += result.err.replace("{cmd}", command).replace(
                 posixpath.normpath(posixpath.join(sh.cwd, name)), name)
             status = result.status
             continue
-        stateless = stateless and result.stateless
         out.append((name, result.out))
-    return out, errors, status, stateless
+    return out, errors, status, scope
 
 
 @_command("cat")
@@ -1531,21 +1694,21 @@ def _cat(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     read = _files(sh, args, "cat")
     if read is None:
         return None
-    files, errors, status, stateless = read
+    files, errors, status, scope = read
     for _, text in files:
         sh.grow(len(text))
-    return _Result("".join(text for _, text in files), errors, status, stateless)
+    return _Result("".join(text for _, text in files), errors, status, scope)
 
 
 # ---- filters ----------------------------------------------------------------------------------
 
 def _input(sh: Shell, files: list[str], stdin: Optional[str], command: str):
-    """(texts with names, errors, status, stateless) from file operands or stdin."""
+    """(texts with names, errors, status, scope) from file operands or stdin."""
     if not files:
         if stdin is None:
             return None                      # would wait on the terminal
         sh.charge(len(stdin))
-        return [("", stdin)], "", 0, True
+        return [("", stdin)], "", 0, FIXED
     return _files(sh, files, command)
 
 
@@ -1644,7 +1807,7 @@ def _grep(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     read = _input(sh, operands, stdin, "grep")
     if read is None:
         return None
-    texts, errors, status, stateless = read
+    texts, errors, status, scope = read
     out, total = [], 0
     many = len(texts) > 1 and "h" not in flags
     for name, text in texts:
@@ -1662,7 +1825,7 @@ def _grep(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
             out.append((f"{name}:" if many else "") + f"{count}\n")
     if "s" in flags:
         errors = ""
-    return _Result("".join(out), errors, 2 if status else (0 if total else 1), stateless)
+    return _Result("".join(out), errors, 2 if status else (0 if total else 1), scope)
 
 
 def _line_count(args: list[str]) -> Optional[tuple[str, list[str]]]:
@@ -1700,7 +1863,7 @@ def _head_tail(sh: Shell, args: list[str], stdin, tail: bool) -> Optional[_Resul
     read = _input(sh, files, stdin, "tail" if tail else "head")
     if read is None:
         return None
-    texts, errors, status, stateless = read
+    texts, errors, status, scope = read
     n = int(spec.lstrip("+-"))
     out = []
     for index, (name, text) in enumerate(texts):
@@ -1714,7 +1877,7 @@ def _head_tail(sh: Shell, args: list[str], stdin, tail: bool) -> Optional[_Resul
         if len(texts) > 1:
             out.append(("\n" if index else "") + f"==> {name} <==\n")
         out.append("".join(chosen))
-    return _Result("".join(out), errors, status, stateless)
+    return _Result("".join(out), errors, status, scope)
 
 
 @_command("head")
@@ -1807,7 +1970,7 @@ def _cut(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     read = _input(sh, files, stdin, "cut")
     if read is None:
         return None
-    texts, errors, status, stateless = read
+    texts, errors, status, scope = read
     delim = "\t" if delim is None else delim
 
     def pick(seq):
@@ -1834,7 +1997,7 @@ def _cut(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
             else:
                 out.append(delim.join(pick(body.split(delim))) + "\n")
             sh.grow(len(out[-1]))
-    return _Result("".join(out), errors, status, stateless)
+    return _Result("".join(out), errors, status, scope)
 
 
 @_command("wc")
@@ -1854,7 +2017,7 @@ def _wc(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     read = _input(sh, files, stdin, "wc")
     if read is None:
         return None
-    texts, errors, status, stateless = read
+    texts, errors, status, scope = read
 
     def counts(text: str) -> dict[str, int]:
         sh.charge(4 * len(text))
@@ -1863,17 +2026,17 @@ def _wc(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
 
     rows = [(name, counts(text)) for name, text in texts]
     if not rows:                                    # every operand was unreadable
-        return _Result("", errors, status, stateless)
+        return _Result("", errors, status, scope)
     if len(rows) > 1:
         rows.append(("total", {k: sum(r[1][k] for r in rows) for k in "lwmc"}))
     if not files and len(order) == 1:
-        return _Result(f"{rows[0][1][order[0]]}\n", errors, status, stateless)
+        return _Result(f"{rows[0][1][order[0]]}\n", errors, status, scope)
     width = 7 if not files else max(len(str(r[1][k])) for r in rows for k in order)
     out = []
     for name, c in rows:
         cells = " ".join(f"{c[k]:>{width}}" for k in order)
         out.append(cells + (f" {name}" if name else "") + "\n")
-    return _Result("".join(out), errors, status, stateless)
+    return _Result("".join(out), errors, status, scope)
 
 
 def _awk_program(program: str) -> Optional[list]:
@@ -1945,7 +2108,7 @@ def _awk(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     read = _input(sh, rest[1:], stdin, "awk")
     if read is None:
         return None
-    texts, errors, status, stateless = read
+    texts, errors, status, scope = read
     out = []
     for _, text in texts:
         for line in _lines(text):
@@ -1964,19 +2127,19 @@ def _awk(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
                                                         else ""))
             out.append("".join(piece) + "\n")
             sh.grow(len(out[-1]))
-    return _Result("".join(out), errors, status, stateless)
+    return _Result("".join(out), errors, status, scope)
 
 
-@_command("sh", "bash")
+@_command("sh", "bash", scope=SESSION)
 def _sh(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     """A shell fed nothing (a failed download piped into it) prints nothing; ``sh`` typed
     as a botnet opener starts a subshell that looks the same."""
     if args or stdin:
         return None
-    return _Result(stateless=False)
+    return _Result(scope=SESSION)
 
 
-# ---- builtins and navigation (session state: never answered ahead of a model) ---------------
+# ---- builtins and navigation (session state) --------------------------------------------------
 
 def _dirs(sh: Shell) -> dict[str, list[str]]:
     """Directories ``ls`` and ``cd`` know, with their visible entries."""
@@ -2018,7 +2181,7 @@ def _denied(sh: Shell, path: str) -> bool:
     return sh.user != "root" and (path == "/root" or path.startswith("/root/"))
 
 
-@_command("ls", stateless=False)
+@_command("ls", scope=SESSION)
 def _ls(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     one = False
     paths = []
@@ -2048,7 +2211,7 @@ def _ls(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result("".join(out), err, status)
 
 
-@_command("cd", stateless=False)
+@_command("cd", scope=STATE)
 def _cd(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     if len(args) > 1:
         return _Result(err=f"{sh.prefix}: cd: too many arguments\n", status=1)
@@ -2063,17 +2226,20 @@ def _cd(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result()
 
 
-@_command("pwd", stateless=False)
+@_command("pwd", scope=SESSION)
 def _pwd(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return None if args else _Result(sh.cwd + "\n")
 
 
-@_command("true", ":", "export", "unset", "history", stateless=False)
+@_command("true", ":")
 def _quiet(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result()
 
 
-@_command("false", stateless=False)
+_command("export", "unset", "history", scope=STATE)(_quiet)
+
+
+@_command("false")
 def _false(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result(status=1)
 
@@ -2121,7 +2287,7 @@ def _escapes(text: str) -> tuple[str, bool]:
     return "".join(out), False
 
 
-@_command("echo", stateless=False)
+@_command("echo")
 def _echo(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     newline, escapes = True, False
     while args and len(args[0]) > 1 and args[0][0] == "-" and not set(args[0][1:]) - set("neE"):
@@ -2139,7 +2305,7 @@ def _echo(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
 
 # ---- lookups, busybox and downloads -----------------------------------------------------------
 
-@_command("which")
+@_command("which", scope=SESSION)
 def _which(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     if not args or any(a.startswith("-") for a in args):
         return None
@@ -2148,7 +2314,7 @@ def _which(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result("".join(p + "\n" for p in found), status=0 if len(found) == len(args) else 1)
 
 
-@_command("command")
+@_command("command", scope=SESSION)
 def _command_v(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     if len(args) < 2 or args[0] != "-v":
         return None
@@ -2212,7 +2378,7 @@ def _busybox(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         sh.argv0 = applet
         result = entry[0](sh, args[1:], stdin)
         if result is not None:
-            result.stateless = result.stateless and entry[1]
+            result.scope = max(result.scope, entry[1])
         return result
     if applet.startswith("-"):
         return None
@@ -2259,7 +2425,7 @@ def _is_ip(host: str) -> bool:
     return bool(re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){3}", host)) or ":" in host
 
 
-@_command("wget", stateless=False)
+@_command("wget", scope=STATE)
 def _wget(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     url, quiet = _url(args, {"-O", "-o", "-P", "-U", "-t", "-T", "-e", "--output-document",
                              "--user-agent", "--directory-prefix", "--tries", "--timeout"})
@@ -2280,7 +2446,7 @@ def _wget(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result(err=f"--{stamp}--  {shown}\n{body}", status=4)
 
 
-@_command("curl", stateless=False)
+@_command("curl", scope=STATE)
 def _curl(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     url, quiet = _url(args, {"-o", "-A", "-H", "-d", "-X", "-u", "-e", "-m", "-x", "-T",
                              "--output", "--user-agent", "--header", "--data", "--request",
@@ -2301,7 +2467,7 @@ def _curl(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result(err="" if quiet and not show_errors else message, status=status)
 
 
-@_command("tftp", stateless=False)
+@_command("tftp", scope=STATE)
 def _tftp(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result(err="Transfer timed out.\n\n", status=1) if args else None
 

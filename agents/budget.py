@@ -11,6 +11,9 @@ is hit the caller does not call the model; it returns a canned response.
   so concurrent sessions cannot overshoot a cap by more than one estimate's error. Failed
   and timed-out calls keep their reserved charge.
 - IPv6 sources are keyed on their /64.
+- Per session, at most ``max_model_commands_per_session`` commands are answered by the
+  model; after that the deterministic shell answers (the session stays open). Answers
+  given without a model call (local, cached) do not count toward it.
 - Per-source mode from the response playbooks (``mode_provider``): ``shallow`` refuses all
   model calls for that source (canned replies); ``deep`` doubles its per-session and
   per-source limits. The global daily cap never changes.
@@ -59,11 +62,14 @@ def ip_key(ip: str) -> str:
 class BudgetConfig:
     max_line_bytes: int = 2048
     max_commands_per_session: int = 200
+    max_model_commands_per_session: int = 50
     max_tokens_per_session: int = 400_000
     max_tokens_per_ip_per_day: int = 1_000_000
     max_tokens_per_day: int = 3_000_000
     max_concurrent_sessions: int = 20
     max_concurrent_sessions_per_ip: int = 3
+    reply_cache_entries: int = 2000      # model replies kept for identical replays; 0 = off
+    reply_cache_max_age: int = 21600     # seconds a cached reply may be served
     state_file: Optional[str] = None
 
     @classmethod
@@ -74,9 +80,11 @@ class BudgetConfig:
         section = config["budget"] if "budget" in config else {}
         defaults = cls()
         values: dict = {}
-        for name in ("max_line_bytes", "max_commands_per_session", "max_tokens_per_session",
+        for name in ("max_line_bytes", "max_commands_per_session",
+                     "max_model_commands_per_session", "max_tokens_per_session",
                      "max_tokens_per_ip_per_day", "max_tokens_per_day",
-                     "max_concurrent_sessions", "max_concurrent_sessions_per_ip"):
+                     "max_concurrent_sessions", "max_concurrent_sessions_per_ip",
+                     "reply_cache_entries", "reply_cache_max_age"):
             raw = section.get(name) if name in section else None
             value = int(raw) if raw is not None else getattr(defaults, name)
             if value < 0:
@@ -234,7 +242,9 @@ class DailyState:
 class _SessionState:
     ip: str
     commands: int = 0
-    answered_locally: int = 0   # commands counted without a model call
+    answered_locally: int = 0   # commands counted without a model call (local, cached, capped)
+    cached: int = 0             # of those, model replies served from the reply cache
+    model_cap_logged: bool = False
     tokens: int = 0
     history_chars: int = 0
     registered: bool = False
@@ -304,6 +314,12 @@ class Budget:
         state = self._sessions.get(session_id)
         return state.commands if state is not None and state.registered else None
 
+    def session_started(self, session_id: str) -> bool:
+        """Whether the session has had any turn counted or charged (admitted or not)."""
+        state = self._sessions.get(session_id)
+        return state is not None and (state.commands > 0 or state.tokens > 0
+                                      or state.history_chars > 0)
+
     def model_commands(self, session_id: str) -> Optional[int]:
         """Commands the model answered so far, or None if the session was never admitted."""
         state = self._sessions.get(session_id)
@@ -311,9 +327,36 @@ class Budget:
             if state is not None and state.registered else None
 
     def model_answered(self, session_id: str) -> bool:
-        """Whether the model has been asked to answer a command in this session."""
+        """Whether a model reply (fresh or from the reply cache) has answered a command in
+        this session, so the session's state may differ from the host profile."""
         state = self._sessions.get(session_id)
-        return state is not None and state.commands > state.answered_locally
+        return state is not None and (state.commands > state.answered_locally
+                                      or state.cached > 0)
+
+    def cached_commands(self, session_id: str) -> int:
+        """Commands answered from the reply cache in this session."""
+        state = self._sessions.get(session_id)
+        return state.cached if state is not None else 0
+
+    def model_cap(self, session_id: str, ip: str) -> int:
+        """The session's ``max_model_commands_per_session`` (doubled for a ``deep``
+        source)."""
+        state = self._session(session_id, ip)
+        factor = 2 if self.mode(state.ip) == "deep" else 1
+        return self.config.max_model_commands_per_session * factor
+
+    def model_cap_reached(self, session_id: str, ip: str) -> bool:
+        """True once the model has answered ``model_cap`` commands in the session."""
+        state = self._session(session_id, ip)
+        return state.commands - state.answered_locally >= self.model_cap(session_id, ip)
+
+    def note_model_cap(self, session_id: str) -> bool:
+        """True the first time it is called for a session (log the cap once)."""
+        state = self._sessions.get(session_id)
+        if state is None or state.model_cap_logged:
+            return False
+        state.model_cap_logged = True
+        return True
 
     # ---- model calls --------------------------------------------------------------------
 
@@ -365,9 +408,10 @@ class Budget:
         self.daily.update(state.ip, est)
         return None, Reservation(session_id, state.ip, est, counts_as_command)
 
-    def count_command(self, session_id: str, ip: str) -> Optional[str]:
-        """Count a command answered without a model (canned reply). Only the per-session
-        command cap and the source's mode apply; no tokens are charged."""
+    def count_command(self, session_id: str, ip: str, cached: bool = False) -> Optional[str]:
+        """Count a command answered without a model call (canned, local or ``cached``).
+        Only the per-session command cap and the source's mode apply; no tokens are
+        charged, and it does not count toward the model cap."""
         state = self._session(session_id, ip)
         mode = self.mode(state.ip)
         if mode == "shallow":
@@ -377,6 +421,7 @@ class Budget:
             return "max_commands_per_session"
         state.commands += 1
         state.answered_locally += 1
+        state.cached += 1 if cached else 0
         return None
 
     def add_history(self, session_id: str, ip: str, input_text: str, output_text: str) -> None:
