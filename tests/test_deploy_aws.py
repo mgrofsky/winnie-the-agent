@@ -828,6 +828,17 @@ def test_rendered_configs_turn_the_tracked_export_on_for_the_exporter_only(senso
     assert ship.get("connector.s3_events", "enabled") == "true"
 
 
+def test_rendered_configs_leave_the_internetdb_lookup_off(sensor, tmp_path):
+    # This stack gives the lookup no egress path; neither config may turn it on.
+    from agents.internetdb import InternetDbSettings
+
+    for dst, ship in (("config.ini", "false"), ("config-ship.ini", "true")):
+        cp = _render(sensor, tmp_path, dst, ship, "true")
+        assert InternetDbSettings.from_config(cp).enabled is False
+    assert "internetdb" not in (AWS / "sensor.yaml").read_text().lower()
+    assert "internetdb" not in (AWS / "host" / "sensor-egress.sh").read_text().lower()
+
+
 def test_smtp_needs_its_own_switch(sensor):
     expr = sensor["Conditions"]["SmtpOn"]["Fn::And"]
     assert {"Fn::Equals": [{"Ref": "SmtpEnabled"}, "true"]} in expr

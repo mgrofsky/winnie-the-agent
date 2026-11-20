@@ -9,8 +9,9 @@ Directories:
 - ``--overlay``: the tuner-owned overlay file.
 
 ``ship`` sends the event log to S3 when ``[connector.s3_events]`` is enabled, the tracked
-export when ``[connector.tracked_export]`` is, and fetches sightings when
-``[connector.sightings]`` is; ``run-all`` runs it as its last step.
+export when ``[connector.tracked_export]`` is, fetches sightings when
+``[connector.sightings]`` is, and looks up interesting sources in Shodan InternetDB when
+``[connector.internetdb]`` is; ``run-all`` runs it as its last step.
 
 ``enforce <address>`` moves one tracked blocklist entry to enforced (``[respond]
 track_before_enforce``).
@@ -136,6 +137,7 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     from agents.sightings import SightingsSettings
 
     from agents.enrich import from_config as geo_from_config
+    from agents.internetdb import reader_from_config as internetdb_reader
 
     geo = geo_from_config(cp)
     if geo.attribution:
@@ -159,7 +161,8 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
               operator=operator,
               respond_settings=lambda: runtime.respond_settings(cp),
               connectors=lambda: runtime.respond_connectors(cp, state),
-              sensor=sensor_label(cp), sightings=sightings, geo=geo)
+              sensor=sensor_label(cp), sightings=sightings, geo=geo,
+              shodan=internetdb_reader(cp, state))
     try:
         serve(settings, api)
     except (ValueError, OSError) as exc:
@@ -391,6 +394,33 @@ def _run(argv=None) -> dict:
         except Exception as exc:  # noqa: BLE001 - the fetch never stops the other stages
             results["sightings_fetch"] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
             log.error("sightings fetch failed: %s", results["sightings_fetch"]["error"])
+        _internetdb_stage()
+
+    def _internetdb_stage() -> None:
+        """What Shodan InternetDB knows about interesting sources, into a local file. Off
+        unless ``[connector.internetdb]`` is enabled; a failure never stops a run."""
+        from agents import internetdb
+        from agents.triage import load_records
+
+        try:
+            settings = internetdb.InternetDbSettings.from_config(cp)
+            if not settings.enabled:
+                return
+            try:
+                networks = _settings().networks()
+            except ValueError as exc:
+                # Without a valid never_act_on list no address is safe to send.
+                results["internetdb"] = {"error": f"[respond]: {str(exc)[:160]}; no lookups"}
+                log.error("internetdb: %s", results["internetdb"]["error"])
+                return
+            results["internetdb"] = internetdb.run_lookup(
+                settings, load_records(reports), networks, state, dry_run=args.dry_run)
+        except internetdb.ConfigError as exc:
+            results["internetdb"] = {"error": f"[{internetdb.SECTION}]: {exc}"}
+            log.error("%s", results["internetdb"]["error"])
+        except Exception as exc:  # noqa: BLE001 - the lookup never stops the other stages
+            results["internetdb"] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            log.error("internetdb lookup failed: %s", results["internetdb"]["error"])
 
     def locked(fn) -> dict:
         """One writing run at a time: a second one exits with an error instead of
@@ -459,6 +489,12 @@ def _run(argv=None) -> dict:
                 geo_cache.append(geo_from_config(cp))
             return geo_cache[0]
 
+        def _shodan():
+            # The exporter's local InternetDB file, read only; None when the feature is off.
+            from agents.internetdb import reader_from_config
+
+            return reader_from_config(cp, state)
+
         if args.command in ("triage", "run-all"):
             log_state, log_error = runtime.event_log_state(log_path)
             if log_state == "missing":
@@ -482,7 +518,7 @@ def _run(argv=None) -> dict:
                                                                MAX_RECORDS_PER_RUN)),
                         retention_days=float(agents_cfg.get("record_retention_days",
                                                             RECORD_RETENTION_DAYS)),
-                        geo=_geo())
+                        geo=_geo(), shodan=_shodan())
 
                 stage("triage", _triage)
         if args.command in ("respond", "run-all") and \

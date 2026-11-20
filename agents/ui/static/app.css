@@ -1347,6 +1347,16 @@ details.raw > summary {
   margin-top: var(--s3);
 }
 
+details.shodan > summary {
+  cursor: pointer;
+  font-size: var(--fs-s);
+  overflow-wrap: anywhere;
+}
+
+details.shodan[open] > summary {
+  margin-bottom: var(--s2);
+}
+
 details.raw[open] > summary {
   margin-bottom: var(--s3);
 }

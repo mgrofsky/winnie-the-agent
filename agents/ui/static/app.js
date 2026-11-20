@@ -506,6 +506,26 @@
     return el("span", null, mono(addr), geoText(geo));
   }
 
+  // What Shodan InternetDB knew about an address, from the server's "shodan" object: a
+  // compact line that opens to the full lists, the lookup date and the credit. Nothing when
+  // the feature is off or the file has no answer. Third-party data (host names are
+  // attacker-influenced), so text nodes only, like everything else.
+  function shodanNode(info, opts) {
+    const s = obj(info);
+    const short = str(s.short);
+    if (!short) return null;
+    const o = obj(opts);
+    const list = (label, items) => arr(items).length
+      ? [label, el("span", { cls: "mono wrap", text: arr(items).map(str).join(", ") })] : null;
+    return el("details", "shodan",
+      el("summary", { cls: "muted", text: (o.prefix ? "Shodan: " : "") + short }),
+      kv([list("Ports", s.ports), list("Tags", s.tags), list("Known CVEs", s.vulns),
+        list("Host names", s.hostnames), list("CPEs", s.cpes),
+        ["Looked up", el("span", null, str(s.looked_up),
+          o.note ? el("span", { cls: "muted", text: o.note }) : null)]]),
+      el("div", { cls: "faint", text: "Data from Shodan InternetDB." }));
+  }
+
   function clip(text, wide) {
     return el("span", { cls: wide ? "clip clip-wide mono" : "clip mono", text: str(text) });
   }
@@ -935,7 +955,8 @@
     const top = arr(data.top_sources);
     append(sources.body, [top.length
       ? table([{ label: "Source" }, { label: "Records", num: true }, { label: "Worst" }],
-        top.map((s) => ({ cells: [addressNode(s.src_ip, s.geo), num(s.records), judgementBadge(s.worst)] })),
+        top.map((s) => ({ cells: [el("div", null, addressNode(s.src_ip, s.geo), shodanNode(s.shodan, { prefix: true })),
+          num(s.records), judgementBadge(s.worst)] })),
         { short: true })
       : empty("No sources in this window.")]);
 
@@ -1658,6 +1679,8 @@
         r.unverified_source === true ? el("span", { cls: "muted", text: " (may be forged)" }) : null)),
       data.geo ? fact("Where", el("span", "wrap", str(obj(data.geo).short),
         el("span", { cls: "muted", text: data.geo_stored === true ? " (when recorded)" : " (looked up now)" }))) : null,
+      data.shodan ? fact("Shodan", shodanNode(data.shodan,
+        { note: data.shodan_stored === true ? " (when recorded)" : " (latest lookup)" })) : null,
       fact("First seen", timeNode(r.first_seen)),
       fact("Last seen", timeNode(r.last_seen)),
       fact("Username", clip(r.username)),
@@ -2495,7 +2518,8 @@
     const items = arr(ss.items).map(obj);
     append(sources.body, [items.length
       ? table([{ label: "Source" }, { label: "Last seen" }, { label: "Kept for them" }, { label: "Why" }, { label: "Until" }],
-        items.map((s) => ({ cells: [el("span", null, sourceLink(s.key), geoText(s.geo)),
+        items.map((s) => ({ cells: [el("div", null, el("span", null, sourceLink(s.key), geoText(s.geo)),
+          shodanNode(s.shodan, { prefix: true })),
           s.last_seen ? timeNode(s.last_seen) : el("span", { cls: "faint", text: "no stored record" }),
           treatment(s), s.reasons && arr(s.reasons).length ? "playbooks: " + arr(s.reasons).map(str).join(", ")
             : el("span", { cls: "faint", text: "-" }),

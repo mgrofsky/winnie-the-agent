@@ -191,6 +191,84 @@ def geo_view(g: Optional[GeoInfo]) -> Optional[dict]:
                                                    if g.rdns is None else None)}
 
 
+# ---- what Shodan InternetDB knows about a source address -----------------------------------
+#
+# Open ports, host names, tags, CPEs and vulnerability ids that Shodan's public InternetDB
+# already held for a record's source address (``agents.internetdb``; looked up by the
+# exporter, never by a honeypot container). The answer is third-party data and the host
+# names are attacker-influenced, so every value is checked against a strict pattern and a
+# bound before it is kept, and again when a stored copy is read. Display only: nothing acts
+# on it and it never goes into a model prompt.
+
+SHODAN_PORTS_MAX = 50
+SHODAN_HOSTNAMES_MAX = 10
+SHODAN_HOSTNAME_LEN = 253
+SHODAN_TAGS_MAX = 20
+SHODAN_TAG_LEN = 40
+SHODAN_CPES_MAX = 20
+SHODAN_CPE_LEN = 128
+SHODAN_VULNS_MAX = 50
+SHODAN_SHORT_MAX = 200
+# One label: letters, digits and inner hyphens, at most 63; labels joined by dots.
+HOSTNAME_PATTERN = (r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$")
+SHODAN_TAG_PATTERN = r"^[a-z0-9][a-z0-9_.+-]{0,39}$"
+CPE_PATTERN = r"^cpe:(?:/|2\.3:)[A-Za-z0-9._~%+:*-]{1,120}$"
+CVE_PATTERN = r"^CVE-[0-9]{4}-[0-9]{4,7}$"
+DAY_REQUIRED = r"^\d{4}-\d{2}-\d{2}$"
+
+Port = Annotated[int, Field(ge=1, le=65535)]
+Hostname = Annotated[str, Field(min_length=1, max_length=SHODAN_HOSTNAME_LEN,
+                                pattern=HOSTNAME_PATTERN)]
+ShodanTag = Annotated[str, Field(max_length=SHODAN_TAG_LEN, pattern=SHODAN_TAG_PATTERN)]
+Cpe = Annotated[str, Field(max_length=SHODAN_CPE_LEN, pattern=CPE_PATTERN)]
+Cve = Annotated[str, Field(max_length=20, pattern=CVE_PATTERN)]
+
+
+class ShodanInfo(Strict):
+    # UTC day the answer was fetched. ``found`` is false when InternetDB had nothing.
+    looked_up: str = Field(pattern=DAY_REQUIRED)
+    found: bool = True
+    ports: list[Port] = Field(default_factory=list, max_length=SHODAN_PORTS_MAX)
+    hostnames: list[Hostname] = Field(default_factory=list, max_length=SHODAN_HOSTNAMES_MAX)
+    tags: list[ShodanTag] = Field(default_factory=list, max_length=SHODAN_TAGS_MAX)
+    cpes: list[Cpe] = Field(default_factory=list, max_length=SHODAN_CPES_MAX)
+    vulns: list[Cve] = Field(default_factory=list, max_length=SHODAN_VULNS_MAX)
+
+
+def _first(items: list, n: int) -> str:
+    shown = ", ".join(str(i) for i in items[:n])
+    return shown + (f" +{len(items) - n}" if len(items) > n else "")
+
+
+def shodan_short(s: Optional[ShodanInfo]) -> str:
+    """The compact line: ``ports 22, 80 · tags vpn · 3 known CVEs · host a.example.net``,
+    ``no data`` when InternetDB had nothing, ``nothing listed`` for an empty answer."""
+    if s is None:
+        return ""
+    if not s.found:
+        return "no data"
+    parts = []
+    if s.ports:
+        parts.append("ports " + _first(s.ports, 6))
+    if s.tags:
+        parts.append("tags " + _first(s.tags, 4))
+    if s.vulns:
+        n = len(s.vulns)
+        more = "+" if n >= SHODAN_VULNS_MAX else ""
+        parts.append(f"{n}{more} known CVE{'s' if n != 1 else ''}")
+    if s.hostnames:
+        parts.append("host " + _first(s.hostnames, 1))
+    return (" · ".join(parts) or "nothing listed")[:SHODAN_SHORT_MAX]
+
+
+def shodan_view(s: Optional[ShodanInfo]) -> Optional[dict]:
+    """What a reader shows: the compact line and the stored lists."""
+    if s is None:
+        return None
+    return {"short": shodan_short(s), **s.model_dump(mode="json")}
+
+
 # ---- the structured narrative -------------------------------------------------------------
 #
 # A record's narrative is laid out in parts: a short headline, what the source did
@@ -328,6 +406,9 @@ class TriageRecord(Strict):
     # Where src_ip was when the record was written (``GeoInfo``); absent on records written
     # with the lookup off or before it existed.
     src_geo: Optional[GeoInfo] = None
+    # What Shodan InternetDB knew about src_ip when the record was written (``ShodanInfo``);
+    # absent with the lookup off, before it existed, or when the address was not looked up.
+    src_shodan: Optional[ShodanInfo] = None
 
     @property
     def structured(self) -> bool:
@@ -1234,11 +1315,14 @@ def write_record(record: TriageRecord, reports_dir: Path) -> Path:
     sub = "sessions" if record.kind == "session" else "campaigns"
     path = reports_dir / sub / f"{_safe_filename(record.id)}.json"
     # Without a lookup the file is exactly as before; rdns is left out until it is set.
+    exclude: dict = {}
     if record.src_geo is None:
-        exclude: object = {"src_geo"}
-    else:
-        exclude = {"src_geo": {"rdns"}} if record.src_geo.rdns is None else None
-    _atomic_write(path, record.model_dump_json(indent=2, exclude=exclude))
+        exclude["src_geo"] = True
+    elif record.src_geo.rdns is None:
+        exclude["src_geo"] = {"rdns"}
+    if record.src_shodan is None:
+        exclude["src_shodan"] = True
+    _atomic_write(path, record.model_dump_json(indent=2, exclude=exclude or None))
     return path
 
 
@@ -1257,6 +1341,24 @@ def with_geo(record: TriageRecord, geo: Optional[GeoLookupFn]) -> TriageRecord:
     if found is None or found.empty:
         return record
     return record.model_copy(update={"src_geo": found})
+
+
+ShodanLookupFn = Callable[[str], Optional[ShodanInfo]]
+
+
+def with_shodan(record: TriageRecord, shodan: Optional[ShodanLookupFn]) -> TriageRecord:
+    """``record`` with ``src_shodan`` filled from ``shodan`` (a read of the exporter's local
+    InternetDB file, no network call) when it has none and the file holds an answer for the
+    address. Never raises."""
+    if shodan is None or record.src_shodan is not None or record.src_ip == UNVERIFIED_SOURCE:
+        return record
+    try:
+        found = shodan(record.src_ip)
+    except Exception:  # noqa: BLE001 - the reader promises not to raise; belt and braces
+        found = None
+    if found is None:
+        return record
+    return record.model_copy(update={"src_shodan": found})
 
 
 def fold_unverified(campaigns: list[Campaign]) -> list[tuple[Campaign, list[str]]]:
@@ -1313,7 +1415,8 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
                state_dir: Optional[os.PathLike | str] = None,
                max_records_per_run: int = MAX_RECORDS_PER_RUN,
                retention_days: float = RECORD_RETENTION_DAYS,
-               geo: Optional[GeoLookupFn] = None) -> dict:
+               geo: Optional[GeoLookupFn] = None,
+               shodan: Optional[ShodanLookupFn] = None) -> dict:
     """Triage what finished since the last run.
 
     The cursor is saved after every item, so a crash or provider outage loses nothing.
@@ -1322,7 +1425,8 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
     At most ``max_records_per_run`` records are written; the rest wait for the next run.
     Unverified UDP sources are folded into one record per protocol and window. Records
     older than ``retention_days`` are removed at the end of the run. With ``geo`` (an
-    ``agents.enrich.GeoLookup``), each record stores where its source address was.
+    ``agents.enrich.GeoLookup``), each record stores where its source address was; with
+    ``shodan`` (``agents.internetdb.InternetDbReader.info``), what InternetDB knew about it.
     """
     reports_dir = Path(reports_dir)
     state = Path(state_dir) if state_dir else reports_dir / "state"
@@ -1375,7 +1479,8 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
                 save()
             continue
         if not dry_run:
-            write_record(with_geo(_attribute(record, ht_sources), geo), reports_dir)
+            write_record(with_shodan(with_geo(_attribute(record, ht_sources), geo), shodan),
+                         reports_dir)
             cursor.mark(s.session_id, s.last_offset)
             save()
         written.append(record.id)
@@ -1403,7 +1508,8 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
             record, used = deterministic_campaign(c, tokens), False
         calls += int(used)
         if not dry_run:
-            write_record(with_geo(_attribute(record, ht_sources), geo), reports_dir)
+            write_record(with_shodan(with_geo(_attribute(record, ht_sources), geo), shodan),
+                         reports_dir)
             for cid in member_ids:
                 cursor.mark(cid, c.last_offset)
             save()

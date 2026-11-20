@@ -670,6 +670,80 @@ once a minute and switch to the new copy without a restart. Overwriting the file
 works too but can give odd answers for up to a minute, so prefer the rename. On AWS the
 host has no path to fetch these files; see the deployment README.
 
+## What Shodan already knows about a source
+
+The console can show what Shodan's public InternetDB already holds about an interesting
+source address: open ports, host names, tags (for example `vpn`, `scanner`, `cloud`), CPEs
+and known vulnerability ids. On the record page and the overview's top sources (and the
+decoy screen's per-source list) it is one line under the address, for example
+`Shodan: ports 22, 80, 8080 · tags vpn · 3 known CVEs · host a.example.net`, which opens to
+the full lists, the lookup date and a "Data from Shodan InternetDB" credit. Shodan collects
+this on its own schedule (refreshed weekly), so the source never sees the lookup.
+
+It is off by default. Off, unreachable or rate limited, everything else works as before.
+
+### Terms of use
+
+InternetDB needs no account or key. Shodan's terms: free for non-commercial use; a company
+may use it internally, but not to build a product it charges for (that needs a Shodan
+enterprise licence). Check that your use fits before you turn it on.
+
+### What is sent, and from where
+
+- One HTTPS GET per address to `https://internetdb.shodan.io/<address>`, with the address
+  in the path and nothing else: no cookies, no key, a generic user agent
+  (`internetdb-client/1`), nothing about what the source did. The host is fixed in the code;
+  the configuration cannot point it anywhere else. The certificate is verified, redirects
+  are not followed, each call has a 5 second deadline and the answer is capped at 64 KB.
+- It runs in the `agents` container as part of `run-all` (and `python -m agents ship`),
+  next to the sightings fetch. The honeypot containers never make it and gain no network
+  access. The results go to `<state-dir>/internetdb.json`, which triage and the console
+  read; no new connection between containers.
+- Which addresses: the single source address of triage records seen in the last 7 days
+  that were judged SUSPICIOUS or MALICIOUS or used a honeytoken, most important first.
+  Never an unverified UDP source, a private or other non-global address, a campaign's
+  network, or an address inside `[respond] never_act_on` (list your own and allow-listed
+  addresses there). With a `never_act_on` that does not parse, nothing is looked up.
+- Pacing: one request at a time, at least a second apart, at most 100 per run and 2000 per
+  UTC day. An answer, including "no information", is kept 7 days. A 429, a server error, a
+  redirect or a network failure stops the run and backs off for 15 minutes, doubling up to
+  a day. The file keeps at most 5000 addresses, oldest dropped first.
+
+### The answer is data
+
+Host names come from reverse DNS and certificates, so an attacker can choose them. Each
+value is checked before it is kept: ports are integers from 1 to 65535 (at most 50),
+host names use only letters, digits, hyphens and dots, at most 253 characters (at most
+10), tags and CPEs a short, conservative character set (at most 20 each), and
+vulnerability ids must look like `CVE-2024-12345` (at most 50). Anything else is dropped,
+and an answer that is not a JSON object for the address asked about is not kept. The
+file is checked the same way again when read. It is display only: nothing acts on it, it
+is never put into a model prompt, and the console shows it as plain text.
+
+### Turning it on
+
+```ini
+[connector.internetdb]
+enabled = true
+```
+
+The other keys (`max_per_run`, `max_per_day`, `min_interval_seconds`, `cache_days`,
+`lookback_days`, `max_entries`) are in `SSH/config.ini.TEMPLATE` with their defaults. In
+`docker-compose.yml` the `agents` service already has outbound access; if you filter its
+egress, allow tcp 443 to `internetdb.shodan.io` (it is served from Cloudflare, so its
+addresses are shared and can change). `python -m agents ship --dry-run` says how many
+addresses would be looked up without sending anything.
+
+### What it changes
+
+- Each new triage record stores what the file held for its source when it was written
+  (`src_shodan`, with the lookup date). The lookup runs at the end of a run, after triage,
+  so a source's first record usually has none stored; the console then shows the file's
+  current answer, marked "latest lookup" rather than "when recorded".
+- Records written with the feature off are byte-for-byte as before. The digest, exports,
+  notifications, approval cards and their `view_hash` do not change.
+- Not available on the AWS deployment; see its README.
+
 ## Using the intelligence outside the sensor
 
 The sensor produces addresses and indicators: `detections/pending/blocklist-candidates.csv`,

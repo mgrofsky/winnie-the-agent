@@ -937,6 +937,11 @@ Still unproven:
 - Models only on Amazon Bedrock in the sensor's own account and region, and only through
   `models.yaml` (see [Models on Bedrock](#models-on-bedrock-optional)); no other model
   provider has an egress path. `[listeners] llm` stays off.
+- No Shodan InternetDB details (`[connector.internetdb]`, see the operations guide). Here
+  the agents container has no egress and the exporter, which has the instance role,
+  sees none of the records the lookup needs. InternetDB is served from Cloudflare
+  addresses shared with other sites, so an address pin would not pin the destination.
+  This stack adds no path for it, and both rendered config files leave it off.
 - No address locations (`[geoip]`, see the operations guide, "Where addresses are"). The
   database files would have to reach the host, and the instance has no read path for that
   by design (its role writes events and nothing else); this stack does not add one.
