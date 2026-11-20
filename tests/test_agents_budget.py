@@ -10,6 +10,7 @@ import asyncssh
 import pytest
 
 from agents import hooks
+from agents.replycache import ReplyCache
 from agents.budget import (
     CANNED_CONNECTION_REFUSED,
     CANNED_INTERACTIVE,
@@ -40,6 +41,7 @@ class CountingHistory:
 @pytest.fixture(autouse=True)
 def reset_hooks():
     hooks.reset()
+    hooks.set_reply_cache(ReplyCache(max_entries=0))   # every call here reaches the model
     yield
     hooks.reset()
 
@@ -50,7 +52,7 @@ def _set_budget(**kw):
     return budget
 
 
-async def _call(history, sid="s1", ip="203.0.113.1", text="ls"):
+async def _call(history, sid="s1", ip="203.0.113.1", text="ls -la"):
     return await hooks.persona_invoke(history, session_id=sid, src_ip=ip, username="root",
                                       text=text, interactive=True,
                                       llm_config={"configurable": {"session_id": sid}})
@@ -77,7 +79,7 @@ async def test_each_limit_triggers_canned_path_without_model_call(limits, setup_
     calls_before = len(history.calls)
     logger = logging.getLogger("budget-test")
     r = await hooks.persona_invoke(history, session_id="s1", src_ip="203.0.113.1", username="root",
-                                   text="ls", interactive=True, llm_config={}, logger=logger,
+                                   text="ls -la", interactive=True, llm_config={}, logger=logger,
                                    log_extra={"task_name": "s1"})
     assert r.budget_exceeded and r.content == CANNED_INTERACTIVE
     assert len(history.calls) == calls_before
@@ -122,7 +124,7 @@ async def test_failed_call_keeps_its_reserved_charge():
             raise RuntimeError("provider down")
 
     r = await _call(Boom())                       # degrades to a canned reply ...
-    assert r.content == "root@srv01:~# "          # (ls of an empty home directory)
+    assert r.content == "root@srv01:~# "          # (ls -la, which the shell leaves to the model)
     assert budget.global_tokens >= OUTPUT_ESTIMATE_TOKENS   # ... and the charge is kept
 
 

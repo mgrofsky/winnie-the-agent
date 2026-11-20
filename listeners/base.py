@@ -492,7 +492,7 @@ class ListenerContext:
         if self.budget.session_commands(session_id) is None:
             if self.budget.session_open(session_id, ip) is not None:
                 return None
-        if self._llm_sem.locked():
+        if self._llm_sem.locked() or self.budget.model_cap_reached(session_id, ip):
             return None
         reason, reservation = self.budget.reserve(session_id, ip, system + user)
         if reason is not None:

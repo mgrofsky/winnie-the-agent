@@ -381,15 +381,15 @@ async def test_ssh_persona_tarpit_token_and_shallow(tmp_path):
     h = History()
     start = time.perf_counter()
     await hooks.persona_invoke(h, session_id="s1", src_ip="198.51.100.50", username="root",
-                               text="ls", interactive=True, llm_config={})
+                               text="ls -la", interactive=True, llm_config={})
     assert time.perf_counter() - start >= 0.28                 # tarpit applied
     access, _ = ss.source_token(SEED, "198.51.100.50")
     assert access in h.payloads[0]["decoy_profile"]            # unique token served
     r = await hooks.persona_invoke(h, session_id="s2", src_ip="198.51.100.51", username="root",
-                                   text="ls", interactive=True, llm_config={})
+                                   text="ls -la", interactive=True, llm_config={})
     assert r.budget_exceeded and len(h.payloads) == 1          # shallow: canned, no model call
     await hooks.persona_invoke(h, session_id="s3", src_ip="198.51.100.52", username="root",
-                               text="ls", interactive=True, llm_config={})
+                               text="ls -la", interactive=True, llm_config={})
     assert access not in h.payloads[-1]["decoy_profile"]      # others never see it
 
 
@@ -553,7 +553,7 @@ async def test_listener_entry_point_hands_source_state_to_the_telnet_persona(tmp
 
     start = time.perf_counter()
     await hooks.persona_invoke(History(), session_id="telnet-1", src_ip="198.51.100.90",
-                               username="admin", text="ls", interactive=True, llm_config={})
+                               username="admin", text="ls -la", interactive=True, llm_config={})
     assert time.perf_counter() - start >= 0.18
     assert ss.source_token(SEED, "198.51.100.90")[0] in History.payload["decoy_profile"]
 

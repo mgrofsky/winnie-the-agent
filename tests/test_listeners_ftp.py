@@ -541,3 +541,25 @@ def test_generated_archives_and_audio_have_real_formats():
     wav = generate_content(ctx, "/voicemail/1001/msg0001.wav", 8000)
     assert wav[:4] == b"RIFF" and wav[8:16] == b"WAVEfmt " and len(wav) == 8000
     assert generate_content(ctx, "/backups/notes.txt", 200).startswith(b"# notes.txt")
+
+
+async def test_mlst_and_site_answer_like_the_advertised_server(ftp_server):
+    ctx, writer, port = await ftp_server(accept="all")
+    c = await Ctl.login(port)
+    assert await c.cmd("MLST /backups/config-2026-03-01.tar.gz") == \
+        "250-Listing /backups/config-2026-03-01.tar.gz"
+    assert await c.line() == (" type=file;size=48213;modify=20260301020000;perm=adfrw; "
+                              "/backups/config-2026-03-01.tar.gz")
+    assert await c.line() == "250 End"
+    assert await c.cmd("MLST") == "250-Listing /"
+    assert (await c.line()).startswith(" type=dir;size=4096;")
+    assert await c.line() == "250 End"
+    assert await c.cmd("MLST /nope") == "550 Permission denied."
+    assert await c.cmd("SITE HELP") == "214 CHMOD UMASK HELP"
+    assert await c.cmd("SITE CHMOD 777 /voicemail/README.txt") == "200 SITE CHMOD command ok."
+    assert await c.cmd("SITE CHMOD 777 /nope") == "550 SITE CHMOD command failed."
+    assert await c.cmd("SITE CHMOD 777") == "501 SITE CHMOD needs 2 arguments."
+    assert await c.cmd("SITE UMASK") == "200 Your current UMASK is 0077"
+    assert await c.cmd("SITE UMASK 022") == "200 UMASK set to 0022"
+    assert await c.cmd("SITE CPFR /etc/passwd") == "500 Unknown SITE command."
+    assert await c.cmd("NOOP") == "200 NOOP ok."

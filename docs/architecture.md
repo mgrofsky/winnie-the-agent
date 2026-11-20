@@ -95,17 +95,41 @@ interactive session, and over SSH exec `bash: line 1: ...` (bash 5.1 and later, 
 scenario's distribution release) or `bash: ...` (older bash). `/proc/meminfo` and `free`
 report whole 4 kB pages.
 
-With a model and `[llm] local_shell_replies = true` (the default), host facts (not `ls`,
-`cd`, `ps`, `echo`, `/etc/passwd` or the downloaders) are answered from the profile, but
-only until the model has handled a command in that session. After that every command goes
-to the model, because the session may have changed something a local answer would
-contradict (`hostname x`, `useradd`, a `cd`). Local answers cost no model call, count
-against the per-session command cap, follow the source's `shallow` mode, and are added to
-the session's chat history (each clipped to 4 KB) so the model's later replies agree with
-them; those characters count in the token estimate made before each model call. A session
-whose commands were all answered this way gets no model summary. When the model fails
-after it has moved the session to another directory, the fallback reply keeps the prompt
-(and working directory) the model last showed.
+With a model and `[llm] local_shell_replies = true` (the default), a line the shell can
+answer is answered from the profile, by how far its commands could disagree with what the
+session has done (`agents.shell.FIXED`, `SESSION`, `STATE`; a line takes the highest):
+
+- Facts no command can change are answered locally for the whole session: the kernel
+  (`uname` without the nodename), `uptime`, `w`, `who`, `nproc`, `free`, `lscpu`, `lspci`,
+  `nvidia-smi` on a GPU host, the `/proc` CPU, memory, version, uptime and load files,
+  `echo`, the IoT openers and `busybox` applet probes.
+- Facts a session can change (`hostname`, `uname -n` and `-a`, `whoami`, `id`, `which`,
+  `command -v`, `ls`, `pwd`, `ps`, `df`, `sh`, every file outside those `/proc` files,
+  including `/etc/os-release` and the other release files, a file that does not exist, and
+  a program path that does not exist, such as `/usr/bin/xmr`) are answered locally only
+  until a model reply (fresh or cached) has answered a command in the session; after that
+  the model answers them, because it may have run `hostname x`, `useradd`, written a file
+  or downloaded a program. The model's own session opener does not count.
+- Commands that change the session (`cd`, `export`, `unset`, `history`, `wget`, `curl`,
+  `tftp`) always go to the model, which then owns the change.
+
+A local answer given after the model has answered ends with exactly the prompt the model
+last showed (the last line of its reply), and paths resolve from the directory that prompt
+shows: `user@host:DIR# `, or `[user@host ~]# ` and `[user@host /]# ` on RHEL. When the
+prompt has any other shape (`export PS1='$ '`, or RHEL's `[root@host tmp]# `, which shows
+only the last path component), the session gets no more local answers; the model answers
+everything from then on. Local answers cost no model call, count
+against the per-session command cap but not the model cap, follow the source's `shallow`
+mode, and are added to the session's chat history (each clipped to 4 KB) so the model's
+later replies agree with them; those characters count in the token estimate made before
+each model call. A session whose commands were all answered this way gets no model
+summary. When the model fails after it has moved the session to another directory, the
+fallback reply keeps the prompt (and working directory) the model last showed.
+
+The persona block tells the model the exact line bash prints for a program the host does
+not have (`-bash: NAME: command not found` in a login shell, `bash: line 1: NAME: command
+not found` over SSH exec on bash 5.1 and later), so it answers an unknown program the way
+the shell would instead of inventing output.
 
 A model reply that reads as the model talking and not as shell output (for example "As an
 AI", "I'm sorry, but", "I apologize, but", or a mention of its instructions or system
@@ -450,11 +474,14 @@ model is not called: the attacker gets a canned error and the session closes, an
 |---|---|
 | `max_line_bytes` (input is truncated) | 2048 |
 | `max_commands_per_session` | 200 |
+| `max_model_commands_per_session` (see below) | 50 |
 | `max_tokens_per_session` | 400,000 |
 | `max_tokens_per_ip_per_day` (IPv6 per /64) | 1,000,000 |
 | `max_tokens_per_day` (global) | 3,000,000 |
 | `max_concurrent_sessions` | 20 |
 | `max_concurrent_sessions_per_ip` | 3 |
+| `reply_cache_entries` (0 turns the reply cache off) | 2000 |
+| `reply_cache_max_age` (seconds) | 21600 |
 
 - The estimated cost (history length / 4 plus 512 output tokens) is reserved before the
   call and corrected from the provider's usage data afterwards, so concurrent sessions can
@@ -464,7 +491,59 @@ model is not called: the attacker gets a canned error and the session closes, an
   and a restart does not reset the day. A malformed file restarts the day from zero with a
   warning.
 - A source in `shallow` mode (set by a playbook) gets canned replies only; `deep` doubles
-  its per-session and per-source limits. The global cap never changes.
+  its per-session and per-source limits (the model cap too). The global cap never changes.
+- `max_model_commands_per_session` counts the commands the model was asked, failed calls
+  included (a failed call still reserved its cost). Cached replies are looked up first and
+  still served past it. When a
+  session reaches it, the session is not closed: every later command is answered by the
+  deterministic shell, so an unknown command gets `command not found` and `exit` still
+  ends the session. One `Model cap reached` event (with `limit`) is logged per session; the
+  shell's answers are added to the history for the summary. Listener model calls (SQL,
+  HTTP) stop at the same cap and get their protocol's error. There is no per-source
+  counterpart: a source opening session after session to reset the cap is already bounded
+  by `max_tokens_per_ip_per_day` and `max_concurrent_sessions_per_ip`.
+- The reply cache (`agents/replycache.py`) keeps model replies in memory and serves one
+  again, with no model call and no tokens, to a session whose history so far is identical.
+  The key is a hash chained over the host (scenario and sensor seed), the login user,
+  interactive or exec, the persona block, and every turn so far: each input line and the
+  reply as the history holds it. Bots replay one script, so their sessions mostly hit. A
+  hit is added to the history, counts toward `max_commands_per_session` but not the model
+  cap, and counts as a model reply for the local-answer rule above. The session summary is
+  cached the same way.
+- A session uses the cache only while everything in its history is a function of its key:
+  a local answer that read neither the clock nor the source address
+  (`agents.shell.Answer.shareable`), a cached reply, or a model reply it has just stored.
+  It leaves the cache for good, neither reading nor writing it, as soon as its history gets
+  anything else: a local answer from `w`, `who`, `uptime`, `ps`, `/proc/uptime` or
+  `/proc/loadavg` (clock or address), a model error or fallback, a reply past the model
+  cap, a reply replaced because it broke character or misprinted an `echo`, or a model
+  reply that was not stored. A source with a planted token or a `deep` or `shallow` mode
+  never uses it, and neither does a session whose cache state was evicted (it never
+  restarts from the root key). Not stored, as a second line: replies that end the
+  session, replies that contain the session's address (whole, or cut to 16 characters as
+  `w` cuts IPv6), replies to lines whose real output changes between runs (`date`,
+  `uptime`, `ps`, `/dev/urandom`, `mktemp`, `openssl`, ...) and replies over 16 KB. The
+  cache is bounded by `reply_cache_entries` (least recently used out first) and
+  `reply_cache_max_age`, and is not kept across a restart, so a changed prompt, model or
+  scenario never serves an old reply.
+- Timing: a local or cached reply is as fast as a real shell, while a model reply takes
+  the model's latency, so a script can tell which commands reach the model. The
+  per-source tarpit does not cover this (it applies to flagged sources only, to every
+  reply). `[llm] local_reply_delay_ms` (default 0, at most 2000) waits a random half to all
+  of that time before a local, cached or capped reply in a model-backed session. It only
+  narrows the gap, since model latency varies far more, and it slows every scripted bot,
+  so it is off by default.
+- `[llm] prompt_caching` marks the persona request for the provider's prompt cache. It is
+  on by default for the Anthropic provider. For `aws` it is off by default and is used
+  only when set to `true`, and then only for model ids containing `anthropic.` or
+  `amazon.nova` (the families langchain-aws marks cache points for; other Bedrock models
+  reject them). Not every model in those families accepts cache points, so if the first
+  request with one is refused as invalid (Bedrock `ValidationException`, Anthropic 400),
+  it is retried without the cache point and caching stays off until restart, with one
+  `Prompt caching disabled` log line. It places one breakpoint on the last message, so the
+  system prompt, persona block and the session so far are read from the provider's cache
+  on the next command. Other providers are unchanged. The budget still charges the full
+  token count the provider reports.
 - Listener model calls (SQL, HTTP and Telnet fallbacks) use the same budget, take a session
   slot, run at most `llm_max_inflight` at a time, make one request with no retries, and
   fail closed when no budget is initialised.
