@@ -580,3 +580,80 @@ def test_found_in_review():
     assert run(["cp /bin/echo /usr/local/bin/x", "/usr/local/bin/x hi"])[1] == "hi\n"
     assert run(["echo é > /tmp/u", "dd if=/tmp/u bs=1 count=1 2>/dev/null | wc -c"])[1] == "1\n"
     assert shell.answer(h, "mkdir -p /tmp/a/b/c/d/e/f/g/h/i", now=NOW) is None
+
+
+# ---- output the shell cannot evaluate still follows its redirections --------------------------
+
+def test_fallback_output_goes_where_its_redirections_point():
+    session = shell.Session(cwd="/root")
+    assert run(["printf hi > /tmp/x", "cat /tmp/x"], session=session) == ["", "hi"]
+    assert run(["printf yo >> /tmp/x", "cat /tmp/x"], session=session) == ["", "hiyo"]
+    assert run(["printf a > /dev/null", "printf b >&2", "printf c 2>/dev/null >&2",
+                "printf d 2>&1"]) == ["", "b", "", "d"]
+    # the missing file's error is the tool's own, sent to /dev/null; the list goes on
+    assert one("cat /tmp/nope 2>/dev/null; echo marker") == "marker\n"
+    assert one("foo 2>/dev/null; echo marker") == "marker\n"
+    assert one("foo > /dev/null 2>&1") == ""
+    assert one("foo 2>&1 > /dev/null") == "-bash: foo: command not found\n"
+    assert run(["foo 2>/tmp/e", "cat /tmp/e"]) == ["", "-bash: foo: command not found\n"]
+    # a target this shell cannot write: the output is not shown instead
+    assert one("printf hi > /etc/passwd") == ""
+
+
+def test_fallback_in_a_pipeline_answers_each_stage_through_its_own_redirections():
+    assert one("printf hi | foo") == "-bash: foo: command not found\n"
+    assert one("printf hi | foo 2>/dev/null") == ""
+    assert one("foo | bar 2>/dev/null") == "-bash: foo: command not found\n"
+    assert one("foo | echo hi") == "-bash: foo: command not found\nhi\n"
+    # the last stage's status decides && and ||
+    assert one("printf hi | foo && echo ok") == "-bash: foo: command not found\n"
+    assert one("foo 2>/dev/null | cat || echo no") == ""
+    # every stage still opens its files, and output into a pipe is not shown
+    session = shell.Session(cwd="/root")
+    assert run(["foo 2>/dev/null | cat > /tmp/q", "ls /tmp/q"], session=session) \
+        == ["", "/tmp/q\n"]
+    assert run(["printf hi > /tmp/p | cat", "cat /tmp/p"], session=session) == ["", "hi"]
+    assert one("printf hi 2>&1 | foo 2>/dev/null") == ""
+    assert one("foo | cat > /root") == ("-bash: foo: command not found\n"
+                                        "-bash: /root: Is a directory\n")
+
+
+def test_busybox_printf_and_a_read_loop_follow_their_redirections():
+    session = shell.Session(cwd="/root")
+    assert run(["busybox printf hi > /tmp/y", "cat /tmp/y"], session=session) == ["", "hi"]
+    # a read loop with nothing to read cannot be answered, but its file is still made
+    assert run(["while read i; do echo $i; done > /tmp/l", "ls /tmp/l"],
+               session=session) == ["", "/tmp/l\n"]
+
+
+def test_a_redirection_error_goes_where_fd_2_points_by_then():
+    session = shell.Session(cwd="/root")
+    run(["touch /tmp/f", "rm /tmp/f"], session=session)
+    assert run(["cat 2>/dev/null < /tmp/f"], session=session) == [""]
+    assert run(["cat < /tmp/f 2>/dev/null"], session=session) \
+        == ["-bash: /tmp/f: No such file or directory\n"]
+    assert run(["echo hi 2>/tmp/e > /root", "cat /tmp/e"], session=session) \
+        == ["", "-bash: /root: Is a directory\n"]
+    assert one("foo 2>/dev/null > /root") == ""
+
+
+def test_a_line_that_cannot_be_parsed_keeps_its_stderr_redirections():
+    assert one("foo $X") == "-bash: foo: command not found\n"
+    assert one("foo $X 2>/dev/null") == ""
+    assert one("foo $X >/dev/null 2>&1") == ""
+    assert one("foo $X &>/dev/null") == ""
+    assert one("foo $X 2>&1 >/dev/null") == "-bash: foo: command not found\n"
+    assert one("foo '2>/dev/null' $X") == "-bash: foo: command not found\n"
+    # only the first command's redirections count
+    assert one("foo $X; bar 2>/dev/null") == "-bash: foo: command not found\n"
+    assert one("foo $X | bar 2>/dev/null") == "-bash: foo: command not found\n"
+
+
+def test_redirected_fallback_output_stays_within_the_session_limits():
+    session = shell.Session(cwd="/root")
+    word = "A" * 1000
+    line = "; ".join([f"printf {word} >> /tmp/big"] * 3)
+    replies = run([line] * 60, session=session)
+    assert session.size() <= shell.MAX_SCRATCH_BYTES
+    assert len(session.files["/tmp/big"].data) > shell.MAX_SCRATCH_BYTES - 3000
+    assert all(r == "" for r in replies)

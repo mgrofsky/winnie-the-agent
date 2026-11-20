@@ -785,6 +785,9 @@ class Shell:
         self.work = 0                       # see MAX_WORK
         self.stage_out = 0                  # characters the current command produced
         self.failed: Optional[list[str]] = None   # the command that could not be evaluated
+        self.stage = 0                      # the pipeline stage being evaluated
+        self.stage_fds: Optional[dict] = None     # its descriptors, once opened
+        self.stage_errs: list[str] = []     # what the stages before it wrote to stderr
         self._files: dict[str, Optional[str]] = {}
         self.memo: dict = {}                # seeded values reused within the line
 
@@ -860,14 +863,44 @@ class Shell:
     def _fallback(self, pipeline: list[_Simple]) -> _Result:
         """What a list part this shell cannot evaluate prints, as ``unhandled`` does for a
         whole line: the tool's own error, a builtin's literal output, nothing for a known
-        command, ``command not found`` for an unknown one."""
+        command, ``command not found`` for an unknown one. The stage that could not be
+        evaluated and every stage after it answer so, each through its own redirections like
+        any other output (bash starts every stage); what the stages before it wrote to
+        stderr stays."""
         failed, self.failed = self.failed, None
-        argv = pipeline[0].argv
-        if not argv or pipeline[0].loop is not None:
+        k, fds, before = self.stage, self.stage_fds, "".join(self.stage_errs)
+        last = len(pipeline) - 1
+        out, errs, late, status, scope = "", [before], "", 0, STATE
+        for index in range(k, last + 1):
+            cmd = pipeline[index]
+            if index == k and fds is not None:
+                opened = (fds, None, FIXED)
+            else:                           # not opened yet, or opening them was what failed
+                opened = self._redirect(cmd, None, lenient=True)
+            if isinstance(opened, _Result):     # a redirection failed: the command never ran
+                routed = opened
+            else:
+                text = self._fallback_text(cmd, failed if index == k else None)
+                routed = self._route(opened[0], text, opened[2])
+            errs.append(routed.err)
+            if index < last:
+                errs.append(routed.late)    # its stdout went into the next stage
+            else:
+                out, late, status = routed.out, routed.late, routed.status
+            scope = max(scope, routed.scope)
+        return _Result(out, "".join(errs), status, scope, late)
+
+    def _fallback_text(self, cmd: _Simple, failed: Optional[list[str]]) -> _Result:
+        """What the command that could not be evaluated prints, before its redirections."""
+        argv = cmd.argv
+        if not argv or cmd.loop is not None:
             return _Result(scope=STATE)
-        name = self.resolve(argv[0])
-        if name in ("echo", "printf") and len(pipeline) == 1:
-            return _Result(literal_output(shlex.join([name] + argv[1:])) or "", scope=STATE)
+        name, words = self.resolve(argv[0]), argv
+        if name == "busybox" and len(argv) > 1 and argv[1] in ("echo", "printf") \
+                and self.installed("busybox"):
+            name, words = argv[1], argv[1:]
+        if name in ("echo", "printf"):
+            return _Result(literal_output(shlex.join([name] + words[1:])) or "", scope=STATE)
         if failed is not None:
             failed_name = self.resolve(failed[0])
             if failed_name is not None and self.installed(failed_name):
@@ -882,8 +915,10 @@ class Shell:
 
     def _pipeline(self, pipeline: list[_Simple]) -> _Result:
         stdin: Optional[str] = None
-        errors, scope, result = [], FIXED, _Result()
+        self.stage_errs = []                # read by _fallback when a stage is unsupported
+        errors, scope, result = self.stage_errs, FIXED, _Result()
         for index, cmd in enumerate(pipeline):
+            self.stage, self.stage_fds = index, None
             result = self._simple(cmd, stdin if index else None, index < len(pipeline) - 1)
             errors.append(result.err)
             if index < len(pipeline) - 1:
@@ -894,36 +929,12 @@ class Shell:
 
     def _simple(self, cmd: _Simple, stdin: Optional[str], piped: bool = False) -> _Result:
         """One command with its redirections, applied in order as bash applies them."""
-        fds: dict[int, tuple] = {1: ("out",), 2: ("err",)}
-        scope = FIXED
         self.exe = "bash"                   # the shell opens the redirections
-        for op, fd, target in cmd.redirs:
-            self.charge(COMMAND)
-            if op == "<":
-                if fd != 0:
-                    raise _Unsupported
-                read = self.read_file(target)
-                if read is None:
-                    raise _Unsupported
-                if read.err:
-                    shown = "".join(c for c in target if c.isprintable())[:256]
-                    return _Result(err=f"{self.prefix}: {shown}: No such file or directory\n",
-                                   status=1, scope=max(scope, SESSION))
-                self.charge(len(read.out))
-                stdin, scope = read.out, max(scope, read.scope)
-            elif op == ">&":
-                if fd not in (1, 2):
-                    raise _Unsupported
-                fds[fd] = fds[int(target)]
-            else:
-                if fd not in (1, 2):
-                    raise _Unsupported
-                dest = self._open_write(target, append=op == ">>")
-                if isinstance(dest, _Result):
-                    dest.scope = max(dest.scope, scope)    # an earlier one may have made a file
-                    return dest
-                fds[fd] = dest
-                scope = max(scope, STATE if dest[0] == "file" else FIXED)
+        opened = self._redirect(cmd, stdin)
+        if isinstance(opened, _Result):
+            return opened
+        fds, stdin, scope = opened
+        self.stage_fds = fds
         self.raw = fds[1][0] == "file" or (piped and fds[1][0] == "out")
         try:
             if cmd.loop is not None:
@@ -934,6 +945,57 @@ class Shell:
                 result = self._command(cmd.argv, stdin)
         finally:
             self.raw = False
+        return self._route(fds, result, scope)
+
+    def _redirect(self, cmd: _Simple, stdin: Optional[str], lenient: bool = False):
+        """Open ``cmd``'s redirections in order: (fds, stdin, scope), or the result of one
+        that fails, its message written where fd 2 points by then (``2>/dev/null </x`` is
+        silent). ``lenient`` (``_fallback``) skips a redirection this shell cannot open, and
+        discards output that would go there, instead of raising ``_Unsupported``."""
+        fds: dict[int, tuple] = {1: ("out",), 2: ("err",)}
+        scope = FIXED
+        for op, fd, target in cmd.redirs:
+            self.charge(COMMAND)
+            try:
+                if op == "<":
+                    if fd != 0:
+                        raise _Unsupported
+                    read = self.read_file(target)
+                    if read is None:
+                        raise _Unsupported
+                    if read.err:
+                        shown = "".join(c for c in target if c.isprintable())[:256]
+                        scope = max(scope, SESSION)
+                        return self._route(fds, _Result(
+                            err=f"{self.prefix}: {shown}: No such file or directory\n",
+                            status=1, scope=scope), scope)
+                    self.charge(len(read.out))
+                    stdin, scope = read.out, max(scope, read.scope)
+                elif op == ">&":
+                    if fd not in (1, 2):
+                        raise _Unsupported
+                    fds[fd] = fds[int(target)]
+                else:
+                    if fd not in (1, 2):
+                        raise _Unsupported
+                    dest = self._open_write(target, append=op == ">>")
+                    if isinstance(dest, _Result):
+                        # an earlier one may have made a file
+                        return self._route(fds, dest, max(dest.scope, scope))
+                    fds[fd] = dest
+                    scope = max(scope, STATE if dest[0] == "file" else FIXED)
+            except _OverBudget:
+                raise
+            except _Unsupported:
+                if not lenient:
+                    raise
+                if op != "<" and fd in (1, 2):
+                    fds[fd] = ("null",)
+        return fds, stdin, scope
+
+    def _route(self, fds: dict[int, tuple], result: _Result, scope: int) -> _Result:
+        """``result`` sent where its descriptors point: to a session file (within the session
+        limits), nowhere, or back as the reply's output or error."""
         routed = {"out": "", "err": "", "late": ""}
         for text, fd, stream in ((result.out, 1, "out"), (result.err, 2, "err"),
                                  (result.late, 2, "late")):
@@ -1233,7 +1295,48 @@ def reply(host: Host, text: str, *, user: str = "root", interactive: bool = True
         return result.output
     if word in SHELL_BUILTINS:
         return literal_output(text) or ""
-    return sh.unhandled(text)
+    return sh.unhandled(text) if _stderr_shown(text) else ""
+
+
+_LOOSE_REDIR = re.compile(r"(?:(?<![^ \t])([0-9]))?(&>>?|>>|>&|>|<)[ \t]*([^ \t;|&<>]*)")
+
+
+def _stderr_shown(line: str) -> bool:
+    """Whether the first command of a line ``run`` could not parse still writes its stderr
+    to the terminal, read loosely from its redirections (``foo $X 2>/dev/null`` is silent).
+    Quotes are honoured; the command ends at an unquoted ``;``, ``|`` or ``&&``."""
+    masked, quote, i = [], None, 0
+    while i < len(line):
+        c = line[i]
+        if quote is not None:
+            masked.append("x" if c != quote else c)
+            quote = None if c == quote else quote
+        elif c in "'\"":
+            quote = c
+            masked.append(c)
+        elif c == "\\":
+            masked.append("xx")
+            i += 1
+        else:
+            masked.append(c)
+        i += 1
+    text = "".join(masked)[:len(line)]
+    end = re.search(r"&&|[;|]|&(?![>])(?<!>&)", text)
+    fds = {1: "out", 2: "err"}
+    for m in _LOOSE_REDIR.finditer(text, 0, end.start() if end else len(text)):
+        op = m.group(2)
+        fd = int(m.group(1)) if m.group(1) else (0 if op == "<" else 1)
+        target = line[m.start(3):m.end(3)].replace("'", "").replace('"', "")
+        if op.startswith("&>"):
+            fds[1] = fds[2] = "away"
+        elif op == ">&":
+            if fd in (1, 2) and target in ("1", "2"):
+                fds[fd] = fds[int(target)]
+            elif fd in (1, 2) and target == "-":
+                fds[fd] = "away"
+        elif op != "<" and fd in (1, 2):
+            fds[fd] = "away"
+    return fds[2] != "away"
 
 
 def prompt_path(cwd: Optional[str], home: str) -> str:
