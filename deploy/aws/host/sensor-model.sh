@@ -107,6 +107,7 @@ if [ "${1:-}" = setup ]; then
   chmod 0400 config.ini
   { grep -v '^COMPOSE_FILE=' .env || :; echo "COMPOSE_FILE=$f:docker-compose.model.yml"; } > .env.new
   mv -f .env.new .env
+  echo "$EP" > "$S/applied"
 fi
 
 # The accept to the current address first, then every caller accept to any other address
@@ -122,17 +123,19 @@ while read -r line; do
   iptables -w -D DOCKER-USER -s "${BASH_REMATCH[1]}" -d "${BASH_REMATCH[2]}" -p tcp --dport 443 -j ACCEPT
 done <<< "$rules"
 
-# The address changed since the overlay was written: pin the new one and recreate only the
-# running callers. Until then they still resolve the old address, which no rule lets them
-# reach any more, so their calls fail rather than go elsewhere.
+# The address is not the one last applied: pin the new one and recreate only the running
+# callers. Until then they still resolve the old address, which no rule lets them reach
+# any more, so their calls fail rather than go elsewhere. The applied address is saved
+# only after every caller was brought up, so a run that failed part way is done again.
 if [ "${1:-}" != setup ] && [ -f docker-compose.model.yml ] \
-    && ! grep -qF "\"$NAME:$EP\"" docker-compose.model.yml; then
+    && [ "$(cat "$S/applied" 2>/dev/null || :)" != "$EP" ]; then
   overlay
   for s in ssh agents; do
     grep -q "^  $s:" docker-compose.model.yml || continue
     [ -z "$(docker compose ps -q --status running "$s" 2>/dev/null || :)" ] \
       || docker compose up -d --no-deps "$s"
   done
+  echo "$EP" > "$S/applied"
 fi
 
 # Credentials, per caller, from its own role into its own directory: written beside the

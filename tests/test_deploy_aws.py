@@ -1810,7 +1810,7 @@ open(path, "w").write("".join(r + "\n" for r in rules))
 
 def _run_model(tmp_path, *, persona="us.anthropic.claude-haiku-5-5", analyst="",
                answer="10.64.0.37", saved=None, aws_fails=False, compose_fails=False,
-               setup=True, env_text=None, running=False, script=None):
+               setup=True, env_text=None, running=False, script=None, up_fails=False):
     """Run host/sensor-model.sh with fakes on PATH. Returns (exit code, stderr, accept
     rules added as (source, destination), the home directory, the credentials directory,
     the log). The fake DOCKER-USER chain persists in tmp_path across runs."""
@@ -1830,7 +1830,8 @@ def _run_model(tmp_path, *, persona="us.anthropic.claude-haiku-5-5", analyst="",
         "docker": "#!/bin/bash\necho \"docker $*\" >> \"$LOG\"\n" + (
             "case \"$*\" in *'compose config'*) exit 1 ;; esac\n" if compose_fails else "")
             + "case \"$*\" in *' run '*|run*) echo '[Unit]' ;; esac\n"
-            + ("case \"$*\" in *'compose ps'*) echo 0123abcd ;; esac\n" if running else ""),
+            + ("case \"$*\" in *'compose ps'*) echo 0123abcd ;; esac\n" if running else "")
+            + ("case \"$*\" in *'compose up'*) exit 1 ;; esac\n" if up_fails else ""),
         "systemctl": "#!/bin/bash\necho \"systemctl $*\" >> \"$LOG\"\n",
         "chown": "#!/bin/bash\n",
         "flock": "#!/bin/bash\necho \"flock $*\" >> \"$LOG\"\n",
@@ -2032,6 +2033,22 @@ def test_a_new_address_moves_the_accepts_and_the_pin(tmp_path):
     first_delete = next(i for i, l in enumerate(lines) if " -D " in l)
     assert max(i for i, l in enumerate(lines) if " -I " in l) < first_delete
     assert first_delete < next(i for i, l in enumerate(lines) if "compose config" in l)
+
+
+def test_a_failed_recreate_is_done_again_on_the_next_run(tmp_path):
+    _run_model(tmp_path)                                          # persona only
+    code, _, _, _, _, log = _run_model(tmp_path, answer="10.64.0.52", setup=False,
+                                       running=True, up_fails=True)
+    assert code != 0 and "docker compose up -d --no-deps ssh" in log
+    # The overlay already names the new address; the caller is still brought up again.
+    code, err, _, _, _, log = _run_model(tmp_path, answer="10.64.0.52", setup=False,
+                                         running=True)
+    assert code == 0, err
+    assert [l for l in log.splitlines() if " up " in l] == ["docker compose up -d --no-deps ssh"]
+    code, err, _, _, _, log = _run_model(tmp_path, answer="10.64.0.52", setup=False,
+                                         running=True)
+    assert code == 0, err
+    assert "compose" not in log
 
 
 def test_a_new_address_recreates_only_the_configured_running_callers(tmp_path):
