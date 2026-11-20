@@ -540,7 +540,7 @@ async def test_server_starts_offline_when_the_provider_key_is_not_set(
         ssh_module.with_message_history, session_id="s1", src_ip="198.51.100.7",
         username="guest", text="uname -a", interactive=True,
         llm_config={"configurable": {"session_id": "s1"}})
-    assert "command not found" in reply.content
+    assert reply.content.startswith("Linux ") and "GNU/Linux\r\n" in reply.content
 
 
 def test_history_trim_counter_weights_non_ascii_text(ssh_module):

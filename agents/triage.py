@@ -397,6 +397,7 @@ def _honeytokens_in(texts: Iterable[str], values) -> list[str]:
 # ---- deterministic records ----------------------------------------------------------------
 
 def deterministic_campaign(c: Campaign, honeytokens: list[str]) -> TriageRecord:
+    add_campaign_signals(c)
     techniques: list[Technique] = []
     intent, stage, judgement = Intent.RECONNAISSANCE, Stage.RECONNAISSANCE, Judgement.BENIGN
     if c.attempts:
@@ -421,6 +422,9 @@ def deterministic_campaign(c: Campaign, honeytokens: list[str]) -> TriageRecord:
         techniques.append(Technique(id="T1059", name="Command and Scripting Interpreter"))
     if c.high_signal.get("smtp_relay_attempt"):
         intent, judgement = Intent.SPAM_RELAY, Judgement.MALICIOUS
+    if c.high_signal.get("hardware_recon"):
+        stage = max(stage, Stage.DISCOVERY, key=lambda s: STAGE_RANK[s])
+        techniques.append(Technique(id="T1082", name="System Information Discovery"))
     if c.protocol == "s3" and any(S3_LISTED_RE.match(cmd) for cmd in c.commands):
         # Enumeration: bucket or object listings that succeeded (refused ones are noise).
         stage = max(stage, Stage.DISCOVERY, key=lambda s: STAGE_RANK[s])
@@ -506,10 +510,165 @@ _PERSIST_CMD_RE = re.compile(
     r"\bsystemctl\s+(?:--\S+\s+)*enable\b|\bupdate-rc\.d\b|\bchkconfig\s+\S+\s+on\b"
     r"|\bcrontab\s+(?:-e\b|-\s*(?:$|[;&|)])|-u\s+\S+\s+[^-\s]|[^-\s])", re.I)
 
+# Sizing a host for mining, judged on command words (after any path, ``sudo``/``env`` style
+# wrappers, ``which`` and ``command -v``), never on substrings: running or looking up
+# nvidia-smi; lspci piped to a grep for VGA, 3D or nvidia, or run with a display-class or
+# NVIDIA-vendor filter (``-d ::0300``, ``-d 10de:``); a CPU count taken from /proc/cpuinfo in
+# one pipeline (``grep -c``, ``wc -l``), or /proc/cpuinfo read in one command and ``nproc``
+# run in another. A plain uname, lscpu, nproc, lspci or cat /proc/cpuinfo alone does not
+# count, nor does ``echo nvidia-smi`` or ``ls .../nvidia-smi.txt``.
+_WRAPPERS = frozenset(("sudo", "env", "nohup", "exec", "time", "nice", "busybox"))
+_LOOKUPS = frozenset(("which", "whereis", "type"))
+_GPU_WORDS = ("vga", "3d", "nvidia")
+
+
+def _pipelines(cmd: str) -> list[list[list[str]]]:
+    """The simple commands of a shell line, as pipelines of argument lists. Quotes are
+    removed and nothing is expanded; ``;``, ``&&``, ``||``, ``&``, newlines, parentheses,
+    braces and command substitution all separate commands, redirection targets are dropped.
+    One linear pass: this reads attacker text."""
+    pipelines: list[list[list[str]]] = []
+    pipeline: list[list[str]] = []
+    argv: list[str] = []
+    word: list[str] = []
+    in_word = skip = False
+    i, n = 0, len(cmd)
+
+    def end_word() -> None:
+        nonlocal word, in_word, skip
+        if in_word:
+            if not skip:
+                argv.append("".join(word))
+            skip = False
+        word, in_word = [], False
+
+    def end_command(end_pipeline: bool) -> None:
+        nonlocal argv, pipeline
+        end_word()
+        if argv:
+            pipeline.append(argv)
+        argv = []
+        if end_pipeline and pipeline:
+            pipelines.append(pipeline)
+            pipeline = []
+
+    while i < n:
+        c = cmd[i]
+        if c in " \t":
+            end_word()
+        elif c in "'\"":
+            close = cmd.find(c, i + 1)
+            close = n if close < 0 else close
+            word.append(cmd[i + 1:close])
+            in_word = True
+            i = close
+        elif c == "\\":
+            word.append(cmd[i + 1:i + 2])
+            in_word = True
+            i += 1
+        elif c == "|" and cmd[i + 1:i + 2] != "|":
+            end_command(False)
+        elif c in ";&|\n\r()`{}" or (c == "$" and cmd[i + 1:i + 2] == "("):
+            end_command(True)
+            if c in "&|" and cmd[i + 1:i + 2] == c or c == "$":
+                i += 1
+        elif c in "<>":
+            if in_word and "".join(word).isdigit():
+                word, in_word = [], False               # a file descriptor: 2>/dev/null
+            end_word()
+            while i + 1 < n and cmd[i + 1] in "<>&":
+                i += 1
+            skip = True                                 # the target is not an argument
+        else:
+            word.append(c)
+            in_word = True
+        i += 1
+    end_command(True)
+    return pipelines
+
+
+def _command_names(argv: list[str]) -> tuple[str, list[str]]:
+    """(the command a simple command runs, its arguments), past assignments and wrappers;
+    for ``which x`` / ``command -v x`` the names looked up are returned as ``which``'s."""
+    k = 0
+    while k < len(argv):
+        word = argv[k]
+        name = word.rsplit("/", 1)[-1]
+        if "=" in word and not word.startswith("=") and k == 0 or \
+                (k and word.startswith("-") and argv[0].rsplit("/", 1)[-1] in _WRAPPERS):
+            k += 1
+        elif name in _WRAPPERS and k + 1 < len(argv):
+            k += 1
+        elif name == "command" and k + 1 < len(argv) and argv[k + 1] not in ("-v", "-V"):
+            k += 1
+        else:
+            return name, argv[k + 1:]
+    return "", []
+
+
+def _runs_or_looks_up(argv: list[str], wanted: str) -> bool:
+    name, args = _command_names(argv)
+    if name == wanted:
+        return True
+    if name in _LOOKUPS or (name == "command" and args[:1] in (["-v"], ["-V"])):
+        return any(a.rsplit("/", 1)[-1] == wanted for a in args if not a.startswith("-"))
+    return False
+
+
+def _gpu_class_filter(args: list[str]) -> bool:
+    """``lspci -d [vendor]:[device][:class]`` selecting NVIDIA or a display controller."""
+    for k, arg in enumerate(args):
+        value = arg[2:] if arg.startswith("-d") and len(arg) > 2 else \
+            (args[k + 1] if arg == "-d" and k + 1 < len(args) else None)
+        if value is None:
+            continue
+        parts = value.lower().split(":")
+        if parts[0] == "10de" or (len(parts) > 2 and parts[2].startswith("03")):
+            return True
+    return False
+
+
+def _counts_lines(name: str, args: list[str]) -> bool:
+    options = [a for a in args if a.startswith("-") and not a.startswith("--")]
+    if name in ("grep", "egrep", "fgrep"):
+        return "--count" in args or any("c" in a[1:] for a in options)
+    return name == "wc" and ("--lines" in args or any("l" in a[1:] for a in options))
+
+
+def hardware_recon(commands: list[str]) -> int:
+    """How many commands size the host for mining (see the comment above ``_pipelines``)."""
+    hits = 0
+    cpuinfo = nproc = False
+    for raw in commands:
+        pipelines = _pipelines(raw[:4000])
+        hit = reads_cpuinfo = False
+        for pipeline in pipelines:
+            names = [_command_names(argv) for argv in pipeline]
+            if any(_runs_or_looks_up(argv, "nvidia-smi") for argv in pipeline):
+                hit = True
+            for k, (name, args) in enumerate(names):
+                if name != "lspci":
+                    continue
+                greps = [a.lower() for later, a_list in names[k + 1:]
+                         if later in ("grep", "egrep", "fgrep") for a in a_list]
+                if _gpu_class_filter(args) or \
+                        any(w in a for a in greps for w in _GPU_WORDS):
+                    hit = True
+            here = any("/proc/cpuinfo" in a for _, args in names for a in args)
+            if here and any(_counts_lines(name, args) for name, args in names):
+                hit = True
+            reads_cpuinfo |= here
+            nproc |= any(name == "nproc" for name, _ in names)
+        hits += hit
+        cpuinfo |= reads_cpuinfo
+    return hits or int(cpuinfo and nproc)       # read in one command, counted in another
+
+
 SESSION_SIGNAL_FLOORS = {
     "download_execute": Stage.EXECUTION,
     "persistence": Stage.PERSISTENCE,
     "credential_file_read": Stage.CREDENTIAL_ACCESS,
+    "hardware_recon": Stage.DISCOVERY,
 }
 
 
@@ -531,7 +690,20 @@ def session_signals(commands: list[str]) -> dict[str, int]:
             out["persistence"] = out.get("persistence", 0) + 1
     if fetched and executed and "download_execute" not in out:
         out["download_execute"] = 1                      # fetched in one command, run in another
+    recon = hardware_recon(commands)
+    if recon:
+        out["hardware_recon"] = recon
     return out
+
+
+def add_campaign_signals(c: Campaign) -> None:
+    """Telnet campaigns carry the shell lines typed after a successful login; the same
+    code-computed ``hardware_recon`` signal is set from them (idempotent)."""
+    if c.protocol != "telnet":
+        return
+    recon = hardware_recon(c.post_login)
+    if recon:
+        c.high_signal["hardware_recon"] = recon
 
 
 def _session_floor(judgement: Judgement, stage: Stage, signals: dict[str, int],
@@ -797,6 +969,7 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
         written.append(record.id)
 
     for c, member_ids in fold_unverified(campaigns):
+        add_campaign_signals(c)
         if capped():
             deferred.append(c.campaign_id)
             continue

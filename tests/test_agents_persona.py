@@ -230,6 +230,7 @@ async def _persona_reply(tmp_path, reply, text, events=None):
 
     hooks.reset()
     hooks.set_budget(Budget(BudgetConfig(state_file=str(tmp_path / "budget.json"))))
+    hooks.set_local_replies(False)   # these tests are about how model replies are handled
 
     class _Logger:
         def info(self, message, extra=None):
@@ -390,6 +391,7 @@ async def test_model_error_event_carries_the_provider_message(tmp_path):
 
     hooks.reset()
     hooks.set_budget(Budget(BudgetConfig(state_file=str(tmp_path / "budget.json"))))
+    hooks.set_local_replies(False)
     try:
         await hooks.persona_invoke(_Failing(), session_id="s", src_ip="203.0.113.5", username="root",
                                    text="id", interactive=True, llm_config={}, logger=_Logger(),

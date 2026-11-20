@@ -1,0 +1,20 @@
+name = "miner_recon"
+description = "Logged-in shell sizing the host for mining: GPU queries, lspci for a display or compute card, or a CPU count from /proc/cpuinfo (found by code). Tag, capture more and notify; no deeper model budget and no enforcement."
+enabled = true
+cooldown_minutes = 60
+max_runs_per_day = 200
+
+[when]
+signals = ["hardware_recon"]
+
+[[steps]]
+action = "tag_source"
+tag = "miner_recon"
+
+[[steps]]
+action = "capture_more"
+
+[[steps]]
+action = "notify"
+connectors = ["webhook", "siem_http", "email"]
+include = ["tags"]

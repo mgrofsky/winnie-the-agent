@@ -13,7 +13,7 @@ halves share files, never a network connection.
 
 | Component | Location | Role |
 |---|---|---|
-| SSH honeypot | `SSH/ssh_server.py`, `agents/hooks.py` | The upstream DECEIVE server: a model plays a Linux shell. `ssh_server.py` stays close to upstream; each addition is a small call into `agents/hooks.py`, marked with an `agent layer` comment. |
+| SSH honeypot | `SSH/ssh_server.py`, `agents/hooks.py`, `agents/shell.py` | The upstream DECEIVE server: a model plays a Linux shell. `ssh_server.py` stays close to upstream; each addition is a small call into `agents/hooks.py`, marked with an `agent layer` comment. |
 | Listeners | `listeners/` | Low-interaction traps for SIP (UDP and TCP), FTP, Telnet, PostgreSQL, MySQL, MSSQL, Redis, SMTP, HTTP, HL7 MLLP and S3-compatible storage, all in one asyncio process (`python -m listeners`). |
 | Scenarios | `scenarios/` | One strict schema describing the fake target; loader, synthetic-data checker and describer. See [scenarios.md](scenarios.md). |
 | Budgets | `agents/budget.py` | Spend and concurrency limits for every model call, shared by the SSH and listener processes. |
@@ -37,12 +37,75 @@ Every persona model call goes through `agents.hooks.persona_invoke`, which:
 3. applies the source's tarpit delay, if a playbook set one.
 
 If the model call fails (provider error, timeout), the session continues with a plausible
-canned reply instead: `-bash: <command>: command not found` followed by a prompt, and
-`exit` or `logout` end the session. If the configured provider needs an API key from the
-environment (`anthropic`, `openai`, `gemini`, `azure`) and the variable is not set, the
-persona runs offline from the start: no network attempt is made and every command gets a
-canned reply. A warning is logged once at startup. Offline replies charge no tokens to any
-budget; the per-session command cap and the concurrency limits still apply.
+canned reply instead, from the deterministic shell in `agents/shell.py` (below), followed
+by a prompt; `exit` or `logout` end the session. If the configured provider needs an API
+key from the environment (`anthropic`, `openai`, `gemini`, `azure`) and the variable is not
+set, the persona runs offline from the start: no network attempt is made and every command
+gets a canned reply. A warning is logged once at startup. Offline replies charge no tokens
+to any budget; the per-session command cap and the concurrency limits still apply.
+
+#### Deterministic shell
+
+`agents/shell.py` is the one answerer for the SSH fallback and the Telnet trap's canned
+shell, so the two cannot disagree. It answers, from the scenario's host profile
+(`[identity]` and `[identity.hardware]`), the sensor seed and the clock, with no model and
+no subprocess:
+
+- identity and uptime: `uname` (all flags, real field order), `hostname`, `uptime` (also
+  `-p`, `-s`), `whoami`, `id`, `w`, `nproc`, `free` (`-b`, `-k`, `-m`, `-g`, `-h`, `-t`),
+  `df` (`-h`, paths), `ps` (plain, `aux`, `-ef`);
+- files: `/proc/cpuinfo`, `/proc/meminfo`, `/proc/version`, `/proc/uptime`,
+  `/proc/loadavg`, `/proc/mounts`, `/etc/os-release`, `/etc/issue`, `/etc/hostname`,
+  `/etc/passwd` (the scenario's users plus the login account), `/etc/shells`, and the
+  distribution's own release files (another distribution's are "No such file");
+- hardware: `lscpu`, `lspci`, `nvidia-smi` (plain, `-q`, `-L`, `--query-gpu` with CSV
+  output), or `command not found` when the profile has no GPU;
+- `which`, `command -v`, `ls` (and `cd`, `pwd`) of `/`, `/home`, `/tmp`, `/var/tmp`,
+  `/dev/shm`, `/root`, `/opt`, `/srv`, `/mnt`, `/media` and home directories, showing the
+  scenario's lures where they live;
+- the IoT botnet openers `system`, `shell`, `sh` (no output), `enable` (bash's list of
+  builtins: both front ends present bash, and a bot sending it reads nothing from the
+  reply) and `busybox NAME` (`NAME: applet not found`), with the BusyBox version the
+  distribution release ships; RHEL and its rebuilds ship none, so there `busybox` is
+  `command not found`;
+- `wget`, `curl` and `tftp`, which exist but fail (no route, or no name resolution) without
+  any lookup or connection;
+- `echo` (including `-e` escapes) and the quiet builtins.
+
+A command given by path (`/bin/uname`, `/bin/./uname`, `/usr/bin/id`) answers the same.
+Pipelines of that output through `grep` (`-c`, `-i`, `-v`, `-n`, `-q`, `-F`, `-e`),
+`head`/`tail -n`, `cut -d -f/-c`, `wc` and `awk '{print $N, ...}'` (with `-F`) are
+evaluated in Python, as are `;`, `&&` and `||` lists of them. `grep` patterns are fixed
+strings plus `.`, `^` and `$`, matched by hand; no attacker text is ever compiled as a
+regular expression, and the module's own parsing of attacker text (words, `awk` programs,
+`cut` lists, counts, `echo -e` escapes) is a single linear pass.
+
+This code runs on the event loop, so one line's cost is bounded as a whole: every command
+and filter charges one work counter per character and per loop step, every command's output
+is capped at 128 KiB (the line's at 128 KiB too), and a command reads at most 8 files. A
+line over any of these limits falls back like an unknown line. The worst line we could
+construct on the largest valid profile (64 CPUs, 8 GPUs) costs about 12 ms. Input over
+4096 characters, more than 8 commands in a pipeline or list, control characters,
+redirection, substitution, variables, globbing, and any command, option or file it does not
+know fall back too: to the model; without one, to a builtin's own output, the known tool's
+own error for an option or file it does not handle (`invalid option`, `No such file or
+directory`) or no output, and `command not found` only for a command the host does not
+have. Errors from the shell itself are worded as bash words them: `-bash: ...` in an
+interactive session, and over SSH exec `bash: line 1: ...` (bash 5.1 and later, by the
+scenario's distribution release) or `bash: ...` (older bash). `/proc/meminfo` and `free`
+report whole 4 kB pages.
+
+With a model and `[llm] local_shell_replies = true` (the default), host facts (not `ls`,
+`cd`, `ps`, `echo`, `/etc/passwd` or the downloaders) are answered from the profile, but
+only until the model has handled a command in that session. After that every command goes
+to the model, because the session may have changed something a local answer would
+contradict (`hostname x`, `useradd`, a `cd`). Local answers cost no model call, count
+against the per-session command cap, follow the source's `shallow` mode, and are added to
+the session's chat history (each clipped to 4 KB) so the model's later replies agree with
+them; those characters count in the token estimate made before each model call. A session
+whose commands were all answered this way gets no model summary. When the model fails
+after it has moved the session to another directory, the fallback reply keeps the prompt
+(and working directory) the model last showed.
 
 A model reply that reads as the model talking and not as shell output (for example "As an
 AI", "I'm sorry, but", "I apologize, but", or a mention of its instructions or system

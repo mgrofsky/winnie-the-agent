@@ -11,7 +11,6 @@ import base64
 import logging
 import os
 import re
-import shlex
 from configparser import ConfigParser
 from types import SimpleNamespace
 from typing import Any, MutableMapping, Optional
@@ -26,7 +25,7 @@ from agents.budget import (
     Budget,
     BudgetConfig,
 )
-from agents import runtime
+from agents import runtime, shell
 from agents.budget import ip_key
 from agents.source_state import MAX_TARPIT_MS, SourceStateView, source_state_path, source_token
 
@@ -39,9 +38,12 @@ _scenario = None                       # scenarios.loader.LoadedScenario
 _scenario_args: Optional[tuple] = None  # (name, seed, overlay_path) for reload
 _overlay_mtime: Optional[float] = None
 _session_fragments: dict[str, str] = {}
+_session_prompts: dict[str, str] = {}   # the last prompt the model showed, per session
+MAX_LOCAL_HISTORY = 4096   # characters of a local answer kept in the chat history
 _source_view: Optional[SourceStateView] = None
 _seed: Optional[str] = None
 _offline_reason: Optional[str] = None   # set when the persona model cannot be used at all
+_local_replies = True   # answer host facts from the profile before asking the model
 
 # Providers whose client needs an API key from the environment; without it every call
 # would fail after network round trips, so the persona runs offline instead.
@@ -70,6 +72,7 @@ def init_runtime(config: ConfigParser, config_path: Optional[str], base_dir: str
     _budget.mode_provider = source_mode
     _seed = runtime.sensor_seed(config, ddir)
     set_offline(provider_unavailable(config))
+    set_local_replies(local_replies_enabled(config))
     _config_path = os.path.abspath(config_path) if config_path else None
     _cli_accounts = dict(cli_accounts or {})
     _overlay_path = str(runtime.overlay_path(config, base_dir))
@@ -97,6 +100,26 @@ def provider_unavailable(config: ConfigParser) -> Optional[str]:
     return f"{key_env} not set" if key_env and not os.environ.get(key_env) else None
 
 
+def local_replies_enabled(config: ConfigParser) -> bool:
+    """``[llm] local_shell_replies`` (default on)."""
+    return config["llm"].getboolean("local_shell_replies", fallback=True) \
+        if "llm" in config else True
+
+
+def set_local_replies(enabled: bool) -> None:
+    """With a model, answer host facts (``uname``, ``nproc``, ``free``, ``/proc``, ``lspci``,
+    ``nvidia-smi``, ...) from the host profile instead, until the model has handled a
+    command in the session."""
+    global _local_replies
+    _local_replies = bool(enabled)
+
+
+def shell_host(scenario=None) -> shell.Host:
+    """The host profile the deterministic shell answers from: the given scenario (the
+    listeners pass their own), else the active one, else the neutral default host."""
+    return shell.host_for(scenario if scenario is not None else get_scenario(), _seed)
+
+
 def offline_reason() -> Optional[str]:
     """Why the persona runs without a model, or None when a model is configured."""
     return _offline_reason
@@ -115,92 +138,62 @@ def _hostname() -> str:
     return scenario.hostname if scenario is not None else "srv01"
 
 
-def shell_prompt(username: Optional[str]) -> str:
+def shell_prompt(username: Optional[str], hostname: Optional[str] = None) -> str:
     user = (username or "user")[:32]
-    return f"{user}@{_hostname()}:~{'#' if user == 'root' else '$'} "
+    return f"{user}@{hostname or _hostname()}:~{'#' if user == 'root' else '$'} "
 
 
-SHELL_BUILTINS = frozenset((
-    "echo", "printf", "cd", "export", "unset", "set", "alias", "unalias", "true", ":",
-    "source", ".", "umask", "ulimit", "shopt", "trap", "wait", "read", "local", "declare",
-    "typeset", "readonly", "eval", "exec", "hash", "history", "builtin", "command",
-))
+SHELL_BUILTINS = shell.SHELL_BUILTINS
+MAX_ECHO_OUTPUT = shell.MAX_ECHO_OUTPUT
+_literal_output = shell.literal_output
 
 
-def fallback_reply(text: str, interactive: bool, username: Optional[str]) -> str:
+def fallback_reply(text: str, interactive: bool, username: Optional[str],
+                   host: Optional[shell.Host] = None, src_ip: Optional[str] = None,
+                   prompt: Optional[str] = None) -> str:
     """A plausible shell reply when the model cannot answer: a prompt for the session
-    opener, the builtin's own output (or none) for a shell builtin, otherwise 'command not
-    found'. Only our own text plus a cleaned command word."""
-    prompt = shell_prompt(username) if interactive else ""
-    word = "".join(c for c in (text.split() or [""])[0] if c.isprintable())[:64]
+    opener, otherwise the deterministic shell's reply (``agents.shell.reply``: host facts
+    from the profile, a builtin's own output, a known tool's own error, else 'command not
+    found'), then the prompt. ``prompt`` is the one the model showed last, so a directory
+    the model moved to stays in the prompt (and is the working directory here)."""
+    host = host or shell_host()
+    cwd = None
+    if interactive and prompt:
+        cwd = _prompt_directory(prompt, username)
+    else:
+        prompt = shell_prompt(username, host.hostname) if interactive else ""
+    word = shell.clean_word(text)
     if not word:
         return prompt
     if word in ("exit", "logout") and interactive:
         return "YYY-END-OF-SESSION-YYY"   # same marker the model uses to end the session
-    if word in SHELL_BUILTINS:      # a builtin is never "not found"
-        return in_character_reply(text, interactive, username)
-    eol = "\r\n" if interactive else "\n"
-    return f"-bash: {word}: command not found{eol}{prompt}"
+    out = shell.reply(host, text, user=username or "user",
+                      interactive=interactive, cwd=cwd, src_ip=src_ip)
+    return (out.replace("\n", "\r\n") if interactive else out) + prompt
 
 
-_NOT_LITERAL = re.compile(r"[$`*?|;&<>(){}\[\]~\\]")
-MAX_ECHO_OUTPUT = 4096
+def _prompt_directory(prompt: str, username: Optional[str]) -> Optional[str]:
+    """The working directory a ``user@host:DIR# `` prompt shows, or None."""
+    _, sep, rest = prompt.strip().partition(":")
+    path = rest[:-1] if sep and rest[-1:] in ("#", "$") else ""
+    user = (username or "user")[:32]
+    home = "/root" if user == "root" else f"/home/{user}"
+    if path == "~" or path.startswith("~/"):
+        path = home + path[1:]
+    return path if path.startswith("/") and len(path) <= 256 else None
 
 
-def _literal_output(text: str) -> Optional[str]:
-    """What ``echo`` or ``printf`` of literal arguments prints, computed in code; None when
-    the command is anything else or its arguments need a shell to expand."""
-    try:
-        words = shlex.split(text)
-    except ValueError:
-        return None
-    if not words or words[0] not in ("echo", "printf"):
-        return None
-    if words[0] == "echo" and any(_NOT_LITERAL.search(w) for w in words[1:]):
-        return None
-    if words[0] == "printf" and (any(_NOT_LITERAL.search(w) for w in words[2:])
-                                 or re.search(r"[$`]", " ".join(words[1:2]))):
-        return None
-    if words[0] == "echo":
-        args, newline = words[1:], True
-        while args and args[0] in ("-n", "-e", "-E", "-ne", "-en"):
-            newline = newline and "n" not in args[0]
-            args = args[1:]
-        out = " ".join(args) + ("\n" if newline else "")
-    else:
-        if len(words) < 2:
-            return None
-        fmt, args = words[1], words[2:]
-        fmt = fmt.replace("\\n", "\n").replace("\\t", "\t")
-        if re.search(r"%[^sd%]", fmt):
-            return None
-        out, i = "", 0
-        for part in re.split(r"(%[sd%])", fmt):
-            if part == "%%":
-                out += "%"
-            elif part in ("%s", "%d"):
-                value = args[i] if i < len(args) else ""
-                i += 1
-                if part == "%d":
-                    try:
-                        value = str(int(value or 0))
-                    except ValueError:
-                        return None
-                out += value
-            else:
-                out += part
-    return "".join(c for c in out if c.isprintable() or c in "\n\t")[:MAX_ECHO_OUTPUT]
-
-
-def in_character_reply(text: str, interactive: bool, username: Optional[str]) -> str:
+def in_character_reply(text: str, interactive: bool, username: Optional[str],
+                       prompt: Optional[str] = None) -> str:
     """Replacement for a model reply that stepped out of the role: the real output for
-    ``echo``/``printf`` of literal arguments, otherwise empty output, then the prompt."""
+    ``echo``/``printf`` of literal arguments, otherwise empty output, then the prompt (the
+    one the model showed last, when known)."""
     word = (text.split() or [""])[0]
     if word in ("exit", "logout") and interactive:
         return "YYY-END-OF-SESSION-YYY"
     output = _literal_output(text) or ""
     if interactive:
-        return output.replace("\n", "\r\n") + shell_prompt(username)
+        return output.replace("\n", "\r\n") + (prompt or shell_prompt(username))
     return output
 
 
@@ -226,8 +219,9 @@ def source_mode(key: str) -> str:
 def reset() -> None:
     """Back to the uninitialised state (tests)."""
     global _budget, _config_path, _scenario, _scenario_args, _overlay_mtime, _overlay_path
-    global _accounts_mtimes, _source_view, _seed, _offline_reason
+    global _accounts_mtimes, _source_view, _seed, _offline_reason, _local_replies
     _offline_reason = None
+    _local_replies = True
     _source_view = None
     _seed = None
     _budget = None
@@ -236,6 +230,7 @@ def reset() -> None:
     _scenario = _scenario_args = _overlay_mtime = None
     _cli_accounts.clear()
     _session_fragments.clear()
+    _session_prompts.clear()
 
 
 def set_budget(budget: Budget) -> None:
@@ -310,6 +305,7 @@ def session_close(session_id: str, history_store: Optional[MutableMapping] = Non
     if _budget is not None:
         _budget.session_close(session_id)
     _session_fragments.pop(session_id, None)
+    _session_prompts.pop(session_id, None)
     if history_store is not None:
         history_store.pop(session_id, None)
 
@@ -441,6 +437,38 @@ def _replace_in_history(history, session_id: str, sent: str) -> None:
         messages[-1] = AIMessage(content=sent)
 
 
+def _remember(history, session_id: str, text: str, sent: str) -> Optional[str]:
+    """Add a turn answered without the model to the session history, so the model's later
+    replies stay consistent with it. Returns what was stored (None when nothing was)."""
+    getter = getattr(history, "get_session_history", None)
+    if not callable(getter):
+        return None
+    try:
+        getter(session_id).add_messages([HumanMessage(content=text), AIMessage(content=sent)])
+    except Exception:  # noqa: BLE001 - a history store without this shape is left alone
+        return None
+    return sent
+
+
+def _clip_local(output: str) -> str:
+    """A local answer as kept in the chat history: at most ``MAX_LOCAL_HISTORY``
+    characters, cut at a line end."""
+    if len(output) <= MAX_LOCAL_HISTORY:
+        return output
+    head = output[:MAX_LOCAL_HISTORY]
+    cut = head.rfind("\n")
+    return head[:cut + 1] if cut > 0 else head + "\n"
+
+
+def _note_prompt(session_id: str, content: str) -> None:
+    """Remember the prompt a model reply ends with, for replies made without the model."""
+    last = content.rstrip(" \r\n").rpartition("\n")[2].strip()
+    if len(last) <= 300 and _FINAL_PROMPT.match(last):
+        if len(_session_prompts) > 10_000:
+            _session_prompts.clear()
+        _session_prompts[session_id] = last + " "
+
+
 _FINAL_PROMPT = re.compile(r"^\S*@\S*[$#]$")
 
 
@@ -467,18 +495,32 @@ async def _tarpit(src_ip: str) -> None:
 
 async def persona_invoke(history, *, session_id: str, src_ip: str, username: Optional[str],
                          text: str, interactive: bool, llm_config: dict, logger=None,
-                         log_extra: Optional[dict] = None, counts_as_command: bool = True):
+                         log_extra: Optional[dict] = None, counts_as_command: bool = True,
+                         scenario=None):
     """The one path every persona model call takes (SSH and telnet).
 
     Reserves the estimated cost first. When a limit would be exceeded the model is not
     called: a canned, plausible response is returned with ``budget_exceeded=True`` and
     the caller closes. A failed call keeps its reserved charge. Offline (no model), replies
-    are canned and charge no tokens; the per-session command cap still applies.
+    are canned and charge no tokens; the per-session command cap still applies. With a
+    model and ``local_shell_replies`` on, a host fact is answered from the profile the same
+    way (no tokens, counted as a command, added to the history and to the token estimate)
+    until the model has handled a command in the session; then the model answers all.
+    ``scenario`` overrides the active scenario for those answers (the telnet listener).
     """
     budget = _budget_or_none()
+    host = shell_host(scenario)
+    local = None
+    # Local answers only until the model has handled a command in this session: after
+    # that the model owns the host's state (it has the local answers in its history).
+    if budget is not None and not _offline_reason and _local_replies and counts_as_command \
+            and not budget.model_answered(session_id):
+        local = shell.answer(host, text, user=username or "user", interactive=interactive,
+                             src_ip=src_ip)
+        local = local if local is not None and local.stateless else None
     if budget is None:
         reason, reservation = "budget_not_initialised", None
-    elif _offline_reason:
+    elif _offline_reason or local is not None:
         reason = budget.count_command(session_id, src_ip) if counts_as_command else None
         reservation = None
     else:
@@ -489,7 +531,18 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         return SimpleNamespace(content=canned, budget_exceeded=True)
     if _offline_reason:
         await _tarpit(src_ip)
-        return SimpleNamespace(content=fallback_reply(text, interactive, username))
+        return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip))
+    if local is not None:
+        await _tarpit(src_ip)
+        prompt = shell_prompt(username, host.hostname) if interactive else ""
+
+        def shown(output: str) -> str:
+            return (output.replace("\n", "\r\n") if interactive else output) + prompt
+
+        stored = _remember(history, session_id, text, shown(_clip_local(local.output)))
+        if stored is not None:
+            budget.add_history(session_id, src_ip, text, stored)
+        return SimpleNamespace(content=shown(local.output), local_reply=True)
     try:
         response = await history.ainvoke(
             {
@@ -504,11 +557,12 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         _log(logger, "Model error", log_extra, error=type(exc).__name__,
              error_detail=_clip_error(exc))
         await _tarpit(src_ip)
-        return SimpleNamespace(content=fallback_reply(text, interactive, username))
+        return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip,
+                                                      _session_prompts.get(session_id)))
     budget.commit(reservation, text, _content(response), usage_tokens=_usage_tokens(response))
     await _tarpit(src_ip)
     if breaks_character(_content(response), text):
-        sent = in_character_reply(text, interactive, username)
+        sent = in_character_reply(text, interactive, username, _session_prompts.get(session_id))
         _replace_in_history(history, session_id, sent)
         original = _content(response)[:MAX_BREAK_LOGGED]
         _log(logger, "Persona break", log_extra,
@@ -519,11 +573,13 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         expected = (_literal_output(text) or "").strip()
         if expected and expected not in reply.content:
             # echo/printf of literal text has one right answer; use it when the model's differs
-            sent = in_character_reply(text, interactive, username)
+            sent = in_character_reply(text, interactive, username,
+                                      _session_prompts.get(session_id))
             _replace_in_history(history, session_id, sent)
             return SimpleNamespace(content=sent,
                                    usage_metadata=getattr(reply, "usage_metadata", None))
         tidy = _tidy_prompt(reply.content)
+        _note_prompt(session_id, tidy)
         if tidy != reply.content:
             return SimpleNamespace(content=tidy,
                                    usage_metadata=getattr(reply, "usage_metadata", None))
@@ -544,7 +600,7 @@ async def summary_invoke(history, *, session_id: str, src_ip: str, username: Opt
         return SimpleNamespace(content=SUMMARY_SKIPPED, budget_exceeded=True)
     if _offline_reason:
         return SimpleNamespace(content=SUMMARY_SKIPPED, budget_exceeded=True)
-    if budget.session_commands(session_id) == 0:
+    if budget.model_commands(session_id) == 0:
         _log(logger, "Summary skipped", log_extra, reason="no_model_commands")
         return SimpleNamespace(content=SUMMARY_SKIPPED, budget_exceeded=True)
     reason, reservation = budget.reserve(session_id, src_ip, prompt, counts_as_command=False)
