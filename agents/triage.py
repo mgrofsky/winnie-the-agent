@@ -503,24 +503,25 @@ INTENT_HEADLINES = {
 }
 
 # What each code-computed high-signal event says the source did; unknown names get a
-# generic line.
+# generic line. A signal records that the source sent the request, not that it worked, so
+# each line says what was tried.
 SIGNAL_ACTIONS = {
-    "download_execute": "Fetched a file and ran it",
-    "persistence": "Wrote to a startup, scheduler or login file to stay on the host",
-    "credential_file_read": "Read a credential file",
+    "download_execute": "Tried to fetch a file and run it",
+    "persistence": "Tried to write a startup, scheduler or login file to stay on the host",
+    "credential_file_read": "Tried to read a credential file",
     "hardware_recon": "Checked CPU or GPU capacity, as miners do before deploying",
-    "redis_takeover": "Rewrote the Redis configuration to write files on the host",
+    "redis_takeover": "Sent Redis commands used to take a server over (rewrite, script or wipe)",
     "sql_exec_attempt": "Tried to run operating system commands through the database",
     "sql_cred_dump": "Queried the database's own credential tables",
     "smtp_relay_attempt": "Tried to relay mail to outside addresses",
-    "sip_dialed_number": "Placed calls to outside numbers",
-    "s3_bulk_download": "Downloaded many objects from the storage bucket",
-    "s3_upload": "Uploaded objects to the storage bucket",
+    "sip_dialed_number": "Tried to place calls to outside numbers",
+    "s3_bulk_download": "Requested many objects from the storage bucket",
+    "s3_upload": "Sent objects to the storage bucket",
     "s3_planted_key": "Used a planted storage access key",
-    "ftp_upload": "Uploaded a file over FTP",
+    "ftp_upload": "Sent a file over FTP",
     "ftp_active_mode": "Asked the server to connect out to another address",
     "http_proxy_attempt": "Tried to use the web server as a proxy",
-    "quarantine_quota": "Uploaded more than the quarantine accepts",
+    "quarantine_quota": "Sent more than the quarantine accepts",
 }
 
 JUDGEMENT_ASSESSMENT = {

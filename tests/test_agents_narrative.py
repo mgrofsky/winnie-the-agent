@@ -208,7 +208,7 @@ def test_rule_based_session_fills_the_parts(tmp_path):
     rec = TriageRecord.model_validate_json((reports / "sessions" / "session-n.json").read_text())
     assert not rec.llm_used and rec.structured
     assert rec.headline == "Download and run over SSH"
-    assert "Fetched a file and ran it" in rec.actions
+    assert "Tried to fetch a file and run it" in rec.actions
     assert rec.narrative.startswith("ssh session with 2 commands")     # paragraph unchanged
 
 
