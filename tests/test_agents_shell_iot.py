@@ -320,7 +320,7 @@ def test_mkdir_mv_touch_and_cd_stay_consistent():
     assert out[:4] == ["", "", "", ""] and out[4] == "b\n"
     assert out[5] == "mkdir: cannot create directory '/tmp/.d': File exists\n"
     assert out[7] == "rm: cannot remove '/tmp/.d': Is a directory\n"
-    assert out[8] == ""                       # the listing of a removed dir is unknown
+    assert out[8] == "ls: cannot access '/tmp/.d': No such file or directory\n"
 
 
 def test_files_are_only_made_where_a_listing_is_known():
@@ -664,3 +664,215 @@ def test_a_copied_program_reads_its_input():
                "/tmp/c < /tmp/in"])
     assert out[1] == "hello\n"
     assert out[3] == "data\n"
+
+
+# ---- review round 3: bounded work, pipeline input after a fallback, removed directories ----
+
+def _old_columns(names, width=80):
+    """The layout search before it was bounded: every column count, for comparison."""
+    import math
+    best = [names]
+    for cols in range(len(names), 0, -1):
+        rows = math.ceil(len(names) / cols)
+        grid = [names[c * rows:(c + 1) * rows] for c in range(cols)]
+        if not grid[-1]:
+            continue
+        if sum(max(map(len, col)) for col in grid) + 2 * (len(grid) - 1) <= width:
+            best = grid
+            break
+    widths = [max(map(len, col)) + 2 for col in best]
+    out = []
+    for r in range(len(best[0])):
+        cells = [(col[r], w) for col, w in zip(best, widths) if r < len(col)]
+        out.append("".join(n.ljust(w) for n, w in cells[:-1]) + cells[-1][0])
+    return "\n".join(out) + "\n"
+
+
+def test_ls_columns_are_laid_out_as_before_in_linear_work():
+    import random
+    r = random.Random(7)
+    for _ in range(300):
+        names = sorted({"".join(r.choice("abcdefgh._-") for _ in range(r.randint(1, 14)))
+                        for _ in range(r.randint(1, 120))})
+        assert shell._columns(names) == _old_columns(names)
+    names = list(host().bin_dirs()["/usr/bin"])
+    assert shell._columns(names) == _old_columns(names)
+    charged = []
+    shell._columns(names, charge=charged.append)
+    assert len(charged) <= 80 // 3 + 2                 # never one try per name
+
+
+def _worst(line, h=None, session=None, user="root"):
+    """(seconds, charged work, answered) for one line, as the canned shell runs it."""
+    sh = shell.Shell(h or host(), user, True, "/root", NOW, None, session or shell.Session())
+    started = time.perf_counter()
+    answer = sh.run(line, partial=True)
+    return time.perf_counter() - started, sh.work, answer is not None
+
+
+def _fill(part):
+    """``part`` repeated as often as one line allows (MAX_LINE and MAX_LIST)."""
+    per = part.count(";") + 1
+    n = 1
+    while len(";".join([part] * (n + 1))) <= shell.MAX_LINE \
+            and (n + 1) * per <= shell.MAX_LIST:
+        n += 1
+    return ";".join([part] * n)
+
+
+@pytest.mark.parametrize("setup,part", [
+    ([], "ls /bin /sbin /usr/bin /usr/sbin /bin /sbin /usr/bin /usr/sbin >/dev/null"),
+    ([], "ls /bin /bin /bin /bin /bin /bin /bin /bin >/dev/null"),
+    ([], "touch /tmp/a;ls /bin /sbin /usr/bin /usr/sbin>/dev/null"),
+    (["touch /tmp/zz"], "touch /tmp/zz;ls /bin /usr/sbin>/dev/null"),
+    (["touch /tmp/zz"], "rm a b c d e f g h|rm a b c d e f g h|rm a b c d e f g h"),
+    ([f"cp /bin/sh /tmp/f{i}" for i in range(30)], "touch /tmp/a;ls -l /tmp / /tmp />/dev/null"),
+    ([f"cp /bin/sh /tmp/f{i}" for i in range(30)], "ls -la /tmp /tmp /tmp /tmp >/dev/null"),
+    ([], "cat /bin/sh /bin/ls|while read i; do echo $i; done >/dev/null"),
+    ([], "foo>/tmp/a|foo>/tmp/b|foo>/tmp/c|foo>/tmp/d|foo>/tmp/e|foo>/tmp/f|foo>/tmp/g"),
+    ([], "printf aaaaaaaaaaaaaaaaaaaa|foo|cat|foo|wc -c|foo|cat|wc -c"),
+    ([], "busybox --list>/dev/null"),
+    ([], "dd if=/bin/sh bs=1 2>/dev/null >/dev/null"),
+])
+def test_the_worst_lines_finish_fast_and_are_charged(setup, part):
+    """Each line here was built to be slow (the listings took 1.5 s before they were cached
+    and charged). Work is charged in rough nanoseconds, so a line within MAX_WORK takes a
+    few milliseconds; the time bound is loose for slow CI."""
+    h, session = host(), shell.Session()
+    run(setup, h, session)
+    line = _fill(part)
+    seconds, work, _ = _worst(line, h, session)
+    assert work <= shell.MAX_WORK + shell.MAX_STAGE_OUTPUT
+    assert seconds < 0.25
+
+
+def test_listing_work_is_charged():
+    h = host()
+    names = h.bin_dirs()["/usr/bin"]
+    _, once, _ = _worst("ls /usr/bin >/dev/null", h)
+    assert once > len(names) * shell.STEP              # each name is a step of Python
+    _, empty, _ = _worst("ls /root >/dev/null", h)
+    assert once - empty > len(names) * shell.STEP
+
+
+def test_literal_output_feeds_the_next_stage():
+    assert one("printf hello | cat") == "hello"
+    assert one("printf hello | wc -c") == "5\n"
+    assert one("echo hello | cat | wc -c") == "6\n"
+    assert one("busybox printf hello | cat") == "hello"
+    assert one("echo a b | foo | wc -c") == "-bash: foo: command not found\n0\n"
+    assert one("printf hi | foo 2>/dev/null | cat") == ""
+    assert one("printf hi > /tmp/p | cat; cat /tmp/p") == "hi"
+    # output this shell does not know stays unknown: the next stage is not run on nothing
+    assert one("ls --color | wc -l") == ""
+
+
+def test_a_removed_directory_stays_removed():
+    out = run(["mkdir /tmp/d", "touch /tmp/d/x", "rm -r /tmp/d", "cd /tmp/d", "ls /tmp/d",
+               "cat /tmp/d/x", "ls /tmp", "mkdir /tmp/d", "ls /tmp/d", "cat /tmp/d/x"])
+    assert out[3] == "-bash: cd: /tmp/d: No such file or directory\n"
+    assert out[4] == "ls: cannot access '/tmp/d': No such file or directory\n"
+    assert out[5] == "cat: /tmp/d/x: No such file or directory\n"
+    assert "d\n" not in out[6].split("  ")
+    assert out[7] == "" and out[8] == ""
+    assert out[9] == "cat: /tmp/d/x: No such file or directory\n"
+
+
+def test_rm_rf_of_a_nested_tree_and_rmdir():
+    out = run(["mkdir -p /tmp/a/b/c", "touch /tmp/a/b/c/f /tmp/a/g", "rm -rf /tmp/a",
+               "cd /tmp/a/b", "ls /tmp/a", "mkdir /tmp/a", "ls /tmp/a",
+               "mkdir /tmp/e", "touch /tmp/e/x", "rmdir /tmp/e", "rm /tmp/e/x", "rmdir /tmp/e",
+               "cd /tmp/e", "rmdir /tmp/e", "rmdir", "busybox rmdir /tmp/e"])
+    assert out[3] == "-bash: cd: /tmp/a/b: No such file or directory\n"
+    assert out[4] == "ls: cannot access '/tmp/a': No such file or directory\n"
+    assert out[5:7] == ["", ""]
+    assert out[9] == "rmdir: failed to remove '/tmp/e': Directory not empty\n"
+    assert out[10:12] == ["", ""]
+    assert out[12] == "-bash: cd: /tmp/e: No such file or directory\n"
+    assert out[13] == "rmdir: failed to remove '/tmp/e': No such file or directory\n"
+    assert out[14] == "rmdir: missing operand\nTry 'rmdir --help' for more information.\n"
+    assert out[15] == "rmdir: '/tmp/e': No such file or directory\n"
+
+
+def test_mv_of_a_directory_moves_what_is_in_it():
+    out = run(["mkdir -p /tmp/a/b", "echo hi > /tmp/a/b/f", "mv /tmp/a /tmp/z",
+               "cat /tmp/z/b/f", "cat /tmp/a/b/f", "cd /tmp/a", "ls /tmp/z", "cd /tmp/z/b",
+               "pwd", "mv /tmp/z /tmp/z/b"])
+    assert out[3] == "hi\n"
+    assert out[4] == "cat: /tmp/a/b/f: No such file or directory\n"
+    assert out[5] == "-bash: cd: /tmp/a: No such file or directory\n"
+    assert out[6] == "b\n" and out[8] == "/tmp/z/b\n"
+    assert out[9] == "mv: cannot move '/tmp/z' to a subdirectory of itself, '/tmp/z/b/z'\n"
+
+
+def test_a_line_starting_with_a_redirection_never_names_an_empty_command():
+    assert one(">/var/tmp/.x && cd /var/tmp; rm -rf *") == ""
+    session = shell.Session()
+    run([f"touch /tmp/f{n}" for n in range(shell.MAX_SCRATCH)], session=session)
+    assert one(">/tmp/.f", session=session) == ""      # at the session's cap
+
+
+def test_the_ssh_fallback_answers_lines_starting_with_a_redirection():
+    assert hooks.fallback_reply(">/tmp/.x && echo ok", True, "root") == "ok\r\nroot@srv01:~# "
+    assert hooks.fallback_reply(">.t; /bin/busybox ECCHI", False, "root") == \
+        "ECCHI: applet not found\n"
+
+
+def test_the_ssh_fallback_keeps_the_session_files():
+    try:
+        assert hooks.fallback_reply("cp /bin/echo /tmp/.x", False, "root", session_id="s1") == ""
+        assert hooks.fallback_reply("/tmp/.x hi", False, "root", session_id="s1") == "hi\n"
+        assert hooks.fallback_reply("cd /tmp", True, "root", session_id="s1") == \
+            "root@srv01:/tmp# "
+        assert hooks.fallback_reply("/tmp/.x hi", False, "root", session_id="s2") != "hi\n"
+        hooks.session_close("s1")
+        assert "s1" not in hooks._shell_sessions
+        for n in range(hooks.MAX_SHELL_SESSIONS + 5):
+            hooks.fallback_reply("true", False, "root", session_id=f"n{n}")
+        assert len(hooks._shell_sessions) == hooks.MAX_SHELL_SESSIONS
+    finally:
+        hooks.reset()
+
+
+def test_piped_echo_stays_a_fixed_answer():
+    a = shell.answer(host(), "echo hello | wc -c", now=NOW)
+    assert a.output == "6\n" and a.scope == shell.FIXED
+    assert shell.answer(host(), "echo hi > /tmp/x", now=NOW).scope == shell.STATE
+
+
+def test_a_command_may_remove_its_own_redirection_target():
+    out = run(["echo hi > /tmp/x; rm /tmp/x /tmp/nope 2>/tmp/x", "ls /tmp/x",
+               "echo hi > /tmp/x; mv /tmp/x /tmp/y 2>/tmp/x; cat /tmp/y"])
+    assert out[0] == ""
+    assert out[1] == "ls: cannot access '/tmp/x': No such file or directory\n"
+    assert out[2] == ""                    # 2>/tmp/x truncated it before mv ran, as in bash
+
+
+def test_busybox_sh_of_a_missing_script_speaks_as_ash():
+    # checked against busybox 1.30.1, 1.35.0 and 1.36.1: same text, status 2
+    assert one("busybox sh /tmp/nope") == "sh: can't open '/tmp/nope': No such file or directory\n"
+    assert shell.answer(host(), "busybox sh /tmp/nope", now=NOW).status == 2
+
+
+def test_program_directories_are_built_once_per_kind_of_host():
+    assert host().bin_dirs() is host().bin_dirs()
+    assert not hasattr(shell.Host, "program")
+    assert "busybox" in host().bin_sets()["/usr/bin"]
+
+
+def test_program_directories_are_left_to_the_model():
+    """/bin is /usr/bin under another name, so a file made in one would be missing from the
+    other's listing: writes there are not answered here."""
+    assert shell.answer(host(), "touch /usr/bin/zz", now=NOW) is None
+    assert shell.answer(host(), "echo x > /bin/.x", now=NOW) is None
+    assert one(">/bin/.x && echo ok") == "ok\n"
+    assert "zz" not in run(["touch /usr/bin/zz", "ls /bin"])[1]
+
+
+def test_nothing_is_made_inside_a_removed_directory():
+    out = run(["mkdir /tmp/d", "rm -r /tmp/d", "touch /tmp/d/x", "echo a > /tmp/d/x",
+               "cp /bin/sh /tmp/d/x", "ls /tmp/d/x"])
+    assert out[2] == "touch: cannot touch '/tmp/d/x': No such file or directory\n"
+    assert out[3] == "-bash: /tmp/d/x: No such file or directory\n"
+    assert out[4] == "cp: cannot create regular file '/tmp/d/x': No such file or directory\n"
+    assert out[5] == "ls: cannot access '/tmp/d/x': No such file or directory\n"

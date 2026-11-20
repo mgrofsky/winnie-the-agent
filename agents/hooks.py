@@ -47,6 +47,10 @@ _session_prompts: dict[str, tuple[str, Optional[str]]] = {}
 _session_keys: dict[str, str] = {}
 _LEFT = ""
 MAX_TRACKED_SESSIONS = 10_000   # per-session tables evict their oldest entry past this
+# What the canned shell keeps per session when it answers instead of the model (files the
+# session wrote, its directory): each holds up to ``shell.MAX_SCRATCH_BYTES``, so far fewer.
+_shell_sessions: dict[str, shell.Session] = {}
+MAX_SHELL_SESSIONS = 256
 _cache: Optional[ReplyCache] = None
 MAX_LOCAL_HISTORY = 4096   # characters of a local answer kept in the chat history
 MAX_LOCAL_DELAY_MS = 2000
@@ -203,26 +207,56 @@ _literal_output = shell.literal_output
 
 def fallback_reply(text: str, interactive: bool, username: Optional[str],
                    host: Optional[shell.Host] = None, src_ip: Optional[str] = None,
-                   prompt: Optional[str] = None) -> str:
+                   prompt: Optional[str] = None, session_id: Optional[str] = None) -> str:
     """A plausible shell reply when the model cannot answer: a prompt for the session
     opener, otherwise the deterministic shell's reply (``agents.shell.reply``: host facts
     from the profile, a builtin's own output, a known tool's own error, else 'command not
     found'), then the prompt. ``prompt`` is the one the model showed last, so a directory
-    the model moved to stays in the prompt (and is the working directory here)."""
+    the model moved to stays in the prompt (and is the working directory here).
+    ``session_id`` keeps the files the session wrote, and its directory, from one fallback
+    line to the next, as the Telnet canned shell does (``shell.Session``)."""
     host = host or shell_host()
     cwd = None
+    session = None
+    if session_id is not None:
+        session = _shell_sessions.get(session_id) or shell.Session()
+        _track_shell(session_id, session)
     if interactive and prompt:
         cwd = prompt_directory(prompt, username)
+        if session is not None and cwd is not None:
+            session.cwd = cwd                # the model's prompt says where the session is
+    elif interactive:
+        prompt = None                        # where the session is once the line has run
     else:
-        prompt = shell_prompt(username, host.hostname) if interactive else ""
+        prompt = ""
     word = shell.clean_word(text)
-    if not word:
-        return prompt
+    if not word and not text.lstrip().startswith(">"):     # ``>f`` is a command too
+        return prompt if prompt is not None else _prompt_at(username, host, session)
     if word in ("exit", "logout") and interactive:
         return "YYY-END-OF-SESSION-YYY"   # same marker the model uses to end the session
     out = shell.reply(host, text, user=username or "user",
-                      interactive=interactive, cwd=cwd, src_ip=src_ip)
+                      interactive=interactive, cwd=cwd, src_ip=src_ip, session=session)
+    if prompt is None:
+        prompt = _prompt_at(username, host, session)
     return (out.replace("\n", "\r\n") if interactive else out) + prompt
+
+
+def _prompt_at(username: Optional[str], host: shell.Host,
+               session: Optional[shell.Session]) -> str:
+    """The prompt for the directory the canned shell's session is in."""
+    user = (username or "user")[:32]
+    if session is None or not session.cwd:
+        return shell_prompt(user, host.hostname)
+    home = "/root" if user == "root" else f"/home/{user}"
+    path = shell.prompt_path(session.cwd, home)
+    return f"{user}@{host.hostname}:{path}{'#' if user == 'root' else '$'} "
+
+
+def _track_shell(session_id: str, session: shell.Session) -> None:
+    _shell_sessions.pop(session_id, None)
+    _shell_sessions[session_id] = session
+    while len(_shell_sessions) > MAX_SHELL_SESSIONS:
+        _shell_sessions.pop(next(iter(_shell_sessions)))
 
 
 def prompt_directory(prompt: str, username: Optional[str]) -> Optional[str]:
@@ -301,6 +335,7 @@ def reset() -> None:
     _cli_accounts.clear()
     _session_fragments.clear()
     _session_prompts.clear()
+    _shell_sessions.clear()
 
 
 def set_budget(budget: Budget) -> None:
@@ -379,6 +414,7 @@ def session_close(session_id: str, history_store: Optional[MutableMapping] = Non
     _session_fragments.pop(session_id, None)
     _session_prompts.pop(session_id, None)
     _session_keys.pop(session_id, None)
+    _shell_sessions.pop(session_id, None)
     if history_store is not None:
         history_store.pop(session_id, None)
 
@@ -758,7 +794,8 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         return SimpleNamespace(content=canned, budget_exceeded=True)
     if _offline_reason:
         await _tarpit(src_ip)
-        return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip))
+        return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip,
+                                                      session_id=session_id))
     if local is not None:
         await _tarpit(src_ip)
         await _pause()
@@ -792,7 +829,8 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         await _tarpit(src_ip)
         await _pause()
         _leave(session_id)
-        sent = fallback_reply(text, interactive, username, host, src_ip, shown_prompt)
+        sent = fallback_reply(text, interactive, username, host, src_ip, shown_prompt,
+                              session_id)
         if sent != "YYY-END-OF-SESSION-YYY":
             stored = _remember(history, session_id, text, _clip_local(shell.printable(sent)))
             if stored is not None:
@@ -815,7 +853,7 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         _leave(session_id)
         await _tarpit(src_ip)
         return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip,
-                                                      shown_prompt))
+                                                      shown_prompt, session_id))
     budget.commit(reservation, text, _content(response), usage_tokens=_usage_tokens(response))
     await _tarpit(src_ip)
     if breaks_character(_content(response), text):
