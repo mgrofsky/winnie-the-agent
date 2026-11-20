@@ -151,6 +151,24 @@ Parameters:
       no "..". It starts with a letter, so it never lands among the events, which are
       written under EventsPrefix/YYYY/MM/DD/.
     Description: Key of the tracked list, relative to EventsPrefix (the object is EventsPrefix/TrackedKey).
+  # Delivered InternetDB answers (docs/operations.md, "Delivered answers"); the sensor still
+  # never reaches InternetDB. run-all writes the wanted list next to tracked.json, the
+  # exporter puts it to EventsPrefix/internetdb/wanted.json (under the prefix it already
+  # writes) and gets InternetDbAnswersKey, which something outside the sensor writes
+  # (deploy/aws/internetdb_lookup.py). On: GetObject of that one key for the role and the S3
+  # endpoint, and the internetdb volume (the exporter writes it; agents and console read it).
+  # The bucket policy must allow that read too (README). Off: nothing here changes.
+  InternetDbDelivered:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  # A key in the events bucket, outside EventsPrefix, so the sensor can read it but not
+  # write it.
+  InternetDbAnswersKey:
+    Type: String
+    Default: internetdb/answers.json
+    MaxLength: 128
+    AllowedPattern: '^[a-z][a-z0-9]*([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*){0,3}\.json$'
   AgentsIntervalSeconds:
     Type: Number
     Default: 3600
@@ -247,6 +265,7 @@ Conditions:
   UiOn: !Equals [!Ref UiEnabled, "true"]
   UiActionsOn: !Equals [!Ref UiActions, "true"]
   TailscaleOn: !Equals [!Ref TailscaleEnabled, "true"]
+  InternetDbOn: !Equals [!Ref InternetDbDelivered, "true"]
   ConsoleStepOn: !Or [!Condition TailscaleOn, !Condition UiActionsOn]
   PersonaOn: !Not [!Equals [!Ref PersonaModelId, ""]]
   AnalystOn: !Not [!Equals [!Ref AnalystModelId, ""]]
@@ -463,6 +482,14 @@ Resources:
             Principal: "*"
             Action: s3:PutObject
             Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${EventsPrefix}/*
+          - !If
+            - InternetDbOn
+            - Sid: InternetDbAnswers
+              Effect: Allow
+              Principal: "*"
+              Action: s3:GetObject
+              Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${InternetDbAnswersKey}
+            - !Ref AWS::NoValue
           - Sid: Al2023Repositories
             Effect: Allow
             Principal: "*"
@@ -835,6 +862,13 @@ Resources:
                 Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${EventsPrefix}/*
+              - !If
+                - InternetDbOn
+                - Sid: GetInternetDbAnswers
+                  Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${InternetDbAnswersKey}
+                - !Ref AWS::NoValue
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -1025,8 +1059,8 @@ Resources:
               docker run --rm --network none --entrypoint cat "$IMAGE" /app/deploy/aws/render_config.py > render_config.py
               ARGS="${NamePrefix} ${Scenario} ${ElasticIp} ${SmtpEnabled} ${EventsBucketName} ${EventsPrefix} $REGION ${EventsBucketOwner} ${TrackedExport} ${EventsPrefix}/${TrackedKey}"
               NEVER="${NeverActOn}"
-              python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "$NEVER" false
-              python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "$NEVER" true
+              python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "$NEVER" false${IdbArgs}
+              python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "$NEVER" true${IdbArgs}
               chown 10001:10001 config.ini config-ship.ini ssh_host_key
               chmod 0400 config.ini config-ship.ini ssh_host_key
 
@@ -1082,7 +1116,7 @@ Resources:
                     - frontend:/data:ro
                     - agentdata:/agents
                     - blocklist:/agents/reports/blocklist
-                    - overlay:/overlay
+                    - overlay:/overlay${IdbRead}
                 exporter:
                   <<: *hardening
                   depends_on: [listeners]
@@ -1095,7 +1129,7 @@ Resources:
                     - ./config-ship.ini:/config/config.ini:ro
                     - frontend:/data:ro
                     - exportstate:/agents
-                    - blocklist:/blocklist:ro
+                    - blocklist:/blocklist:ro${IdbWrite}
                 ui:
                   <<: *hardening
                   profiles: [ui]
@@ -1111,7 +1145,7 @@ Resources:
                     - frontend:/data:ro
                     - agentdata:/agents:ro
                     - blocklist:/agents/reports/blocklist:ro
-                    - overlay:/overlay:ro
+                    - overlay:/overlay:ro${IdbRead}
               networks:
                 frontend:
                   ipam:
@@ -1124,7 +1158,7 @@ Resources:
                 agentdata: {}
                 blocklist: {}
                 overlay: {}
-                exportstate: {}
+                exportstate: {}${IdbVolume}
               EOF
               echo "COMPOSE_PROFILES=${UiProfiles}" > .env
 
@@ -1185,6 +1219,13 @@ Resources:
                   - !If [MllpOn, mllp, ""]
                   - !If [S3On, s3, ""]
               UiProfiles: !If [UiOn, ui, ""]
+              # InternetDbDelivered only: the render arguments and the internetdb volume,
+              # written by the exporter and read by the agents and the console. Off, each
+              # renders to "" and the script is byte for byte what it was without them.
+              IdbArgs: !If [InternetDbOn, !Sub " true ${EventsPrefix}/internetdb/wanted.json ${InternetDbAnswersKey}", ""]
+              IdbRead: !If [InternetDbOn, "\n      - internetdb:/internetdb:ro", ""]
+              IdbWrite: !If [InternetDbOn, "\n      - internetdb:/internetdb", ""]
+              IdbVolume: !If [InternetDbOn, "\n  internetdb: {}", ""]
               # TailscaleEnabled only, before the stack starts, and not allowed to fail: an
               # error here stops the bootstrap, so the stack never runs without these rules.
               # sensor-egress.sh (deploy/aws/host in the image; its header explains the rules)

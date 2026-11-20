@@ -539,3 +539,32 @@ stale_hours = 48
 #lookback_days = 7
 # Addresses kept in the local file; the oldest answers are dropped first.
 #max_entries = 5000
+# direct: this process asks InternetDB (above). delivered: it never does. run-all writes the
+# addresses it wants looked up (addresses only, at most max_wanted) to wanted_file, something
+# outside the sensor answers through the object store, and every answer is checked here
+# exactly like a direct one before it reaches answers_file, which triage and the console
+# read. See docs/operations.md, "Delivered answers".
+#mode = direct
+#max_wanted = 500
+# Default: internetdb_wanted.json next to the blocklist file (as tracked.json).
+#wanted_file = /blocklist/internetdb_wanted.json
+# Default: internetdb.json in the agents' state directory.
+#answers_file = /internetdb/internetdb.json
+# A delivered answer older than this is not accepted.
+#max_age_days = 30
+
+# Delivered mode only: PutObject of the wanted list to one key, GetObject of the answers from
+# another, run by ship / run-all in the process that has the credentials. The answers object
+# is refused whole above max_bytes or max_entries; each answer is checked on its own.
+#[connector.internetdb_exchange]
+#enabled = false
+#kind = s3
+#bucket = example-honeypot-events
+#wanted_key = events/internetdb/wanted.json
+#answers_key = internetdb/answers.json
+#region = us-east-1
+#bucket_owner = 123456789012
+#endpoint_url = https://s3.example.com
+#interval_minutes = 15
+#max_bytes = 4194304
+#max_entries = 1000

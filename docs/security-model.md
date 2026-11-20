@@ -252,6 +252,21 @@ authentication only and are never rendered into a prompt.
     approval's `view_hash`, and the console shows it as text nodes.
   - *Failure is quiet.* Rate limits, server errors and unreachability stop that run and
     back off; triage, response and the console carry on as with the feature off.
+  - *Delivered mode* (`mode = delivered`, see
+    [operations.md](operations.md#delivered-answers)). The sensor has no path to
+    InternetDB at all: the lookup happens outside it, and the sensor gains no new outbound
+    destination, only one more object written and one read in the store it already uses.
+    Both files are data. The wanted list leaving the sensor holds addresses only (the
+    same selection as a direct lookup, `never_act_on` applied when it is written and again
+    before it leaves, rebuilt from the checked addresses so nothing else in the file can
+    go). The answers object coming in is untrusted: refused whole over its size or entry
+    caps or when it is not a version 1 object, and each answer is dropped unless it is for
+    an address the sensor asked for or already holds, has a sane `checked_at`, and passes
+    the same field checks as a direct answer. A producer that is taken over can therefore
+    show wrong ports or tags for addresses the sensor itself chose, and nothing more: the
+    answers stay display only. A sensor that is taken over learns nothing new from it and
+    can write only the wanted list (on AWS the answers key is outside the prefix it may
+    write, so it cannot write its own answers).
 - **Notification content.** Built from structured fields; attacker-derived URLs, domains,
   addresses and `@` are defanged in chat, email and ticket outputs; the enrichment
   response is treated as untrusted and flattened to a few short scalar fields.

@@ -1,7 +1,7 @@
 """Render a sensor config file from the image's config template (AWS bootstrap).
 
     python3 render_config.py SRC DST NAME SCENARIO PUBLIC_IP SMTP BUCKET PREFIX REGION OWNER \\
-        TRACKED TRACKED_KEY NEVER_ACT_ON SHIP
+        TRACKED TRACKED_KEY NEVER_ACT_ON SHIP [INTERNETDB WANTED_KEY ANSWERS_KEY]
     python3 render_config.py models DST PERSONA_MODEL ANALYST_MODEL REGION
 
 deploy/aws/sensor.yaml copies this file out of the image (/app/deploy/aws/render_config.py)
@@ -10,6 +10,13 @@ and runs it with the host's python3 (Amazon Linux 2023 ships 3.9, so nothing new
 for the exporter with SHIP=true. Sections the template has only commented out
 ("#[connector.s3_events]") get a real header at the end. Every value written is read back
 with configparser; any mismatch exits non-zero and the bootstrap stops.
+
+The three optional arguments (InternetDbDelivered) turn on delivered InternetDB answers:
+both files get [connector.internetdb] in delivered mode, reading the answers from the
+internetdb volume; config.ini writes the wanted list next to the blocklist (the default),
+config-ship.ini reads it from the exporter's read-only blocklist mount and turns on
+[connector.internetdb_exchange]. Without them, or with INTERNETDB false, nothing about
+InternetDB is written, so both files are exactly as before.
 
 The models form edits DST in place (the model step, PersonaModelId / AnalystModelId): a
 non-empty persona model id sets [llm] to Bedrock with that model, a non-empty analyst model
@@ -29,6 +36,10 @@ if sys.argv[1:2] == ["models"]:
 else:
     (src, dst, name, scenario, public_ip, smtp, bucket, prefix, region, owner, tracked,
      tracked_key, never, ship) = sys.argv[1:15]
+    internetdb = sys.argv[15:]
+    if internetdb not in ([], ["false"]) and not (len(internetdb) == 3
+                                                  and internetdb[0] == "true"):
+        sys.exit("usage: INTERNETDB WANTED_KEY ANSWERS_KEY, or nothing")
     want = None
 lines = open(src, encoding="utf-8").read().splitlines()
 if want is None:
@@ -46,6 +57,14 @@ if want is None:
             "kind": "s3", "file": "/blocklist/tracked.json", "bucket": bucket,
             "key": tracked_key, "region": region, "bucket_owner": owner},
     }
+    if internetdb[:1] == ["true"]:
+        want["connector.internetdb"] = {"enabled": "true", "mode": "delivered",
+                                        "answers_file": "/internetdb/internetdb.json"}
+        if ship == "true":
+            want["connector.internetdb"]["wanted_file"] = "/blocklist/internetdb_wanted.json"
+        want["connector.internetdb_exchange"] = {
+            "enabled": ship, "kind": "s3", "bucket": bucket, "wanted_key": internetdb[1],
+            "answers_key": internetdb[2], "region": region, "bucket_owner": owner}
     if smtp != "true":
         want["listeners"]["smtp_enabled"] = "false"
     if never.strip():

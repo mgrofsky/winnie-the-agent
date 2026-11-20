@@ -742,7 +742,98 @@ addresses would be looked up without sending anything.
   current answer, marked "latest lookup" rather than "when recorded".
 - Records written with the feature off are byte-for-byte as before. The digest, exports,
   notifications, approval cards and their `view_hash` do not change.
-- Not available on the AWS deployment; see its README.
+- On the AWS deployment only delivered answers are available (below); see its README.
+
+### Delivered answers
+
+Some sensors must not reach InternetDB at all: on AWS the agents container has no egress,
+and InternetDB sits behind a shared CDN, so no firewall rule can let the sensor reach it
+without also reaching every other site there. Delivered mode moves the lookup off the
+sensor. The sensor never makes a request to InternetDB; only two small files move, through
+the object store the sensor already writes to.
+
+```ini
+[connector.internetdb]
+enabled = true
+mode = delivered            ; direct (the default) | delivered
+
+[connector.internetdb_exchange]   ; in the process that has the store credentials
+enabled = true
+kind = s3
+bucket = example-honeypot-events
+wanted_key = events/internetdb/wanted.json
+answers_key = internetdb/answers.json
+#region, bucket_owner, endpoint_url, interval_minutes = 15, max_bytes, max_entries
+```
+
+1. `run-all` writes the wanted list: the addresses a direct lookup would choose (same
+   selection, same `never_act_on` rule), most important first, at most `max_wanted`
+   (default and limit 500), to `internetdb_wanted.json` next to the blocklist file (or
+   `wanted_file`). Written atomically, owner only, on every run.
+2. The exchange (`ship`, or the end of `run-all`) puts that list to `wanted_key` when its
+   addresses changed and at least once a day. It is checked first and rebuilt from the
+   checked addresses, so nothing else in the local file can leave, and `never_act_on` is
+   applied again.
+3. Something outside the sensor reads the list, asks InternetDB and writes the answers to
+   `answers_key`. [`deploy/aws/internetdb_lookup.py`](../deploy/aws/internetdb_lookup.py) is
+   a reference: one file, standard library plus boto3, runnable as a Lambda function or by
+   hand.
+4. The exchange gets the answers object (one GetObject of one key, at most once per
+   `interval_minutes`, at most `max_bytes`), checks it (below) and merges what passes into
+   `answers_file` (default `<state-dir>/internetdb.json`), the file triage and the console
+   already read. Everything after that works as in direct mode.
+
+On one host, one config does all of it. On AWS the agents container writes the list and the
+exporter moves both files; the deployment README has the wiring.
+
+**The wanted list** (sensor to store):
+
+```json
+{"version": 1, "generated_at": "2026-11-20T12:00:00+00:00",
+ "addresses": ["198.51.100.7", "2001:db8::5"]}
+```
+
+Addresses only, in canonical form, no duplicates, at most 500. Nothing about what a source
+did.
+
+**The answers object** (store to sensor):
+
+```json
+{"version": 1, "generated_at": "2026-11-20T12:05:00Z",
+ "answers": [
+   {"ip": "198.51.100.7", "checked_at": "2026-11-20T12:04:10Z", "status": "found",
+    "ports": [22, 80], "hostnames": ["a.example.net"], "tags": ["vpn"],
+    "cpes": ["cpe:/a:openbsd:openssh:7.4"], "vulns": ["CVE-2017-15906"]},
+   {"ip": "2001:db8::5", "checked_at": "2026-11-20T12:04:11Z", "status": "not_found"}]}
+```
+
+A found answer is InternetDB's own answer body plus `checked_at` and `status`; `not_found`
+is what a 404 means. Rules, in the order the sensor applies them:
+
+- The whole object is refused (the local answers stay as they were, logged once per bad
+  copy) when it is larger than `max_bytes` (default 4 MB), not UTF-8 JSON, not an object
+  with `"version": 1`, has no `answers` list, or has more than `max_entries` answers
+  (default 1000).
+- Each answer is then checked on its own and dropped on any problem:
+  - `ip` is a string in canonical form (`2001:db8::5`, not `2001:DB8::5`), a single global
+    address, outside `[respond] never_act_on`, and either on the current local wanted list
+    or already held in `answers_file`. Answers for addresses the sensor never asked about
+    are dropped.
+  - `checked_at` is an ISO 8601 time (no zone means UTC), at most five minutes in the
+    future, no older than `max_age_days` (default 30), and newer than the answer already
+    held for that address (an older or equal one is skipped, not counted as bad).
+  - `status` is `found` or `not_found`.
+  - For `found`, `ip`, `ports`, `hostnames`, `tags`, `cpes` and `vulns` go through exactly
+    the check a direct answer gets (see "The answer is data" above), with the lookup date
+    taken from `checked_at`.
+- Unknown keys are ignored (the reference producer keeps its own state under `producer`).
+- The local file keeps at most `max_entries` addresses of `[connector.internetdb]`, oldest
+  dropped first.
+
+The direct-mode keys (`max_per_run`, `max_per_day`, `min_interval_seconds`, `cache_days`)
+do nothing in delivered mode; pacing is the producer's job. The reference producer uses the
+same defaults: at most 100 lookups a run and 2000 a day, a second apart, answers fresh for
+7 days, back-off on 429, 5xx or network failure.
 
 ## Using the intelligence outside the sensor
 

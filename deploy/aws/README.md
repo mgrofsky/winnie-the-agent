@@ -38,7 +38,8 @@ them before deploying, and run the checks below after every change.
   (172.30.0.0/24) and agents (172.30.1.0/24) networks; only replies pass.
 - **Exporter.** A fifth container runs `python -m agents ship` every five minutes on the
   host network. It is the only container that can use the instance role, which may pull
-  this one image, write this one log group and `s3:PutObject` under the events prefix.
+  this one image, write this one log group and `s3:PutObject` under the events prefix
+  (and, only with `InternetDbDelivered=true`, `s3:GetObject` of one answers key).
   It has its own `config-ship.ini` with `[connector.s3_events]` on (`passwords = hash`,
   `bucket_owner` sent as `ExpectedBucketOwner`); the shared `config.ini` keeps the export
   off, because `run-all` in the agents container would otherwise try to ship without
@@ -230,6 +231,8 @@ Open a shell with `aws ssm start-session --target <InstanceId> $S`, then `sudo -
       aws s3api get-object --bucket $B --key events/verify/<key> /dev/null  # AccessDenied
       aws s3api delete-object --bucket $B --key events/verify/<key>         # AccessDenied
       echo verify | aws s3 cp - s3://$B/other/verify.txt                    # AccessDenied
+      # InternetDbDelivered=true only: this one read succeeds, every other get still fails
+      aws s3api get-object --bucket $B --key internetdb/answers.json /dev/null
 
 - [ ] Events show real client addresses: connect from your own address (for example
       `nc -vz <PublicIp> 22`) and check that `docker compose logs listeners ssh` or the
@@ -589,7 +592,8 @@ parts and anything but lower case letters, digits, `.`, `_` and `-`, so the obje
 lands under the events prefix. It must start with a letter, so it never lands among the
 events themselves, which are written under `<EventsPrefix>/YYYY/MM/DD/`. That is why no IAM, endpoint or bucket policy changes: the
 instance role, the S3 gateway endpoint policy and the bucket policy already allow
-`s3:PutObject` on `<EventsPrefix>/*` and nothing else. The object also falls under the
+`s3:PutObject` on `<EventsPrefix>/*` and nothing else (apart from the optional InternetDB
+answers read, below). The object also falls under the
 bucket's `expire-events` lifecycle rule; it is sent again whenever the list changes and at
 least once a day, so it does not expire while the sensor runs (as long as `ExpirationDays`
 is more than one). Older versions are kept for `ExpirationDays`.
@@ -612,7 +616,8 @@ the stored list, along with `tracked.json` when `TrackedExport=true`.
 
 **Sightings are not fetched here.** `[connector.sightings]` with `kind = s3` needs
 `s3:GetObject`, which this deployment's write-only bucket design refuses on purpose. Leave
-it off on AWS, or feed `sightings.json` another way.
+it off on AWS, or feed `sightings.json` another way. (Delivered InternetDB answers, below,
+are the one exception: one key, off by default.)
 
 Not proven without a real deploy:
 
@@ -628,6 +633,120 @@ Not proven without a real deploy:
 - The PutObject itself: from the bucket account, `aws s3api head-object --bucket
   example-winnie-events --key events/tracked/tracked.json $B` should succeed after the
   first approval with `TrackedExport=true`.
+
+## Delivered InternetDB answers (optional)
+
+The sensor still never reaches InternetDB. With `InternetDbDelivered=true` the lookup
+happens outside the sensor and only two small objects move through the events bucket (see
+"Delivered answers" in the [operations guide](../../docs/operations.md#delivered-answers)
+for the formats and the checks):
+
+| Object | Key | Written by | Read by |
+| --- | --- | --- | --- |
+| Wanted list | `<EventsPrefix>/internetdb/wanted.json` | the exporter (PutObject, already allowed) | your producer |
+| Answers | `InternetDbAnswersKey` (default `internetdb/answers.json`) | your producer | the exporter (GetObject, added) |
+
+Keep `InternetDbAnswersKey` outside `EventsPrefix`: the sensor may then read it but never
+write it, and the events lifecycle rule does not expire it. Anything that reads the events
+prefix should skip `events/internetdb/`, as it skips `events/tracked/`.
+
+**Who does what on the host.**
+
+- The agents container (records, no credentials, no egress) writes
+  `internetdb_wanted.json` next to the blocklist file, in the `blocklist` volume, on every
+  `run-all`. `config.ini` has `[connector.internetdb] mode = delivered` and the exchange off.
+- The exporter (the instance role, no records) reads that file through its read-only
+  `/blocklist` mount, puts it, gets the answers, checks them and writes the accepted ones to
+  `/internetdb/internetdb.json`. `config-ship.ini` turns `[connector.internetdb_exchange]` on.
+- The agents (triage) and the console read `/internetdb/internetdb.json`.
+
+**The one mount change.** A new named volume, `internetdb`, holds only the checked answers:
+read-write for the exporter at `/internetdb`, read-only for the agents and the console at
+`/internetdb`. Nothing else changes: the exporter still sees none of `agentdata`, and the
+agents still cannot write anything the exporter reads except the `blocklist` volume they
+already wrote. The answers had to reach the agents somehow, and every existing volume the
+exporter can write (`exportstate`) also holds its cursor and state; a volume of their own
+keeps that out of the agents' view. `check.py` fails if any other service mounts it, or if
+it exists with the switch off. The image creates `/internetdb` owned by uid 10001, so a
+fresh volume gets that owner (rebuild and push the image before turning this on).
+
+**What the stack adds with the switch on** (each is `!If InternetDbOn`, so with it off the
+role, the endpoint policy and the bootstrap are byte for byte what they were):
+
+```yaml
+# InstanceRole, inline policy sensor-host
+- Sid: GetInternetDbAnswers
+  Effect: Allow
+  Action: s3:GetObject
+  Resource: arn:aws:s3:::<EventsBucketName>/<InternetDbAnswersKey>
+# S3GatewayEndpoint policy
+- Sid: InternetDbAnswers
+  Effect: Allow
+  Principal: "*"
+  Action: s3:GetObject
+  Resource: arn:aws:s3:::<EventsBucketName>/<InternetDbAnswersKey>
+```
+
+**The bucket policy, on your side.** `events-bucket.yaml` denies the sensor account
+everything but `s3:PutObject` (`DenySensorAccountEverythingElse`), and an explicit deny
+wins over any allow. So the read needs the deny narrowed for that one key and an allow
+added, in the bucket account. Replace `DenySensorAccountEverythingElse` with the two denies
+below and add the allow (shown for `SensorRoleName=winnie-sensor-host`, `EventsPrefix=events`
+and the default key; `SENSOR_ACCOUNT` is the sensor account id):
+
+```json
+{"Sid": "SensorRoleGetInternetDbAnswers", "Effect": "Allow",
+ "Principal": {"AWS": "arn:aws:iam::SENSOR_ACCOUNT:root"},
+ "Action": "s3:GetObject",
+ "Resource": "arn:aws:s3:::example-winnie-events/internetdb/answers.json",
+ "Condition": {"ArnEquals": {"aws:PrincipalArn":
+   "arn:aws:iam::SENSOR_ACCOUNT:role/winnie-sensor-host"}}},
+{"Sid": "DenySensorAccountEverythingElse", "Effect": "Deny",
+ "Principal": {"AWS": "arn:aws:iam::SENSOR_ACCOUNT:root"},
+ "NotAction": ["s3:PutObject", "s3:GetObject"],
+ "Resource": ["arn:aws:s3:::example-winnie-events",
+              "arn:aws:s3:::example-winnie-events/*"]},
+{"Sid": "DenySensorAccountGetElsewhere", "Effect": "Deny",
+ "Principal": {"AWS": "arn:aws:iam::SENSOR_ACCOUNT:root"},
+ "Action": "s3:GetObject",
+ "NotResource": "arn:aws:s3:::example-winnie-events/internetdb/answers.json"}
+```
+
+The other statements stay as they are. If the bucket comes from `events-bucket.yaml`, a
+hand edit is overwritten by the next update of that stack; apply it through your own
+change process and re-check after every bucket stack update. Without it the exporter logs
+`GetObject failed: ClientError: AccessDenied` every `interval_minutes` and the sensor runs
+on without answers.
+
+**The producer.** [`internetdb_lookup.py`](internetdb_lookup.py) is a reference, one file:
+the standard library plus boto3 (in the Lambda Python runtime). This stack does not create
+it or its role. Run it wherever outbound HTTPS to `internetdb.shodan.io` is acceptable, for
+example as a Lambda function in the bucket account on a 15 to 60 minute schedule:
+
+- Handler `internetdb_lookup.handler`, Python 3.9 or later, timeout 5 minutes or more
+  (it stops asking 20 seconds before the end), memory 128 MB.
+- Environment: `BUCKET`, `WANTED_KEY` (`events/internetdb/wanted.json`), `ANSWERS_KEY`
+  (`internetdb/answers.json`), optionally `EXPECTED_BUCKET_OWNER`, `MAX_PER_RUN` (100),
+  `MAX_PER_DAY` (2000), `CACHE_DAYS` (7).
+- Its role needs exactly `s3:GetObject` on the wanted key and `s3:GetObject` and
+  `s3:PutObject` on the answers key, plus its log group. In the bucket account, an identity
+  policy is enough: none of the bucket policy's denies name that account.
+
+By hand: `python3 internetdb_lookup.py --bucket example-winnie-events --wanted-key
+events/internetdb/wanted.json --answers-key internetdb/answers.json`, or with
+`--wanted-file` / `--answers-file` against local copies. InternetDB's terms (free for
+non-commercial use; a company may use it internally) apply to whoever runs the producer.
+
+**Turning it on.** Rebuild and push the image, apply the bucket policy change, deploy the
+producer, then update the stack with `InternetDbDelivered=true` (the user data changes, so
+the instance is replaced). The first wanted list appears after the first agents run and the
+next exporter pass; answers after the producer's next run and the exporter's next fetch (15
+minutes). Check with `docker compose exec exporter ls -l /internetdb` and the `internetdb`
+key in the exporter's log lines. Rollback: `InternetDbDelivered=false`; the role, endpoint
+and bootstrap go back to exactly what they were, and the bucket policy change can be undone.
+
+Not proven without a real deploy: the bucket policy change, the producer as a Lambda
+function, and the ownership of a fresh `internetdb` volume.
 
 ## Models on Bedrock (optional)
 
@@ -937,11 +1056,12 @@ Still unproven:
 - Models only on Amazon Bedrock in the sensor's own account and region, and only through
   `models.yaml` (see [Models on Bedrock](#models-on-bedrock-optional)); no other model
   provider has an egress path. `[listeners] llm` stays off.
-- No Shodan InternetDB details (`[connector.internetdb]`, see the operations guide). Here
-  the agents container has no egress and the exporter, which has the instance role,
-  sees none of the records the lookup needs. InternetDB is served from Cloudflare
-  addresses shared with other sites, so an address pin would not pin the destination.
-  This stack adds no path for it, and both rendered config files leave it off.
+- No direct Shodan InternetDB lookups (`[connector.internetdb]`, see the operations
+  guide). InternetDB is served from Cloudflare addresses shared with other sites, so an
+  address pin would not pin the destination, and this stack adds no path for it. Delivered
+  answers work instead ([above](#delivered-internetdb-answers-optional)): the lookup runs
+  outside the sensor and only objects in the events bucket move.
 - No address locations (`[geoip]`, see the operations guide, "Where addresses are"). The
   database files would have to reach the host, and the instance has no read path for that
-  by design (its role writes events and nothing else); this stack does not add one.
+  by design (its role writes events and, with delivered InternetDB answers, reads that
+  one object); this stack does not add one.
