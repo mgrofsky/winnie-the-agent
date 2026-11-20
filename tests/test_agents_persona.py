@@ -236,6 +236,24 @@ def test_first_interactive_turn_has_no_empty_content(ssh_module):
     assert messages[0]["content"] == ssh_module.SESSION_OPENER
 
 
+def test_earlier_replies_are_replayed_as_text_only(ssh_module):
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    earlier = AIMessage(content=[
+        {"type": "reasoning_content",
+         "reasoning_content": {"text": "", "signature": "c2lnbmVk"}},
+        {"type": "thinking", "thinking": "", "signature": "c2lnbmVk"},
+        {"type": "text", "text": "srv01\r\nroot@srv01:~# "}])
+    only_reasoning = AIMessage(content=[
+        {"type": "reasoning_content", "reasoning_content": {"text": "", "signature": "eA=="}}])
+    out = ssh_module._non_empty_messages(
+        [HumanMessage("hostname"), earlier, HumanMessage("true"), only_reasoning,
+         HumanMessage("ls")])
+    assert out[1].content == "srv01\r\nroot@srv01:~# "
+    assert out[3].content == "[no output]"
+    assert all(isinstance(m.content, str) for m in out)
+
+
 def test_profile_block_only_when_present(ssh_module):
     from langchain_core.messages import HumanMessage
 

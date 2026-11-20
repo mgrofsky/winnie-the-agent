@@ -681,13 +681,18 @@ def configure_logging() -> None:
 
 def _non_empty_messages(messages):
     # Never send empty content to a provider: the session opener is an empty human turn,
-    # and a model may return an empty reply that is replayed as history.
+    # and a model may return an empty reply that is replayed as history. Earlier replies
+    # are replayed as plain text.
     out = []
     for m in messages:
         if isinstance(m, HumanMessage) and not str(m.content).strip():
             m = HumanMessage(content=SESSION_OPENER)
-        elif isinstance(m, AIMessage) and not str(m.content).strip():
-            m = AIMessage(content="[no output]")
+        elif isinstance(m, AIMessage):
+            # Replay only the text of an earlier reply. A reasoning block is signed for
+            # the exact system prompt and messages that produced it, and the persona block
+            # changes with the host state, so a replayed one is refused by the provider.
+            text = agent_hooks._content(m)
+            m = AIMessage(content=text if text.strip() else "[no output]")
         out.append(m)
     return out
 
