@@ -30,6 +30,10 @@ Everything returned here was typed by attackers or derived from it. The rules:
 - Activity (``agents.ui.activity``) reads the event log only: an in-memory index of every
   line, and back-reads of the lines shown (or searched, under a byte budget). Honeytoken
   values the sensor planted are masked in it.
+- Where an address is (``agents.enrich``: country, city, network owner) is display only,
+  from database files on disk. A record keeps the place stored when it was written; one
+  written without it is looked up now. A live lookup never enters a ``view_hash``: queue
+  cards carry it beside the hashed record summary, which shows only the stored place.
 - Sightings (``agents.sightings``) are display only. The file is parsed strictly, the last
   good copy stays on show when a new one is refused, and only sightings of listed
   addresses are served.
@@ -86,7 +90,15 @@ from agents.sightings import SightingsReader, SightingsSettings, by_address
 from agents.runtime import event_log_state
 from agents.source_state import load as load_source_state
 from agents.source_state import valid_source_key
-from agents.triage import JUDGEMENT_RANK, Judgement, TriageRecord, rank, record_layout
+from agents.triage import (
+    JUDGEMENT_RANK,
+    Judgement,
+    TriageRecord,
+    geo_view,
+    rank,
+    record_layout,
+    with_geo,
+)
 from agents.tuner import history as tuner_history
 from agents.ui import activity, logindex
 from agents.ui.activity import EventIndex
@@ -153,6 +165,7 @@ DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 DETECTION_RE = re.compile(DETECTION_FILE_RE)
 TOKEN_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 PROTOCOL_RE = re.compile(r"[a-z0-9]{1,16}")
+COUNTRY_RE = re.compile(r"[A-Z]{2}")
 TUNER_FILE_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}\.json")
 APPROVAL_RE = re.compile(APPROVAL_ID_RE)
 APPROVAL_FILE_RE = re.compile(APPROVAL_ID_RE + r"\.json")
@@ -584,7 +597,16 @@ def _summary(r: TriageRecord) -> dict:
             "connections": r.connections, "honeytokens": list(r.honeytokens),
             "high_signal": sum(r.high_signal.values()), "llm_used": r.llm_used,
             "unverified_source": r.unverified_source, "narrative": r.narrative[:300],
-            "layout": record_layout(r)}
+            "layout": record_layout(r),
+            **({"geo": geo_view(r.src_geo)} if r.src_geo is not None else {})}
+
+
+def _placed(item: dict, geo: Optional[dict]) -> dict:
+    """``item`` with ``"geo"`` added when there is a place (absent otherwise, so answers
+    are as before with the lookup off)."""
+    if geo is not None:
+        item["geo"] = geo
+    return item
 
 
 def _haystack(r: TriageRecord) -> str:
@@ -696,6 +718,8 @@ class Api:
     connectors: Optional[Callable[[], object]] = None
     sensor: str = ""
     sightings: SightingsSettings = field(default_factory=SightingsSettings)
+    # ``agents.enrich.GeoLookup`` (address -> GeoInfo or None, never raises), or None.
+    geo: Optional[Callable] = None
 
     def __post_init__(self) -> None:
         self._sightings = SightingsReader(self.sightings.file(self.paths.state), self.sightings)
@@ -853,6 +877,8 @@ class Api:
                "can_approve_here": decidable and self._connector_ready(item.raw),
                "undecidable_reason": v.reason,
                "record": v.record}
+        # Beside the hashed parts: a looked-up place can change with the database.
+        _placed(out, self._where(item.raw.get("subject")))
         if item.raw.get("action") == "publish_detection" and v.reason is None:
             out["detection_files"] = [{"name": n, "present": d != MISSING_FILE}
                                       for n, d in v.files.items()]
@@ -871,6 +897,20 @@ class Api:
                 return None
             out[name] = digest
         return out
+
+    def _where(self, value: object) -> Optional[dict]:
+        """Where an address or network is, as served (``triage.geo_view``), or None."""
+        if self.geo is None or not isinstance(value, str):
+            return None
+        return geo_view(self.geo(value))
+
+    def _src_where(self, raw: object, mask) -> Optional[dict]:
+        """``_where`` for an event-log source, only when masking leaves it as it is."""
+        return self._where(raw) if isinstance(raw, str) and mask(raw) == raw else None
+
+    def _shown(self, r: TriageRecord) -> TriageRecord:
+        """``r`` as displayed: its stored place, or one looked up now when it has none."""
+        return with_geo(r, self.geo)
 
     def _record_id(self, raw: str) -> Optional[TriageRecord]:
         if not RECORD_ID_RE.fullmatch(raw):
@@ -912,7 +952,7 @@ class Api:
             seen = worst.get(r.src_ip)
             if seen is None or JUDGEMENT_RANK[r.judgement] > JUDGEMENT_RANK[seen]:
                 worst[r.src_ip] = r.judgement
-        hits = [_summary(r) for r in inside if r.honeytokens][:HONEYTOKEN_HITS]
+        hits = [_summary(self._shown(r)) for r in inside if r.honeytokens][:HONEYTOKEN_HITS]
         pending = [a.raw for a in self._queue_now() if a.status_at(now) == "pending"]
         expiries = sorted(str(a.get("expires_at", "")) for a in pending if a.get("expires_at"))
         return 200, {
@@ -923,7 +963,8 @@ class Api:
                        "by_protocol": dict(sorted(by_protocol.items())),
                        "by_judgement": {j.value: by_judgement.get(j.value, 0)
                                         for j in Judgement}},
-            "top_sources": [{"src_ip": ip, "records": n, "worst": worst[ip].value}
+            "top_sources": [_placed({"src_ip": ip, "records": n, "worst": worst[ip].value},
+                                    self._where(ip))
                             for ip, n in sources.most_common(TOP_SOURCES)],
             "honeytoken_hits": hits,
             "approvals": {"pending": len(pending),
@@ -1020,14 +1061,22 @@ class Api:
             if len(src) > 64:
                 raise _BadQuery
             items = [r for r in items if r.src_ip == src or src in r.src_addresses]
+        country = (query.get("country") or "").strip().upper()
+        if country:
+            if not COUNTRY_RE.fullmatch(country):
+                raise _BadQuery
+            items = [r for r in items
+                     if (g := self._shown(r).src_geo) is not None and g.country_code == country]
         q = (query.get("q") or "").strip().lower()
         if q:
             if len(q) > 200:
                 raise _BadQuery
             items = [r for r in items if q in _haystack(r)]
         page = paginate(items, query)
-        page["items"] = [_summary(r) for r in page["items"]]
+        page["items"] = [_summary(self._shown(r)) for r in page["items"]]
         page["sort"] = sort
+        if self.geo is not None:
+            page["geo"] = bool(getattr(self.geo, "enabled", True))
         return 200, page
 
     def record(self, query: dict[str, str], rid: str) -> tuple[int, object]:
@@ -1035,9 +1084,16 @@ class Api:
         if r is None:
             return NOT_FOUND
         approvals = [a.stem for a in self._queue_now() if a.raw.get("record_id") == r.id]
+        stored = r.src_geo is not None
+        r = self._shown(r)
         out = {"record": r.model_dump(mode="json"), "layout": record_layout(r),
                "approvals": approvals,
                "transcript_available": False, "transcript_withheld": None}
+        if r.src_geo is not None:
+            out.update(geo=geo_view(r.src_geo), geo_stored=stored)
+        places = {a: g for a in r.src_addresses[:20] if (g := self._where(a)) is not None}
+        if places:
+            out["address_geo"] = places
         span = self.index.range_of(r.id) if r.kind == "session" and r.protocol == "ssh" \
             else None
         if span is not None and span[1] - span[0] > logindex.MAX_RANGE_BYTES:
@@ -1198,6 +1254,7 @@ class Api:
                 "service": mask(e[activity.SERVICE]), "kind": e[activity.KIND],
                 "session": mask(e[activity.SESSION]), "username": user,
                 "outcome": outcome}
+        _placed(item, self._src_where(e[activity.SRC], mask))
         if rec is None:
             item.update(time=None, summary="this line is no longer in the event log",
                         unreadable=True)
@@ -1329,13 +1386,14 @@ class Api:
         cut = len(mine) > activity.SESSION_EVENTS or read_cut
         first = next((e for e in mine if e[activity.SRC]), mine[0])
         times = [ev["time"] for ev in events if ev.get("time")]
-        return 200, {"id": sid, "service": mask(mine[0][activity.SERVICE]),
-                     "src": mask(first[activity.SRC]),
-                     "start": times[0] if times else None, "end": times[-1] if times else None,
-                     "from": "index", "events": events, "events_cut": cut,
-                     "read_cut": read_cut, "log_id": info["log_id"],
-                     "record_id": self._record_for(sid, mine[0][activity.SERVICE],
-                                                   first[activity.SRC], mine[0][activity.TS])}
+        out = {"id": sid, "service": mask(mine[0][activity.SERVICE]),
+               "src": mask(first[activity.SRC]),
+               "start": times[0] if times else None, "end": times[-1] if times else None,
+               "from": "index", "events": events, "events_cut": cut,
+               "read_cut": read_cut, "log_id": info["log_id"],
+               "record_id": self._record_for(sid, mine[0][activity.SERVICE],
+                                             first[activity.SRC], mine[0][activity.TS])}
+        return 200, _placed(out, self._src_where(first[activity.SRC], mask))
 
     def _read_events(self, mine: list, budget: int, mask) -> tuple[list[dict], bool]:
         """Items for ``mine`` in order, read back until ``budget`` bytes run out, and
@@ -1397,10 +1455,11 @@ class Api:
         read_cut = read_cut or t.get("cut") is True
         cut = len(events) > activity.SESSION_EVENTS or read_cut \
             or len(others) > activity.SESSION_EVENTS
-        return {"id": sid, "service": "ssh", "src": mask(t["src_ip"]), "start": t["start"],
+        return _placed({"id": sid, "service": "ssh", "src": mask(t["src_ip"]), "start": t["start"],
                 "end": t["end"], "from": "transcript", "events": events[:activity.SESSION_EVENTS],
                 "events_cut": cut, "read_cut": read_cut, "connection_lines": bool(others),
-                "record_id": sid if sid in self._records.get().by_id else None}
+                "record_id": sid if sid in self._records.get().by_id else None},
+                       self._src_where(t["src_ip"], mask))
 
     def _record_for(self, sid: str, service: str, src: Optional[str],
                     ts: Optional[float]) -> Optional[str]:
@@ -1449,6 +1508,8 @@ class Api:
                          "expires_at": v["expires_at"]} for k, v in entries.items()),
                        key=lambda e: e["approved_at"], reverse=True)
         page = paginate(items, query)
+        for e in page["items"]:
+            _placed(e, self._where(e["target"]))
         if not staged:
             return 200, page
         seen = self._sightings.read(now)
@@ -1532,6 +1593,7 @@ class Api:
         for e in page["items"]:
             stamp = seen.get(e["key"])
             e["last_seen"] = stamp.isoformat(timespec="seconds") if stamp else None
+            _placed(e, self._where(e.get("key")))
         return 200, {"overlay": overlay, "overlay_error": overlay_error,
                      "history": list(reversed(tuner_history(p.state / "tuner")))[:50],
                      "tuner_runs": tuner_runs, "source_state": page}

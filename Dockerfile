@@ -14,7 +14,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.23 /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock .python-version ./
-RUN uv sync --frozen --no-dev --no-install-project --no-cache
+# --extra geoip: the reader for the optional [geoip] database files (no network use).
+RUN uv sync --frozen --no-dev --extra geoip --no-install-project --no-cache
 
 COPY SSH ./SSH
 COPY agents ./agents

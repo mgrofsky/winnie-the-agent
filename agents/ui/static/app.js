@@ -34,6 +34,7 @@
   const DETECTION_RE = /^[0-9a-f]{8}-[a-z0-9-]{1,60}\.yml$/;
   const TOKEN_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
   const PROTOCOL_RE = /^[a-z0-9]{1,16}$/;
+  const COUNTRY_RE = /^[A-Z]{2}$/;
   const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
   const COMPACT_TIME_RE = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/;
   const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -493,6 +494,18 @@
     return el("span", { cls: "mono", text: str(text) });
   }
 
+  // Where an address is (city, country, network owner) from the server's "geo" object, as
+  // muted text after the address; nothing when the lookup is off or knows nothing. The
+  // text comes from a database file, so it is a text node like everything else.
+  function geoText(geo) {
+    const short = str(obj(geo).short);
+    return short ? el("span", { cls: "muted", text: " · " + short }) : null;
+  }
+
+  function addressNode(addr, geo) {
+    return el("span", null, mono(addr), geoText(geo));
+  }
+
   function clip(text, wide) {
     return el("span", { cls: wide ? "clip clip-wide mono" : "clip mono", text: str(text) });
   }
@@ -666,7 +679,10 @@
     shell.main = el("main", "main");
     const hint = el("div", { cls: "footer-hint",
       text: "Keys: 1-7 switch sections, r refreshes, / searches records or activity, Esc closes a confirmation." });
-    document.body.replaceChildren(header, shell.main, el("div", "main", hint));
+    // [geoip] attribution (free databases require credit), plain text.
+    const credit = str(state.session.attribution);
+    document.body.replaceChildren(header, shell.main, el("div", "main", hint,
+      credit ? el("div", { cls: "footer-hint", text: credit }) : null));
   }
 
   function setNav(key) {
@@ -919,7 +935,7 @@
     const top = arr(data.top_sources);
     append(sources.body, [top.length
       ? table([{ label: "Source" }, { label: "Records", num: true }, { label: "Worst" }],
-        top.map((s) => ({ cells: [mono(s.src_ip), num(s.records), judgementBadge(s.worst)] })),
+        top.map((s) => ({ cells: [addressNode(s.src_ip, s.geo), num(s.records), judgementBadge(s.worst)] })),
         { short: true })
       : empty("No sources in this window.")]);
 
@@ -961,7 +977,7 @@
         judgementBadge(r.judgement),
         recordLink(r.id, mono(r.id)),
         el("span", { cls: "muted", text: str(r.protocol) + " " + str(r.kind) }),
-        mono(r.src_ip),
+        addressNode(r.src_ip, r.geo),
         tags(r.honeytokens),
         el("span", "faint", timeNode(r.last_seen || r.first_seen))),
       narrativeView(r.layout, r.narrative))));
@@ -1166,7 +1182,7 @@
 
     const head = el("div", "card-title", mono(a.action),
       publish ? [" of ", fileNames(files), el("span", { cls: "muted", text: " from " }), mono(a.subject)]
-        : [" on ", mono(a.subject)]);
+        : [" on ", mono(a.subject), geoText(item.geo)]);
     const headRow = el("div", "card-head", head,
       statusBadge(a.status), tierBadge(a.tier),
       a.unverified_source === true ? badge("source may be forged", "st-bad") : null);
@@ -1192,6 +1208,7 @@
         el("span", { cls: "muted", text: str(record.protocol) + " " + str(record.kind) })),
       kv([
         ["Source", el("span", null, mono(record.src_ip),
+          geoText(record.geo || (record.src_ip === a.subject ? item.geo : null)),
           record.unverified_source === true ? el("span", { cls: "muted", text: " (unverified)" }) : null)],
         ["Last seen", timeNode(record.last_seen || record.first_seen)],
         ["User", clip(record.username)],
@@ -1335,7 +1352,7 @@
     if (ctx.actions) columns.push({ label: "" });
     const wrap = table(columns, items.map((it) => {
       const target = str(it.target);
-      const cells = [mono(target), timeNode(it.approved_at), timeNode(it.expires_at)];
+      const cells = [addressNode(target, it.geo), timeNode(it.approved_at), timeNode(it.expires_at)];
       if (ctx.actions) {
         const cell = el("span");
         cell.append(button("Unblock", () => openConfirm(wrap, {
@@ -1405,7 +1422,7 @@
       const target = str(it.target);
       const stage = it.status === "enforced" ? "enforced" : "tracked";
       const since = stage === "enforced" && it.enforced_at ? it.enforced_at : it.approved_at;
-      const cells = [mono(target), badge(STAGE_LABEL[stage], STAGE_CLASS[stage]), timeNode(since),
+      const cells = [addressNode(target, it.geo), badge(STAGE_LABEL[stage], STAGE_CLASS[stage]), timeNode(since),
         timeNode(it.expires_at), sightingsCell(it.sightings)];
       if (ctx.actions) {
         const cell = el("span", "stack");
@@ -1482,12 +1499,14 @@
       return v && allowed.includes(v) ? v : "";
     };
     const protocol = (params.get("protocol") || "").toLowerCase();
+    const country = (params.get("country") || "").trim().toUpperCase();
     return {
       kind: pick("kind", ["session", "campaign"]),
       protocol: PROTOCOL_RE.test(protocol) ? protocol : "",
       judgement: pick("judgement", JUDGEMENTS),
       honeytoken: pick("honeytoken", ["1", "0"]),
       src: (params.get("src") || "").trim().slice(0, 64),
+      country: COUNTRY_RE.test(country) ? country : "",
       q: (params.get("q") || "").slice(0, 200),
       sort: pick("sort", ["rank"]),
     };
@@ -1497,7 +1516,7 @@
     setTitle("Records");
     const f = recordFilters(route.params);
     const page = pageParam(route.params, "page");
-    const active = Boolean(f.kind || f.protocol || f.judgement || f.honeytoken || f.src || f.q);
+    const active = Boolean(f.kind || f.protocol || f.judgement || f.honeytoken || f.src || f.country || f.q);
 
     const select = (name, label, options) => {
       const s = el("select", { attrs: { name: name } },
@@ -1520,12 +1539,15 @@
       select("judgement", "Judgement", [["", "Any"]].concat(JUDGEMENTS.map((j) => [j, j]))),
       select("honeytoken", "Honeytoken", [["", "Any"], ["1", "Used one"], ["0", "Did not"]]),
       input("src", "Source", "exact address"),
+      input("country", "Country", "code, e.g. DE"),
       select("sort", "Sort", [["", "Newest"], ["rank", "Rank"]]),
       el("button", { cls: "btn btn-primary", attrs: { type: "submit" }, text: "Apply" }),
       active ? link("#/records", "Clear filters") : null);
     form.elements.namedItem("q").setAttribute("data-search", "");
     const protocolInput = form.elements.namedItem("protocol");
     protocolInput.addEventListener("input", () => protocolInput.setCustomValidity(""));
+    const countryInput = form.elements.namedItem("country");
+    countryInput.addEventListener("input", () => countryInput.setCustomValidity(""));
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
       apply();
@@ -1534,10 +1556,16 @@
     function apply() {
       const data = new FormData(form);
       const next = {};
-      for (const key of ["q", "kind", "protocol", "judgement", "honeytoken", "src", "sort"]) {
+      for (const key of ["q", "kind", "protocol", "judgement", "honeytoken", "src", "country", "sort"]) {
         next[key] = String(data.get(key) || "").trim();
       }
       next.protocol = next.protocol.toLowerCase();
+      next.country = next.country.toUpperCase();
+      if (next.country && !COUNTRY_RE.test(next.country)) {
+        countryInput.setCustomValidity("Two letters, the country's ISO code (DE, US, ...).");
+        form.reportValidity();
+        return;
+      }
       if (next.protocol && !PROTOCOL_RE.test(next.protocol)) {
         form.elements.namedItem("protocol").setCustomValidity("Letters and digits only, up to 16.");
         form.reportValidity();
@@ -1577,7 +1605,7 @@
           judgementBadge(r.judgement),
           mono(r.protocol),
           str(r.kind),
-          el("span", null, mono(r.src_ip)),
+          addressNode(r.src_ip, r.geo),
           clip(r.username),
           num(r.commands),
           num(r.auth_successes) + "/" + num(r.auth_attempts),
@@ -1628,6 +1656,8 @@
     out.push(el("section", "section", el("div", "section-body", el("div", "facts",
       fact("Source", el("span", null, mono(r.src_ip),
         r.unverified_source === true ? el("span", { cls: "muted", text: " (may be forged)" }) : null)),
+      data.geo ? fact("Where", el("span", "wrap", str(obj(data.geo).short),
+        el("span", { cls: "muted", text: data.geo_stored === true ? " (when recorded)" : " (looked up now)" }))) : null,
       fact("First seen", timeNode(r.first_seen)),
       fact("Last seen", timeNode(r.last_seen)),
       fact("Username", clip(r.username)),
@@ -1688,7 +1718,10 @@
     const addresses = arr(r.src_addresses);
     if (addresses.length || (typeof r.src_address_count === "number" && r.src_address_count > 0)) {
       const sources = section("Source addresses (" + num(r.src_address_count || addresses.length) + ")");
-      sources.body.append(tags(addresses));
+      const places = obj(data.address_geo);
+      sources.body.append(Object.keys(places).length
+        ? el("ul", null, addresses.map((a) => el("li", null, addressNode(a, places[a]))))
+        : tags(addresses));
       out.push(sources.node);
     }
 
@@ -2166,7 +2199,7 @@
     const row = el("tr", "nav-row",
       el("td", null, toggle),
       el("td", null, timeNode(it.time)),
-      el("td", null, sourceLink(it.src)),
+      el("td", null, sourceLink(it.src), geoText(it.geo)),
       el("td", null, mono(it.service)),
       el("td", null, kindLabel(it.kind)),
       el("td", null, clip(it.username)),
@@ -2198,7 +2231,7 @@
       it.kind === "login" && it.password !== undefined ? ["Password", el("span", { cls: "mono wrap", text: str(it.password) })] : null,
       it.message ? ["Logged as", el("span", { cls: "wrap", text: str(it.message) })] : null,
       ["Session", sid ? link(sid, mono(it.session)) : el("span", { cls: "faint", text: "-" })],
-      ["Source", sourceLink(it.src)],
+      ["Source", el("span", null, sourceLink(it.src), geoText(it.geo))],
     ]));
     return el("div", "stack pad", blocks);
   }
@@ -2254,7 +2287,7 @@
       el("span", { cls: "tag", text: str(data.service) }),
       record ? link(record, "Open the triage record") : el("span", { cls: "muted", text: "No triage record for this session yet." }));
     const facts = el("section", "section", el("div", "section-body", el("div", "facts",
-      fact("Source", sourceLink(data.src)),
+      fact("Source", el("span", null, sourceLink(data.src), geoText(data.geo))),
       fact("Started", timeNode(data.start)),
       fact("Ended", timeNode(data.end)),
       fact("Events", num(events.length)))));
@@ -2462,7 +2495,7 @@
     const items = arr(ss.items).map(obj);
     append(sources.body, [items.length
       ? table([{ label: "Source" }, { label: "Last seen" }, { label: "Kept for them" }, { label: "Why" }, { label: "Until" }],
-        items.map((s) => ({ cells: [sourceLink(s.key),
+        items.map((s) => ({ cells: [el("span", null, sourceLink(s.key), geoText(s.geo)),
           s.last_seen ? timeNode(s.last_seen) : el("span", { cls: "faint", text: "no stored record" }),
           treatment(s), s.reasons && arr(s.reasons).length ? "playbooks: " + arr(s.reasons).map(str).join(", ")
             : el("span", { cls: "faint", text: "-" }),

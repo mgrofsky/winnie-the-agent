@@ -190,3 +190,7 @@ decoy/*.tmp
 
 # Excalidraw diagram sources (only the exported images are committed)
 *.excalidraw
+
+# IP location databases ([geoip]); never committed
+*.mmdb
+/geoip/

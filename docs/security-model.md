@@ -49,6 +49,19 @@ connections are accepted only from the control connection's source. The S3 trap 
 traffic a front-end originates is a model API call, when a model is configured. Enforce
 this with a host firewall as well (see [operations.md](operations.md#egress-control-in-production)).
 
+### Address locations come from files, not the network
+
+The optional `[geoip]` lookup (country, city and network owner of a source address) reads
+`.mmdb` files on disk and makes no network call: no web lookup and no DNS, so it adds no
+egress and tells no third party which addresses touched the sensor. Reverse DNS is not
+done. The files are third-party content and are treated as data: names are stripped of
+control and format characters and clipped, the country code must be two capital letters
+and the AS number a 32-bit integer or they are dropped, the console shows them only as
+text nodes, and the digest puts them in code spans. A missing, corrupt or replaced file
+turns the lookup off or changes what is shown; it cannot raise into the agents or the
+console, and a looked-up place never enters an approval's `view_hash`, so a database
+update cannot block or change a decision.
+
 ### Not a reflector
 
 Over UDP, SIP sends at most one response per request, never larger than the request by

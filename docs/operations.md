@@ -601,6 +601,75 @@ Things to hold on both sides:
   access to the one sightings object, nothing else, and no credentials for the systems the
   lists feed.
 
+## Where addresses are
+
+The console and the digest can show where a source address is: country, region, city and
+the network that owns it (AS number and name), for example
+`198.51.100.7 · Frankfurt, Germany · AS64500 Example Cloud`. The answer comes from database
+files you put on disk. Nothing is looked up over the network: the containers have no
+internet access, and this feature does not change that. Reverse DNS names are not shown;
+they need a live query.
+
+It is off until you set a path. With the files or the `maxminddb` package missing, it
+stays off and everything else works as before; the agents and the console each log one
+line at start saying whether it is on, with each file's build date, or why it is off.
+
+### Getting a database
+
+Two free sources work, in MaxMind's `.mmdb` format. Use either, or one of each:
+
+- **DB-IP Lite** (no account): "IP to City Lite" and "IP to ASN Lite" in MMDB format from
+  db-ip.com, updated monthly. Licensed CC BY 4.0: wherever the results are shown you must
+  credit DB-IP with "IP Geolocation by DB-IP" and a link to db-ip.com. Set `attribution`
+  (below) and the console shows it in its footer.
+- **MaxMind GeoLite2** (free account and licence key): "GeoLite2 City" and "GeoLite2 ASN".
+  The GeoLite2 licence applies, including its attribution requirement and keeping the files
+  up to date; read it before you use them.
+
+Download on a machine with internet access, never from inside the sensor's containers,
+then copy the files to the sensor host.
+
+### Turning it on
+
+Put the files in a `geoip` directory next to `docker-compose.yml`, uncomment the
+`./geoip:/geoip:ro` lines under the `agents` and `ui` services, and add to `SSH/config.ini`:
+
+```ini
+[geoip]
+city_db = /geoip/dbip-city-lite.mmdb
+asn_db = /geoip/dbip-asn-lite.mmdb
+attribution = IP Geolocation by DB-IP (db-ip.com)
+```
+
+Paths are as the containers see them and must be absolute. Either key alone works. The image
+installs `maxminddb` (the `geoip` extra in `pyproject.toml`); without Docker,
+`uv sync --extra geoip`. `*.mmdb` and `geoip/` are in `.gitignore`: never commit them.
+
+### What it changes
+
+- Each new triage record stores what the lookup said when it was written (`src_geo`:
+  country code and name, region, city, AS number and owner, and the build date of each
+  file), so the record keeps what was true at the time. Older records get a lookup when
+  shown, and the record page says which ("when recorded" or "looked up now").
+- The console shows it after the address on the overview's top sources and honeytoken
+  hits, the records list (with a country filter), the record page (the Who line and the
+  campaign's source addresses), approval cards, the blocklist and tracked list, the decoy
+  screen's per-source state and the activity screen.
+- The digest's Who line carries the same short form.
+- Exports and notifications do not change.
+
+Private, loopback, link-local, shared (CGNAT), documentation, multicast and reserved
+addresses are labelled ("private address") without a lookup. A network wider than /24
+(IPv4) or /48 (IPv6) is not looked up.
+
+### Refreshing
+
+Download the new release, copy it next to the old file and rename it into place
+(`mv dbip-city-lite.mmdb.new dbip-city-lite.mmdb`). Both processes check the files about
+once a minute and switch to the new copy without a restart. Overwriting the file in place
+works too but can give odd answers for up to a minute, so prefer the rename. On AWS the
+host has no path to fetch these files; see the deployment README.
+
 ## Using the intelligence outside the sensor
 
 The sensor produces addresses and indicators: `detections/pending/blocklist-candidates.csv`,

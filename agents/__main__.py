@@ -135,6 +135,13 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     from agents.sightings import ConfigError as SightingsConfigError
     from agents.sightings import SightingsSettings
 
+    from agents.enrich import from_config as geo_from_config
+
+    geo = geo_from_config(cp)
+    if geo.attribution:
+        import dataclasses
+
+        settings = dataclasses.replace(settings, attribution=geo.attribution)
     try:
         sightings = SightingsSettings.from_config(cp)
     except SightingsConfigError as exc:
@@ -152,7 +159,7 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
               operator=operator,
               respond_settings=lambda: runtime.respond_settings(cp),
               connectors=lambda: runtime.respond_connectors(cp, state),
-              sensor=sensor_label(cp), sightings=sightings)
+              sensor=sensor_label(cp), sightings=sightings, geo=geo)
     try:
         serve(settings, api)
     except (ValueError, OSError) as exc:
@@ -442,6 +449,16 @@ def _run(argv=None) -> dict:
                 results[name] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
                 log.error("%s failed: %s", name, results[name]["error"])
 
+        geo_cache: list = []
+
+        def _geo():
+            # The [geoip] lookup, opened once for triage and the digest; off when unset.
+            if not geo_cache:
+                from agents.enrich import from_config as geo_from_config
+
+                geo_cache.append(geo_from_config(cp))
+            return geo_cache[0]
+
         if args.command in ("triage", "run-all"):
             log_state, log_error = runtime.event_log_state(log_path)
             if log_state == "missing":
@@ -464,7 +481,8 @@ def _run(argv=None) -> dict:
                         max_records_per_run=int(agents_cfg.get("max_records_per_run",
                                                                MAX_RECORDS_PER_RUN)),
                         retention_days=float(agents_cfg.get("record_retention_days",
-                                                            RECORD_RETENTION_DAYS)))
+                                                            RECORD_RETENTION_DAYS)),
+                        geo=_geo())
 
                 stage("triage", _triage)
         if args.command in ("respond", "run-all") and \
@@ -494,7 +512,7 @@ def _run(argv=None) -> dict:
             from agents.triage import digest
 
             def _digest():
-                text = digest(reports, day=args.day, dry_run=args.dry_run)
+                text = digest(reports, day=args.day, dry_run=args.dry_run, geo=_geo())
                 if args.dry_run or args.command == "digest":
                     print(text)
                 return "printed" if args.dry_run else "written"

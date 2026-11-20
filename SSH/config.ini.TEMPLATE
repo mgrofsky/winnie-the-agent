@@ -491,6 +491,19 @@ max_entries = 5000
 # The console marks the file stale when its generated_at is older than this.
 stale_hours = 48
 
+# Where source addresses are: country, region, city and network owner (AS number), shown in
+# the console and the digest and stored on each triage record. Read from MaxMind-format
+# .mmdb files on disk (MaxMind GeoLite2 City / ASN or DB-IP Lite City / ASN) with the
+# optional maxminddb package; no network call of any kind. Off unless a path is set; a
+# missing file or package leaves it off. Replace a file by renaming a new copy into place;
+# it is picked up within a minute. See docs/operations.md, "Where addresses are".
+#[geoip]
+#city_db = /geoip/dbip-city-lite.mmdb
+#asn_db = /geoip/dbip-asn-lite.mmdb
+# Credit line the console shows in its footer as plain text. The free databases require
+# one; DB-IP Lite (CC BY 4.0) asks for "IP Geolocation by DB-IP" with a link to db-ip.com.
+#attribution = IP Geolocation by DB-IP (db-ip.com)
+
 # Optional sightings fetch (python -m agents ship; also run-all), at most once per
 # interval_minutes. kind = s3: GetObject of exactly one key; kind = https: GET. The local
 # file is replaced only by a copy that passes the checks.
