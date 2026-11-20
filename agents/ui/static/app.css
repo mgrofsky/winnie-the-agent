@@ -1456,3 +1456,23 @@ tr.row-detail > td {
     scroll-behavior: auto !important;
   }
 }
+
+/* A record's narrative laid out in parts (narrativeView). */
+.narrative-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+}
+
+.nl-head strong {
+  font-weight: 600;
+}
+
+.nl-list {
+  margin: 0.2em 0 0;
+  padding-left: 1.2em;
+}
+
+.nl-list li {
+  overflow-wrap: anywhere;
+}

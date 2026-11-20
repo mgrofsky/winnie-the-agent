@@ -97,7 +97,7 @@ object (analysts).
 |---|---|---|
 | Persona (SSH, Telnet) | the text the attacker sees in that session | anything else: its output is sent to the attacker and logged, nothing more |
 | SQL / HTTP fallback | column names and capped cell values, or a JSON body, validated against a strict schema | protocol state, other connections, files |
-| Triage analyst | intent, stage, skill, judgement, techniques, a narrative and extra IOCs, all schema-validated | severity below the deterministic floor; IOCs that do not appear verbatim in the transcript; which playbooks run beyond what those enum fields select |
+| Triage analyst | intent, stage, skill, judgement, techniques, a narrative (headline, actions, assessment, not seen, paragraph) and extra IOCs, all schema-validated; who, volume and target are computed by code | severity below the deterministic floor; IOCs that do not appear verbatim in the transcript; which playbooks run beyond what those enum fields select |
 | Tuner ranking | the order of candidates the code generated, by index | any value written to the overlay |
 | Detect | a length-capped, character-restricted title and description | the rule body and selectors |
 
@@ -109,7 +109,8 @@ control is schema validation plus the fact that no free-form model text flows in
 persona prompt, the config, the overlay or a playbook decision.
 
 Playbooks match only on enum and numeric fields of a validated record plus facts computed by
-code. The model-written narrative leaves the honeypot only if
+code; the narrative parts are read by nothing but the digest and the console, which show
+them as escaped text. The model-written narrative leaves the honeypot only if
 `[respond] include_narrative = true`, labelled untrusted, stripped of markup, and cut to
 fit the 300-character summary.
 
