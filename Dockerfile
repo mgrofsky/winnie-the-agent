@@ -29,9 +29,9 @@ COPY deploy/aws/host ./deploy/aws/host
 
 # Volume mount points owned by the runtime user, so fresh named volumes inherit the owner.
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin winnie \
-    && mkdir -p /data /agents/reports/blocklist /overlay /blocklist \
-    && chown winnie:winnie /data /agents /agents/reports /agents/reports/blocklist /overlay /blocklist \
-    && chmod 0750 /data /agents /agents/reports /agents/reports/blocklist /overlay /blocklist
+    && mkdir -p /data /agents/reports/blocklist /overlay /blocklist /internetdb \
+    && chown winnie:winnie /data /agents /agents/reports /agents/reports/blocklist /overlay /blocklist /internetdb \
+    && chmod 0750 /data /agents /agents/reports /agents/reports/blocklist /overlay /blocklist /internetdb
 USER 10001
 
 EXPOSE 8022

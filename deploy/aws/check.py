@@ -79,11 +79,27 @@ EXPORTER_MOUNTS = {"./config-ship.ini": ("/config/config.ini", True),
                    "frontend": ("/data", True),
                    "exportstate": ("/agents", False),
                    "blocklist": ("/blocklist", True)}
+# InternetDbDelivered: the one object the role and the S3 endpoint may read, and the user
+# data variables that carry the feature. Each renders to "" when the switch is off, so the
+# bootstrap is then exactly what it was without the feature.
+IDB_ANSWERS = "arn:${AWS::Partition}:s3:::${EventsBucketName}/${InternetDbAnswersKey}"
+IDB_ROLE_STATEMENT = {"Sid": "GetInternetDbAnswers", "Effect": "Allow",
+                      "Action": "s3:GetObject", "Resource": {"Fn::Sub": IDB_ANSWERS}}
+IDB_ENDPOINT_STATEMENT = {"Sid": "InternetDbAnswers", "Effect": "Allow", "Principal": "*",
+                          "Action": "s3:GetObject", "Resource": {"Fn::Sub": IDB_ANSWERS}}
+IDB_WANTED_KEY = "${EventsPrefix}/internetdb/wanted.json"
+IDB_VARIABLES = {"IdbArgs": " true " + IDB_WANTED_KEY + " ${InternetDbAnswersKey}",
+                 "IdbRead": "\n      - internetdb:/internetdb:ro",
+                 "IdbWrite": "\n      - internetdb:/internetdb",
+                 "IdbVolume": "\n  internetdb: {}"}
+# Who mounts the internetdb volume, where, and read-only or not; no other service may.
+IDB_MOUNTS = {"exporter": ("/internetdb", False), "agents": ("/internetdb", True),
+              "ui": ("/internetdb", True)}
 # Literal parameter defaults: project or example names, scenario names, instance types,
 # public SSM parameter paths, addresses, numbers and switches. Nothing that could name an
 # organisation.
 GENERIC_DEFAULT = re.compile(r"^(winnie[a-z0-9-]*|example[a-z0-9.-]*|events|compose-bin|console|"
-                             r"tracked/tracked\.json|"
+                             r"tracked/tracked\.json|internetdb/answers\.json|"
                              r"[a-z][0-9][a-z]*\.[a-z0-9]+|/aws/service/[a-z0-9/_.-]+|"
                              r"[0-9./]+|true|false|)$")
 
@@ -266,8 +282,15 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
             errors.append(f"launch template {name} hop limit is not 1")
         if "KeyName" in data:
             errors.append(f"launch template {name} sets a key pair")
-        user_data = text((data.get("UserData") or {}).get("Fn::Base64"))
-        errors += [f"launch template {name}: {e}" for e in check_user_data(user_data)]
+        base64_value = (data.get("UserData") or {}).get("Fn::Base64")
+        user_data = text(base64_value)
+        sub = base64_value.get("Fn::Sub") if isinstance(base64_value, dict) else None
+        variables = sub[1] if isinstance(sub, list) and len(sub) == 2 else {}
+        found: list[str] = []
+        for on in (False, True):
+            expanded, problems = internetdb_user_data(user_data, variables, on)
+            found += problems + check_user_data(expanded, internetdb=on)
+        errors += [f"launch template {name}: {e}" for e in dict.fromkeys(found)]
         errors += [f"launch template {name}: {e}"
                    for e in check_user_data_steps(doc, (data.get("UserData") or {})
                                                   .get("Fn::Base64"))]
@@ -279,6 +302,8 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
             errors.append(f"instance {name} does not use the launch template")
 
     errors += check_role(doc)
+    errors += check_endpoint_policy(doc)
+    errors += check_internetdb_switch(doc)
     errors += check_repository(doc)
     if raw:
         errors += deploy_copy_problems(raw)
@@ -789,8 +814,61 @@ RENDER_FACTS = {
 }
 
 
+def internetdb_user_data(user_data: str, variables: dict, on: bool) -> tuple[str, list[str]]:
+    """The user data with the InternetDbDelivered variables rendered for ``on``, and any
+    variable that is not exactly its expected value when on and "" when off."""
+    errors: list[str] = []
+    for name, value in IDB_VARIABLES.items():
+        got = variables.get(name)
+        branch = got.get("Fn::If") if isinstance(got, dict) else None
+        if not (isinstance(branch, list) and len(branch) == 3 and branch[0] == "InternetDbOn"
+                and text(branch[1]) == value and branch[2] == ""):
+            errors.append(f"user data variable {name} is not exactly its InternetDbDelivered "
+                          "value, and empty when off")
+        user_data = user_data.replace("${" + name + "}", value if on else "")
+    return user_data, errors
+
+
+def check_internetdb_switch(doc: dict) -> list[str]:
+    errors: list[str] = []
+    params = doc.get("Parameters") or {}
+    if (params.get("InternetDbDelivered") or {}).get("Default") != "false":
+        errors.append("parameter InternetDbDelivered is not off by default")
+    if (doc.get("Conditions") or {}).get("InternetDbOn") != \
+            {"Fn::Equals": [{"Ref": "InternetDbDelivered"}, "true"]}:
+        errors.append("condition InternetDbOn is not InternetDbDelivered=true")
+    key = params.get("InternetDbAnswersKey") or {}
+    pattern = key.get("AllowedPattern")
+    if not isinstance(pattern, str) or any(re.search(pattern, k) for k in TRACKED_KEY_ESCAPES) \
+            or not re.fullmatch(pattern, str(key.get("Default"))):
+        errors.append("parameter InternetDbAnswersKey allows a key that is not one plain key")
+    return errors
+
+
+def _conditional(item, condition: str, statement: dict) -> Optional[bool]:
+    """None for a plain statement; True when ``item`` is exactly ``statement`` under
+    ``condition`` and nothing otherwise; False for any other conditional."""
+    if not (isinstance(item, dict) and "Fn::If" in item):
+        return None
+    branch = item["Fn::If"]
+    return isinstance(branch, list) and len(branch) == 3 and branch[0] == condition \
+        and branch[1] == statement and branch[2] == {"Ref": "AWS::NoValue"}
+
+
+def check_endpoint_policy(doc: dict) -> list[str]:
+    """The S3 gateway endpoint: the only conditional statement is the answers read."""
+    errors: list[str] = []
+    for name, ep in resources(doc, "AWS::EC2::VPCEndpoint").items():
+        policy = (ep.get("Properties") or {}).get("PolicyDocument") or {}
+        for item in as_list(policy.get("Statement") or []):
+            if _conditional(item, "InternetDbOn", IDB_ENDPOINT_STATEMENT) is False:
+                errors.append(f"endpoint {name} has a conditional statement other than the "
+                              "InternetDB answers read")
+    return errors
+
+
 def check_user_data(user_data: str, render_script: Optional[str] = None,
-                    dockerfile: Optional[str] = None) -> list[str]:
+                    dockerfile: Optional[str] = None, internetdb: bool = False) -> list[str]:
     errors = [msg for msg, needle in USER_DATA_FACTS.items() if needle not in user_data]
     ships = re.findall(r"python -m agents ship[^\"\]]*", user_data)
     if not ships:
@@ -802,14 +880,15 @@ def check_user_data(user_data: str, render_script: Optional[str] = None,
     compose = embedded_compose(user_data)
     errors += check_ui(compose)
     if compose is not None:
-        errors += check_exporter(compose) + check_blocklist(compose) + check_configs(compose)
-    errors += check_render(user_data, render_script, dockerfile)
+        errors += check_exporter(compose, internetdb) + check_blocklist(compose) \
+            + check_configs(compose) + check_internetdb_volume(compose, internetdb)
+    errors += check_render(user_data, render_script, dockerfile, internetdb)
     errors += check_host_files(dockerfile=dockerfile)
     return errors
 
 
 def check_render(user_data: str, script: Optional[str] = None,
-                 dockerfile: Optional[str] = None) -> list[str]:
+                 dockerfile: Optional[str] = None, internetdb: bool = False) -> list[str]:
     """render_config.py as the image carries it, run on the repository's config template:
     the tracked export is on only when shipping and TrackedExport both are, and the agents'
     config.ini keeps every transport off (only config-ship.ini, the exporter's, ships)."""
@@ -828,8 +907,9 @@ def check_render(user_data: str, script: Optional[str] = None,
     except SyntaxError:
         errors.append("render_config.py does not parse as Python 3.9 (the host's python3)")
     errors += [msg for msg, needle in RENDER_FACTS.items() if needle not in script]
+    tail = re.escape(IDB_VARIABLES["IdbArgs"]) if internetdb else ""
     calls = dict(re.findall(r'^python3 render_config\.py config\.ini\.TEMPLATE (\S+) \$ARGS '
-                            r'"\$NEVER" (\S+)$', user_data, re.M))
+                            r'"\$NEVER" (\S+)' + tail + '$', user_data, re.M))
     if not re.search(r'^NEVER="\$\{NeverActOn\}"$', user_data, re.M):
         errors.append("render_config.py does not get NeverActOn")
     if calls != RENDER_CALLS:
@@ -854,7 +934,47 @@ def check_render(user_data: str, script: Optional[str] = None,
                 if got.get((section, key)) != value:
                     errors.append(f"with shipping {ship} and TrackedExport {tracked} the "
                                   f"rendered [{section}] {key} is not {value}")
+    if internetdb:
+        for ship in ("true", "false"):
+            got = _render_internetdb(script, ship)
+            want = {("connector.internetdb", "mode"): "delivered",
+                    ("connector.internetdb", "answers_file"): "/internetdb/internetdb.json",
+                    ("connector.internetdb", "wanted_file"):
+                        "/blocklist/internetdb_wanted.json" if ship == "true" else None,
+                    ("connector.internetdb_exchange", "enabled"): ship,
+                    ("connector.internetdb_exchange", "wanted_key"): "events/internetdb/wanted.json",
+                    ("connector.internetdb_exchange", "answers_key"): "internetdb/answers.json"}
+            if got is None or any(got.get(k) != v for k, v in want.items()):
+                errors.append(f"with shipping {ship} and InternetDbDelivered the rendered "
+                              "InternetDB settings are not delivered mode with the exchange "
+                              "on for the exporter only")
     return errors
+
+
+@functools.lru_cache(maxsize=4)
+def _render_internetdb(script: str, ship: str) -> Optional[dict]:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "render_config.py"
+        path.write_text(script, encoding="utf-8")
+        out = Path(tmp) / "config.ini"
+        try:
+            subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),
+                            "winnie-sensor", "example", "192.0.2.10", "false",
+                            "example-events", "events", "us-east-1", "123456789012", "false",
+                            "events/tracked/tracked.json", "", ship, "true",
+                            "events/internetdb/wanted.json", "internetdb/answers.json"],
+                           check=True, capture_output=True, timeout=60, cwd=tmp)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.read(out, encoding="utf-8")
+        return {(s, k): cp.get(s, k, fallback=None)
+                for s, k in (("connector.internetdb", "mode"),
+                             ("connector.internetdb", "answers_file"),
+                             ("connector.internetdb", "wanted_file"),
+                             ("connector.internetdb_exchange", "enabled"),
+                             ("connector.internetdb_exchange", "wanted_key"),
+                             ("connector.internetdb_exchange", "answers_key"))}
 
 
 @functools.lru_cache(maxsize=16)
@@ -948,9 +1068,13 @@ def _mounts(service: dict) -> list[tuple[str, str, bool]]:
     return out
 
 
-def check_exporter(compose: dict) -> list[str]:
+def check_exporter(compose: dict, internetdb: bool = False) -> list[str]:
     """The exporter holds the instance role, so it mounts its own config and state, the
-    front-end log (read-only) and the blocklist directory (read-only), nothing else."""
+    front-end log (read-only) and the blocklist directory (read-only), and with
+    InternetDbDelivered the internetdb volume it writes; nothing else."""
+    allowed = dict(EXPORTER_MOUNTS)
+    if internetdb:
+        allowed["internetdb"] = IDB_MOUNTS["exporter"]
     exporter = (compose.get("services") or {}).get("exporter")
     if not isinstance(exporter, dict):
         return ["the embedded compose file has no exporter service"]
@@ -958,18 +1082,34 @@ def check_exporter(compose: dict) -> list[str]:
     if any(not isinstance(v, str) for v in as_list(exporter.get("volumes") or [])):
         errors.append("the exporter has a volume that is not in short syntax")
     sources = [source for source, _, _ in _mounts(exporter)]
-    for source in EXPORTER_MOUNTS:
+    for source in allowed:
         if sources.count(source) != 1:
             errors.append(f"the exporter does not mount {source} exactly once")
     for source, target, read_only in _mounts(exporter):
-        if source not in EXPORTER_MOUNTS:
+        if source not in allowed:
             errors.append(f"the exporter mounts {source}")
             continue
-        want_target, want_ro = EXPORTER_MOUNTS[source]
+        want_target, want_ro = allowed[source]
         if target != want_target:
             errors.append(f"the exporter mounts {source} at {target}")
         if want_ro and not read_only:
             errors.append(f"the exporter mounts {source} read-write")
+    return errors
+
+
+def check_internetdb_volume(compose: dict, internetdb: bool) -> list[str]:
+    """Off: no internetdb volume anywhere. On: the exporter writes it, the agents and the
+    console read it, each at /internetdb, and no other service mounts it."""
+    errors: list[str] = []
+    for name, service in (compose.get("services") or {}).items():
+        got = [(t, ro) for s, t, ro in _mounts(service or {}) if s == "internetdb"]
+        want = [IDB_MOUNTS[name]] if internetdb and name in IDB_MOUNTS else []
+        if got != want:
+            errors.append(f"the {name} service mounts the internetdb volume other than as "
+                          "InternetDbDelivered requires")
+    if ("internetdb" in (compose.get("volumes") or {})) != internetdb:
+        errors.append("the internetdb volume is declared without InternetDbDelivered, or "
+                      "missing with it")
     return errors
 
 
@@ -1007,7 +1147,15 @@ def check_role(doc: dict) -> list[str]:
         errors.append(f"instance role {name} managed policies are not exactly "
                       "AmazonSSMManagedInstanceCore")
     for policy in as_list(props.get("Policies") or []):
-        errors += _check_statements(name, as_list(policy["PolicyDocument"]["Statement"]))
+        statements = []
+        for item in as_list(policy["PolicyDocument"]["Statement"]):
+            kind = _conditional(item, "InternetDbOn", IDB_ROLE_STATEMENT)
+            if kind is None:
+                statements.append(item)
+            elif kind is False:
+                errors.append(f"instance role {name} has a conditional statement other than "
+                              "the InternetDB answers read")
+        errors += _check_statements(name, statements)
     # A role can be named in many forms (Ref, a Sub of its name, a literal), so every
     # separate policy resource is suspect: only the one tailnet policy may exist.
     for kind in ("AWS::IAM::ManagedPolicy", "AWS::IAM::Policy"):

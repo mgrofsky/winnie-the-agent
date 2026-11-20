@@ -38,6 +38,12 @@ def _lt(doc):
     return doc["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]
 
 
+def _user_data(doc, internetdb=False):
+    """The user data template with the InternetDbDelivered variables rendered."""
+    ud, variables = _lt(doc)["UserData"]["Fn::Base64"]["Fn::Sub"]
+    return check.internetdb_user_data(ud, variables, internetdb)[0]
+
+
 def _bucket_statements(doc):
     return doc["Resources"]["EventsBucketPolicy"]["Properties"]["PolicyDocument"]["Statement"]
 
@@ -86,7 +92,8 @@ def _key_pair(d):
 
 
 def _role_get_object(d):
-    _role_statements(d)[-1]["Action"] = ["s3:PutObject", "s3:GetObject"]
+    [put] = [s for s in _role_statements(d) if s.get("Sid") == "PutEventsOnly"]
+    put["Action"] = ["s3:PutObject", "s3:GetObject"]
 
 
 def _role_wildcard_action(d):
@@ -197,6 +204,52 @@ def _blocklist_undeclared(d):
     _user_data_edit(d, "\n  blocklist: {}\n", "\n")
 
 
+def _idb_variables(d):
+    return _lt(d)["UserData"]["Fn::Base64"]["Fn::Sub"][1]
+
+
+def _idb_role_whole_bucket(d):
+    [item] = [s for s in _role_statements(d) if "Fn::If" in s]
+    item["Fn::If"][1]["Resource"] = {"Fn::Sub": "arn:${AWS::Partition}:s3:::${EventsBucketName}/*"}
+
+
+def _idb_role_always(d):
+    [item] = [s for s in _role_statements(d) if "Fn::If" in s]
+    item["Fn::If"][0] = "HostOn"
+
+
+def _idb_endpoint_put(d):
+    sts = d["Resources"]["S3GatewayEndpoint"]["Properties"]["PolicyDocument"]["Statement"]
+    [item] = [s for s in sts if "Fn::If" in s]
+    item["Fn::If"][1]["Action"] = "s3:PutObject"
+
+
+def _idb_default_on(d):
+    d["Parameters"]["InternetDbDelivered"]["Default"] = "true"
+
+
+def _idb_volume_when_off(d):
+    _idb_variables(d)["IdbVolume"]["Fn::If"][2] = "\n  internetdb: {}"
+
+
+def _idb_ui_writes(d):
+    _idb_variables(d)["IdbRead"]["Fn::If"][1] = "\n      - internetdb:/internetdb"
+
+
+def _idb_ssh_reads(d):
+    _user_data_edit(d, "  - overlay:/overlay:ro\nservices:",
+                    "  - overlay:/overlay:ro\n  - internetdb:/internetdb:ro\nservices:")
+
+
+def _idb_args_dropped(d):
+    _user_data_edit(d, 'config-ship.ini $ARGS "$NEVER" true${IdbArgs}',
+                    'config-ship.ini $ARGS "$NEVER" true')
+
+
+def _idb_key_loose(d):
+    d["Parameters"]["InternetDbAnswersKey"]["AllowedPattern"] = "^.+$"
+
+
 def _tracked_default_on(d):
     d["Parameters"]["TrackedExport"]["Default"] = "true"
 
@@ -229,17 +282,18 @@ def _agents_mount_ship_config(d):
 
 
 def _exporter_without_blocklist(d):
-    _service_edit(d, "exporter", "\n      - blocklist:/blocklist:ro\n", "\n")
+    _service_edit(d, "exporter", "\n      - blocklist:/blocklist:ro${IdbWrite}\n",
+                  "${IdbWrite}\n")
 
 
 def _exporter_blocklist_twice(d):
-    _service_edit(d, "exporter", "- blocklist:/blocklist:ro\n",
-                  "- blocklist:/blocklist:ro\n      - blocklist:/more:ro\n")
+    _service_edit(d, "exporter", "- blocklist:/blocklist:ro${IdbWrite}\n",
+                  "- blocklist:/blocklist:ro${IdbWrite}\n      - blocklist:/more:ro\n")
 
 
 def _exporter_mounts_agent_state(d):
-    _service_edit(d, "exporter", "- blocklist:/blocklist:ro\n",
-                  "- blocklist:/blocklist:ro\n      - agentdata:/agents/state:ro\n")
+    _service_edit(d, "exporter", "- blocklist:/blocklist:ro${IdbWrite}\n",
+                  "- blocklist:/blocklist:ro${IdbWrite}\n      - agentdata:/agents/state:ro\n")
 
 
 def _tracked_key_numeric(d):
@@ -643,6 +697,15 @@ SENSOR_BREAKS = {
     "agents service does not write the blocklist volume": _agents_blocklist_read_only,
     "the blocklist volume is not declared": _blocklist_undeclared,
     "TrackedExport is not off by default": _tracked_default_on,
+    "role InstanceRole has a conditional statement other than": _idb_role_whole_bucket,
+    "InstanceRole has a conditional statement other than the InternetDB": _idb_role_always,
+    "endpoint S3GatewayEndpoint has a conditional statement other than": _idb_endpoint_put,
+    "InternetDbDelivered is not off by default": _idb_default_on,
+    "variable IdbVolume is not exactly": _idb_volume_when_off,
+    "variable IdbRead is not exactly": _idb_ui_writes,
+    "the ssh service mounts the internetdb volume": _idb_ssh_reads,
+    "configs are not rendered as config.ini without shipping": _idb_args_dropped,
+    "InternetDbAnswersKey allows a key that is not one plain key": _idb_key_loose,
     "TrackedKey allows a key outside the events prefix": _tracked_key_loose,
     "tracked key is not under the events prefix": _tracked_key_outside_prefix,
 }
@@ -762,15 +825,14 @@ def test_console_is_switched_by_a_profile_and_matches_the_compose_service(sensor
     assert 'echo "COMPOSE_PROFILES=${UiProfiles}" > .env' in ud
     assert variables["UiProfiles"] == {"Fn::If": ["UiOn", "ui", ""]}
     assert sensor["Conditions"]["UiOn"] == {"Fn::Equals": [{"Ref": "UiEnabled"}, "true"]}
-    embedded = check.embedded_compose(ud)["services"]["ui"]
+    embedded = check.embedded_compose(_user_data(sensor))["services"]["ui"]
     local = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]["ui"]
     assert embedded["command"] == local["command"]
     assert embedded["ports"] == local["ports"] == ["127.0.0.1:8480:8480"]
 
 
 def test_blocklist_volume_is_written_by_the_agents_and_read_by_the_rest(sensor):
-    ud = _lt(sensor)["UserData"]["Fn::Base64"]["Fn::Sub"][0]
-    compose = check.embedded_compose(ud)
+    compose = check.embedded_compose(_user_data(sensor))
     services = compose["services"]
     assert "blocklist" in compose["volumes"]
     assert "blocklist:/agents/reports/blocklist" in services["agents"]["volumes"]
@@ -828,15 +890,170 @@ def test_rendered_configs_turn_the_tracked_export_on_for_the_exporter_only(senso
     assert ship.get("connector.s3_events", "enabled") == "true"
 
 
-def test_rendered_configs_leave_the_internetdb_lookup_off(sensor, tmp_path):
-    # This stack gives the lookup no egress path; neither config may turn it on.
+def _render_args(dst, ship, internetdb=()):
+    return [sys.executable, str(AWS / "render_config.py"),
+            str(ROOT / "SSH" / "config.ini.TEMPLATE"), str(dst), "winnie-sensor",
+            "sip-provider", "192.0.2.10", "false", "example-honeypot-events", "events",
+            "us-east-1", "123456789012", "true", "events/tracked/tracked.json", "", ship,
+            *internetdb]
+
+
+IDB_ARGS = ("true", "events/internetdb/wanted.json", "internetdb/answers.json")
+
+
+def test_rendered_configs_never_turn_the_direct_lookup_on(sensor, tmp_path):
+    # This stack gives the sensor no path to InternetDB: off, nothing about it is written;
+    # on, only delivered mode.
     from agents.internetdb import InternetDbSettings
 
-    for dst, ship in (("config.ini", "false"), ("config-ship.ini", "true")):
-        cp = _render(sensor, tmp_path, dst, ship, "true")
-        assert InternetDbSettings.from_config(cp).enabled is False
-    assert "internetdb" not in (AWS / "sensor.yaml").read_text().lower()
+    for internetdb in ((), ("false",), IDB_ARGS):
+        for dst, ship in (("config.ini", "false"), ("config-ship.ini", "true")):
+            out = tmp_path / dst
+            subprocess.run(_render_args(out, ship, internetdb), check=True, capture_output=True)
+            cp = configparser.ConfigParser(interpolation=None, strict=False)
+            cp.read(out, encoding="utf-8")
+            settings = InternetDbSettings.from_config(cp)
+            assert settings.enabled == settings.delivered == bool(internetdb[1:])
     assert "internetdb" not in (AWS / "host" / "sensor-egress.sh").read_text().lower()
+
+
+@pytest.mark.parametrize("ship", ["true", "false"])
+def test_with_internetdb_off_the_rendered_configs_are_byte_for_byte_as_before(tmp_path, ship):
+    outs = []
+    for i, internetdb in enumerate(((), ("false",))):
+        out = tmp_path / f"{i}.ini"
+        subprocess.run(_render_args(out, ship, internetdb), check=True, capture_output=True)
+        outs.append(out.read_bytes())
+    assert outs[0] == outs[1]
+    assert b"internetdb]" not in outs[0].replace(b"#[connector.internetdb", b"")
+
+
+def test_render_refuses_half_given_internetdb_arguments(tmp_path):
+    for bad in (("true",), ("true", "a.json"), ("yes", "a.json", "b.json"),
+                (*IDB_ARGS, "extra")):
+        result = subprocess.run(_render_args(tmp_path / "x.ini", "true", bad),
+                                capture_output=True, text=True)
+        assert result.returncode != 0, bad
+
+
+def test_rendered_configs_with_internetdb_delivered(tmp_path):
+    from agents import internetdb_delivered as dl
+    from agents.internetdb import InternetDbSettings
+
+    configs = {}
+    for dst, ship in (("config.ini", "false"), ("config-ship.ini", "true")):
+        out = tmp_path / dst
+        subprocess.run(_render_args(out, ship, IDB_ARGS), check=True, capture_output=True)
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.read(out, encoding="utf-8")
+        configs[dst] = cp
+    agents, ship = configs["config.ini"], configs["config-ship.ini"]
+    for cp in (agents, ship):
+        s = InternetDbSettings.from_config(cp)
+        assert s.delivered and s.answers_file == "/internetdb/internetdb.json"
+    # The agents write the wanted list next to the blocklist (the default); the exporter
+    # reads it from its read-only blocklist mount and alone moves the files.
+    assert InternetDbSettings.from_config(agents).wanted_file is None
+    assert InternetDbSettings.from_config(ship).wanted_file == "/blocklist/internetdb_wanted.json"
+    assert dl.ExchangeSettings.from_config(agents).enabled is False
+    ex = dl.ExchangeSettings.from_config(ship)
+    assert ex.enabled and ex.wanted.bucket == "example-honeypot-events"
+    assert ex.wanted.key == "events/internetdb/wanted.json"
+    assert ex.answers.key == "internetdb/answers.json"
+    assert ex.wanted.bucket_owner == "123456789012" and ex.wanted.region == "us-east-1"
+
+
+def _resolve(node, on):
+    """``node`` with every InternetDbOn branch taken and AWS::NoValue items removed."""
+    if isinstance(node, list):
+        out = [_resolve(v, on) for v in node]
+        return [v for v in out if v != {"Ref": "AWS::NoValue"}]
+    if isinstance(node, dict):
+        if "Fn::If" in node and node["Fn::If"][0] == "InternetDbOn":
+            return _resolve(node["Fn::If"][1 if on else 2], on)
+        return {k: _resolve(v, on) for k, v in node.items()}
+    return node
+
+
+# The statements as they were before InternetDbDelivered existed.
+ROLE_BEFORE_S3 = {"Sid": "PutEventsOnly", "Effect": "Allow", "Action": "s3:PutObject",
+                  "Resource": {"Fn::Sub": "arn:${AWS::Partition}:s3:::${EventsBucketName}/"
+                                          "${EventsPrefix}/*"}}
+
+
+def test_with_internetdb_off_the_role_and_endpoint_policies_are_unchanged(sensor):
+    role = _resolve(_role_statements(sensor), False)
+    assert [s["Sid"] for s in role] == ["EcrAuthToken", "EcrPullOneRepository",
+                                        "WriteOneLogGroup", "PutEventsOnly"]
+    assert role[-1] == ROLE_BEFORE_S3
+    endpoint = _resolve(sensor["Resources"]["S3GatewayEndpoint"]["Properties"]
+                        ["PolicyDocument"]["Statement"], False)
+    assert [s["Sid"] for s in endpoint] == ["EventsPutOnly", "Al2023Repositories",
+                                            "EcrLayers", "SsmAgent"]
+    assert not any(s.get("Action") == "s3:GetObject" and "EventsBucketName" in str(s)
+                   for s in endpoint)
+    # Every other resource never mentions the switch.
+    for name, res in sensor["Resources"].items():
+        if name not in ("InstanceRole", "S3GatewayEndpoint", "LaunchTemplate"):
+            assert "InternetDb" not in str(res), name
+
+
+def test_with_internetdb_on_one_more_read_of_one_key(sensor):
+    role = _resolve(_role_statements(sensor), True)
+    added = [s for s in role if s.get("Action") == "s3:GetObject"]
+    assert added == [check.IDB_ROLE_STATEMENT]
+    endpoint = _resolve(sensor["Resources"]["S3GatewayEndpoint"]["Properties"]
+                        ["PolicyDocument"]["Statement"], True)
+    assert check.IDB_ENDPOINT_STATEMENT in endpoint
+    assert check.IDB_ANSWERS.endswith("/${InternetDbAnswersKey}")
+
+
+def test_internetdb_answers_key_is_one_plain_key(sensor):
+    param = sensor["Parameters"]["InternetDbAnswersKey"]
+    assert param["Default"] == "internetdb/answers.json" and param["MaxLength"] == 128
+    assert sensor["Parameters"]["InternetDbDelivered"]["Default"] == "false"
+    for key in check.TRACKED_KEY_ESCAPES + ("internetdb/*", "internetdb/answers", "*.json"):
+        assert not re.fullmatch(param["AllowedPattern"], key), key
+
+
+def test_with_internetdb_off_the_bootstrap_is_byte_for_byte_as_before(sensor):
+    for switches in SWITCHES:
+        off = _rendered(sensor, *switches)
+        assert "internetdb" not in off.lower() and "Idb" not in off
+        # The same text the template held before the variables were added.
+        template = _lt(sensor)["UserData"]["Fn::Base64"]["Fn::Sub"][0]
+        for name in check.IDB_VARIABLES:
+            template = template.replace("${" + name + "}", "")
+        assert "${Idb" not in template
+
+
+def test_with_internetdb_on_the_volume_and_render_calls(sensor):
+    on = _rendered(sensor, "false", "false", "false", internetdb="true")
+    compose = check.embedded_compose(on)
+    services = compose["services"]
+    assert "internetdb" in compose["volumes"]
+    assert "internetdb:/internetdb" in services["exporter"]["volumes"]
+    assert "internetdb:/internetdb:ro" in services["agents"]["volumes"]
+    assert "internetdb:/internetdb:ro" in services["ui"]["volumes"]
+    for name in ("ssh", "listeners"):
+        assert not any(str(v).startswith("internetdb") for v in services[name]["volumes"])
+    assert check.check_internetdb_volume(compose, True) == []
+    assert check.check_exporter(compose, True) == []
+    lines = [l for l in on.splitlines() if l.startswith("python3 render_config.py")]
+    assert lines == [
+        'python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "$NEVER" false true '
+        "events/internetdb/wanted.json internetdb/answers.json",
+        'python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "$NEVER" true true '
+        "events/internetdb/wanted.json internetdb/answers.json"]
+    path = Path(check.HERE).parents[1] / "Dockerfile"
+    assert "/internetdb" in path.read_text()
+
+
+def test_internetdb_bootstrap_is_valid_shell(sensor, tmp_path):
+    path = tmp_path / "user-data"
+    path.write_text(_rendered(sensor, "true", "true", "true", internetdb="true"))
+    result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_smtp_needs_its_own_switch(sensor):
@@ -927,15 +1144,16 @@ SAMPLE = {"AWS::Region": "us-east-1", "AWS::AccountId": "123456789012",
           "AgentsIntervalSeconds": "3600", "TailscaleImageTag": "tailscale-v1.0.0",
           "TailscaleHostname": "sensor-1", "TailnetSuffix": "example-tailnet.ts.net",
           "UiOperator": "console", "S3PrefixListId": "pl-0123456789abcdef0",
-          "VpcCidr": "10.64.0.0/16"}
+          "VpcCidr": "10.64.0.0/16", "InternetDbAnswersKey": "internetdb/answers.json"}
 
 
-def _rendered(sensor, tailscale, actions, sign_in, persona="", analyst=""):
+def _rendered(sensor, tailscale, actions, sign_in, persona="", analyst="", internetdb="false"):
     """The user data CloudFormation would produce for these switches and SAMPLE values."""
     values = dict(SAMPLE, TailscaleEnabled=tailscale, UiActions=actions, UiTailnetSignIn=sign_in,
-                  PersonaModelId=persona, AnalystModelId=analyst)
+                  PersonaModelId=persona, AnalystModelId=analyst, InternetDbDelivered=internetdb)
     on = {"TailscaleOn": tailscale == "true", "UiActionsOn": actions == "true",
-          "ConsoleStepOn": "true" in (tailscale, actions), "ModelOn": bool(persona or analyst)}
+          "ConsoleStepOn": "true" in (tailscale, actions), "ModelOn": bool(persona or analyst),
+          "InternetDbOn": internetdb == "true"}
 
     def render(v):
         if isinstance(v, str):
@@ -1302,13 +1520,13 @@ RENDER_BREAKS = {
 
 @pytest.mark.parametrize("expected", sorted(RENDER_BREAKS))
 def test_each_render_rule_fires(sensor, expected):
-    ud = _lt(sensor)["UserData"]["Fn::Base64"]["Fn::Sub"][0]
+    ud = _user_data(sensor)
     errors = check.check_render(ud, script=_render_edit(*RENDER_BREAKS[expected]))
     assert any(expected in e for e in errors), errors
 
 
 def test_render_config_must_come_from_the_image(sensor):
-    ud = _lt(sensor)["UserData"]["Fn::Base64"]["Fn::Sub"][0]
+    ud = _user_data(sensor)
     assert check.check_render(ud) == []
     assert any("does not copy render_config.py out of the image" in e
                for e in check.check_render(ud.replace(check.RENDER_COPY, "true")))

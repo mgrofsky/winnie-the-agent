@@ -11,7 +11,9 @@ Directories:
 ``ship`` sends the event log to S3 when ``[connector.s3_events]`` is enabled, the tracked
 export when ``[connector.tracked_export]`` is, fetches sightings when
 ``[connector.sightings]`` is, and looks up interesting sources in Shodan InternetDB when
-``[connector.internetdb]`` is; ``run-all`` runs it as its last step.
+``[connector.internetdb]`` is; ``run-all`` runs it as its last step. With
+``[connector.internetdb] mode = delivered`` nothing is looked up here: ``run-all`` writes the
+wanted list, and ``[connector.internetdb_exchange]`` moves it and the answers.
 
 ``enforce <address>`` moves one tracked blocklist entry to enforced (``[respond]
 track_before_enforce``).
@@ -413,6 +415,9 @@ def _run(argv=None) -> dict:
                 results["internetdb"] = {"error": f"[respond]: {str(exc)[:160]}; no lookups"}
                 log.error("internetdb: %s", results["internetdb"]["error"])
                 return
+            if settings.delivered:
+                results["internetdb"] = _internetdb_delivered(settings, networks)
+                return
             results["internetdb"] = internetdb.run_lookup(
                 settings, load_records(reports), networks, state, dry_run=args.dry_run)
         except internetdb.ConfigError as exc:
@@ -421,6 +426,31 @@ def _run(argv=None) -> dict:
         except Exception as exc:  # noqa: BLE001 - the lookup never stops the other stages
             results["internetdb"] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
             log.error("internetdb lookup failed: %s", results["internetdb"]["error"])
+
+    def _internetdb_delivered(settings, networks) -> dict:
+        """Delivered mode: run-all writes the wanted list (it has the records); the exchange,
+        where enabled, puts it and gets the answers. Nothing here asks InternetDB."""
+        from agents import internetdb_delivered as dl
+        from agents.respond import tracked_target
+        from agents.triage import load_records
+
+        out: dict = {"mode": "delivered"}
+        wanted = dl.wanted_path(settings, tracked_target(reports, _settings().blocklist_file)
+                                .parent)
+        if args.command == "run-all":
+            out["wanted"] = dl.write_wanted(settings, load_records(reports), networks, wanted,
+                                            dry_run=args.dry_run)
+        try:
+            exchange = dl.ExchangeSettings.from_config(cp)
+        except dl.ConfigError as exc:
+            out["exchange"] = {"error": f"[{dl.SECTION}]: {exc}"}
+            log.error("%s", out["exchange"]["error"])
+            return out
+        if exchange.enabled:
+            out["exchange"] = dl.run_exchange(exchange, settings, wanted,
+                                              settings.answers_path(state), state, networks,
+                                              dry_run=args.dry_run)
+        return out
 
     def locked(fn) -> dict:
         """One writing run at a time: a second one exits with an error instead of

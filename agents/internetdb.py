@@ -36,6 +36,12 @@ Configuration::
     max_per_run = 100
     max_per_day = 2000
     cache_days = 7
+    #mode = direct            ; direct (this process asks InternetDB) | delivered
+
+Delivered mode (``agents/internetdb_delivered.py``): this process never asks InternetDB.
+``run-all`` writes the addresses it wants looked up to a small file, something outside the
+sensor answers through the object store, and the answers are checked here exactly like a
+direct answer before they reach the same local file.
 """
 
 from __future__ import annotations
@@ -95,11 +101,13 @@ BACKOFF_FIRST_MINUTES = 15
 BACKOFF_MAX_MINUTES = 24 * 60
 
 DEFAULTS = {"max_per_run": 100, "max_per_day": 2000, "cache_days": 7.0,
-            "lookback_days": 7.0, "min_interval_seconds": 1.0, "max_entries": 5000}
+            "lookback_days": 7.0, "min_interval_seconds": 1.0, "max_entries": 5000,
+            "max_wanted": 500, "max_age_days": 30.0}
 BOUNDS = {"max_per_run": (1, 1000), "max_per_day": (1, 20000), "cache_days": (1.0, 90.0),
           "lookback_days": (1.0, 90.0), "min_interval_seconds": (1.0, 60.0),
-          "max_entries": (100, 20000)}
-KNOWN_KEYS = {"enabled", *DEFAULTS}
+          "max_entries": (100, 20000), "max_wanted": (1, 500), "max_age_days": (1.0, 90.0)}
+MODES = ("direct", "delivered")
+KNOWN_KEYS = {"enabled", "mode", "wanted_file", "answers_file", *DEFAULTS}
 
 _HOSTNAME_RE = re.compile(HOSTNAME_PATTERN)
 _TAG_RE = re.compile(SHODAN_TAG_PATTERN)
@@ -130,6 +138,23 @@ class InternetDbSettings:
     lookback_days: float = DEFAULTS["lookback_days"]
     min_interval_seconds: float = DEFAULTS["min_interval_seconds"]
     max_entries: int = DEFAULTS["max_entries"]
+    # Delivered mode only: the wanted list's size and file, the answers' local file (the one
+    # the reader reads; default <state-dir>/internetdb.json) and the oldest answer accepted.
+    mode: str = "direct"
+    max_wanted: int = DEFAULTS["max_wanted"]
+    max_age_days: float = DEFAULTS["max_age_days"]
+    wanted_file: Optional[str] = None
+    answers_file: Optional[str] = None
+
+    @property
+    def delivered(self) -> bool:
+        return self.enabled and self.mode == "delivered"
+
+    def answers_path(self, state_dir) -> Path:
+        # Direct mode always uses the state directory, where run_lookup writes.
+        if self.delivered and self.answers_file:
+            return Path(self.answers_file)
+        return state_path(state_dir)
 
     @classmethod
     def from_config(cls, config) -> "InternetDbSettings":
@@ -160,7 +185,18 @@ class InternetDbSettings:
                 raise ConfigError(f"{name} must be between {lo} and {hi}")
             return value
 
-        return cls(enabled=True,
+        mode = sec.get("mode", "direct").strip().lower() or "direct"
+        if mode not in MODES:
+            raise ConfigError("mode must be direct or delivered")
+        files = {}
+        for name in ("wanted_file", "answers_file"):
+            value = sec.get(name, "").strip() or None
+            if value is not None and (not os.path.isabs(value) or len(value) > 4096):
+                raise ConfigError(f"{name} must be an absolute path")
+            files[name] = value
+        return cls(enabled=True, mode=mode,
+                   max_wanted=num("max_wanted", sec.get("max_wanted")),
+                   max_age_days=num("max_age_days", sec.get("max_age_days")), **files,
                    max_per_run=num("max_per_run", sec.get("max_per_run")),
                    max_per_day=num("max_per_day", sec.get("max_per_day")),
                    cache_days=num("cache_days", sec.get("cache_days")),
@@ -482,6 +518,9 @@ def run_lookup(settings: InternetDbSettings, records: Iterable[TriageRecord], ne
     no way to set it). Never raises for lookup failures."""
     if not settings.enabled:
         return {"status": "disabled"}
+    if settings.delivered:
+        # Never a request from this process in delivered mode.
+        return {"status": "delivered mode: no lookups here"}
     now = now or datetime.datetime.now(UTC)
     path = state_path(state_dir)
     state = load_state(path)
@@ -587,4 +626,6 @@ def reader_from_config(config, state_dir) -> Optional[InternetDbReader]:
         return None
     except Exception:  # noqa: BLE001 - a bad config never stops triage or the console
         return None
-    return InternetDbReader(state_path(state_dir)) if settings.enabled else None
+    if not settings.enabled:
+        return None
+    return InternetDbReader(settings.answers_path(state_dir))
