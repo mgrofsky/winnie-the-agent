@@ -876,3 +876,21 @@ def test_nothing_is_made_inside_a_removed_directory():
     assert out[3] == "-bash: /tmp/d/x: No such file or directory\n"
     assert out[4] == "cp: cannot create regular file '/tmp/d/x': No such file or directory\n"
     assert out[5] == "ls: cannot access '/tmp/d/x': No such file or directory\n"
+
+
+def test_a_resumed_pipeline_runs_each_stage_once():
+    out = run(["cat /tmp/nope | printf hi >> /tmp/x | cat", "cat /tmp/x"])
+    assert out[1] == "hi"
+
+
+def test_the_fallback_session_keeps_its_directory_under_a_model_prompt():
+    sid, shown = "fallback-cwd-test", "root@app01:~# "
+    try:
+        hooks.fallback_reply("cd /tmp", True, "root", host(), None, prompt=shown,
+                             session_id=sid)
+        out = hooks.fallback_reply("pwd", True, "root", host(), None, prompt=shown,
+                                   session_id=sid)
+        assert out.startswith("/tmp\r\n")
+        assert out.endswith("/tmp# ")
+    finally:
+        hooks.session_close(sid, None)

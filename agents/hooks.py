@@ -218,10 +218,17 @@ def fallback_reply(text: str, interactive: bool, username: Optional[str],
     host = host or shell_host()
     cwd = None
     session = None
+    entered = False
     if session_id is not None:
-        session = _shell_sessions.get(session_id) or shell.Session()
+        session = _shell_sessions.get(session_id)
+        entered = session is not None
+        session = session or shell.Session()
         _track_shell(session_id, session)
-    if interactive and prompt:
+    if interactive and prompt and entered:
+        # The model's last prompt seeded the directory on the first fallback line; from
+        # then on the session says where it is, and the prompt follows it.
+        cwd, prompt = session.cwd or None, None
+    elif interactive and prompt:
         cwd = prompt_directory(prompt, username)
         if session is not None and cwd is not None:
             session.cwd = cwd                # the model's prompt says where the session is

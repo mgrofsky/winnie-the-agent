@@ -904,11 +904,12 @@ class Shell:
                 scope = max(scope, routed.scope)
                 if index < last and exact:
                     break
-            if not (k < last and exact):
+            if not (index < last and exact):
                 return _Result(out, "".join(errs), status, scope, late)
             # Literal output, or none at all (``command not found``): what follows reads it.
             try:
-                rest = self._pipeline(pipeline, k + 1, routed.out, "".join(errs))
+                # after the stage that just completed, so nothing before it runs twice
+                rest = self._pipeline(pipeline, index + 1, routed.out, "".join(errs))
             except _OverBudget:
                 raise
             except _Unsupported:
