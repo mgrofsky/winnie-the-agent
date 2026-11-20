@@ -322,3 +322,12 @@ def test_rule_parts_claim_commands_after_login_only_when_some_came_after():
     after = _t.rule_parts("smtp", _t.Intent.UNKNOWN, _t.Judgement.SUSPICIOUS,
                               commands=3, after_login=3, **kw)
     assert "Logged in and ran 3 commands" in after["actions"]
+
+
+def test_the_rest_of_a_capped_list_is_not_counted():
+    from agents import triage as _t
+    assert _t._rest(3, 3, "number") == []
+    assert _t._rest(5, 3, "number") == ["2 more numbers"]
+    assert _t._rest(4, 3, "username") == ["1 more username"]
+    # a full list is only the most common entries: how many more there were is not known
+    assert _t._rest(_t.TOP_KEPT, 3, "username") == ["more usernames"]

@@ -393,7 +393,10 @@ def _iso(dt) -> Optional[str]:
     return dt.isoformat(timespec="seconds") if dt else None
 
 
-def _top(counter: Counter, n: int = 10) -> list:
+TOP_KEPT = 10                     # most common entries a record keeps per credential list
+
+
+def _top(counter: Counter, n: int = TOP_KEPT) -> list:
     return [(str(k), int(v)) for k, v in counter.most_common(n)]
 
 
@@ -625,6 +628,16 @@ def _model_narrative(out: TriageModelOutput, fallback: str) -> str:
 
 
 
+def _rest(kept: int, shown: int, word: str) -> list[str]:
+    """The phrase for entries beyond the ``shown`` ones. A record keeps only the
+    ``TOP_KEPT`` most common, so a full list gives no count of the rest."""
+    if kept <= shown:
+        return []
+    if kept >= TOP_KEPT:
+        return [f"more {word}s"]
+    return [_plural(kept - shown, f"more {word}")]
+
+
 def record_facts(r: TriageRecord) -> dict[str, list[str]]:
     """Who, volume and target, derived from the record's own fields (never from model
     text), so they are right for every record, old ones included. Each value is one short
@@ -659,14 +672,12 @@ def record_facts(r: TriageRecord) -> dict[str, list[str]]:
     dialed = r.credentials.dialed_numbers
     if dialed:
         target += [f"number {n}" for n, _ in dialed[:3]]
-        if len(dialed) > 3:
-            target.append(_plural(len(dialed) - 3, "more number"))
+        target += _rest(len(dialed), 3, "number")
     target += [f"extension {e}" for e, _ in r.credentials.sip_extensions[:3]]
     if r.kind == "campaign" and not dialed:
         users = r.credentials.top_usernames
         target += [f"user {u[:CLIENT_MAX]}" for u, _ in users[:3]]
-        if len(users) > 3:
-            target.append(_plural(len(users) - 3, "more username"))
+        target += _rest(len(users), 3, "username")
     target += [f"honeytoken {t}" for t in r.honeytokens[:3]]
     if not target:
         target.append(f"the {re.sub(r'[^a-z0-9]', '', r.protocol)[:16]} service")
