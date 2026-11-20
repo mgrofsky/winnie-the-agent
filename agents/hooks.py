@@ -444,10 +444,17 @@ def _strip_fences(reply: str, text: str) -> str:
     """The reply without the Markdown code fence a model sometimes wraps shell output in:
     a fence line on its own at the very start or the very end, and the line closing a
     fence opened at the start. Left alone when the input
-    itself contains a fence (``echo`` or ``cat`` of one)."""
+    itself contains a fence (``echo`` of one). For a content viewer (``cat``, ``less``,
+    ...) a fence may be the file's own text, so only one after the final prompt goes."""
     if "```" not in reply or "```" in text:
         return reply
     lines = reply.split("\n")
+    if _is_content_viewer(text):
+        solid = [i for i, line in enumerate(lines) if line.strip()]
+        if (len(solid) >= 2 and _FENCE_LINE.match(lines[solid[-1]].rstrip("\r"))
+                and _FINAL_PROMPT.match(lines[solid[-2]].strip())):
+            del lines[solid[-1]:]
+        return "\n".join(lines)
     def fence(i: int) -> bool:
         return bool(_FENCE_LINE.match(lines[i].rstrip("\r")))
 

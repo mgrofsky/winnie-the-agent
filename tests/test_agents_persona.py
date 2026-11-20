@@ -483,6 +483,11 @@ def test_canned_reply_never_reports_a_shell_builtin_as_not_found(text, expected)
     ("```", "frob", "root@srv01:~# "),
     ("```\r\nroot@srv01:~# ", "echo '```'", "```\r\nroot@srv01:~# "),
     ("a ``` b\r\nroot@srv01:~# ", "cat notes", "a ``` b\r\nroot@srv01:~# "),
+    # a viewed file may hold fences of its own: only one after the prompt is the model's
+    ("```bash\r\necho hi\r\n```\r\nroot@srv01:~# ", "cat snippet.md",
+     "```bash\r\necho hi\r\n```\r\nroot@srv01:~# "),
+    ("```bash\r\necho hi\r\n```\r\nroot@srv01:~# \r\n```", "cat snippet.md",
+     "```bash\r\necho hi\r\n```\r\nroot@srv01:~# "),
 ])
 async def test_a_code_fence_around_the_reply_is_removed(tmp_path, reply, text, expected):
     r = await _persona_reply(tmp_path, reply, text)
