@@ -657,3 +657,10 @@ def test_redirected_fallback_output_stays_within_the_session_limits():
     assert session.size() <= shell.MAX_SCRATCH_BYTES
     assert len(session.files["/tmp/big"].data) > shell.MAX_SCRATCH_BYTES - 3000
     assert all(r == "" for r in replies)
+
+
+def test_a_copied_program_reads_its_input():
+    out = run(["cp /bin/cat /tmp/c", "echo hello | /tmp/c", "echo data > /tmp/in",
+               "/tmp/c < /tmp/in"])
+    assert out[1] == "hello\n"
+    assert out[3] == "data\n"

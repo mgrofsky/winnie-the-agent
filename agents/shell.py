@@ -1133,7 +1133,7 @@ class Shell:
         word = argv[0]
         name = self.resolve(word)
         if name is None or ("/" in word and self.path(word) in self.session.files):
-            return self._execute(word, argv[1:])
+            return self._execute(word, argv[1:], stdin)
         if not self.installed(name):
             # a download can put a program there, so these hold only until the model answers
             if "/" in word:
@@ -1160,7 +1160,7 @@ class Shell:
         result.scope = max(result.scope, scope)
         return result
 
-    def _execute(self, word: str, args: list[str]) -> _Result:
+    def _execute(self, word: str, args: list[str], stdin: Optional[str] = None) -> _Result:
         """``./x``: a file the session wrote. Nothing is ever run: an empty file is an empty
         script, a copy of a program answers as that program, an ELF for another machine is
         refused as the kernel refuses it. Anything else (a script, a program for this
@@ -1176,7 +1176,7 @@ class Shell:
             return _Result(err=f"{self.prefix}: {word}: Permission denied\n", status=126,
                            scope=STATE)
         if entry.program is not None and entry.data == self.elf(entry.program):
-            result = self._command([entry.program] + args, None)
+            result = self._command([entry.program] + args, stdin)
             result.scope = STATE
             return result
         if not entry.data:
