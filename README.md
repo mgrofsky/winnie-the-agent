@@ -236,7 +236,11 @@ On a remote host, reach it with `ssh -L 8480:127.0.0.1:8480 <host>`. Sign-in, ac
 - **Uploads are quarantined.** FTP uploads are stored once per SHA-256 with mode 0600,
   under per-file, per-source and total caps, and are never read back or executed.
 - **Budgets in code.** Every model call reserves its estimated cost first; when a limit is
-  reached the model is not called and the attacker gets a canned error.
+  reached the model is not called and the attacker gets a canned error. Known commands are
+  answered by a deterministic shell without the model, a session gets at most 50 model
+  answers (then the shell answers the rest), and a bot replaying a script another session
+  already ran, with an identical history, gets the cached replies instead of new model
+  calls.
 - **The model cannot steer the system.** Models get no tools, files or network. Analyst
   output must validate against strict schemas; the tuner only picks from candidates the
   code generated; playbooks are matched and executed by code. Attacker text reaches

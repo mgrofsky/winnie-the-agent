@@ -471,7 +471,88 @@ def choose_llm(llm_provider: Optional[str] = None, model_name: Optional[str] = N
     else:
         raise ValueError(f"Invalid LLM provider {llm_provider_name}.")
 
+    if prompt_caching_enabled(llm_provider_name, model_name,
+                              config['llm'].getboolean("prompt_caching", fallback=None)):
+        # One cache breakpoint on the last message: the system prompt, the persona block
+        # and the session so far are read from the provider's cache on the next command.
+        return with_cache_point_fallback(llm_model.bind(cache_control={"type": "ephemeral"}),
+                                         llm_model)
     return llm_model
+
+
+def prompt_cache_supported(provider: str, model_name: Optional[str]) -> bool:
+    """Providers whose client takes a ``cache_control`` request option: Anthropic, and
+    Bedrock Converse for the model families langchain-aws marks cache points for (ids
+    containing ``anthropic`` or ``amazon.nova``; other Bedrock models reject them)."""
+    if provider == 'anthropic':
+        return True
+    model = (model_name or "").lower()
+    return provider == 'aws' and ("anthropic." in model or "amazon.nova" in model)
+
+
+def prompt_caching_enabled(provider: str, model_name: Optional[str],
+                           setting: Optional[bool]) -> bool:
+    """``[llm] prompt_caching``: on by default for ``anthropic``; off by default for ``aws``,
+    because not every Claude or Nova model on Bedrock accepts cache points (older ones
+    reject them), so it is turned on there only by setting it to true."""
+    if not prompt_cache_supported(provider, model_name):
+        return False
+    return provider == 'anthropic' if setting is None else setting
+
+
+def _rejected_request(exc: BaseException) -> bool:
+    """The provider refused the request as invalid (Bedrock ``ValidationException``,
+    Anthropic HTTP 400), as opposed to a transient or auth failure."""
+    if type(exc).__name__ in ("ValidationException", "BadRequestError"):
+        return True
+    response = getattr(exc, "response", None)
+    return isinstance(response, dict) and \
+        response.get("Error", {}).get("Code") == "ValidationException"
+
+
+def with_cache_point_fallback(cached, plain):
+    """The model with a cache point, until the first request with it is refused as invalid:
+    that request is retried without the cache point, which then stays off for the process
+    (one log line), so a model that does not take cache points never turns every reply into
+    the canned fallback. After one accepted request, errors pass through unchanged."""
+    state = {"cache": True, "proven": False}
+
+    def _note(exc: BaseException) -> bool:
+        if state["proven"] or not _rejected_request(exc):
+            return False
+        if not state["cache"]:
+            return True                  # another request already turned it off
+        state["cache"] = False
+        logger.warning("Prompt caching disabled",
+                       extra={"reason": "provider_rejected_cache_point",
+                              "error": type(exc).__name__})
+        return True
+
+    def invoke(value, config=None):
+        if state["cache"]:
+            try:
+                out = cached.invoke(value, config)
+                state["proven"] = True
+                return out
+            except Exception as exc:  # noqa: BLE001 - re-raised unless it is the cache point
+                if not _note(exc):
+                    raise
+        return plain.invoke(value, config)
+
+    async def ainvoke(value, config=None):
+        if state["cache"]:
+            try:
+                out = await cached.ainvoke(value, config)
+                state["proven"] = True
+                return out
+            except Exception as exc:  # noqa: BLE001 - re-raised unless it is the cache point
+                if not _note(exc):
+                    raise
+        return await plain.ainvoke(value, config)
+
+    runnable = RunnableLambda(invoke, afunc=ainvoke, name="persona_model")
+    runnable.cache_state = state
+    return runnable
 
 def get_prompts(prompt: Optional[str], prompt_file: Optional[str]) -> dict:
     system_prompt = config['llm']['system_prompt']
