@@ -559,16 +559,22 @@ SESSION_HEADLINES = {
 def rule_parts(protocol: str, intent: Intent, judgement: Judgement, *, attempts: int,
                successes: int, commands: int, usernames: int, passwords: int, dialed: int,
                signals: dict[str, int], honeytokens: list[str], unverified: bool,
-               ) -> dict[str, object]:
+               after_login: Optional[int] = None) -> dict[str, object]:
     """Narrative parts from what code knows, so a record reads the same way with and
-    without a model. Every string here is fixed text or a number."""
+    without a model. Every string here is fixed text or a number. ``after_login`` is how
+    many of ``commands`` came after a successful login (all of them when not given)."""
+    after_login = commands if after_login is None else after_login
     p = re.sub(r"[^a-z0-9]", "", protocol.lower())[:16].upper() or "?"
     actions: list[str] = []
     if attempts:
         actions.append(f"Tried {attempts} logins with {usernames} usernames and "
                        f"{passwords} passwords")
-    if successes and commands:
-        actions.append(f"Logged in and ran {_plural(commands, _unit(protocol))}")
+    if successes and after_login:
+        actions.append(f"Logged in and ran {_plural(after_login, _unit(protocol))}")
+    elif successes:
+        if commands:
+            actions.append(f"Sent {_plural(commands, _unit(protocol))} before logging in")
+        actions.append("Logged in and did nothing after")
     elif commands and not attempts and not dialed:
         actions.append(f"Sent {_plural(commands, _unit(protocol))}")
     if dialed:
@@ -746,7 +752,8 @@ def deterministic_campaign(c: Campaign, honeytokens: list[str]) -> TriageRecord:
                        successes=c.successes, commands=len(c.post_login or c.commands),
                        usernames=len(c.usernames), passwords=len(c.passwords),
                        dialed=sum(c.dialed.values()), signals=dict(c.high_signal),
-                       honeytokens=honeytokens, unverified=c.unverified_source)
+                       honeytokens=honeytokens, unverified=c.unverified_source,
+                       after_login=len(c.post_login))
     return _campaign_record(c, intent, stage, Skill.AUTOMATED, judgement, uniq,
                             narrative[:600] + ".", False, honeytokens, parts=parts)
 

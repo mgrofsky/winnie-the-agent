@@ -308,3 +308,17 @@ def test_console_renders_the_layout_as_text_only():
     # clipped line: the headline, or the paragraph for old records).
     assert js.count("narrativeView(") == 4
     assert "text: str(r.narrative) }" not in js and "text: str(record.narrative) }" not in js
+
+
+def test_rule_parts_claim_commands_after_login_only_when_some_came_after():
+    from agents import triage as _t
+    kw = dict(attempts=1, successes=1, usernames=1, passwords=1, dialed=0, signals={},
+              honeytokens=[], unverified=False)
+    before = _t.rule_parts("smtp", _t.Intent.UNKNOWN, _t.Judgement.SUSPICIOUS,
+                               commands=2, after_login=0, **kw)
+    assert "Sent 2 commands before logging in" in before["actions"]
+    assert "Logged in and did nothing after" in before["actions"]
+    assert not any("ran" in a for a in before["actions"])
+    after = _t.rule_parts("smtp", _t.Intent.UNKNOWN, _t.Judgement.SUSPICIOUS,
+                              commands=3, after_login=3, **kw)
+    assert "Logged in and ran 3 commands" in after["actions"]
