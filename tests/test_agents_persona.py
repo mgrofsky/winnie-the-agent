@@ -476,6 +476,19 @@ def test_canned_reply_never_reports_a_shell_builtin_as_not_found(text, expected)
     assert hooks.fallback_reply(text, True, "root") == expected
 
 
+@pytest.mark.parametrize("reply, text, expected", [
+    ("```\r\nuid=0(root)\r\nroot@srv01:~# \r\n```", "id", "uid=0(root)\r\nroot@srv01:~# "),
+    ("```bash\nuid=0(root)\n```\nroot@srv01:~# ", "id", "uid=0(root)\nroot@srv01:~# "),
+    ("uid=0(root)\r\nroot@srv01:~# \r\n```\r\n", "id", "uid=0(root)\r\nroot@srv01:~# "),
+    ("```", "frob", "root@srv01:~# "),
+    ("```\r\nroot@srv01:~# ", "echo '```'", "```\r\nroot@srv01:~# "),
+    ("a ``` b\r\nroot@srv01:~# ", "cat notes", "a ``` b\r\nroot@srv01:~# "),
+])
+async def test_a_code_fence_around_the_reply_is_removed(tmp_path, reply, text, expected):
+    r = await _persona_reply(tmp_path, reply, text)
+    assert r.content == expected
+
+
 async def test_block_style_reply_is_sent_as_plain_text(tmp_path):
     blocks = [{"type": "reasoning_content", "reasoning_content": {"text": "thinking about it"}},
               {"type": "text", "text": "uid=0(root) gid=0(root)\r\nroot@srv01:~# "}]

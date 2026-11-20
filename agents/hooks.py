@@ -437,6 +437,35 @@ def _as_text_reply(response: Any) -> Any:
                            usage_metadata=getattr(response, "usage_metadata", None))
 
 
+_FENCE_LINE = re.compile(r"^[ \t]*```[\w+.-]*[ \t]*$")
+
+
+def _strip_fences(reply: str, text: str) -> str:
+    """The reply without the Markdown code fence a model sometimes wraps shell output in:
+    a fence line on its own at the very start or the very end, and the line closing a
+    fence opened at the start. Left alone when the input
+    itself contains a fence (``echo`` or ``cat`` of one)."""
+    if "```" not in reply or "```" in text:
+        return reply
+    lines = reply.split("\n")
+    def fence(i: int) -> bool:
+        return bool(_FENCE_LINE.match(lines[i].rstrip("\r")))
+
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    opened = first is not None and fence(first)
+    if opened:
+        del lines[:first + 1]
+    last = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip()), None)
+    if last is not None and fence(last):
+        del lines[last:]
+    elif opened:
+        # the fence closed before the prompt line: drop that closing line too
+        closing = next((i for i in range(len(lines) - 1, -1, -1) if fence(i)), None)
+        if closing is not None:
+            del lines[closing]
+    return "\n".join(lines)
+
+
 # Phrases a shell never prints but a model does when it steps out of the role. A reply that
 # matches is replaced (see ``breaks_character`` for where in the reply a match counts),
 # unless the attacker's own input contains the phrase (so ``echo`` of it still works).
@@ -789,6 +818,13 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
              details=base64.b64encode(original.encode("utf-8", "replace")).decode("ascii"))
         return SimpleNamespace(content=sent, persona_break=True)
     reply = _as_text_reply(response)
+    unfenced = _strip_fences(reply.content, text)
+    if unfenced != reply.content:
+        if not unfenced.strip():
+            unfenced = in_character_reply(text, interactive, username, shown_prompt)
+        _replace_in_history(history, session_id, unfenced)
+        reply = SimpleNamespace(content=unfenced,
+                                usage_metadata=getattr(reply, "usage_metadata", None))
     if interactive:
         expected = (_literal_output(text) or "").strip()
         if expected and expected not in reply.content:
