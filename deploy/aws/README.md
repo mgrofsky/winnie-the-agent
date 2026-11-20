@@ -697,13 +697,25 @@ every region it routes to allowed, and a `global.` profile can route to any comm
 region. If those regions are denied, calls
 through the profile fail even though this grant allows them; allow the profile's regions
 for `bedrock:InvokeModel` on the model roles, or use a plain model id in the sensor's
-region where the model is offered on demand there. This is how the AWS documentation describes cross-region inference; it is unproven
-until run with this template.
+region where the model is offered on demand there. Seen on a real account with a `us.`
+profile: calls served in another region were denied by a region-restricting SCP until it
+excepted the profile (a condition on `bedrock:InferenceProfileArn` keeps the exception to
+that profile), and succeeded after. An organization policy that denies Bedrock outright
+needs the two model roles excepted in the same way.
 
 **Model access.** The account must have access to each model enabled in the Bedrock
 console (Model access) in the sensor's region, and for a profile, in the regions it
 routes to. Without it calls fail with `AccessDeniedException` and the persona falls back
 to canned replies.
+
+Models sold through AWS Marketplace (Anthropic's among them) are subscribed on the first
+call in an account, and that call must come from a principal allowed
+`aws-marketplace:Subscribe` and `aws-marketplace:ViewSubscriptions`. The model roles are
+not, on purpose. Make the first call for each model from an administrator before
+deploying, or the roles' calls work for a few minutes and then fail with an
+`AccessDeniedException` that names those two actions. After the subscribing call, wait
+ten minutes or so without retrying; repeated calls while it settles kept failing in the
+run described below.
 
 ### Which containers make the calls, and what they gain
 
@@ -867,35 +879,39 @@ canned replies, and the timer logs a failure every 15 minutes.
 
 ### What has and has not been run
 
-Nothing of this option has been run on a real AWS account. What is checked offline:
-`check.py` evaluates the endpoint policy and each caller's role for sample ids (every
-geographic prefix among them) and refuses any widening, including a role that covers the
-other caller's model (the
-mutation tests in `tests/test_deploy_aws.py` cover each rule); the user data with both ids
-empty is byte for byte what it was before the option for every console and tailnet
-switch combination; `sensor-model.sh` runs in the tests against fake `aws`, `getent`,
-`iptables` and `docker`; and boto3 and `ChatBedrockConverse` were seen to resolve
-refreshable credentials from the `credential_process` file as the overlay sets it up.
+The option has been run once on a real AWS account: one sensor in `us-east-1`, a `us.`
+inference profile for each caller (a different Anthropic model each), and the console over
+a tailnet. Seen there:
 
-Unproven until run:
+- the endpoint policy and each role's grant against real calls through a `us.` profile,
+  including calls the profile served in another region (`aws:SourceVpce` held on those);
+- each container calling its own model and refused the other's;
+- the `ssh` container reaching the Bedrock endpoint and nothing else (the internet, the
+  metadata service, the `sts` endpoint and S3 all refused);
+- Compose merging the overlay's networks and fixed addresses;
+- the private DNS name of the `sts` endpoint answering the host's `aws sts assume-role`;
+- the timer's first run during set-up, and the same order, rules and model access after a
+  reboot;
+- an SSH session answered by the model for commands the built-in shell does not know.
+
+What is checked offline on every change: `check.py` evaluates the endpoint policy and each
+caller's role for sample ids (every geographic prefix among them) and refuses any
+widening, including a role that covers the other caller's model (the mutation tests in
+`tests/test_deploy_aws.py` cover each rule); the user data with both ids empty is byte for
+byte what it was before the option for every console and tailnet switch combination; and
+`sensor-model.sh` runs in the tests against fake `aws`, `getent`, `iptables` and `docker`.
+
+Still unproven:
 
 - that CloudFormation leaves `LaunchTemplate` and the instance alone on a stack updated
   to this template with both ids empty (the user data is the same, but the template text
   of the launch template is not; check the change set);
-- the endpoint policy and the role grant against real calls, for a plain id, a `us.` and
-  a `global.` profile, including `aws:SourceVpce` being present on calls through the
-  endpoint and on the profile's cross-region calls;
-- the region-restricting policy behaviour described above;
-- Compose merging the overlay's `networks` mapping over the base file's list and the
-  fixed addresses (the bootstrap runs `docker compose config` before using it);
+- a plain model id and a `global.` profile;
 - the credentials renewing in a running container across the hour (boto3's refresh of
   `credential_process` credentials);
-- the private DNS name of the `sts` endpoint answering the host's `aws sts assume-role`,
-  and `GetCallerIdentity` passing its policy;
 - the endpoint's address changing under a running sensor: the accepts move and the pin is
   rewritten in the tests, but `docker compose up -d --no-deps` recreating only the callers
-  on a real host has not been seen;
-- the timer's first run, started by `enable --now` during set-up, waiting on the lock.
+  on a real host has not been seen.
 
 ## Stop and rollback
 
