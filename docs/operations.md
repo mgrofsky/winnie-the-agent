@@ -680,7 +680,10 @@ $dc exec agents python -m agents ship --dry-run --log /data/ssh_log.log $args
 
 - an overview and pipeline health;
 - the response approval queue;
-- triage records, with SSH transcript replay and the decoy's reply under each command;
+- triage records, with SSH transcript replay and the decoy's reply under each command; a
+  record's narrative is laid out in parts (headline, who, volume, target, what they did,
+  what it means, not seen) on the record page, the overview and the queue, and the records
+  table shows the headline; records written before the parts existed show their paragraph;
 - raw activity: every event in the log, any service, with filters and search;
 - daily digests;
 - how the decoy is being adjusted (Decoy);

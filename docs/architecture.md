@@ -293,6 +293,49 @@ a short narrative, high-signal counts, honeytoken use and credential statistics.
 come from the analyst model when one is used and validate against a strict schema;
 otherwise they are computed by code.
 
+The narrative is laid out in parts so every record reads the same way:
+
+| Field | What it holds | Cap |
+|---|---|---|
+| `headline` | a few words naming the activity | 100 characters |
+| `actions` | what the source did, one short sentence each | 5 items, 160 characters each |
+| `assessment` | what it most likely means | 4 items, 160 characters each |
+| `not_seen` | what was looked for and not found | 5 items, 60 characters each |
+| `narrative` | one plain paragraph, always filled | 600 characters |
+| `clients` | campaigns: the most frequent client names the source announced | 3 items, 80 characters each |
+
+The model writes `headline`, `actions`, `assessment` and `not_seen`; without a model the
+rule-based triage fills them from the same facts it uses for judgement (signals, counts,
+dialed numbers, honeytokens). The parts are forgiving where the rest of the schema is
+strict: a part that is missing or of the wrong type is empty, an over-long one is clipped,
+control characters become spaces, and the record is still written. The model is asked to
+leave `narrative` empty and it is composed from the parts; a paragraph the model does give
+is kept. `narrative` stays for everything that already reads it (connectors, the
+`include_narrative` summary, search).
+
+Who, volume and target are never written by the model. They are derived from the record
+at display time (`triage.record_facts`): who from the source address, address count,
+username and `clients`; volume from connections, login attempts, commands or requests and
+high-signal counts; target from dialed numbers, SIP extensions, usernames tried and
+honeytokens. Records written before the parts existed have them empty and are shown as
+their paragraph.
+
+Example (a rule-based SIP record, as the digest shows it):
+
+```text
+1. MALICIOUS / IMPACT / sip from `198.51.100.7` (`campaign-sip-198_51_100_7-20261101T1200`)
+   - **`Toll-fraud probing over SIP`** (MALICIOUS)
+   - Who: `198.51.100.7`, `client "examplesip"`
+   - Volume: 6 connections, no login attempts, 6 requests, 6 x sip_dialed_number
+   - Target: `number 0015550100`, `number 01115550100`, `number 915550100`, `1 more number`
+   - What they did
+     - `Dialed 6 outside numbers`
+   - What it means
+     - `Hostile: the activity goes beyond scanning or guessing`
+     - `Looking for a route that places outbound calls at someone else's cost`
+   - Not seen: `login attempts`, `honeytoken use`
+```
+
 Deterministic rules set floors the model cannot lower:
 
 - In SSH sessions, code detects download-and-execute, persistence (cron, systemd, shell rc
@@ -314,7 +357,9 @@ cursor is saved after every item.
 
 The digest (`reports/daily/YYYY-MM-DD.md`) lists counts, the top three items (honeytoken
 use first, then judgement, stage, high-signal events and novelty), high-signal events,
-credential statistics per protocol, and SIP extensions and dialed numbers. Attacker strings
+credential statistics per protocol, and SIP extensions and dialed numbers. Each of the top
+three is laid out as above (headline, who, volume, target, what they did, what it means,
+not seen), or as its paragraph when the record has no parts. Attacker and model strings
 are rendered inside escaped code spans.
 
 ### Tuner

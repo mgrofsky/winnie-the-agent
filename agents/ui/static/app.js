@@ -460,6 +460,34 @@
     return pre;
   }
 
+  // A record's narrative laid out in parts (headline, who / volume / target, what they did,
+  // what it means, not seen) from the server's "layout" object. Every value is model or
+  // attacker text and goes in as a text node. A record without parts (written before they
+  // existed) shows its paragraph instead: through textBlock when "block" is set, otherwise
+  // as a plain line.
+  function narrativeView(layout, narrative, block) {
+    const l = obj(layout);
+    if (l.structured !== true) {
+      return block ? textBlock(narrative) : el("div", { cls: "hit-narrative", text: str(narrative) });
+    }
+    const joined = (v) => arr(v).map(str).join(", ");
+    const list = (title, items) => arr(items).length
+      ? el("div", "nl-block", el("div", { cls: "label", text: title }),
+        el("ul", "nl-list", arr(items).map((i) => el("li", { text: str(i) }))))
+      : null;
+    return el("div", "narrative-layout",
+      str(l.headline) ? el("div", "nl-head", el("strong", { text: str(l.headline) }),
+        el("span", { cls: "muted", text: " (" + str(l.judgement) + ")" })) : null,
+      kv([
+        ["Who", el("span", { cls: "wrap", text: joined(l.who) })],
+        ["Volume", el("span", { text: joined(l.volume) })],
+        ["Target", el("span", { cls: "wrap", text: joined(l.target) })],
+      ]),
+      list("What they did", l.actions),
+      list("What it means", l.assessment),
+      arr(l.not_seen).length ? el("p", { cls: "muted", text: "Not seen: " + joined(l.not_seen) }) : null);
+  }
+
   // Short identifier (address, id, name): one line inside tables.
   function mono(text) {
     return el("span", { cls: "mono", text: str(text) });
@@ -936,7 +964,7 @@
         mono(r.src_ip),
         tags(r.honeytokens),
         el("span", "faint", timeNode(r.last_seen || r.first_seen))),
-      el("div", { cls: "hit-narrative", text: str(r.narrative) }))));
+      narrativeView(r.layout, r.narrative))));
   }
 
   // Each row: name, level ("ok" | "warn" | "bad") and a detail. Healthy rows stay quiet.
@@ -1171,7 +1199,7 @@
           num(record.auth_attempts) + " logins"],
         ["Honeytokens", tags(record.honeytokens)],
       ]),
-      el("div", { cls: "hit-narrative", text: str(record.narrative) }),
+      narrativeView(record.layout, record.narrative),
       recordHref(record.id) ? link(recordHref(record.id), "Open record") : null)
       : el("div", "stack", el("p", { cls: "muted", text: "The triggering record is no longer stored." }),
         kv([["Record id", mono(a.record_id)]]));
@@ -1554,7 +1582,7 @@
           num(r.commands),
           num(r.auth_successes) + "/" + num(r.auth_attempts),
           tags(r.honeytokens),
-          el("span", { cls: "clip clip-wide", text: str(r.narrative) }),
+          el("span", { cls: "clip clip-wide", text: str(obj(r.layout).headline) || str(r.narrative) }),
         ],
       };
     });
@@ -1608,7 +1636,7 @@
       fact("Commands", num(r.commands))))));
 
     const narrative = section("Narrative");
-    narrative.body.append(textBlock(r.narrative));
+    narrative.body.append(narrativeView(data.layout, r.narrative, true));
     const signals = obj(r.high_signal);
     const assess = section("Assessment");
     assess.body.append(kv([

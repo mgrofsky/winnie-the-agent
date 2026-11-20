@@ -86,7 +86,7 @@ from agents.sightings import SightingsReader, SightingsSettings, by_address
 from agents.runtime import event_log_state
 from agents.source_state import load as load_source_state
 from agents.source_state import valid_source_key
-from agents.triage import JUDGEMENT_RANK, Judgement, TriageRecord, rank
+from agents.triage import JUDGEMENT_RANK, Judgement, TriageRecord, rank, record_layout
 from agents.tuner import history as tuner_history
 from agents.ui import activity, logindex
 from agents.ui.activity import EventIndex
@@ -583,11 +583,13 @@ def _summary(r: TriageRecord) -> dict:
             "auth_attempts": r.auth_attempts, "auth_successes": r.auth_successes,
             "connections": r.connections, "honeytokens": list(r.honeytokens),
             "high_signal": sum(r.high_signal.values()), "llm_used": r.llm_used,
-            "unverified_source": r.unverified_source, "narrative": r.narrative[:300]}
+            "unverified_source": r.unverified_source, "narrative": r.narrative[:300],
+            "layout": record_layout(r)}
 
 
 def _haystack(r: TriageRecord) -> str:
-    parts = [r.id, r.src_ip, r.username or "", r.narrative, *r.command_sample,
+    parts = [r.id, r.src_ip, r.username or "", r.narrative, r.headline, *r.actions,
+             *r.assessment, *r.clients, *r.command_sample,
              *(i.value for i in r.iocs), *r.honeytokens, *r.src_addresses]
     parts += [u for u, _ in r.credentials.top_usernames]
     return "\n".join(parts).lower()
@@ -1033,7 +1035,8 @@ class Api:
         if r is None:
             return NOT_FOUND
         approvals = [a.stem for a in self._queue_now() if a.raw.get("record_id") == r.id]
-        out = {"record": r.model_dump(mode="json"), "approvals": approvals,
+        out = {"record": r.model_dump(mode="json"), "layout": record_layout(r),
+               "approvals": approvals,
                "transcript_available": False, "transcript_withheld": None}
         span = self.index.range_of(r.id) if r.kind == "session" and r.protocol == "ssh" \
             else None
