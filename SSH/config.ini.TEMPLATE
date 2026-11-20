@@ -519,3 +519,23 @@ stale_hours = 48
 #url = https://intel.example.com/api/winnie/sightings
 #secret_env = WINNIE_SIGHTINGS_TOKEN
 #header = Authorization
+
+# Optional: what Shodan InternetDB (https://internetdb.shodan.io, no key) already knows about
+# interesting source addresses: open ports, host names, tags, CPEs and known CVE ids, shown
+# in the console and stored on triage records. Looked up by run-all / ship in the agents
+# container (never a honeypot container), one HTTPS GET per address with only the address
+# in it. Free for non-commercial use; a company may use it internally but not in a product
+# it charges for. The destination is fixed in code. See docs/operations.md, "What Shodan
+# already knows about a source".
+#[connector.internetdb]
+#enabled = false
+# Lookups per run and per UTC day; one request at a time, at least min_interval_seconds apart.
+#max_per_run = 100
+#max_per_day = 2000
+#min_interval_seconds = 1
+# An answer (also "no information") is kept this long; InternetDB is refreshed weekly.
+#cache_days = 7
+# Records seen in this window are considered (SUSPICIOUS, MALICIOUS or a honeytoken used).
+#lookback_days = 7
+# Addresses kept in the local file; the oldest answers are dropped first.
+#max_entries = 5000

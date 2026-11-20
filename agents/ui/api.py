@@ -34,6 +34,11 @@ Everything returned here was typed by attackers or derived from it. The rules:
   from database files on disk. A record keeps the place stored when it was written; one
   written without it is looked up now. A live lookup never enters a ``view_hash``: queue
   cards carry it beside the hashed record summary, which shows only the stored place.
+- What Shodan InternetDB knows about an address (``agents.internetdb``: open ports, host
+  names, tags, CPEs, CVE ids) is display only, read from the local file the exporter
+  writes; every value is checked again on read. A record keeps what was stored when it
+  was written; one written without it shows the file's current answer. It never enters a
+  ``view_hash`` or a record summary.
 - Sightings (``agents.sightings``) are display only. The file is parsed strictly, the last
   good copy stays on show when a new one is refused, and only sightings of listed
   addresses are served.
@@ -96,6 +101,7 @@ from agents.triage import (
     TriageRecord,
     geo_view,
     rank,
+    shodan_view,
     record_layout,
     with_geo,
 )
@@ -609,6 +615,14 @@ def _placed(item: dict, geo: Optional[dict]) -> dict:
     return item
 
 
+def _known_as(item: dict, known: Optional[dict]) -> dict:
+    """``item`` with ``"shodan"`` added when the InternetDB file has an answer (absent
+    otherwise, so answers are as before with the feature off)."""
+    if known is not None:
+        item["shodan"] = known
+    return item
+
+
 def _haystack(r: TriageRecord) -> str:
     parts = [r.id, r.src_ip, r.username or "", r.narrative, r.headline, *r.actions,
              *r.assessment, *r.clients, *r.command_sample,
@@ -720,6 +734,9 @@ class Api:
     sightings: SightingsSettings = field(default_factory=SightingsSettings)
     # ``agents.enrich.GeoLookup`` (address -> GeoInfo or None, never raises), or None.
     geo: Optional[Callable] = None
+    # ``agents.internetdb.InternetDbReader`` (address -> ShodanInfo or None, never raises),
+    # or None when ``[connector.internetdb]`` is off.
+    shodan: Optional[Callable] = None
 
     def __post_init__(self) -> None:
         self._sightings = SightingsReader(self.sightings.file(self.paths.state), self.sightings)
@@ -904,6 +921,15 @@ class Api:
             return None
         return geo_view(self.geo(value))
 
+    def _known(self, value: object) -> Optional[dict]:
+        """What the InternetDB file holds for an address, as served, or None."""
+        if self.shodan is None or not isinstance(value, str):
+            return None
+        try:
+            return shodan_view(self.shodan(value))
+        except Exception:  # noqa: BLE001 - display only
+            return None
+
     def _src_where(self, raw: object, mask) -> Optional[dict]:
         """``_where`` for an event-log source, only when masking leaves it as it is."""
         return self._where(raw) if isinstance(raw, str) and mask(raw) == raw else None
@@ -963,8 +989,9 @@ class Api:
                        "by_protocol": dict(sorted(by_protocol.items())),
                        "by_judgement": {j.value: by_judgement.get(j.value, 0)
                                         for j in Judgement}},
-            "top_sources": [_placed({"src_ip": ip, "records": n, "worst": worst[ip].value},
-                                    self._where(ip))
+            "top_sources": [_known_as(_placed({"src_ip": ip, "records": n,
+                                               "worst": worst[ip].value}, self._where(ip)),
+                                      self._known(ip))
                             for ip, n in sources.most_common(TOP_SOURCES)],
             "honeytoken_hits": hits,
             "approvals": {"pending": len(pending),
@@ -1086,11 +1113,18 @@ class Api:
         approvals = [a.stem for a in self._queue_now() if a.raw.get("record_id") == r.id]
         stored = r.src_geo is not None
         r = self._shown(r)
-        out = {"record": r.model_dump(mode="json"), "layout": record_layout(r),
+        # Without a stored answer the record is served exactly as before.
+        dumped = r.model_dump(mode="json", exclude={"src_shodan"} if r.src_shodan is None
+                              else None)
+        out = {"record": dumped, "layout": record_layout(r),
                "approvals": approvals,
                "transcript_available": False, "transcript_withheld": None}
         if r.src_geo is not None:
             out.update(geo=geo_view(r.src_geo), geo_stored=stored)
+        if r.src_shodan is not None:
+            out.update(shodan=shodan_view(r.src_shodan), shodan_stored=True)
+        elif (known := self._known(r.src_ip)) is not None:
+            out.update(shodan=known, shodan_stored=False)
         places = {a: g for a in r.src_addresses[:20] if (g := self._where(a)) is not None}
         if places:
             out["address_geo"] = places
@@ -1593,7 +1627,7 @@ class Api:
         for e in page["items"]:
             stamp = seen.get(e["key"])
             e["last_seen"] = stamp.isoformat(timespec="seconds") if stamp else None
-            _placed(e, self._where(e.get("key")))
+            _known_as(_placed(e, self._where(e.get("key"))), self._known(e.get("key")))
         return 200, {"overlay": overlay, "overlay_error": overlay_error,
                      "history": list(reversed(tuner_history(p.state / "tuner")))[:50],
                      "tuner_runs": tuner_runs, "source_state": page}

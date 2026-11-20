@@ -25,6 +25,10 @@ On top of that SSH honeypot this project adds:
 - **Where addresses are** (optional): country, city and network owner of each source,
   read from GeoLite2 or DB-IP Lite database files on disk (no network call), stored on
   the triage record and shown in the console and the digest.
+- **What Shodan already knows** (optional, off by default): open ports, host names, tags
+  and known CVEs that Shodan's public InternetDB holds for interesting sources, looked up
+  by the agents (never a honeypot container), checked as untrusted data and shown in the
+  console. Free for non-commercial use.
 - **Tuning**: a fenced tuner that adds the fake accounts, SIP extensions and lure files
   attackers actually go for, writing only to a versioned overlay file.
 - **Detections**: Sigma rule drafts and blocklist candidates for human review.

@@ -229,6 +229,29 @@ authentication only and are never rendered into a prompt.
     when each was seen elsewhere, at whatever granularity the producer chose to write. The
     producer should write the minimum: listed addresses only, coarse labels, no internal
     host names, addresses or account ids.
+- **Shodan InternetDB lookup.** One more outbound destination for the agents process,
+  off by default (`[connector.internetdb]`, see
+  [operations.md](operations.md#what-shodan-already-knows-about-a-source)). It runs at the
+  end of `run-all` / `ship`, never in a honeypot container, and adds no connection between
+  containers: results go to a local file that triage and the console read.
+  - *What it carries.* One HTTPS GET per address to `internetdb.shodan.io`, the address in
+    the path and nothing else: no key, no cookie, a generic user agent, nothing about what
+    the source did. The host is a constant in the code with no configuration key; the
+    connection goes to a resolved, checked and pinned public address, the certificate is
+    verified, redirects are refused, each call has a 5 second deadline and a 64 KB cap.
+    Only single global unicast sources of SUSPICIOUS, MALICIOUS or honeytoken records are
+    sent, never an unverified UDP source or anything in `[respond] never_act_on`. Shodan
+    learns which addresses this sensor found interesting, at most 100 per run and 2000 a
+    day; the sources themselves see nothing, since InternetDB answers from data it already
+    holds.
+  - *The answer is data.* Host names are attacker-influenced. Every value is checked
+    against a strict pattern and bound (ports 1 to 65535, hostname character set and
+    length, a CVE id pattern) and anything else is dropped; an answer for another address
+    or not a JSON object is not kept; the file is checked again when read. It is display
+    only: no code path acts on it, it never enters a model prompt, a record summary or an
+    approval's `view_hash`, and the console shows it as text nodes.
+  - *Failure is quiet.* Rate limits, server errors and unreachability stop that run and
+    back off; triage, response and the console carry on as with the feature off.
 - **Notification content.** Built from structured fields; attacker-derived URLs, domains,
   addresses and `@` are defanged in chat, email and ticket outputs; the enrichment
   response is treated as untrusted and flattened to a few short scalar fields.
