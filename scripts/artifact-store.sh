@@ -182,6 +182,22 @@ file_store_check() {
   else
     warn "file store: no ARTIFACT_STORE_MOUNT, so this may be an ordinary folder on the boot disk (it is on ${m:-unknown}); it is not proof of an off-host copy"
   fi
+  if [ -n "${ARTIFACT_STORE_MOUNT:-}" ] && [ "$(uname -s)" = Darwin ]; then
+    # On macOS, "Ignore ownership on this volume" makes UID checks meaningless. Query
+    # the df mount point, not the nested store path (diskutil does not report it there).
+    local ownership=
+    ownership=$(diskutil info -plist "$m" 2>/dev/null | \
+      plutil -extract GlobalPermissionsEnabled raw -o - - 2>/dev/null) || ownership=
+    case "$ownership" in
+      true) ;;
+      false)
+        [ "$MODE" = put ] && die "file store refused: volume ownership is disabled on $m"
+        warn "file store: volume ownership is disabled on $m; UID checks cannot prove isolation" ;;
+      *)
+        [ "$MODE" = put ] && die "file store refused: cannot verify macOS volume ownership on $m"
+        warn "file store: cannot verify macOS volume ownership on $m; UID checks cannot prove isolation" ;;
+    esac
+  fi
   local d=$ROOT bad= reason= perms= owner=
   while :; do
     # Anyone who can write or owns an ancestor can swap its child between the canonical

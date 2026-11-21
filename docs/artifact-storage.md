@@ -33,12 +33,15 @@ restrict the mount root and every ancestor as well.
 For example, `/tmp` is world-writable on Linux, so a store beneath it is refused
 even if the store directory itself has private permissions.
 For `get` and `verify`, these permissions produce a warning while the downloaded
-bytes are still checked against the manifest. Review ACLs separately. On macOS, turn
-off [Ignore ownership on this volume](https://support.apple.com/en-ie/guide/mac-help/mchlp1204/27/mac/27)
-for the connected drive; that setting treats files as owned by the current user. If you
+bytes are still checked against the manifest. Review ACLs separately. On macOS,
+`put` also checks the selected mount's ownership setting and refuses writes when
+[Ignore ownership on this volume](https://support.apple.com/en-ie/guide/mac-help/mchlp1204/27/mac/27)
+is on or the setting cannot be read. `get` and `verify` warn in those cases while still
+checking hashes. If you
 deliberately use a folder on the machine's own disk, set
 `ARTIFACT_STORE_LOCAL_DISK_OK=1` instead.
-That is an explicit waiver of the connected-drive check, not proof of a backup.
+That is an explicit waiver of the connected-drive and macOS ownership checks, not proof
+of a secure connected drive or backup.
 The script cannot determine whether a drive is encrypted or backed up.
 
 ## Pin, copy, and restore

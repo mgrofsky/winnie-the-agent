@@ -326,6 +326,48 @@ class FileBackend(Base):
         self.assertIn("not on mount point", out)
         self.assertEqual(os.listdir(self.root), [])
 
+    def _fake_macos_ownership(self, value):
+        commands = {
+            "uname": '#!/bin/sh\necho Darwin\n',
+            "df": ('#!/bin/sh\nprintf "Filesystem 512-blocks Used Available Capacity Mounted on\\n'
+                   'test 100 1 99 1%% /mnt/test-drive\\n"\n'),
+            "diskutil": '#!/bin/sh\nprintf "<plist/>\\n"\n',
+            "plutil": ('#!/bin/sh\ncat >/dev/null\n'
+                       + (f'echo {value}\n' if value is not None else 'exit 1\n')),
+        }
+        for name, source in commands.items():
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as fh:
+                fh.write(source)
+            os.chmod(path, 0o700)
+
+    def test_macos_disabled_volume_ownership_refuses_put_but_warns_on_verify(self):
+        self._fake_macos_ownership("true")
+        env = {"ARTIFACT_STORE_MOUNT": "/mnt/test-drive", "ARTIFACT_STORE_LOCAL_DISK_OK": ""}
+        rc, out = self.run_tool("put", self.url, env=env)
+        self.assertEqual(rc, 0, out)
+        self._fake_macos_ownership("false")
+        rc, out = self.run_tool("put", self.url, env=env)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("volume ownership is disabled", out)
+        rc, out = self.run_tool("verify", self.url, env=env)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("volume ownership is disabled", out)
+
+    def test_macos_unknown_volume_ownership_refuses_put(self):
+        self._fake_macos_ownership(None)
+        rc, out = self.run_tool("put", self.url,
+                                env={"ARTIFACT_STORE_MOUNT": "/mnt/test-drive",
+                                     "ARTIFACT_STORE_LOCAL_DISK_OK": ""})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("cannot verify macOS volume ownership", out)
+        self.assertEqual(os.listdir(self.root), [])
+
+    def test_macos_local_disk_waiver_does_not_require_volume_ownership_query(self):
+        self._fake_macos_ownership(None)
+        rc, out = self.run_tool("put", self.url)
+        self.assertEqual(rc, 0, out)
+
     def test_plan_touches_nothing(self):
         missing = "file://" + os.path.join(self.t, "absent")
         rc, out = self.run_tool("plan", missing)
