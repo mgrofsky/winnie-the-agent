@@ -743,7 +743,8 @@ def test_every_unblock_record_is_read_not_only_the_newest(tmp_path):
     assert validate(body) == []
 
 
-@pytest.mark.parametrize("damage", ["malformed", "not json", "unreadable", "too many"])
+@pytest.mark.parametrize("damage", ["malformed", "not json", "unreadable", "too many",
+                                    "future"])
 def test_an_untrustworthy_audit_trail_stops_the_export(tmp_path, monkeypatch, damage):
     from agents.respond import unblock
 
@@ -758,6 +759,11 @@ def test_an_untrustworthy_audit_trail_stops_the_export(tmp_path, monkeypatch, da
     elif damage == "unreadable":
         record.unlink()
         record.mkdir()
+    elif damage == "future":
+        # The clock went back after the unblock: the record is later than "now".
+        doc = json.loads(record.read_text())
+        doc["timestamp"] = (NOW + datetime.timedelta(days=1)).isoformat()
+        record.write_text(json.dumps(doc))
     else:
         monkeypatch.setattr(stix, "MAX_AUDIT_FILES", 0)
     later = NOW + datetime.timedelta(hours=2)

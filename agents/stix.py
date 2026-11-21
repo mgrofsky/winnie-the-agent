@@ -437,7 +437,7 @@ def unblocked(reports_dir, now: datetime.datetime) -> dict[str, datetime.datetim
                 not all(isinstance(k, str) and len(k) <= 64 for k in removed):
             raise ExportRefused(f"unblock record {name} is not in the expected form")
         if when > now:
-            continue
+            raise ExportRefused(f"unblock record {name} is dated in the future")
         for key in removed:
             out[key] = max(out.get(key, when), when)
     return out

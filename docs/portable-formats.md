@@ -167,9 +167,10 @@ when:
 - the state file is missing while a bundle from the same identity exists;
 - the state would grow past what the next run may read (lower `lookback_days` or
   `keep_days`);
-- an unblock record in `reports/response` cannot be read or is not in the expected form, or
-  there are more than 20,000 of them (the export reads every one, so that no withdrawal is
-  missed; `[respond] retention_days` removes old ones);
+- an unblock record in `reports/response` cannot be read, is not in the expected form or is
+  dated later than the export's clock, or there are more than 20,000 of them (the export
+  reads every one, so that no withdrawal is missed; `[respond] retention_days` removes old
+  ones);
 - a reference would not resolve.
 
 This prevents an id that was revoked from being written live again. To recover, restore
