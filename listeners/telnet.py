@@ -143,6 +143,15 @@ def _logged(text: str) -> str:
     return printable(text[:RESPONSE_LOG_CAP])[:RESPONSE_LOG_CAP]
 
 
+def _note_cut(conn: Conn, user: str, resp) -> None:
+    """One ``notice`` event when the persona reply was cut back to one round
+    (``agents.onereply``): counts and a short sample of what the model invented, which is
+    never an input of the client's."""
+    cut = getattr(resp, "reply_cut", None)
+    if isinstance(cut, dict):
+        conn.emit("notice", "Reply cut", username=user, data=cut)
+
+
 async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:
     from agents import hooks
 
@@ -161,6 +170,7 @@ async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:
                 counts_as_command=counts, scenario=ctx.scenario)
 
         first = await ask("", counts=False)
+        _note_cut(conn, user, first)
         content = str(getattr(first, "content", ""))
         await conn.write(_crlf(content))
         if getattr(first, "budget_exceeded", False):
@@ -177,6 +187,7 @@ async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:
                       data={"input": line, "response": _logged(content),
                             "persona": True, "budget_exceeded": exceeded})
             conn.capture("telnet_input", line)
+            _note_cut(conn, user, resp)
             if content == END_OF_SESSION:
                 return
             await conn.write(_wire(_crlf(content)))

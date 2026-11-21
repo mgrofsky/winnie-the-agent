@@ -316,7 +316,13 @@ seen and what is still unproven. In short:
 - **Image size.** The Docker image is about 650 MB on disk, mostly the Python base image
   and the model provider client libraries. See
   [docs/operations.md](docs/operations.md#image-size-and-token-counting).
-- The model sometimes invents the attacker's next command and answers it too.
+- **Invented commands are handled.** A chat model playing a shell can carry on past the
+  prompt, type a command the client never sent and answer it. This is a known behaviour and
+  Winnie handles it: every model reply is cut back to the output of the one input and one
+  prompt before it is sent, stored or cached, and each cut is logged as a `Reply cut`
+  event, so you can see how often it happens. A reply to an input that can print a
+  prompt-shaped line itself (it contains `@`, `$`, a backtick, a backslash or `%`) is left
+  whole rather than risk cutting real output.
 - The daily budget is shared between processes on one host through a file lock; several
   hosts do not share one cap.
 - Changing the SSH banner or the active scenario needs a restart.

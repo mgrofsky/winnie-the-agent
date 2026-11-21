@@ -25,7 +25,7 @@ from agents.budget import (
     Budget,
     BudgetConfig,
 )
-from agents import runtime, shell
+from agents import onereply, runtime, shell
 from agents.budget import ip_key
 from agents.replycache import ReplyCache, conversation_key, session_root, volatile
 from agents.source_state import MAX_TARPIT_MS, SourceStateView, source_state_path, source_token
@@ -46,6 +46,11 @@ _session_prompts: dict[str, tuple[str, Optional[str]]] = {}
 # once the session has left the cache (see ``persona_invoke``).
 _session_keys: dict[str, str] = {}
 _LEFT = ""
+# Sessions that typed a line able to print a prompt-shaped line (``onereply.builds_text``),
+# and how many model replies were cut per session (``agents.onereply``).
+_session_built: dict[str, bool] = {}
+_session_cuts: dict[str, int] = {}
+_cuts_total = 0
 MAX_TRACKED_SESSIONS = 10_000   # per-session tables evict their oldest entry past this
 # What the canned shell keeps per session when it answers instead of the model (files the
 # session wrote, its directory): each holds up to ``shell.MAX_SCRATCH_BYTES``, so far fewer.
@@ -333,8 +338,12 @@ def reset() -> None:
     """Back to the uninitialised state (tests)."""
     global _budget, _config_path, _scenario, _scenario_args, _overlay_mtime, _overlay_path
     global _accounts_mtimes, _source_view, _seed, _offline_reason, _local_replies, _cache
+    global _cuts_total
     _cache = None
     _session_keys.clear()
+    _session_built.clear()
+    _session_cuts.clear()
+    _cuts_total = 0
     _offline_reason = None
     _local_replies = True
     set_local_delay(0)
@@ -427,6 +436,8 @@ def session_close(session_id: str, history_store: Optional[MutableMapping] = Non
     _session_fragments.pop(session_id, None)
     _session_prompts.pop(session_id, None)
     _session_keys.pop(session_id, None)
+    _session_built.pop(session_id, None)
+    _session_cuts.pop(session_id, None)
     _shell_sessions.pop(session_id, None)
     _shell_stale.discard(session_id)
     if history_store is not None:
@@ -555,6 +566,26 @@ def _is_content_viewer(text: str) -> bool:
     if words[0] == "sudo" and len(words) > 1:
         words = words[1:]
     return words[0] in CONTENT_VIEWERS or words[:2] == ["git", "log"]
+
+
+# Commands that can print text a session stored earlier. Wider than CONTENT_VIEWERS on
+# purpose: this only decides when a reply is left whole.
+_SHOWS_TEXT = CONTENT_VIEWERS | frozenset({
+    "sed", "awk", "nl", "tac", "cut", "sort", "uniq", "tee", "paste", "od", "xxd",
+    "hexdump", "base64", "vi", "vim", "nano", "ed", "source", ".", "sh", "bash", "ash",
+    "dash", "read", "diff", "cmp", "wc", "rev", "tr", "fold", "column", "egrep", "fgrep",
+    "zcat", "dd", "cp", "mv", "history",
+})
+_WORD_SPLIT = re.compile(r"""[\s"'`;|&(){}<>]+""")
+
+
+def _may_show_text(text: str) -> bool:
+    """True when any word of the input names such a command, by any path or wrapper
+    (``/bin/cat n``, ``sudo -u root cat n``, ``busybox cat n``, ``xargs cat``)."""
+    for word in _WORD_SPLIT.split(text):
+        if word.rpartition("/")[2] in _SHOWS_TEXT or word.startswith("./"):
+            return True
+    return False
 
 
 def breaks_character(reply: str, text: str) -> bool:
@@ -740,6 +771,39 @@ async def _pause() -> None:
         await asyncio.sleep(random.uniform(0.5, 1.0) * _local_delay_ms / 1000)
 
 
+def replies_cut() -> int:
+    """How many model replies were cut back to one round since start (``agents.onereply``)."""
+    return _cuts_total
+
+
+def _cut_reply(history, response, *, session_id: str, text: str, interactive: bool,
+               username: Optional[str], host: shell.Host, shown_prompt: Optional[str],
+               logger, log_extra: Optional[dict]) -> Optional[dict]:
+    """Cut a model reply back to what a shell prints for ``text`` (``onereply.one_reply``).
+    When it was cut: the history holds the kept text instead, one "Reply cut" event is
+    logged (counts and a short escaped sample, never the whole dropped text), and the
+    returned dict carries the kept text and the event fields."""
+    global _cuts_total
+    reply = _content(response)
+    current = shown_prompt or shell_prompt(username, host.hostname)
+    noted = onereply.prompt_host(shown_prompt) if shown_prompt else None
+    cut = onereply.one_reply(
+        reply, text, interactive=interactive, hosts=(host.hostname, noted),
+        current_prompt=current, user=(username or "user")[:32],
+        viewer=_may_show_text(text),
+        text_built_before=session_id in _session_built)
+    if cut is None:
+        return None
+    _replace_in_history(history, session_id, cut.kept)
+    _cuts_total += 1
+    count = _session_cuts.get(session_id, 0) + 1
+    _track(_session_cuts, session_id, count)
+    fields = {"cut_reason": cut.reason, "dropped_chars": cut.dropped,
+              "dropped_sample": cut.sample, "cuts_in_session": count}
+    _log(logger, "Reply cut", log_extra, **fields)
+    return {"kept": cut.kept, **fields}
+
+
 async def persona_invoke(history, *, session_id: str, src_ip: str, username: Optional[str],
                          text: str, interactive: bool, llm_config: dict, logger=None,
                          log_extra: Optional[dict] = None, counts_as_command: bool = True,
@@ -772,9 +836,15 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
     (``shell.Answer.shareable``), a cached reply, or a model reply it has just stored. Any
     other turn (such a local answer, a model error, a fallback, a replaced or unstored
     reply) takes it out for good.
+
+    A fresh model reply is cut back to one round (``_cut_reply``, ``agents.onereply``)
+    before anything else reads it; the result then carries ``reply_cut`` (the logged
+    fields) so a caller without a logger (telnet) can record the event.
     """
     budget = _budget_or_none()
     host = shell_host(scenario)
+    if onereply.builds_text(text):
+        _track(_session_built, session_id, True)
     prompt_state = _session_prompts.get(session_id) if interactive else None
     shown_prompt = prompt_state[0] if prompt_state else None
     with_model = budget is not None and not _offline_reason
@@ -889,6 +959,30 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
                                                       shown_prompt, session_id))
     budget.commit(reservation, text, _content(response), usage_tokens=_usage_tokens(response))
     await _tarpit(src_ip)
+    # First, before the reply is sent, kept, cached, logged or read for the prompt: cut it
+    # back to the one round the input asked for.
+    cut = _cut_reply(history, response, session_id=session_id, text=text,
+                     interactive=interactive, username=username, host=host,
+                     shown_prompt=shown_prompt, logger=logger, log_extra=log_extra)
+    if cut is not None:
+        response = SimpleNamespace(content=cut["kept"],
+                                   usage_metadata=getattr(response, "usage_metadata", None))
+    result = _model_reply(history, response, session_id=session_id, key=key, text=text,
+                          interactive=interactive, username=username,
+                          shown_prompt=shown_prompt, src_ip=src_ip, logger=logger,
+                          log_extra=log_extra)
+    if cut is not None:
+        if not isinstance(result, SimpleNamespace):
+            result = SimpleNamespace(content=result.content,
+                                     usage_metadata=getattr(result, "usage_metadata", None))
+        result.reply_cut = {k: v for k, v in cut.items() if k != "kept"}
+    return result
+
+
+def _model_reply(history, response, *, session_id: str, key: Optional[str], text: str,
+                 interactive: bool, username: Optional[str], shown_prompt: Optional[str],
+                 src_ip: str, logger, log_extra: Optional[dict]):
+    """A fresh model reply (already cut to one round) checked, tidied, kept and returned."""
     if breaks_character(_content(response), text):
         _leave(session_id)
         sent = in_character_reply(text, interactive, username, shown_prompt)
