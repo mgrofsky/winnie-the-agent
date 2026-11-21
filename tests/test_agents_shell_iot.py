@@ -271,7 +271,7 @@ def test_gnu_tools_without_operands_say_what_is_missing():
                            "Try 'cp --help' for more information.\n")
     assert one("rm") == "rm: missing operand\nTry 'rm --help' for more information.\n"
     assert one("rm -f") == ""
-    assert one("chmod 777") == ("chmod: missing operand after '777'\n"
+    assert one("chmod 777") == ("chmod: missing operand after ‘777’\n"
                                 "Try 'chmod --help' for more information.\n")
     assert one("kill") == ("kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | "
                            "jobspec ... or kill -l [sigspec]\n")
@@ -318,7 +318,7 @@ def test_mkdir_mv_touch_and_cd_stay_consistent():
     out = run(["mkdir /tmp/.d", "cd /tmp/.d", "touch a", "mv a b", "ls", "mkdir /tmp/.d",
                "cd /", "rm /tmp/.d", "rm -r /tmp/.d; ls -a /tmp/.d"])
     assert out[:4] == ["", "", "", ""] and out[4] == "b\n"
-    assert out[5] == "mkdir: cannot create directory '/tmp/.d': File exists\n"
+    assert out[5] == "mkdir: cannot create directory ‘/tmp/.d’: File exists\n"
     assert out[7] == "rm: cannot remove '/tmp/.d': Is a directory\n"
     assert out[8] == "ls: cannot access '/tmp/.d': No such file or directory\n"
 
@@ -902,3 +902,281 @@ def test_recursive_chmod_reaches_files_in_a_session_directory():
     assert "Permission denied" in out[1]
     assert out[2] == ""
     assert out[3] == "hi\n"
+
+
+class _History:
+    """A chat-history chain that answers every model call the same way."""
+
+    def __init__(self, fail: bool = False):
+        self.calls: list = []
+        self.fail = fail
+        self.store: dict = {}
+
+    def get_session_history(self, session_id):
+        from langchain_core.chat_history import InMemoryChatMessageHistory
+
+        return self.store.setdefault(session_id, InMemoryChatMessageHistory())
+
+    async def ainvoke(self, payload, config=None):
+        from types import SimpleNamespace
+
+        self.calls.append(payload["messages"][-1].content)
+        if self.fail:
+            raise RuntimeError("provider down")
+        return SimpleNamespace(content="model\r\nroot@srv01:/srv# ",
+                               usage_metadata={"total_tokens": 10})
+
+
+def _ask(history, text, sid="own-1"):
+    return asyncio.run(hooks.persona_invoke(
+        history, session_id=sid, src_ip="203.0.113.9", username="root", text=text,
+        interactive=True, llm_config={"configurable": {"session_id": sid}}))
+
+
+def test_local_answers_read_the_state_the_capped_shell_keeps():
+    hooks.set_budget(Budget(BudgetConfig(max_model_commands_per_session=0)))
+    history = _History()
+    assert _ask(history, "cd /tmp").content == "root@srv01:/tmp# "
+    r = _ask(history, "pwd")
+    assert r.local_reply and r.content == "/tmp\r\nroot@srv01:/tmp# "
+    _ask(history, "echo hi > /tmp/x; touch .h")
+    assert "x" in _ask(history, "ls /tmp").content.split("\r\n")
+    assert ".h" not in _ask(history, "ls /tmp").content
+    assert _ask(history, "cat /tmp/x").content.startswith("hi\r\n")
+    assert history.calls == []
+
+
+def test_a_rejected_local_answer_leaves_the_fallback_state_alone():
+    """A state-changing line is tried locally on a copy; the capped shell then runs it on
+    the session itself, once."""
+    hooks.set_budget(Budget(BudgetConfig(max_model_commands_per_session=0)))
+    history = _History()
+    _ask(history, "cd /tmp", sid="own-2")
+    _ask(history, "echo a >> /tmp/y", sid="own-2")
+    assert _ask(history, "cat /tmp/y", sid="own-2").content == "a\r\nroot@srv01:/tmp# "
+
+
+def test_a_model_error_leaves_the_state_with_the_model_path():
+    """A failed model call still counts as the model's turn: later lines that read state go
+    to the model (and to the offline shell while it keeps failing), never to a fresh local
+    shell."""
+    hooks.set_budget(Budget(BudgetConfig()))
+    failing = _History(fail=True)
+    _ask(failing, "cd /tmp", sid="own-3")
+    assert _ask(failing, "pwd", sid="own-3").content == "/tmp\r\nroot@srv01:/tmp# "
+    assert failing.calls == ["cd /tmp", "pwd"]
+
+
+def test_plain_ls_hides_dot_files_the_session_made():
+    out = run(["touch /tmp/.loader /tmp/vis; mkdir /tmp/d; touch /tmp/d/.x", "ls /tmp",
+               "ls -l /tmp", "ls -a /tmp", "ls -A /tmp", "ls -la /tmp", "ls /tmp/.loader",
+               "busybox ls /tmp", "ls /tmp/d", "ls -a /tmp/d", "ls -A /tmp/d"])
+    assert ".loader" not in out[1] and "vis" in out[1]
+    assert ".loader" not in out[2]
+    assert ".loader" in out[3] and out[3].split()[:2] == [".", ".."]
+    assert ".loader" in out[4] and "." not in out[4].split() and ".." not in out[4].split()
+    assert " .loader\n" in out[5] and " .\n" in out[5]
+    assert out[6] == "/tmp/.loader\n"
+    assert ".loader" not in out[7]
+    assert out[8] == ""
+    assert out[9].split() == [".", "..", ".x"]
+    assert out[10] == ".x\n"
+
+
+# ---- found by running the same sessions in ubuntu:22.04 bash and busybox 1.30.1 ash --------
+
+def status(lines, h=None):
+    """The exit status of the last line, after the others ran in the same session."""
+    session = shell.Session()
+    run(lines[:-1], h, session=session)
+    sh = shell._shell(h or host(), "root", True, "/root", NOW, None, session)
+    return sh.run(lines[-1], partial=True).status
+
+
+def test_gnu_mkdir_and_chmod_quote_with_the_locale_quotes():
+    out = run(["mkdir /tmp/w", "mkdir /tmp/w", "chmod 755", "busybox mkdir /tmp/w"])
+    assert out[1] == "mkdir: cannot create directory ‘/tmp/w’: File exists\n"
+    assert out[2].startswith("chmod: missing operand after ‘755’\n")
+    assert out[3] == "mkdir: can't create directory '/tmp/w': File exists\n"
+
+
+def test_a_session_directory_holds_only_what_the_session_put_there():
+    out = run(["mkdir /tmp/w; cd /tmp/w", "cat .h", "cat d/e", "touch d/e", "> d/e",
+               "cd nope", "./nope", "/tmp/nope", "ls -a d .h"])
+    assert out[1] == "cat: .h: No such file or directory\n"
+    assert out[2] == "cat: d/e: No such file or directory\n"
+    assert out[3] == "touch: cannot touch 'd/e': No such file or directory\n"
+    assert out[4] == "-bash: d/e: No such file or directory\n"
+    assert out[5] == "-bash: cd: nope: No such file or directory\n"
+    assert out[6] == "-bash: ./nope: No such file or directory\n"
+    assert out[7] == ""                  # /tmp is the host's: left to the model
+    assert out[8] == ("ls: cannot access 'd': No such file or directory\n"
+                      "ls: cannot access '.h': No such file or directory\n")
+    assert status(["mkdir /tmp/w; cd /tmp/w", "ls nope"]) == 2
+    assert status(["mkdir /tmp/w; cd /tmp/w", "./nope"]) == 127
+
+
+def test_a_path_below_a_file_is_not_a_directory():
+    out = run(["mkdir /tmp/w; cd /tmp/w; touch f a", "cat f/x", "ls f/x", "touch f/x",
+               "echo > f/x", "rm f/x", "rm -f f/x", "rmdir f/x", "cd f/x", "chmod 7 f/x",
+               "cp a f/x", "cp f/x a", "mv a f/x", "mv f/x a", "./f/x", "mkdir f/x"])
+    assert out[1] == "cat: f/x: Not a directory\n"
+    assert out[2] == "ls: cannot access 'f/x': Not a directory\n"
+    assert out[3] == "touch: cannot touch 'f/x': Not a directory\n"
+    assert out[4] == "-bash: f/x: Not a directory\n"
+    assert out[5] == "rm: cannot remove 'f/x': Not a directory\n"
+    assert out[6] == ""
+    assert out[7] == "rmdir: failed to remove 'f/x': Not a directory\n"
+    assert out[8] == "-bash: cd: f/x: Not a directory\n"
+    assert out[9] == "chmod: cannot access 'f/x': Not a directory\n"
+    assert out[10] == "cp: failed to access 'f/x': Not a directory\n"
+    assert out[11] == "cp: cannot stat 'f/x': Not a directory\n"
+    assert out[12] == "mv: failed to access 'f/x': Not a directory\n"
+    assert out[13] == "mv: cannot stat 'f/x': Not a directory\n"
+    assert out[14] == "-bash: ./f/x: Not a directory\n"
+    assert out[15] == "mkdir: cannot create directory ‘f/x’: Not a directory\n"
+
+
+def test_busybox_applets_below_a_file():
+    out = run(["mkdir /tmp/w; cd /tmp/w; touch f a", "busybox rm -f f/x", "busybox cp f/x a",
+               "busybox cp a f/x", "busybox mv f/x a", "busybox mv a f/x", "busybox chmod 7 f/x",
+               "busybox touch f/x", "busybox rmdir f/x", "busybox ls f/x", "busybox cat f/x",
+               "busybox mkdir -p f/x/y"])
+    assert out[1:] == ["rm: can't stat 'f/x': Not a directory\n",
+                       "cp: can't stat 'f/x': Not a directory\n",
+                       "cp: can't stat 'f/x': Not a directory\n",
+                       "mv: can't rename 'f/x': Not a directory\n",
+                       "mv: can't stat 'f/x': Not a directory\n",
+                       "chmod: f/x: Not a directory\n",
+                       "touch: f/x: Not a directory\n",
+                       "rmdir: 'f/x': Not a directory\n",
+                       "ls: f/x: Not a directory\n",
+                       "cat: can't open 'f/x': Not a directory\n",
+                       "mkdir: can't create directory 'f/': Not a directory\n"]
+
+
+def test_mkdir_p_stops_at_a_file_in_the_way():
+    out = run(["mkdir /tmp/w; cd /tmp/w; touch a", "mkdir -p a/q/r", "mkdir -p /tmp/w/a/q",
+               "ls -a a"])
+    assert out[1] == "mkdir: cannot create directory ‘a’: Not a directory\n"
+    assert out[2] == "mkdir: cannot create directory ‘/tmp/w/a’: Not a directory\n"
+    assert out[3] == "a\n"
+
+
+def test_session_directories_count_their_subdirectories():
+    out = run(["mkdir -p /tmp/w/d/e /tmp/w/d/f; touch /tmp/w/d/x", "ls -la /tmp/w/d"])
+    rows = out[1].splitlines()
+    assert rows[1].split()[:2] == ["drwxr-xr-x", "4"]
+    assert [r.split()[1] for r in rows[3:5]] == ["2", "2"]
+
+
+def test_cp_and_mv_name_the_same_file_and_skip_directories():
+    out = run(["mkdir -p /tmp/w/d; cd /tmp/w; touch a", "cp a a", "cp a .", "mv a ./",
+               "mv d d/", "mv d .", "cp d e", "busybox mv a .", "busybox cp d e",
+               "busybox mv d d"])
+    assert out[1] == "cp: 'a' and 'a' are the same file\n"
+    assert out[2] == "cp: 'a' and './a' are the same file\n"
+    assert out[3] == "mv: 'a' and './a' are the same file\n"
+    assert out[4] == "mv: cannot move 'd' to a subdirectory of itself, 'd/d'\n"
+    assert out[5] == "mv: 'd' and './d' are the same file\n"
+    assert out[6] == "cp: -r not specified; omitting directory 'd'\n"
+    assert out[7] == ""
+    assert out[8] == "cp: omitting directory 'd'\n"
+    assert out[9] == "mv: can't rename 'd': Invalid argument\n"
+    assert status(["mkdir /tmp/w; cd /tmp/w; touch a", "cp a a"]) == 1
+
+
+def test_more_operands_than_followed_are_left_to_the_model():
+    names = " ".join(f"/tmp/f{i}" for i in range(9))
+    for command in ("touch", "rm -f", "mkdir", "chmod 755", "rmdir", "cp /bin/sh"):
+        assert shell.answer(host(), f"{command} {names}", now=NOW) is None, command
+
+
+def test_touch_makes_the_other_operands_after_one_fails():
+    out = run(["mkdir /tmp/w; cd /tmp/w", "touch d/e a", "ls"])
+    assert out[1] == "touch: cannot touch 'd/e': No such file or directory\n"
+    assert out[2] == "a\n"
+
+
+def test_printf_uses_its_format_again_for_the_remaining_arguments():
+    assert one("printf '%s\\n' a b") == "a\nb\n"
+    assert one("printf '%s-%s|' a b c") == "a-b|c-|"
+    assert one("printf x a b") == "x"
+
+
+def test_cat_shows_errors_where_they_fall():
+    out = run(["mkdir /tmp/w; echo hi > /tmp/w/x", "cat /tmp/w/x /tmp/w/no",
+               "cat /tmp/w/no /tmp/w/x", "cat /tmp/w/x /tmp/w/no /tmp/w/x",
+               "cat /tmp/w/x /tmp/w/no 2>&1 | cat"])
+    assert out[1] == "hi\ncat: /tmp/w/no: No such file or directory\n"
+    assert out[2] == "cat: /tmp/w/no: No such file or directory\nhi\n"
+    # interleaved: not modelled; the fallback shows only the tool's own error
+    assert out[3] == "cat: /tmp/w/no: No such file or directory\n"
+    assert out[4] == "hi\ncat: /tmp/w/no: No such file or directory\n"
+
+
+def test_busybox_cat_and_cp_and_touch_speak_as_busybox():
+    out = run(["mkdir /tmp/w; cd /tmp/w; mkdir d", "busybox cat nope", "busybox cat d",
+               "busybox cp nope x", "busybox cp /bin/sh q/x", "busybox touch q/x",
+               "busybox mv d q/x", "busybox rmdir"])
+    assert out[1] == "cat: can't open 'nope': No such file or directory\n"
+    assert out[2] == "cat: read error: Is a directory\n"
+    assert out[3] == "cp: can't stat 'nope': No such file or directory\n"
+    assert out[4] == "cp: can't create 'q/x': No such file or directory\n"
+    assert out[5] == "touch: q/x: No such file or directory\n"
+    assert out[6] == "mv: can't rename 'd': No such file or directory\n"
+    assert out[7].startswith("BusyBox v1.36.1") and "Usage: rmdir [-p] DIRECTORY...\n" in out[7]
+
+
+def test_ls_sorts_as_en_us_and_busybox_ls_as_bytes():
+    out = run(["mkdir /tmp/w; cd /tmp/w; touch h .h H _h a A; touch .A b.c bc b-c B",
+               "ls -A", "busybox ls -A", "busybox ls -l"])
+    assert out[1].split() == "a .A A B b-c b.c bc .h _h h H".split()   # as glibc 2.35
+    assert out[2].split() == ".A .h A B H _h a b-c b.c bc h".split()
+    assert out[3].splitlines()[1] == \
+        "-rw-r--r--    1 root     root             0 Nov 18 11:06 A"
+
+
+def test_stderr_sent_to_stdout_keeps_its_order():
+    out = run(["mkdir /tmp/w; cd /tmp/w; echo hi > a", "cat nope a 2>&1 | cat",
+               "cat nope a >f 2>&1; cat f"])
+    assert out[1] == "cat: nope: No such file or directory\nhi\n"
+    assert out[2] == "cat: nope: No such file or directory\nhi\n"
+
+
+def test_cd_in_a_pipeline_moves_nobody():
+    out = run(["mkdir -p /tmp/w/d; cd /tmp/w/d", "cd /tmp | cat", "pwd", "cd .. | pwd"])
+    assert out[2] == "/tmp/w/d\n"
+    assert out[3] == "/tmp/w/d\n"
+
+
+def test_options_may_follow_the_operands():
+    out = run(["mkdir /tmp/w/d -p", "touch /tmp/w/d/x -c", "ls -a /tmp/w", "rm /tmp/w/d -r",
+               "ls /tmp/w"])
+    assert out[0] == "" and out[1] == ""
+    assert out[2] == ".  ..  d\n"
+    assert out[3] == "" and out[4] == ""
+
+
+def test_chmod_changes_a_session_directory_and_mv_keeps_it():
+    out = run(["mkdir -p /tmp/w/d/q; touch /tmp/w/d/x", "chmod -R 700 /tmp/w/d",
+               "ls -la /tmp/w/d", "chmod 750 /tmp/w/d/q; mv /tmp/w/d /tmp/w/e", "ls -l /tmp/w/e",
+               "chmod 755 /tmp/w/e/q; ls -l /tmp/w/e"])
+    rows = out[2].splitlines()
+    assert rows[1].startswith("drwx------ ") and rows[1].endswith(" .")
+    assert rows[3].startswith("drwx------ ") and rows[3].endswith(" q")
+    assert rows[4].startswith("-rwx------ ") and rows[4].endswith(" x")
+    assert out[4].splitlines()[1].startswith("drwxr-x--- ")
+    assert out[5].splitlines()[1].startswith("drwxr-xr-x ")
+
+
+def test_busybox_cp_and_mv_look_at_the_destination_first():
+    out = run(["mkdir /tmp/w; cd /tmp/w; touch d", "busybox cp nope d/x", "busybox mv nope d/x",
+               "cp nope d/x", "busybox cp d/y d/x", "busybox mv d/y d/x"])
+    assert out[1] == "cp: can't stat 'd/x': Not a directory\n"
+    assert out[2] == "mv: can't stat 'd/x': Not a directory\n"
+    assert out[3] == "cp: failed to access 'd/x': Not a directory\n"
+    assert out[4] == "cp: can't stat 'd/y': Not a directory\n"    # a lone source first
+    assert out[5] == "mv: can't stat 'd/x': Not a directory\n"
+    assert run(["mkdir /tmp/w; touch /tmp/f", "busybox mv /tmp/w /tmp/f"])[1] == \
+        "mv: can't rename '/tmp/w': Not a directory\n"

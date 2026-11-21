@@ -773,15 +773,31 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         if with_model else None
     local = cached = None
     capped = False
+    owned = None
     if with_model:
         local_ok = prompt_state is None or prompt_state[1] is not None
         if _local_replies and counts_as_command and local_ok:
             cwd = prompt_state[1] if prompt_state else None
+            answered = budget.model_answered(session_id)
+            # While no model call has been made for a command (``model_answered``; a
+            # failed call counts), the only state is what ``fallback_reply`` keeps in
+            # ``_shell_sessions`` (as under a model cap of 0). Local
+            # answers read that state, on a copy kept only if the answer is used, so a
+            # line left to the fallback is not applied twice. Once a model call has been
+            # made (which never reverts), only FIXED answers are used, and no session
+            # state can change those: the state then lives in the model's history, or in
+            # the fallback session that the model path (cap, error) itself runs.
+            fallback = _shell_sessions.get(session_id) if not answered else None
+            scratch = fallback.copy() if fallback is not None else None
             answer = shell.answer(host, text, user=username or "user",
-                                  interactive=interactive, cwd=cwd, src_ip=src_ip)
+                                  interactive=interactive, cwd=cwd, src_ip=src_ip,
+                                  session=scratch)
             if answer is not None and (answer.scope == shell.FIXED or (
-                    answer.scope == shell.SESSION and not budget.model_answered(session_id))):
+                    answer.scope == shell.SESSION and not answered)):
                 local = answer
+                if scratch is not None:
+                    _track_shell(session_id, scratch)
+                    owned = scratch
         cache = reply_cache()
         if local is None and key is not None and cache is not None:
             cached = cache.get(key)
@@ -806,7 +822,8 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
     if local is not None:
         await _tarpit(src_ip)
         await _pause()
-        prompt = (shown_prompt or shell_prompt(username, host.hostname)) if interactive else ""
+        prompt = "" if not interactive else _prompt_at(username, host, owned) \
+            if owned is not None else (shown_prompt or shell_prompt(username, host.hostname))
 
         def shown(output: str) -> str:
             return (output.replace("\n", "\r\n") if interactive else output) + prompt

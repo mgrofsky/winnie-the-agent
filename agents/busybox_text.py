@@ -88,6 +88,13 @@ APPLETS = {
 
 USAGE = {
     "1.30": {
+        "rmdir": (
+            'Usage: rmdir [OPTIONS] DIRECTORY...\n'
+            '\n'
+            'Remove DIRECTORY if it is empty\n'
+            '\n'
+            '\t-p\tInclude parents\n'
+            '\t--ignore-fail-on-non-empty\n'),
         "wget": (
             'Usage: wget [-c|--continue] [--spider] [-q|--quiet] [-O|--output-document FILE]\n'
             "\t[--header 'header: value'] [-Y|--proxy on/off] [-P DIR]\n"
@@ -234,6 +241,13 @@ USAGE = {
             '\t-Y on/off\tUse proxy\n'),
     },
     "1.36": {
+        "rmdir": (
+            'Usage: rmdir [-p] DIRECTORY...\n'
+            '\n'
+            'Remove DIRECTORY if it is empty\n'
+            '\n'
+            '\t-p\tInclude parents\n'
+            '\t--ignore-fail-on-non-empty\n'),
         "wget": (
             'Usage: wget [-cqS] [--spider] [-O FILE] [-o LOGFILE] [--header STR]\n'
             '\t[--post-data STR | --post-file FILE] [-Y on/off]\n'

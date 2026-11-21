@@ -41,7 +41,7 @@ import random
 import re
 import shlex
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 from scenarios.schema import GPU_SPECS, HARDWARE_PRESETS, Hardware
@@ -130,20 +130,25 @@ def literal_output(text: str) -> Optional[str]:
         if re.search(r"%[^sd%]", fmt):
             return None
         out, i = "", 0
-        for part in re.split(r"(%[sd%])", fmt):
-            if part == "%%":
-                out += "%"
-            elif part in ("%s", "%d"):
-                value = args[i] if i < len(args) else ""
-                i += 1
-                if part == "%d":
-                    try:
-                        value = str(int(value or 0))
-                    except ValueError:
-                        return None
-                out += value
-            else:
-                out += part
+        parts = re.split(r"(%[sd%])", fmt)
+        takes = any(part in ("%s", "%d") for part in parts)
+        while True:                          # the format is used again for the rest
+            for part in parts:
+                if part == "%%":
+                    out += "%"
+                elif part in ("%s", "%d"):
+                    value = args[i] if i < len(args) else ""
+                    i += 1
+                    if part == "%d":
+                        try:
+                            value = str(int(value or 0))
+                        except ValueError:
+                            return None
+                    out += value
+                else:
+                    out += part
+            if not takes or i >= len(args) or len(out) > MAX_ECHO_OUTPUT:
+                break
     return "".join(c for c in out if c.isprintable() or c in "\n\t")[:MAX_ECHO_OUTPUT]
 
 
@@ -418,7 +423,7 @@ def _bin_dirs(key: str, bins: tuple) -> tuple[dict, dict]:
         names[posixpath.dirname(path)].add(name)
     if "busybox" not in dict(bins):
         names["/usr/bin"].discard("busybox")
-    return ({d: tuple(sorted(v)) for d, v in names.items()},
+    return ({d: tuple(sorted(v, key=_collate)) for d, v in names.items()},   # ls order
             {d: frozenset(v) for d, v in names.items()})
 
 
@@ -769,9 +774,15 @@ class Session:
     dirs: dict = field(default_factory=dict)       # path -> mtime, directories it made
     removed: set = field(default_factory=set)      # its own files it removed again
     version: int = 0       # bumped whenever an entry is made or removed (listing caches)
+    modes: dict = field(default_factory=dict)      # its directories' modes, other than 755
 
     def size(self) -> int:
         return sum(len(f.data) for f in self.files.values())
+
+    def copy(self) -> "Session":
+        """An independent copy: a line may run on it and be kept only if its answer is."""
+        return Session(self.cwd, {p: replace(f) for p, f in self.files.items()},
+                       dict(self.dirs), set(self.removed), self.version, dict(self.modes))
 
 
 # Where a non-root login may create files.
@@ -947,15 +958,23 @@ class Shell:
         a pipeline after a stage it answered) after ``errs`` already written to stderr."""
         self.stage_errs = [errs]            # read by _fallback when a stage is unsupported
         errors, scope, result = self.stage_errs, FIXED, _Result()
-        for index in range(start, len(pipeline)):
-            cmd = pipeline[index]
-            self.stage, self.stage_fds = index, None
-            result = self._simple(cmd, stdin if index else None, index < len(pipeline) - 1)
-            errors.append(result.err)
-            if index < len(pipeline) - 1:
-                errors.append(result.late)
-            scope = max(scope, result.scope)
-            stdin = result.out
+        # Each stage of a real pipeline is a subshell: a ``cd`` in one moves nobody.
+        cwd = self.cwd if len(pipeline) > 1 else None
+        try:
+            for index in range(start, len(pipeline)):
+                cmd = pipeline[index]
+                self.stage, self.stage_fds = index, None
+                if cwd is not None:
+                    self.cwd = cwd
+                result = self._simple(cmd, stdin if index else None, index < len(pipeline) - 1)
+                errors.append(result.err)
+                if index < len(pipeline) - 1:
+                    errors.append(result.late)
+                scope = max(scope, result.scope)
+                stdin = result.out
+        finally:
+            if cwd is not None:
+                self.cwd = cwd
         return _Result(result.out, "".join(errors), result.status, scope, result.late)
 
     def _simple(self, cmd: _Simple, stdin: Optional[str], piped: bool = False) -> _Result:
@@ -1028,7 +1047,9 @@ class Shell:
         """``result`` sent where its descriptors point: to a session file (within the session
         limits), nowhere, or back as the reply's output or error."""
         routed = {"out": "", "err": "", "late": ""}
-        for text, fd, stream in ((result.out, 1, "out"), (result.err, 2, "err"),
+        # in the order a command writes them (``run`` shows err, out, late): ``2>&1`` and
+        # ``>f 2>&1`` keep that order
+        for text, fd, stream in ((result.err, 2, "err"), (result.out, 1, "out"),
                                  (result.late, 2, "late")):
             dest = fds[fd]
             if dest[0] == "file":
@@ -1060,6 +1081,10 @@ class Shell:
         Raises ``_Unsupported`` for a path whose parent this shell does not know."""
         parent = posixpath.dirname(path)
         if parent in self.session.removed and parent not in self.session.dirs:
+            return "No such file or directory"
+        if _below_file(self, path):
+            return "Not a directory"
+        if not self.directory(parent) and _absent(self, parent):
             return "No such file or directory"
         if parent in ("/bin", "/sbin", "/usr/bin", "/usr/sbin"):
             # /bin and /sbin are /usr/bin and /usr/sbin under another name: a file made in
@@ -1131,6 +1156,7 @@ class Shell:
         s = self.session
         s.files.pop(path, None)
         s.dirs.pop(path, None)
+        s.modes.pop(path, None)
         if len(s.removed) >= MAX_SCRATCH:
             s.removed.pop()
         s.removed.add(path)
@@ -1219,7 +1245,13 @@ class Shell:
         path = self.path(word)
         entry = self.session.files.get(path)
         if entry is None:
-            if path in self.session.removed:
+            if path in self.session.dirs:
+                return _Result(err=f"{self.prefix}: {word}: Is a directory\n", status=126,
+                               scope=STATE)
+            if _below_file(self, path):
+                return _Result(err=f"{self.prefix}: {word}: Not a directory\n", status=126,
+                               scope=STATE)
+            if path in self.session.removed or _absent(self, path):
                 return _Result(err=f"{self.prefix}: {word}: No such file or directory\n",
                                status=127, scope=STATE)
             raise _Unsupported
@@ -1271,6 +1303,11 @@ class Shell:
         if path in _ABSENT.get(self.host.family, ()):
             return _Result(status=1, err=f"{{cmd}}: {path}: No such file or directory\n",
                            scope=SESSION)
+        reason = "Is a directory" if self.directory(path) else \
+            "Not a directory" if _below_file(self, path) else \
+            "No such file or directory" if _absent(self, path) else None
+        if reason is not None:               # what the session's own listings say
+            return _Result(status=1, err=f"{{cmd}}: {path}: {reason}\n", scope=SESSION)
         return None
 
     def unhandled(self, line: str) -> str:
@@ -1294,9 +1331,10 @@ class Shell:
 
 def answer(host: Host, line: str, *, user: str = "root", interactive: bool = True,
            cwd: Optional[str] = None, now: Optional[float] = None,
-           src_ip: Optional[str] = None) -> Optional[Answer]:
-    """The deterministic answer to one input line, or None when it needs a real shell."""
-    return _shell(host, user, interactive, cwd, now, src_ip).run(line.strip())
+           src_ip: Optional[str] = None, session: Optional[Session] = None) -> Optional[Answer]:
+    """The deterministic answer to one input line, or None when it needs a real shell.
+    ``session`` is the state earlier lines left; a line that changes state changes it."""
+    return _shell(host, user, interactive, cwd, now, src_ip, session).run(line.strip())
 
 
 def _shell(host: Host, user: str, interactive: bool, cwd: Optional[str], now: Optional[float],
@@ -2293,8 +2331,12 @@ def _files(sh: Shell, args: list[str], command: str) -> Optional[tuple]:
         sh.charge(len(result.out) + STEP)
         scope = max(scope, result.scope)
         if result.err:
-            errors += _missing(sh, command, _shown(name))
+            reason = result.err.rsplit(": ", 1)[1].strip()
+            if reason == "Is a directory" and command != "cat":
+                return None                  # head, wc and the rest word it their own way
+            errors += _missing(sh, command, _shown(name), reason)
             status = result.status
+            out.append((name, None))         # where the error falls among the outputs
             continue
         out.append((name, result.out))
     return out, errors, status, scope
@@ -2310,9 +2352,15 @@ def _cat(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     if read is None:
         return None
     files, errors, status, scope = read
+    order = "".join("e" if text is None else "o" for _, text in files if text != "")
+    if "oe" in order and "eo" in order:
+        return None                          # errors between outputs: not modelled
     for _, text in files:
-        sh.grow(len(text))
-    return _Result("".join(text for _, text in files), errors, status, scope)
+        sh.grow(len(text or ""))
+    out = "".join(text or "" for _, text in files)
+    if "oe" in order:                        # the errors follow the output on a terminal
+        return _Result(out, "", status, scope, late=errors)
+    return _Result(out, errors, status, scope)
 
 
 # ---- filters ----------------------------------------------------------------------------------
@@ -2324,7 +2372,11 @@ def _input(sh: Shell, files: list[str], stdin: Optional[str], command: str):
             return None                      # would wait on the terminal
         sh.charge(len(stdin))
         return [("", stdin)], "", 0, FIXED
-    return _files(sh, files, command)
+    read = _files(sh, files, command)
+    if read is None:
+        return None
+    texts, errors, status, scope = read
+    return [(n, t) for n, t in texts if t is not None], errors, status, scope
 
 
 class _Pattern:
@@ -2804,10 +2856,25 @@ def _dirs(sh: Shell) -> dict[str, list[str]]:
         if parent in touched or parent in out:
             names(parent).discard(name)
     for path, entries in touched.items():
-        out[path] = sorted(entries, key=lambda n: n.lower().lstrip("._"))
+        out[path] = sorted(entries, key=_collate)
     sh.charge(len(s.dirs) + len(s.files) + len(s.removed) * STEP)
     sh.memo[key] = out
     return out
+
+
+_ALNUM = "".join(chr(c) for c in range(128) if chr(c).isalnum())
+_PUNCT = "".join(chr(c) for c in range(128) if not chr(c).isalnum())
+_DROP_PUNCT = str.maketrans("", "", _PUNCT)
+_MARK_ALNUM = str.maketrans({c: "\U0010ffff" for c in _ALNUM})
+
+
+@functools.lru_cache(maxsize=8192)
+def _collate(name: str) -> tuple:
+    """``ls`` order in a glibc en_US.UTF-8 locale: letters and digits ignoring case first,
+    then lower case before upper, then punctuation (``.h`` before ``h``, ``-`` before
+    ``.``). String operations only: the host's tables sort a few thousand names a line."""
+    plain = name.translate(_DROP_PUNCT)
+    return plain.lower(), plain.swapcase(), name.translate(_MARK_ALNUM)
 
 
 def _host_dirs(sh: Shell) -> dict[str, list[str]]:
@@ -2842,11 +2909,13 @@ def _host_dirs(sh: Shell) -> dict[str, list[str]]:
                 out[parent].append(name)
             if depth < len(parts) - 1:
                 out.setdefault("/" + "/".join(parts[:depth + 1]), [])
+    ordered = {}                             # sorted once per kind of host
     for directory, names in h.bin_dirs().items():
-        out[directory] = list(names)
-        out[directory.replace("/usr", "", 1)] = list(names)     # /bin and /sbin point there
+        ordered[directory] = list(names)
+        ordered[directory.replace("/usr", "", 1)] = list(names)  # /bin and /sbin point there
     out["/usr/local/bin"], out["/usr/local/sbin"] = [], []
-    return {k: sorted(v, key=lambda s: s.lower().lstrip("._")) for k, v in out.items()}
+    return {**{k: sorted(v, key=_collate) for k, v in out.items() if k not in ordered},
+            **ordered}
 
 
 # Directories cd accepts whose contents ls does not list.
@@ -2868,7 +2937,7 @@ def _ls(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
             return None
         else:
             operands.append(arg)
-    if flags - set("1al") or len(operands) > MAX_FILES:
+    if flags - set("1alA") or {"a", "A"} <= flags or len(operands) > MAX_FILES:
         return None
     dirs = _dirs(sh)
     operands = operands or ["."]
@@ -2877,7 +2946,13 @@ def _ls(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         path = sh.path(word)
         if path not in dirs and not _denied(sh, path):
             if path not in sh.session.files:
-                return None
+                reason = "Not a directory" if _below_file(sh, path) else \
+                    "No such file or directory" if _absent(sh, path) else None
+                if reason is None:
+                    return None
+                err += _missing(sh, "ls", _shown(word), reason)
+                status = 1 if sh.busybox else 2
+                continue
             files.append((word, path))
     if files:
         if "l" in flags:
@@ -2916,11 +2991,15 @@ def _listing(sh: Shell, path: str, dirs: dict, flags: set) -> Optional[str]:
 def _list_dir(sh: Shell, path: str, dirs: dict, flags: set) -> Optional[str]:
     names = list(dirs[path])
     sh.charge(len(names) * STEP)
-    if "a" in flags:
+    if "a" in flags or "A" in flags:
         if path not in _HIDDEN and path not in sh.session.dirs:
             return None                  # dot files this shell does not know
-        names = [".", ".."] + sorted(names + _HIDDEN.get(path, []),
-                                     key=lambda n: n.lower().lstrip("._"))
+        names = ([".", ".."] if "a" in flags else []) + sorted(
+            names + _HIDDEN.get(path, []), key=_collate)
+    else:                                # a dot file the session made stays out of sight
+        names = [n for n in names if not n.startswith(".")]
+    if sh.busybox:                       # busybox ls sorts bytes, as in the C locale
+        names = sorted(names, key=lambda n: (n not in (".", ".."), n))
     if "l" in flags:
         rows = []
         for name in names:
@@ -2963,7 +3042,10 @@ def _stat(sh: Shell, path: str) -> Optional[tuple]:
     if entry is not None:
         return (_mode_string(entry.mode, "-"), 1, sh.user, len(wire(entry.data)), entry.mtime)
     if path in sh.session.dirs:
-        return ("drwxr-xr-x", 2, sh.user, 4096, sh.session.dirs[path])
+        sh.charge(len(sh.session.dirs) * STEP)
+        subdirs = sum(1 for d in sh.session.dirs if posixpath.dirname(d) == path)
+        return (_mode_string(sh.session.modes.get(path, 0o755), "d"), 2 + subdirs, sh.user, 4096,
+                sh.session.dirs[path])
     if posixpath.basename(path).startswith(_PRIVATE_DIRS):
         return ("drwx------", 3, "root", 4096, boot + 40)
     if posixpath.basename(path) in _X11 and posixpath.dirname(path) == "/tmp":
@@ -3001,6 +3083,9 @@ def _long(sh: Shell, rows: list[tuple[str, tuple]]) -> str:
         return t.strftime("%b %e %H:%M") if abs(now - ts) < 15552000 else \
             t.strftime("%b %e  %Y")
 
+    if sh.busybox:                           # busybox's fixed columns
+        return "".join(f"{m[0]} {m[1]:>4} {m[2]:<8} {m[2]:<8} {m[3]:>9} {when(m[4])} {name}\n"
+                       for name, m in rows)
     links = max(len(str(m[1])) for _, m in rows)
     owner = max(len(m[2]) for _, m in rows)
     size = max(len(str(m[3])) for _, m in rows)
@@ -3017,11 +3102,14 @@ def _cd(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     if _denied(sh, target):
         return _Result(err=f"{sh.prefix}: cd: {args[0]}: Permission denied\n", status=1)
     if target not in _dirs(sh) and target not in _SYSTEM_DIRS:
-        if target in sh.session.removed or target in sh.session.files:
-            reason = "Not a directory" if target in sh.session.files else \
-                "No such file or directory"
-            return _Result(err=f"{sh.prefix}: cd: {args[0]}: {reason}\n", status=1)
-        return None
+        if target in sh.session.files or _below_file(sh, target):
+            reason = "Not a directory"
+        elif target in sh.session.removed or (".." not in args[0].split("/")
+                                              and _absent(sh, target)):
+            reason = "No such file or directory"
+        else:
+            return None
+        return _Result(err=f"{sh.prefix}: cd: {args[0]}: {reason}\n", status=1)
     sh.cwd = target
     return _Result()
 
@@ -3165,8 +3253,8 @@ _APPLETS = frozenset(("cat", "echo", "uname", "id", "whoami", "hostname", "nproc
                       "touch", "chmod", "dd", "rmdir", "kill", "killall", "nc", "ftpget", "ftpput",
                       "printf"))
 # Applets that print their usage when run without arguments (stderr, status 1).
-_USAGE_APPLETS = frozenset(("wget", "tftp", "cp", "chmod", "rm", "mkdir", "mv", "touch",
-                            "printf", "nc", "ftpget", "ftpput"))
+_USAGE_APPLETS = frozenset(("wget", "tftp", "cp", "chmod", "rm", "rmdir", "mkdir", "mv",
+                            "touch", "printf", "nc", "ftpget", "ftpput"))
 
 
 def _applet_usage(sh: Shell, applet: str) -> _Result:
@@ -3317,12 +3405,13 @@ def _shown(word: str) -> str:
 
 
 def _split_flags(args: list[str], allowed: str) -> Optional[tuple[set, list[str]]]:
-    """(short flags, operands); None for a flag outside ``allowed`` or a long option."""
+    """(short flags, operands); None for a flag outside ``allowed`` or a long option.
+    Options may follow operands (``mkdir d -p``), as GNU and busybox getopt permute them."""
     flags, operands = set(), []
     for arg in args:
-        if arg.startswith("-") and len(arg) > 1 and not operands:
+        if arg.startswith("-") and len(arg) > 1:
             if arg.startswith("--") or set(arg[1:]) - set(allowed):
-                return None
+                return None                  # ``--`` too: operands that look like options
             flags |= set(arg[1:])
         else:
             operands.append(arg)
@@ -3335,9 +3424,35 @@ def _exists(sh: Shell, path: str) -> Optional[bool]:
         return True
     parent, name = posixpath.split(path)
     dirs = _dirs(sh)
-    if parent in dirs and not name.startswith("."):    # listings leave out dot files
-        return name in dirs[parent]
+    if parent in dirs:
+        # Host listings leave out dot files, except where ``_HIDDEN`` names them all; a
+        # directory the session made holds only what the session put there.
+        if not name.startswith(".") or parent in _HIDDEN or parent not in sh.memo["dirs"]:
+            return name in dirs[parent] or name in _HIDDEN.get(parent, ())
+        return None
+    # Below something that is not there (below a file the error is another one: None).
+    sh.charge(STEP + len(path))
+    if parent != path and path.count("/") <= 64 and parent not in sh.session.files \
+            and _exists(sh, parent) is False:
+        return False
     return None
+
+
+def _absent(sh: Shell, path: str) -> bool:
+    """Whether ``path`` is missing by what the session itself made: its nearest existing
+    directory is one the session made (the host has no other entries there). A path in, or
+    below a missing name in, one of the host's own directories stays unknown here: commands
+    that read or run it are left to the model, as before."""
+    if _exists(sh, path) is not False:
+        return False
+    parent = posixpath.dirname(path)
+    for _ in range(64):
+        sh.charge(STEP + len(parent))
+        if parent == "/" or sh.directory(parent):
+            break
+        parent = posixpath.dirname(parent)
+    _dirs(sh)
+    return parent in sh.session.dirs and parent not in sh.memo["dirs"]
 
 
 def _source(sh: Shell, word: str) -> Optional[_Scratch]:
@@ -3355,6 +3470,32 @@ def _source(sh: Shell, word: str) -> Optional[_Scratch]:
     if _exists(sh, path) is False or path in sh.session.removed:
         return _Scratch(mode=0)
     return None
+
+
+def _below_file(sh: Shell, path: str) -> bool:
+    """Whether a file the session wrote stands where a directory of ``path`` would be."""
+    parent = posixpath.dirname(path)
+    while parent != "/" and parent:
+        sh.charge(STEP + len(parent))
+        if parent in sh.session.files:
+            return True
+        parent = posixpath.dirname(parent)
+    return False
+
+
+def _dest_word(sh: Shell, source: str, target: str) -> str:
+    """The destination as GNU cp and mv name it in errors: the target, or the source's
+    name inside it when it is a directory."""
+    if not sh.directory(sh.path(target)):
+        return target
+    return target.rstrip("/") + "/" + posixpath.basename(source.rstrip("/"))
+
+
+def _same_file(sh: Shell, word: str, target: str) -> Optional[_Result]:
+    if sh.busybox:
+        return _Result()                     # busybox renames it onto itself, silently
+    return _Result(err=f"mv: '{_shown(word)}' and '{_shown(_dest_word(sh, word, target))}' "
+                       "are the same file\n", status=1)
 
 
 def _destination(sh: Shell, source: str, target: str) -> str:
@@ -3379,11 +3520,36 @@ def _cp(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     *sources, target = operands
     if len(sources) > 1 and not sh.directory(sh.path(target)):
         return None
+    if sh.busybox and len(sources) == 1 and _below_file(sh, sh.path(sources[0])):
+        # busybox stats a lone source before the destination (a missing one is no error yet)
+        return _Result(err=f"cp: can't stat '{_shown(sources[0])}': Not a directory\n",
+                       status=1)
+    if _below_file(sh, sh.path(target)):
+        return _Result(err=f"cp: can't stat '{_shown(target)}': Not a directory\n"
+                       if sh.busybox else
+                       f"cp: failed to access '{_shown(target)}': Not a directory\n", status=1)
     err, status = "", 0
-    for word in sources[:MAX_FILES]:
+    if len(sources) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in sources:
+        if _below_file(sh, sh.path(word)):
+            err += f"cp: can't stat '{_shown(word)}': Not a directory\n" if sh.busybox else \
+                f"cp: cannot stat '{_shown(word)}': Not a directory\n"
+            status = 1
+            continue
+        if sh.directory(sh.path(word)) and not flags & set("rRa"):
+            err += f"cp: omitting directory '{_shown(word)}'\n" if sh.busybox else \
+                f"cp: -r not specified; omitting directory '{_shown(word)}'\n"
+            status = 1
+            continue
         src = _source(sh, word)
         if src is None:
             return None
+        if src.mode != 0 and _destination(sh, word, target) == sh.path(word):
+            err += f"cp: '{_shown(word)}' and '{_shown(_dest_word(sh, word, target))}' " \
+                   "are the same file\n"
+            status = 1
+            continue
         if src.mode == 0:
             err += (f"cp: can't stat '{_shown(word)}': No such file or directory\n"
                     if sh.busybox else
@@ -3393,7 +3559,8 @@ def _cp(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         dest = _destination(sh, word, target)
         reason = sh.writable(dest) if dest not in sh.session.files else None
         if reason is not None:
-            err += f"cp: cannot create regular file '{_shown(target)}': {reason}\n"
+            err += f"cp: can't create '{_shown(target)}': {reason}\n" if sh.busybox else \
+                f"cp: cannot create regular file '{_shown(target)}': {reason}\n"
             status = 1
             continue
         old = sh.session.files.get(dest)
@@ -3419,6 +3586,14 @@ def _mv(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     word, target = operands
     path = sh.path(word)
     entry = sh.session.files.get(path)
+    if _below_file(sh, sh.path(target)):     # both look at the destination first
+        return _Result(err=f"mv: can't stat '{_shown(target)}': Not a directory\n"
+                       if sh.busybox else
+                       f"mv: failed to access '{_shown(target)}': Not a directory\n", status=1)
+    if _below_file(sh, path):
+        return _Result(err=f"mv: can't rename '{_shown(word)}': Not a directory\n"
+                       if sh.busybox else
+                       f"mv: cannot stat '{_shown(word)}': Not a directory\n", status=1)
     if entry is None and path in sh.session.dirs:
         return _mv_dir(sh, word, target, path)
     if entry is None:
@@ -3430,10 +3605,11 @@ def _mv(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         return None
     dest = _destination(sh, word, target)
     if dest == path:
-        return _Result()
+        return _same_file(sh, word, target)
     reason = sh.writable(dest) if dest not in sh.session.files else None
     if reason is not None:
-        return _Result(err=f"mv: cannot move '{_shown(word)}' to '{_shown(target)}': {reason}\n",
+        return _Result(err=f"mv: can't rename '{_shown(word)}': {reason}\n" if sh.busybox
+                       else f"mv: cannot move '{_shown(word)}' to '{_shown(target)}': {reason}\n",
                        status=1)
     sh.remove(path)
     sh.store(dest, entry)
@@ -3444,30 +3620,39 @@ def _mv_dir(sh: Shell, word: str, target: str, path: str) -> Optional[_Result]:
     """``mv`` of a directory the session made: it and everything in it move."""
     dest = _destination(sh, word, target)
     if dest == path:
-        return _Result()
+        return _same_file(sh, word, target)
     if dest.startswith(path + "/"):
+        if sh.busybox:
+            return _Result(err=f"mv: can't rename '{_shown(word)}': Invalid argument\n",
+                           status=1)
         return _Result(err=f"mv: cannot move '{_shown(word)}' to a subdirectory of itself, "
-                           f"'{_shown(dest)}'\n", status=1)
+                           f"'{_shown(_dest_word(sh, word, target))}'\n", status=1)
+    if dest in sh.session.files and sh.busybox:
+        return _Result(err=f"mv: can't rename '{_shown(word)}': Not a directory\n", status=1)
     if dest in sh.session.files:
-        return _Result(err=f"mv: cannot overwrite non-directory '{_shown(dest)}' with "
+        return _Result(err=f"mv: cannot overwrite non-directory "
+                           f"'{_shown(_dest_word(sh, word, target))}' with "
                            f"directory '{_shown(word)}'\n", status=1)
     if sh.directory(dest):
         if dest not in sh.session.dirs or sh.scratch_entries(dest):
             return None                      # bash would merge or refuse: not followed
     reason = sh.writable(dest)
     if reason is not None:
-        return _Result(err=f"mv: cannot move '{_shown(word)}' to '{_shown(target)}': {reason}\n",
+        return _Result(err=f"mv: can't rename '{_shown(word)}': {reason}\n" if sh.busybox
+                       else f"mv: cannot move '{_shown(word)}' to '{_shown(target)}': {reason}\n",
                        status=1)
     s = sh.session
     inner = sorted(p for p in list(s.files) + list(s.dirs) if p.startswith(path + "/"))
     sh.charge((len(s.files) + len(s.dirs)) * STEP)
-    moved = [(p, s.files.get(p)) for p in [path] + inner]
-    for p, _ in reversed(moved):
+    moved = [(p, s.files.get(p), s.modes.get(p)) for p in [path] + inner]
+    for p, _, _ in reversed(moved):
         sh.remove(p)
     if dest in s.dirs:
         sh.remove(dest)
-    for p, entry in moved:
+    for p, entry, mode in moved:
         sh.store(dest + p[len(path):], entry)
+        if mode is not None:
+            s.modes[dest + p[len(path):]] = mode
     return _Result()
 
 
@@ -3479,14 +3664,16 @@ def _rmdir(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     operands = split[1]
     if not operands:
         if sh.busybox:
-            return None
+            return _applet_usage(sh, "rmdir")
         return _Result(err="rmdir: missing operand\n" + _try("rmdir"), status=1)
     err, status = "", 0
-    for word in operands[:MAX_FILES]:
+    if len(operands) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in operands:
         path = sh.path(word)
         if path in sh.session.dirs:
             reason = "Directory not empty" if sh.scratch_entries(path) else None
-        elif path in sh.session.files:
+        elif path in sh.session.files or _below_file(sh, path):
             reason = "Not a directory"
         elif path in sh.session.removed or _exists(sh, path) is False:
             reason = "No such file or directory"
@@ -3514,7 +3701,9 @@ def _rm(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
             return _applet_usage(sh, "rm")
         return _Result(err="rm: missing operand\n" + _try("rm"), status=1)
     err, status = "", 0
-    for word in operands[:MAX_FILES]:
+    if len(operands) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in operands:
         path = sh.path(word)
         shown = _shown(word)
         if path in sh.session.files:
@@ -3529,6 +3718,13 @@ def _rm(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
                           if p.startswith(path + "/")]:
                 sh.remove(inner)
             sh.remove(path)
+        elif _below_file(sh, path):
+            if sh.busybox:                   # even with -f
+                err += f"rm: can't stat '{shown}': Not a directory\n"
+                status = 1
+            elif "f" not in flags:
+                err += f"rm: cannot remove '{shown}': Not a directory\n"
+                status = 1
         elif path in sh.session.removed or _exists(sh, path) is False:
             if "f" not in flags:
                 err += f"rm: can't remove '{shown}': No such file or directory\n" \
@@ -3537,6 +3733,12 @@ def _rm(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         else:
             return None                      # a file of the host: the model owns that change
     return _Result(err=err, status=status)
+
+
+def _quoted(sh: Shell, word: str) -> str:
+    """A name as GNU tools quote it with the locale's quotes (a UTF-8 locale, the one
+    ``ls`` sorts by): mkdir's directory, chmod's mode. Busybox quotes plainly."""
+    return f"'{_shown(word)}'" if sh.busybox else f"\u2018{_shown(word)}\u2019"
 
 
 @_command("mkdir", scope=STATE)
@@ -3550,31 +3752,48 @@ def _mkdir(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
             return _applet_usage(sh, "mkdir")
         return _Result(err="mkdir: missing operand\n" + _try("mkdir"), status=1)
     err, status = "", 0
-    for word in operands[:MAX_FILES]:
+    if len(operands) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in operands:
         path = sh.path(word)
-        shown = _shown(word)
+        # GNU mkdir quotes with the locale's quotes (a UTF-8 one, as ``ls`` sorts by)
+        shown = _quoted(sh, word)
         cannot = "can't" if sh.busybox else "cannot"
         if sh.directory(path) or path in sh.session.files:
             if "p" not in flags or path in sh.session.files:
-                err += f"mkdir: {cannot} create directory '{shown}': File exists\n"
+                err += f"mkdir: {cannot} create directory {shown}: File exists\n"
                 status = 1
             continue
         chain = [path]
         while "p" in flags and not sh.directory(posixpath.dirname(chain[-1])) \
                 and len(chain) < MAX_FILES:
             chain.append(posixpath.dirname(chain[-1]))
+        blocked = [c for c in chain[1:] + [posixpath.dirname(chain[-1])]
+                   if c in sh.session.files]
+        if blocked:                          # a file where a directory would go
+            if "p" in flags:
+                # the highest one, named as typed: mkdir -p makes the path top down
+                cut = len(path) - len(blocked[-1])
+                if "//" in word or "." in word.split("/") or ".." in word.split("/") \
+                        or cut <= 0 or not word.rstrip("/").endswith(path[-cut:]):
+                    return None
+                shown = _quoted(sh, word.rstrip("/")[:-cut].rstrip("/")
+                                + ("/" if sh.busybox else ""))
+            err += f"mkdir: {cannot} create directory {shown}: Not a directory\n"
+            status = 1
+            continue
         if not sh.directory(posixpath.dirname(chain[-1])):
             if len(chain) >= MAX_FILES:
                 return None                  # deeper than this shell follows
             if _exists(sh, posixpath.dirname(chain[-1])) is False:
-                err += f"mkdir: {cannot} create directory '{shown}': No such file or directory\n"
+                err += f"mkdir: {cannot} create directory {shown}: No such file or directory\n"
                 status = 1
                 continue
             return None
         for target in reversed(chain):
             reason = sh.writable(target)
             if reason is not None:
-                err += f"mkdir: {cannot} create directory '{shown}': {reason}\n"
+                err += f"mkdir: {cannot} create directory {shown}: {reason}\n"
                 status = 1
                 break
             sh.store(target, None)
@@ -3591,7 +3810,10 @@ def _touch(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         if sh.busybox:
             return _applet_usage(sh, "touch")
         return _Result(err="touch: missing file operand\n" + _try("touch"), status=1)
-    for word in operands[:MAX_FILES]:
+    err, status = "", 0
+    if len(operands) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in operands:
         path = sh.path(word)
         entry = sh.session.files.get(path)
         if entry is not None:
@@ -3604,11 +3826,13 @@ def _touch(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
             continue                         # a host file: only its time changes
         elif "c" not in flags:
             reason = sh.writable(path)
-            if reason is not None:
-                return _Result(err=f"touch: cannot touch '{_shown(word)}': {reason}\n",
-                               status=1)
+            if reason is not None:           # and the other operands are still made
+                err += f"touch: {_shown(word)}: {reason}\n" if sh.busybox else \
+                    f"touch: cannot touch '{_shown(word)}': {reason}\n"
+                status = 1
+                continue
             sh.store(path, _Scratch(mtime=sh._now))
-    return _Result()
+    return _Result(err=err, status=status)
 
 
 def _parse_mode(spec: str, mode: int) -> Optional[int]:
@@ -3641,24 +3865,37 @@ def _chmod(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
             return _applet_usage(sh, "chmod")
         if not operands:
             return _Result(err="chmod: missing operand\n" + _try("chmod"), status=1)
-        return _Result(err=f"chmod: missing operand after '{_shown(operands[0])}'\n"
+        return _Result(err=f"chmod: missing operand after {_quoted(sh, operands[0])}\n"
                            + _try("chmod"), status=1)
     spec, files = operands[0], operands[1:]
     if _parse_mode(spec, 0) is None or "-v" in flags or "-c" in flags:
         return None
     err, status = "", 0
-    for word in files[:MAX_FILES]:
+    if len(files) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in files:
         path = sh.path(word)
         entry = sh.session.files.get(path)
+        if path in sh.session.dirs and sh.user != "root":
+            return None                      # a mode that would bar its owner: not followed
         if "-R" in flags:                   # and what the session wrote below it
             below = path.rstrip("/") + "/"
             for name, inner in sh.session.files.items():
                 if name.startswith(below):
                     inner.mode = _parse_mode(spec, inner.mode)
                     sh.session.version += 1
-        if entry is not None:
+            for name in [d for d in sh.session.dirs if d.startswith(below)]:
+                _chmod_dir(sh, name, spec)
+        if path in sh.session.dirs:
+            _chmod_dir(sh, path, spec)
+        elif entry is not None:
             entry.mode = _parse_mode(spec, entry.mode)
             sh.session.version += 1
+        elif _below_file(sh, path):
+            if "-f" not in flags:
+                err += f"chmod: {_shown(word)}: Not a directory\n" if sh.busybox else \
+                    f"chmod: cannot access '{_shown(word)}': Not a directory\n"
+                status = 1
         elif path in sh.session.removed or _exists(sh, path) is False:
             if "-f" not in flags:
                 err += f"chmod: {_shown(word)}: No such file or directory\n" if sh.busybox \
@@ -3667,6 +3904,16 @@ def _chmod(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         elif _exists(sh, path) is None:
             return None
     return _Result(err=err, status=status)
+
+
+def _chmod_dir(sh: Shell, path: str, spec: str) -> None:
+    """A session directory's new mode (``+X`` is ``+x`` on a directory)."""
+    mode = _parse_mode(spec, sh.session.modes.get(path, 0o755))
+    if mode == 0o755:
+        sh.session.modes.pop(path, None)
+    else:
+        sh.session.modes[path] = mode
+    sh.session.version += 1
 
 
 def _si(value: float, binary: bool = False) -> str:
@@ -3819,17 +4066,22 @@ _FILE_TOOLS = {"cat": 0, "head": 0, "tail": 0, "cut": 0, "wc": 0, "grep": 1, "eg
                "fgrep": 1, "awk": 1, "gawk": 1, "mawk": 1, "ls": 0, "df": 0}
 
 
-def _missing(sh: Shell, name: str, path: str) -> str:
+def _missing(sh: Shell, name: str, path: str, reason: str = "No such file or directory") -> str:
     """What the tool says about a path that is not on this host."""
+    if sh.busybox:                           # an applet: busybox 1.30 to 1.36 alike
+        if name == "cat" and reason == "Is a directory":
+            return "cat: read error: Is a directory\n"
+        return f"ls: {path}: {reason}\n" if name == "ls" else \
+            f"{name}: can't open '{path}': {reason}\n"
     if name == "ls":
-        return f"ls: cannot access '{path}': No such file or directory\n"
+        return f"ls: cannot access '{path}': {reason}\n"
     if name in ("head", "tail"):
-        return f"{name}: cannot open '{path}' for reading: No such file or directory\n"
+        return f"{name}: cannot open '{path}' for reading: {reason}\n"
     if name in ("awk", "gawk", "mawk"):
         if sh.host.family == "rhel" or name == "gawk":
-            return f"{name}: fatal: cannot open file `{path}' for reading: No such file or directory\n"
-        return f"{name}: cannot open {path} (No such file or directory)\n"
-    return f"{name}: {path}: No such file or directory\n"
+            return f"{name}: fatal: cannot open file `{path}' for reading: {reason}\n"
+        return f"{name}: cannot open {path} ({reason})\n"
+    return f"{name}: {path}: {reason}\n"
 
 
 def _tool_error(sh: Shell, name: str, args: list[str]) -> str:
@@ -3872,6 +4124,8 @@ def _tool_error(sh: Shell, name: str, args: list[str]) -> str:
             shown_path = "".join(c for c in path if c.isprintable())[:256]
             if full in known and name not in ("ls", "df"):
                 out.append(f"{shown}: {shown_path}: Is a directory\n")
+            elif _below_file(sh, full):
+                out.append(_missing(sh, shown, shown_path, "Not a directory"))
             elif full not in known and full not in lures and full not in _FILES \
                     and full not in sh.session.files and sh.program(full) is None:
                 out.append(_missing(sh, shown, shown_path))
