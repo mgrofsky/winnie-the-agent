@@ -208,13 +208,46 @@ def _idb_variables(d):
     return _lt(d)["UserData"]["Fn::Base64"]["Fn::Sub"][1]
 
 
+def _idb_lookup_default_on(d):
+    d["Parameters"]["InternetDbLookup"]["Default"] = "true"
+
+
+def _idb_both_allowed(d):
+    del d["Rules"]["InternetDbOneWay"]
+
+
+def _host_egress_tailscale_only(d):
+    d["Conditions"]["HostEgressOn"] = {"Fn::Equals": [{"Ref": "TailscaleEnabled"}, "true"]}
+
+
+def _idb_egress_always(d):
+    _lt(d)["UserData"]["Fn::Base64"]["Fn::Sub"][1]["IdbEgress"]["Fn::If"][2] = \
+        "echo INTERNETDB_LOOKUP=true > /etc/sensor-egress-idb.env\n"
+
+
+def _idb_lookup_args_s3(d):
+    var = _lt(d)["UserData"]["Fn::Base64"]["Fn::Sub"][1]["IdbArgs"]
+    var["Fn::If"][2]["Fn::If"][1] = " true a.json b.json"
+
+
+def _idb_lookup_mount_rw(d):
+    var = _lt(d)["UserData"]["Fn::Base64"]["Fn::Sub"][1]["IdbWrite"]
+    var["Fn::If"][2]["Fn::If"][1] = var["Fn::If"][2]["Fn::If"][1].replace(":/egress:ro",
+                                                                          ":/egress")
+
+
+def _idb_agents_read_egress(d):
+    _user_data_edit(d, "- overlay:/overlay${IdbRead}",
+                    "- overlay:/overlay${IdbRead}\n      - /var/lib/sensor-egress/exporter:/egress:ro")
+
+
 def _idb_role_whole_bucket(d):
-    [item] = [s for s in _role_statements(d) if "Fn::If" in s]
+    [item] = [s for s in _role_statements(d) if s.get("Fn::If", [None])[0] == "InternetDbOn"]
     item["Fn::If"][1]["Resource"] = {"Fn::Sub": "arn:${AWS::Partition}:s3:::${EventsBucketName}/*"}
 
 
 def _idb_role_always(d):
-    [item] = [s for s in _role_statements(d) if "Fn::If" in s]
+    [item] = [s for s in _role_statements(d) if s.get("Fn::If", [None])[0] == "InternetDbOn"]
     item["Fn::If"][0] = "HostOn"
 
 
@@ -523,8 +556,15 @@ def _tailnet_policy_by_name(d):
 
 
 def _prefix_list_any(d):
-    _tailscale_statements(d)[2]["Resource"] = {
+    [item] = [s for s in _role_statements(d) if s.get("Fn::If", [None])[0] == "HostEgressOn"]
+    item["Fn::If"][1]["Resource"] = {
         "Fn::Sub": "arn:${AWS::Partition}:ec2:${AWS::Region}:aws:prefix-list/*"}
+
+
+def _prefix_list_in_tailnet_policy(d):
+    _tailscale_statements(d).append({
+        "Effect": "Allow", "Action": "ec2:GetManagedPrefixListEntries",
+        "Resource": {"Fn::Sub": check.PREFIX_LIST_ARN}})
 
 
 def _ec2_endpoint_open(d):
@@ -583,7 +623,7 @@ TAILNET_BREAKS = {
     "TailscaleEnabled is not off by default": _tailscale_default_on,
     "UiTailnetSignIn is not off by default": _sign_in_default_on,
     "UiActions is not off by default": _actions_default_on,
-    "InstanceEgressTailscale does not depend on TailscaleOn": _tailscale_egress_always,
+    "InstanceEgressTailscale does not depend on HostEgressOn": _tailscale_egress_always,
     "InstanceEgressTailscale allows more than tcp 443": _tailscale_egress_all_ports,
     "InstanceEgressTailscale allows more than tcp 443 ": _tailscale_egress_udp,
     "egress rule InstanceEgressAnywhere goes to an address range": _other_egress_to_anywhere,
@@ -630,12 +670,15 @@ TAILNET_BREAKS = {
         _role_policy_by_name,
     "role policy InstanceTailscaleParameters is not InstanceTailscaleParameters":
         _tailnet_policy_by_name,
-    "reads a prefix list other than S3's": _prefix_list_any,
+    "conditional statement other than the InternetDB answers read and the S3 prefix list":
+        _prefix_list_any,
+    "instance role InstanceRole allows ec2:GetManagedPrefixListEntries":
+        _prefix_list_in_tailnet_policy,
     "endpoint Ec2Endpoint policy allows more than reading the S3 prefix list": _ec2_endpoint_open,
-    "endpoint Ec2Endpoint exists without TailscaleOn": _ec2_endpoint_always,
+    "endpoint Ec2Endpoint exists without HostEgressOn": _ec2_endpoint_always,
     "the egress step lacks the line: /usr/local/sbin/sensor-egress.sh refresh":
         _egress_step_tolerated,
-    "step EgressStep is not empty unless TailscaleOn": _egress_step_skipped,
+    "step EgressStep is not empty unless HostEgressOn": _egress_step_skipped,
     "the egress step lacks the line: systemctl enable --now sensor-egress-boot.service":
         _boot_unit_not_enabled,
     "the egress step lacks the line: for u in sensor-egress.service sensor-egress.timer sensor-egress-b":
@@ -701,6 +744,13 @@ SENSOR_BREAKS = {
     "InstanceRole has a conditional statement other than the InternetDB": _idb_role_always,
     "endpoint S3GatewayEndpoint has a conditional statement other than": _idb_endpoint_put,
     "InternetDbDelivered is not off by default": _idb_default_on,
+    "InternetDbLookup is not off by default": _idb_lookup_default_on,
+    "rule InternetDbOneWay does not refuse": _idb_both_allowed,
+    "condition HostEgressOn is not exactly as required": _host_egress_tailscale_only,
+    "step IdbEgress is not exactly the InternetDB switch": _idb_egress_always,
+    "variable IdbArgs is not exactly": _idb_lookup_args_s3,
+    "variable IdbWrite is not exactly": _idb_lookup_mount_rw,
+    "the agents service mounts the host firewall's files": _idb_agents_read_egress,
     "variable IdbVolume is not exactly": _idb_volume_when_off,
     "variable IdbRead is not exactly": _idb_ui_writes,
     "the ssh service mounts the internetdb volume": _idb_ssh_reads,
@@ -902,19 +952,18 @@ IDB_ARGS = ("true", "events/internetdb/wanted.json", "internetdb/answers.json")
 
 
 def test_rendered_configs_never_turn_the_direct_lookup_on(sensor, tmp_path):
-    # This stack gives the sensor no path to InternetDB: off, nothing about it is written;
-    # on, only delivered mode.
+    # The agents container never asks InternetDB: off, nothing about it is written; on
+    # (either switch), only delivered mode in both files.
     from agents.internetdb import InternetDbSettings
 
-    for internetdb in ((), ("false",), IDB_ARGS):
+    for internetdb in ((), ("false",), IDB_ARGS, ("lookup",)):
         for dst, ship in (("config.ini", "false"), ("config-ship.ini", "true")):
             out = tmp_path / dst
             subprocess.run(_render_args(out, ship, internetdb), check=True, capture_output=True)
             cp = configparser.ConfigParser(interpolation=None, strict=False)
             cp.read(out, encoding="utf-8")
             settings = InternetDbSettings.from_config(cp)
-            assert settings.enabled == settings.delivered == bool(internetdb[1:])
-    assert "internetdb" not in (AWS / "host" / "sensor-egress.sh").read_text().lower()
+            assert settings.enabled == settings.delivered == (internetdb not in ((), ("false",)))
 
 
 @pytest.mark.parametrize("ship", ["true", "false"])
@@ -930,7 +979,7 @@ def test_with_internetdb_off_the_rendered_configs_are_byte_for_byte_as_before(tm
 
 def test_render_refuses_half_given_internetdb_arguments(tmp_path):
     for bad in (("true",), ("true", "a.json"), ("yes", "a.json", "b.json"),
-                (*IDB_ARGS, "extra")):
+                (*IDB_ARGS, "extra"), ("lookup", "a.json"), ("lookup", "a.json", "b.json")):
         result = subprocess.run(_render_args(tmp_path / "x.ini", "true", bad),
                                 capture_output=True, text=True)
         assert result.returncode != 0, bad
@@ -963,15 +1012,17 @@ def test_rendered_configs_with_internetdb_delivered(tmp_path):
     assert ex.wanted.bucket_owner == "123456789012" and ex.wanted.region == "us-east-1"
 
 
-def _resolve(node, on):
-    """``node`` with every InternetDbOn branch taken and AWS::NoValue items removed."""
+def _resolve(node, on, host_egress=False):
+    """``node`` with every InternetDbOn branch taken for ``on``, every HostEgressOn branch
+    for ``host_egress``, and AWS::NoValue items removed."""
     if isinstance(node, list):
-        out = [_resolve(v, on) for v in node]
+        out = [_resolve(v, on, host_egress) for v in node]
         return [v for v in out if v != {"Ref": "AWS::NoValue"}]
     if isinstance(node, dict):
-        if "Fn::If" in node and node["Fn::If"][0] == "InternetDbOn":
-            return _resolve(node["Fn::If"][1 if on else 2], on)
-        return {k: _resolve(v, on) for k, v in node.items()}
+        if "Fn::If" in node and node["Fn::If"][0] in ("InternetDbOn", "HostEgressOn"):
+            take = on if node["Fn::If"][0] == "InternetDbOn" else host_egress
+            return _resolve(node["Fn::If"][1 if take else 2], on, host_egress)
+        return {k: _resolve(v, on, host_egress) for k, v in node.items()}
     return node
 
 
@@ -1022,7 +1073,7 @@ def test_with_internetdb_off_the_bootstrap_is_byte_for_byte_as_before(sensor):
         assert "internetdb" not in off.lower() and "Idb" not in off
         # The same text the template held before the variables were added.
         template = _lt(sensor)["UserData"]["Fn::Base64"]["Fn::Sub"][0]
-        for name in check.IDB_VARIABLES:
+        for name in [*check.IDB_VARIABLES, "IdbEgress"]:
             template = template.replace("${" + name + "}", "")
         assert "${Idb" not in template
 
@@ -1054,6 +1105,100 @@ def test_internetdb_bootstrap_is_valid_shell(sensor, tmp_path):
     path.write_text(_rendered(sensor, "true", "true", "true", internetdb="true"))
     result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+# ---- InternetDbLookup: the exporter asks InternetDB itself ---------------------------------
+
+def test_rendered_configs_with_internetdb_lookup(tmp_path):
+    from agents import internetdb_delivered as dl
+    from agents.internetdb import InternetDbSettings
+
+    configs = {}
+    for dst, ship in (("config.ini", "false"), ("config-ship.ini", "true")):
+        out = tmp_path / dst
+        subprocess.run(_render_args(out, ship, ("lookup",)), check=True, capture_output=True)
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.read(out, encoding="utf-8")
+        configs[dst] = cp
+    agents, ship = configs["config.ini"], configs["config-ship.ini"]
+    for cp in (agents, ship):
+        s = InternetDbSettings.from_config(cp)
+        assert s.delivered and s.answers_file == "/internetdb/internetdb.json"
+    assert InternetDbSettings.from_config(agents).wanted_file is None
+    assert InternetDbSettings.from_config(ship).wanted_file == "/blocklist/internetdb_wanted.json"
+    # The agents' copy has the exchange off: that container never asks.
+    assert dl.ExchangeSettings.from_config(agents).enabled is False
+    assert dl.ExchangeSettings.from_config(ship) == dl.ExchangeSettings(
+        enabled=True, kind="lookup", addresses_file="/egress/internetdb-addresses")
+    for key in ("bucket", "wanted_key", "answers_key"):
+        assert ship.get("connector.internetdb_exchange", key, fallback=None) is None
+
+
+def test_with_internetdb_lookup_the_exporter_alone_reads_the_pinned_addresses(sensor):
+    for tailscale in ("false", "true"):
+        on = _rendered(sensor, tailscale, "false", "false", internetdb="lookup")
+        compose = check.embedded_compose(on)
+        services = compose["services"]
+        assert "/var/lib/sensor-egress/exporter:/egress:ro" in services["exporter"]["volumes"]
+        assert "internetdb:/internetdb" in services["exporter"]["volumes"]
+        for name in ("agents", "ui"):
+            assert "internetdb:/internetdb:ro" in services[name]["volumes"]
+        for name in ("ssh", "listeners", "agents", "ui"):
+            assert not any("sensor-egress" in str(v) for v in services[name]["volumes"])
+        assert check.check_exporter(compose, "lookup") == []
+        assert check.check_internetdb_volume(compose, "lookup") == []
+        lines = on.splitlines()
+        assert [l for l in lines if l.startswith("python3 render_config.py")] == [
+            'python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "$NEVER" false lookup',
+            'python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "$NEVER" true '
+            "lookup"]
+        # The switch is written, then the host firewall is installed and run, before the
+        # stack starts, with or without the tailnet.
+        switch = lines.index("echo INTERNETDB_LOOKUP=true > /etc/sensor-egress-idb.env")
+        assert lines[switch + 1].startswith("printf 'REGION=%s")
+        assert switch < lines.index("/usr/local/sbin/sensor-egress.sh refresh") < \
+            lines.index("systemctl enable --now sensor.service")
+        assert ("sensor-tailscale.sh" in on) == (tailscale == "true")
+
+
+def test_with_internetdb_lookup_off_the_egress_step_is_unchanged(sensor):
+    # The switch is a separate line, so a stack with the tailnet on (or InternetDbDelivered
+    # on) renders exactly the bootstrap it rendered before InternetDbLookup existed.
+    for internetdb in ("false", "true"):
+        text_ = _rendered(sensor, "true", "false", "false", internetdb=internetdb)
+        assert "INTERNETDB_LOOKUP" not in text_ and "sensor-egress-idb" not in text_
+        assert "/egress" not in text_
+    assert "sensor-egress.sh" not in _rendered(sensor, "false", "false", "false",
+                                               internetdb="true")
+
+
+@pytest.mark.parametrize("tailscale", ["false", "true"])
+def test_internetdb_lookup_bootstrap_is_valid_shell(sensor, tmp_path, tailscale):
+    path = tmp_path / "user-data"
+    path.write_text(_rendered(sensor, tailscale, "false", "false", internetdb="lookup"))
+    result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("lookup,delivered,tailscale", [
+    (a, b, c) for a in ("true", "false") for b in ("true", "false") for c in ("true", "false")])
+def test_internetdb_switches_conditions_and_the_rule(sensor, lookup, delivered, tailscale):
+    values = {"InternetDbLookup": lookup, "InternetDbDelivered": delivered,
+              "TailscaleEnabled": tailscale}
+
+    def cond(name):
+        return check.evaluate({"Condition": name}, sensor, values)
+
+    assert cond("IdbLookupOn") == (lookup == "true")
+    assert cond("HostEgressOn") == ("true" in (lookup, tailscale))
+    assert cond("IdbAnyOn") == ("true" in (lookup, delivered))
+    # Template validation refuses the two answers paths together, and nothing else.
+    rule = sensor["Rules"]["InternetDbOneWay"]
+    applies = check.evaluate(rule["RuleCondition"], sensor, values)
+    passes = all(check.evaluate(a["Assert"], sensor, values) for a in rule["Assertions"])
+    assert (applies and not passes) == (lookup == delivered == "true")
+    assert sensor["Parameters"]["InternetDbLookup"]["Default"] == "false"
+    assert sensor["Parameters"]["InternetDbLookup"]["AllowedValues"] == ["true", "false"]
 
 
 def test_smtp_needs_its_own_switch(sensor):
@@ -1149,11 +1294,14 @@ SAMPLE = {"AWS::Region": "us-east-1", "AWS::AccountId": "123456789012",
 
 def _rendered(sensor, tailscale, actions, sign_in, persona="", analyst="", internetdb="false"):
     """The user data CloudFormation would produce for these switches and SAMPLE values."""
+    delivered, lookup = internetdb == "true", internetdb == "lookup"
     values = dict(SAMPLE, TailscaleEnabled=tailscale, UiActions=actions, UiTailnetSignIn=sign_in,
-                  PersonaModelId=persona, AnalystModelId=analyst, InternetDbDelivered=internetdb)
+                  PersonaModelId=persona, AnalystModelId=analyst,
+                  InternetDbDelivered=str(delivered).lower(), InternetDbLookup=str(lookup).lower())
     on = {"TailscaleOn": tailscale == "true", "UiActionsOn": actions == "true",
           "ConsoleStepOn": "true" in (tailscale, actions), "ModelOn": bool(persona or analyst),
-          "InternetDbOn": internetdb == "true"}
+          "InternetDbOn": delivered, "IdbLookupOn": lookup,
+          "IdbAnyOn": delivered or lookup, "HostEgressOn": tailscale == "true" or lookup}
 
     def render(v):
         if isinstance(v, str):
@@ -1257,7 +1405,7 @@ def test_join_key_and_token_never_reach_a_command_line_or_the_log(sensor):
     assert "umask 077" in node.split("go.html")[0]
 
 
-def test_tailnet_role_policy_is_one_write_three_reads_and_the_prefix_list(sensor):
+def test_tailnet_role_policy_is_one_write_and_three_reads(sensor):
     policy = sensor["Resources"]["InstanceTailscaleParameters"]
     assert policy["Condition"] == "TailscaleOn"
     assert policy["Properties"]["RoleName"] == {"Ref": "InstanceRole"}
@@ -1267,8 +1415,20 @@ def test_tailnet_role_policy_is_one_write_three_reads_and_the_prefix_list(sensor
             by_action.setdefault(action, set()).update(
                 check.text(r) for r in check.as_list(st["Resource"]))
     assert by_action == {"ssm:PutParameter": {check.TAILSCALE_STATE},
-                         "ssm:GetParameter": check.TAILSCALE_READS,
-                         "ec2:GetManagedPrefixListEntries": {check.PREFIX_LIST_ARN}}
+                         "ssm:GetParameter": check.TAILSCALE_READS}
+
+
+def test_the_prefix_list_read_comes_with_the_host_firewall(sensor):
+    # The host firewall (TailscaleEnabled or InternetDbLookup) reads the S3 prefix list;
+    # the role may do that one read then, and nothing else on EC2 ever.
+    items = [s for s in _role_statements(sensor) if "Fn::If" in s
+             and s["Fn::If"][0] == "HostEgressOn"]
+    assert items == [{"Fn::If": ["HostEgressOn", check.PREFIX_ROLE_STATEMENT,
+                                 {"Ref": "AWS::NoValue"}]}]
+    assert sensor["Conditions"]["HostEgressOn"] == {
+        "Fn::Or": [{"Condition": "TailscaleOn"}, {"Condition": "IdbLookupOn"}]}
+    for name in ("Ec2Endpoint", "InstanceEgressTailscale"):
+        assert sensor["Resources"][name]["Condition"] == "HostEgressOn"
 
 
 def test_tailnet_option_opens_nothing_inbound(sensor):
@@ -1290,14 +1450,24 @@ exit 0
 
 
 def _run_egress(tmp_path, answer, *, saved=None, vpc="10.64.0.0/16", aws_fails=False,
-                refresh=True, args=None, env_file_present=True):
-    """Run host/sensor-egress.sh with fake iptables, ip6tables and aws on PATH. Returns
-    (exit code, stderr, the OUTPUT order, the SENSOR-UID rules, the saved list or None)."""
+                refresh=True, args=None, env_file_present=True, idb=None, dns=None):
+    """Run host/sensor-egress.sh with fake iptables, ip6tables, aws and getent on PATH.
+    ``idb`` is the INTERNETDB_LOOKUP line's value (None: no such line), ``dns`` what getent
+    answers for the InternetDB name (None: it fails). Returns (exit code, stderr, the OUTPUT
+    order, the SENSOR-UID rules, the saved list or None)."""
     bin_ = tmp_path / "bin"
     bin_.mkdir(exist_ok=True)
     for name in ("iptables", "ip6tables"):
         (bin_ / name).write_text(FAKE_IPTABLES)
         (bin_ / name).chmod(0o755)
+    (tmp_path / "dns").write_text("".join(f"{a} STREAM internetdb.shodan.io\n"
+                                          f"{a} DGRAM\n{a} RAW\n" for a in dns or []))
+    (bin_ / "getent").write_text(
+        "#!/bin/bash\n"
+        '[ "$*" = "ahostsv4 internetdb.shodan.io" ] || exit 9\n'
+        f'echo getent >> {tmp_path / "getent-calls"}\n'
+        + ("exit 2\n" if dns is None else f"cat {tmp_path / 'dns'}\n"))
+    (bin_ / "getent").chmod(0o755)
     (tmp_path / "answer").write_text(answer + "\n")
     (bin_ / "aws").write_text("#!/bin/bash\n" + ("exit 255\n" if aws_fails
                                                   else f"cat {tmp_path / 'answer'}\n"))
@@ -1309,12 +1479,17 @@ def _run_egress(tmp_path, answer, *, saved=None, vpc="10.64.0.0/16", aws_fails=F
     env_file = tmp_path / "egress.env"
     if env_file_present:
         env_file.write_text(f"REGION=us-east-1\nPREFIX_LIST=pl-0123456789abcdef0\nVPC_CIDR={vpc}\n")
+    # The InternetDbLookup switch lives in a file of its own, as sensor.yaml writes it.
+    idb_file = tmp_path / "egress-idb.env"
+    if idb is not None:
+        idb_file.write_text(f"INTERNETDB_LOOKUP={idb}\n")
     log = tmp_path / "log"
     log.write_text("")
     import os
     env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", LOG=str(log),
                SENSOR_EGRESS_ENV=str(env_file), SENSOR_EGRESS_DIR=str(state),
-               SENSOR_EGRESS_RETRY_SECONDS="0")
+               SENSOR_EGRESS_RETRY_SECONDS="0", SENSOR_EGRESS_TEST_DOC_RANGES="1",
+               SENSOR_EGRESS_IDB_ENV=str(idb_file))
     args = ["bash", str(AWS / "host" / "sensor-egress.sh")] + (
         args if args is not None else ["refresh"] if refresh else [])
     result = subprocess.run(args, env=env, capture_output=True, text=True)
@@ -1406,6 +1581,135 @@ def test_boot_order_deny_then_saved_list(tmp_path):
     assert code == 0, err
     assert output[:2] == [f"iptables {UID} -j SENSOR-UID", f"iptables {UID} -j REJECT"]
     assert _s3_accepts(chain) == ["198.51.100.0/24"]
+
+
+# ---- InternetDbLookup: uid 10001 may also reach InternetDB's addresses ---------------------
+
+IDB_EDGES = ["203.0.113.80", "203.0.113.81"]
+
+
+def _idb_file(tmp_path):
+    path = tmp_path / "state" / "exporter" / "internetdb-addresses"
+    return path.read_text() if path.exists() else None
+
+
+def _idb_accepts(chain):
+    return [r.split()[1] for r in chain if r.endswith("/32 -p tcp --dport 443 -j ACCEPT")]
+
+
+@pytest.mark.parametrize("args", [["refresh"], [], ["deny"]])
+def test_internetdb_off_leaves_every_rule_exactly_as_before(tmp_path, args):
+    # No INTERNETDB_LOOKUP line (every existing install) and an explicit false give the
+    # same rules, in the same order, as each other; nothing is resolved or saved.
+    runs = []
+    for i, idb in enumerate((None, "false")):
+        d = tmp_path / str(i)
+        d.mkdir()
+        runs.append(_run_egress(d, "198.51.100.0/24\t203.0.113.0/24",
+                                saved="198.51.100.0/24\n", args=args, idb=idb,
+                                dns=IDB_EDGES))
+        assert not (d / "getent-calls").exists() and _idb_file(d) is None
+    assert runs[0][0] == 0 and runs[0][1:] == runs[1][1:]
+    assert _idb_accepts(runs[0][3]) == []
+
+
+def test_internetdb_off_matches_the_rules_without_the_feature(tmp_path):
+    # The full chain with the feature off is the chain the script built before it existed.
+    code, err, output, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", idb="false",
+                                              dns=IDB_EDGES)
+    assert code == 0, err
+    assert output == [f"iptables {UID} -j SENSOR-UID", f"iptables {UID} -j REJECT",
+                      f"ip6tables {UID} -j REJECT"]
+    assert chain == [
+        "-o tailscale0 -j REJECT",
+        "-o lo -d 127.0.0.53 -p udp --dport 53 -j ACCEPT",
+        "-o lo -d 127.0.0.53 -p tcp --dport 53 -j ACCEPT",
+        "-d 169.254.169.254 -p tcp --dport 80 -j ACCEPT",
+        "-d 169.254.169.253 -p udp --dport 53 -j ACCEPT",
+        "-d 10.64.0.0/16 -p udp --dport 53 -j ACCEPT",
+        "-d 10.64.0.0/16 -p tcp --dport 443 -j ACCEPT",
+        "-d 198.51.100.0/24 -p tcp --dport 443 -j ACCEPT"]
+
+
+def test_internetdb_on_only_adds_accepts_after_the_other_rules(tmp_path):
+    (tmp_path / "off").mkdir()
+    (tmp_path / "on").mkdir()
+    off = _run_egress(tmp_path / "off", "198.51.100.0/24", idb="false", dns=IDB_EDGES)
+    code, err, output, chain, cache = _run_egress(tmp_path / "on", "198.51.100.0/24",
+                                                  idb="true", dns=IDB_EDGES)
+    assert code == 0, err
+    # Same OUTPUT order (the jump, then the final REJECT), same rules in the same order,
+    # then one /32 tcp 443 ACCEPT per address and nothing else.
+    assert output == off[2]
+    assert chain[:len(off[3])] == off[3]
+    assert chain[len(off[3]):] == [f"-d {a}/32 -p tcp --dport 443 -j ACCEPT"
+                                   for a in IDB_EDGES]
+    assert cache == off[4]
+    assert _idb_file(tmp_path / "on") == "203.0.113.80\n203.0.113.81\n"
+    mode = (tmp_path / "on" / "state" / "exporter" / "internetdb-addresses").stat().st_mode
+    assert mode & 0o777 == 0o644
+
+
+def test_internetdb_keeps_at_most_eight_addresses(tmp_path):
+    edges = [f"203.0.113.{i}" for i in range(1, 13)]
+    code, err, _, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", idb="true", dns=edges)
+    assert code == 0, err
+    assert _idb_accepts(chain) == [f"{a}/32" for a in edges[:8]]
+
+
+@pytest.mark.parametrize("dns", [None, [], ["10.0.0.5"], ["203.0.113.80", "127.0.0.1"],
+                                 ["203.0.113.80", "169.254.169.254"], ["172.20.0.1"],
+                                 ["100.64.0.1"], ["224.0.0.1"], ["0.0.0.0"],
+                                 ["255.255.255.255"], ["203.0.113.080"], ["203.0.113.300"],
+                                 ["203.0.113.80;reboot"], ["2001:db8::1"]])
+def test_internetdb_a_bad_or_failed_lookup_keeps_the_last_set(tmp_path, dns):
+    (tmp_path / "state" / "exporter").mkdir(parents=True)
+    (tmp_path / "state" / "exporter" / "internetdb-addresses").write_text("203.0.113.90\n")
+    code, err, _, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", idb="true", dns=dns)
+    assert code == 0, err
+    assert "internetdb: lookup failed, keeping the last addresses" in err
+    assert _idb_file(tmp_path) == "203.0.113.90\n"
+    assert _idb_accepts(chain) == ["203.0.113.90/32"]
+
+
+def test_internetdb_with_nothing_saved_opens_nothing(tmp_path):
+    code, err, _, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", idb="true", dns=None)
+    assert code == 0, err
+    assert _idb_accepts(chain) == [] and _idb_file(tmp_path) is None
+
+
+def test_internetdb_without_refresh_uses_the_saved_set_and_checks_it(tmp_path):
+    (tmp_path / "state" / "exporter").mkdir(parents=True)
+    (tmp_path / "state" / "exporter" / "internetdb-addresses").write_text(
+        "203.0.113.80\n10.0.0.1\n0.0.0.0/0\n203.0.113.81 -j ACCEPT\n" + "203.0.113.82\n" * 9)
+    code, err, _, chain, _ = _run_egress(tmp_path, "", refresh=False, idb="true",
+                                         dns=["203.0.113.99"], saved="198.51.100.0/24\n")
+    assert code == 0, err
+    assert not (tmp_path / "getent-calls").exists()
+    # Only the first eight lines are read, and only valid addresses become rules.
+    assert _idb_accepts(chain) == ["203.0.113.80/32", "203.0.113.81/32"] + \
+        ["203.0.113.82/32"] * 4
+    assert not any("0.0.0.0" in r or "10.0.0.1" in r for r in chain)
+
+
+def test_internetdb_documentation_ranges_are_not_public_outside_the_tests(tmp_path):
+    import os
+
+    script = (AWS / "host" / "sensor-egress.sh").read_text()
+    body = script[script.index("pub() {"):script.index("\n}\n", script.index("pub() {")) + 3]
+    for env, want in (({}, 1), ({"SENSOR_EGRESS_TEST_DOC_RANGES": "1"}, 0)):
+        got = subprocess.run(["bash", "-c", body + 'pub "$1"', "x", "203.0.113.80"],
+                             env={**os.environ, **env}).returncode
+        assert got == want
+
+
+@pytest.mark.parametrize("value", ["yes", "1", "\"true false\"", "TRUE"])
+def test_internetdb_a_bad_setting_leaves_only_the_deny(tmp_path, value):
+    code, err, output, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", idb=value,
+                                              dns=IDB_EDGES)
+    assert code != 0 and "bad INTERNETDB_LOOKUP" in err
+    assert output == [f"iptables {UID} -j REJECT", f"ip6tables {UID} -j REJECT"]
+    assert chain == []
 
 
 def test_host_files_are_valid_and_reach_the_image():

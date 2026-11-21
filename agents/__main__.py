@@ -12,8 +12,10 @@ Directories:
 export when ``[connector.tracked_export]`` is, fetches sightings when
 ``[connector.sightings]`` is, and looks up interesting sources in Shodan InternetDB when
 ``[connector.internetdb]`` is; ``run-all`` runs it as its last step. With
-``[connector.internetdb] mode = delivered`` nothing is looked up here: ``run-all`` writes the
-wanted list, and ``[connector.internetdb_exchange]`` moves it and the answers.
+``[connector.internetdb] mode = delivered`` ``run-all`` writes the wanted list, and
+``[connector.internetdb_exchange]`` moves it and the answers through the object store
+(``kind = s3``) or, with ``kind = lookup``, asks InternetDB itself in the process that runs
+it (on AWS the exporter, never the agents container).
 
 ``enforce <address>`` moves one tracked blocklist entry to enforced (``[respond]
 track_before_enforce``).
@@ -446,7 +448,14 @@ def _run(argv=None) -> dict:
             out["exchange"] = {"error": f"[{dl.SECTION}]: {exc}"}
             log.error("%s", out["exchange"]["error"])
             return out
-        if exchange.enabled:
+        if exchange.enabled and exchange.kind == "lookup":
+            # This process asks InternetDB itself: on AWS the exporter, never the agents.
+            from agents.internetdb_lookup_exchange import run_lookup_exchange
+
+            out["exchange"] = run_lookup_exchange(exchange, settings, wanted,
+                                                  settings.answers_path(state), state,
+                                                  networks, dry_run=args.dry_run)
+        elif exchange.enabled:
             out["exchange"] = dl.run_exchange(exchange, settings, wanted,
                                               settings.answers_path(state), state, networks,
                                               dry_run=args.dry_run)

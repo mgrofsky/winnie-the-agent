@@ -39,7 +39,9 @@ object store the sensor already writes to:
 
 The two halves may run in different processes: on AWS the agents container (records, no
 credentials, no egress) writes the wanted list and the exporter (the instance role, no
-records) moves both files. Failures are logged, recorded in the export's event file and
+records) moves both files. ``kind = lookup`` replaces the object store and the producer
+with the exchange asking InternetDB itself (``agents/internetdb_lookup_exchange.py``); this
+module still never does. Failures are logged, recorded in the export's event file and
 returned; they never raise and never stop the other stages.
 """
 
@@ -66,6 +68,7 @@ from agents.internetdb import (
     save_state,
     select_addresses,
 )
+from agents.localfile import read_regular
 from agents.objectstore import ConfigError as StoreConfigError
 from agents.objectstore import ObjectTooLarge, S3Target, error_code, get_object, put_object
 from agents.ship import _record_event
@@ -88,6 +91,7 @@ DEFAULT_INTERVAL_MINUTES = 15.0
 REFRESH_HOURS = 24
 FUTURE_SKEW = datetime.timedelta(minutes=5)
 STATUSES = ("found", "not_found")
+KINDS = ("s3", "lookup")
 _TS_CAP = 40
 # The fields of a found answer handed to ``sanitize``: InternetDB's own answer body.
 ANSWER_FIELDS = ("ip", "ports", "hostnames", "tags", "cpes", "vulns")
@@ -106,6 +110,11 @@ class InvalidDocument(ValueError):
 @dataclass(frozen=True)
 class ExchangeSettings:
     enabled: bool = False
+    # s3: through the object store (below). lookup: the exchange asks InternetDB itself
+    # (agents/internetdb_lookup_exchange.py); ``addresses_file`` then optionally limits the
+    # addresses it connects to.
+    kind: str = "s3"
+    addresses_file: Optional[str] = None
     wanted: Optional[S3Target] = None
     answers: Optional[S3Target] = None
     interval_minutes: float = DEFAULT_INTERVAL_MINUTES
@@ -125,10 +134,17 @@ class ExchangeSettings:
             raise ConfigError("enabled must be true or false") from None
         if not enabled:
             return cls()
-        if sec.get("kind", "s3").strip().lower() != "s3":
-            raise ConfigError("kind must be s3")
+        kind = sec.get("kind", "s3").strip().lower()
+        if kind not in KINDS:
+            raise ConfigError("kind must be s3 or lookup")
         if not InternetDbSettings.from_config(config).delivered:
             raise ConfigError("needs [connector.internetdb] enabled with mode = delivered")
+        if kind == "lookup":
+            # No store and no destination to set: the host is fixed in agents/internetdb.py.
+            addresses = sec.get("addresses_file", "").strip() or None
+            if addresses is not None and (not os.path.isabs(addresses) or len(addresses) > 4096):
+                raise ConfigError("addresses_file must be an absolute path")
+            return cls(enabled=True, kind="lookup", addresses_file=addresses)
 
         def num(name: str, default, lo, hi, kind=int):
             try:
@@ -197,8 +213,10 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 
 def _read_capped(path: Path, cap: int) -> bytes:
-    with open(path, "rb") as f:
-        body = f.read(cap + 1)
+    # The wanted list sits in a volume the agents container writes: a FIFO, symlink or
+    # directory there is an unreadable file (OSError), never a blocking read or a link
+    # followed.
+    body = read_regular(path, cap)
     if len(body) > cap:
         raise InvalidDocument(f"larger than {cap} bytes")
     return body
@@ -359,6 +377,8 @@ def run_exchange(exchange: ExchangeSettings, settings: InternetDbSettings, wante
     ``client_factory`` exists for tests. Never raises for transfer failures."""
     if not exchange.enabled:
         return {"status": "disabled"}
+    if exchange.kind != "s3":
+        return {"status": "not an object store exchange"}
     state_dir = Path(state_dir)
     now = now or datetime.datetime.now(UTC)
     st = _state(state_dir)
@@ -459,10 +479,20 @@ def _fetch(exchange: ExchangeSettings, settings: InternetDbSettings, answers_fil
     summary.update(get="fetched", **counts)
     if counts["dropped"]:
         log.warning("InternetDB exchange: %d answers dropped by the checks", counts["dropped"])
+    error = merge_accepted(path, state, accepted, settings.max_entries)
+    if error:
+        errors.append(error)
+
+
+def merge_accepted(path: Path, state: dict, accepted: dict, max_entries: int) -> Optional[str]:
+    """Merge answers that passed ``check_answers`` into the local answers file (``state`` is
+    that file as loaded) and write it, bounded. Nothing to merge: nothing is written.
+    Returns an error text, or None."""
     if not accepted:
-        return
+        return None
     state["entries"].update(accepted)
     try:
-        save_state(path, state, settings.max_entries)
+        save_state(path, state, max_entries)
     except OSError as exc:
-        errors.append(f"cannot write the local answers ({type(exc).__name__})")
+        return f"cannot write the local answers ({type(exc).__name__})"
+    return None

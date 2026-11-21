@@ -337,6 +337,40 @@ def test_a_tampered_wanted_file_is_not_sent(tmp_path):
     assert "wanted list is refused" in out["error"] and len(s3.puts) == 1
 
 
+def _not_a_file(path, kind):
+    """Put a FIFO, a symlink to a valid copy, or a directory at ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "symlink":
+        real = path.parent / "real.json"
+        real.write_bytes(dl.wanted_document([A], NOW))
+        path.symlink_to(real)
+    else:
+        path.mkdir()
+
+
+@pytest.mark.parametrize("kind", ["fifo", "symlink", "directory"])
+def test_a_wanted_list_that_is_not_a_regular_file_is_unreadable_and_not_sent(tmp_path, kind):
+    _not_a_file(tmp_path / "blocklist" / dl.WANTED_FILE, kind)
+    s3 = FakeS3({ANSWERS_KEY: answers(found(A))})
+    out = exchange(tmp_path, s3)    # a FIFO would block here with a plain open()
+    assert out["error"].startswith("cannot read the wanted list (")
+    assert s3.puts == [] and "wanted" not in out
+    # The rest of the exchange runs as it does for any unreadable list.
+    assert out["get"] == "fetched"
+
+
+def test_an_oversize_wanted_list_is_refused_as_before(tmp_path):
+    path = tmp_path / "blocklist" / dl.WANTED_FILE
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b" " * (dl.MAX_WANTED_BYTES + 1))
+    s3 = FakeS3({ANSWERS_KEY: answers()})
+    out = exchange(tmp_path, s3)
+    assert f"refused: larger than {dl.MAX_WANTED_BYTES} bytes" in out["error"]
+    assert s3.puts == []
+
+
 # ---- the exchange: the answers in ----------------------------------------------------------
 
 def test_answers_for_addresses_never_asked_for_are_dropped(tmp_path):

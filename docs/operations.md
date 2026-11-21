@@ -742,7 +742,8 @@ addresses would be looked up without sending anything.
   current answer, marked "latest lookup" rather than "when recorded".
 - Records written with the feature off are byte-for-byte as before. The digest, exports,
   notifications, approval cards and their `view_hash` do not change.
-- On the AWS deployment only delivered answers are available (below); see its README.
+- On the AWS deployment the agents container never asks InternetDB; use delivered answers
+  or the exporter's own lookups (below); see its README.
 
 ### Delivered answers
 
@@ -830,10 +831,58 @@ is what a 404 means. Rules, in the order the sensor applies them:
 - The local file keeps at most `max_entries` addresses of `[connector.internetdb]`, oldest
   dropped first.
 
-The direct-mode keys (`max_per_run`, `max_per_day`, `min_interval_seconds`, `cache_days`)
-do nothing in delivered mode; pacing is the producer's job. The reference producer uses the
+With `kind = s3` the direct-mode keys (`max_per_run`, `max_per_day`, `min_interval_seconds`,
+`cache_days`) do nothing; pacing is the producer's job. The reference producer uses the
 same defaults: at most 100 lookups a run and 2000 a day, a second apart, answers fresh for
-7 days, back-off on 429, 5xx or network failure.
+7 days, back-off on 429, 5xx or network failure. With `kind = lookup` (next) they apply to
+the exporter's own lookups.
+
+### The exporter asks InternetDB
+
+The third way needs nothing outside the sensor and no object store. The agents side does
+not change at all: it stays `mode = delivered`, writes the wanted list and reads
+`answers_file`. The exchange step (`ship`, in the process that has egress) reads the wanted
+list, asks InternetDB itself and writes the checked answers to `answers_file`.
+
+```ini
+[connector.internetdb]
+enabled = true
+mode = delivered
+
+[connector.internetdb_exchange]   ; in the exporter's config only
+enabled = true
+kind = lookup
+#addresses_file = /egress/internetdb-addresses   ; connect only to these (AWS sets it)
+```
+
+- The wanted list is treated as untrusted input: the same check as the `s3` kind (read up
+  to 64 KB, version 1, at most 500 distinct canonical global addresses or the whole file is
+  refused, other keys ignored, `never_act_on` applied again). Only an address from it goes
+  into a request, in the path of the fixed URL; nothing in the file can change the host,
+  the headers or anything else sent.
+- The lookups are the same code as direct mode: the fixed host, certificate checked, no
+  redirects, 5 s deadline, 64 KB cap, one at a time at least `min_interval_seconds` apart,
+  `max_per_run` and `max_per_day`, answers (including "not found") fresh for `cache_days`,
+  back-off on 429, 5xx or a network failure, and the same check of every answer.
+- The exporter keeps its cache, day count and back-off in its own state directory
+  (`<state-dir>/internetdb_lookup.json`). On AWS the agents container cannot write it.
+- Answers reach `answers_file` through the same check as an answers object from the store,
+  so the file has exactly the shape the `s3` kind writes.
+- Unreachable, refused by a firewall or rate limited: the event export, the tracked export
+  and sightings carry on; the reason is in the run result (`internetdb.exchange`).
+- `addresses_file` (optional): a file of IPv4 addresses, one per line, at most 8. When set,
+  a lookup connects only to one of them (the first the name resolves to, else the first
+  listed), still checking the certificate for `internetdb.shodan.io`. On AWS the host
+  firewall writes it (see the deployment README). With the file set but empty or missing,
+  nothing is looked up.
+- `python -m agents ship --dry-run` reports how many addresses would be looked up.
+
+**Which of the three.** Direct when the process that triages may reach the internet (a
+single host you run yourself). The exporter's lookups when that process must stay without
+egress but the exporter may reach InternetDB (the AWS deployment with `InternetDbLookup`).
+Delivered through the object store when nothing on the sensor may reach InternetDB, or you
+want the lookups to come from another network (`InternetDbDelivered` and a producer such as
+the reference Lambda function).
 
 ## Using the intelligence outside the sensor
 

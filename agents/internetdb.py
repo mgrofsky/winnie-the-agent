@@ -41,7 +41,9 @@ Configuration::
 Delivered mode (``agents/internetdb_delivered.py``): this process never asks InternetDB.
 ``run-all`` writes the addresses it wants looked up to a small file, something outside the
 sensor answers through the object store, and the answers are checked here exactly like a
-direct answer before they reach the same local file.
+direct answer before they reach the same local file. With the exchange's ``kind = lookup``
+(``agents/internetdb_lookup_exchange.py``) the exporter answers it instead, through
+``lookup_addresses``, the same request loop direct mode runs.
 """
 
 from __future__ import annotations
@@ -522,7 +524,26 @@ def run_lookup(settings: InternetDbSettings, records: Iterable[TriageRecord], ne
         # Never a request from this process in delivered mode.
         return {"status": "delivered mode: no lookups here"}
     now = now or datetime.datetime.now(UTC)
-    path = state_path(state_dir)
+    return lookup_addresses(settings, select_addresses(records, networks, now,
+                                                       settings.lookback_days),
+                            state_path(state_dir), dry_run=dry_run, transport=transport,
+                            resolver=resolver, now=now, clock=clock, sleep=sleep,
+                            base_url=base_url)
+
+
+def lookup_addresses(settings: InternetDbSettings, addresses: Iterable[str], path, *,
+                     dry_run: bool = False, transport=None, resolver=None,
+                     now: Optional[datetime.datetime] = None,
+                     clock: Callable[[], float] = time.monotonic,
+                     sleep: Callable[[float], None] = time.sleep,
+                     base_url: str = BASE_URL) -> dict:
+    """Ask InternetDB about ``addresses`` (most important first) that have no answer from
+    the last ``cache_days`` in the file at ``path``, within its caps and back-off, and
+    update that file. The one request loop: direct mode and the exporter's lookup exchange
+    both come through here. An item that is not one canonical global address is skipped.
+    Never raises for lookup failures."""
+    now = now or datetime.datetime.now(UTC)
+    path = Path(path)
     state = load_state(path)
     summary: dict = {"looked_up": 0, "found": 0, "not_found": 0, "refused": 0}
     until = state["backoff_until"]
@@ -536,7 +557,13 @@ def run_lookup(settings: InternetDbSettings, records: Iterable[TriageRecord], ne
     if state["day"] != today:
         state["day"], state["day_count"] = today, 0
     fresh = datetime.timedelta(days=settings.cache_days)
-    due = [a for a in select_addresses(records, networks, now, settings.lookback_days)
+    chosen: list[str] = []
+    seen: set = set()
+    for a in addresses:
+        if isinstance(a, str) and a not in seen and lookup_address(a) == a:
+            seen.add(a)
+            chosen.append(a)
+    due = [a for a in chosen
            if a not in state["entries"]
            or now - state["entries"][a]["checked_at"] >= fresh
            or state["entries"][a]["checked_at"] > now]

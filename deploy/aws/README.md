@@ -748,6 +748,71 @@ and bootstrap go back to exactly what they were, and the bucket policy change ca
 Not proven without a real deploy: the bucket policy change, the producer as a Lambda
 function, and the ownership of a fresh `internetdb` volume.
 
+## The exporter asks InternetDB (optional)
+
+With `InternetDbLookup=true` the exporter looks the addresses up itself: no producer, no
+object store keys, no bucket policy change. The agents container is exactly as with
+`InternetDbDelivered` (no egress, writes the wanted list, reads the answers); the exporter
+reads the wanted list from its read-only `/blocklist` mount, asks InternetDB and writes the
+checked answers to `/internetdb/internetdb.json` (see "The exporter asks InternetDB" in the
+[operations guide](../../docs/operations.md#the-exporter-asks-internetdb)). It cannot be
+combined with `InternetDbDelivered`; template validation refuses the pair.
+
+**What changes on the stack.**
+
+- Security group: `InstanceEgressTailscale` (tcp 443 to anywhere, no UDP, no IPv6) now
+  exists with `TailscaleEnabled` or `InternetDbLookup`. Its name and description are kept so
+  a tailnet stack sees no change.
+- `Ec2Endpoint` and the role's one `ec2:GetManagedPrefixListEntries` read now come with
+  either switch (the host firewall needs the S3 prefix list whenever 443 is open). The
+  statement moved from `InstanceTailscaleParameters` into the role's own policy; with the
+  tailnet on, the role can do exactly what it could before.
+- The host firewall (`sensor-egress.sh`, `EgressStep`) is installed with either switch. With
+  `InternetDbLookup` the bootstrap writes `INTERNETDB_LOOKUP=true` to
+  `/etc/sensor-egress-idb.env` first; with it off that line and file do not exist and every
+  rule is exactly as before.
+- Config: both files get `[connector.internetdb] mode = delivered` with
+  `answers_file = /internetdb/internetdb.json`; `config-ship.ini` also gets
+  `wanted_file = /blocklist/internetdb_wanted.json` and
+  `[connector.internetdb_exchange] enabled = true, kind = lookup,
+  addresses_file = /egress/internetdb-addresses`. `config.ini` has the exchange off.
+- Compose: the `internetdb` volume as with `InternetDbDelivered` (exporter read-write,
+  agents and console read-only), and for the exporter alone
+  `/var/lib/sensor-egress/exporter:/egress:ro`.
+
+**The host firewall's InternetDB rule.** On every `refresh` (at the bootstrap and every 15
+minutes) root resolves `internetdb.shodan.io` (IPv4 only). Every address must be a global
+unicast IPv4 address; any other answer, an empty one or a failed lookup keeps the last
+saved set, and with none saved nothing is opened. At most 8 are kept, in
+`/var/lib/sensor-egress/exporter/internetdb-addresses` (root, mode 0644). Each becomes one
+`-d <address>/32 -p tcp --dport 443 -j ACCEPT` for uid 10001, appended after every other
+rule and before the final `REJECT`. The exporter reads the same file and connects only to
+those addresses (the first one the name resolves to now, else the first listed), with SNI
+and the certificate checked for `internetdb.shodan.io`. So a name that moved between
+refreshes costs at most one failed handshake and a back-off, never a connection the
+firewall did not allow.
+
+**The CDN caveat.** InternetDB is served from a shared CDN (Cloudflare). Those addresses
+also serve other sites, so this rule lets uid 10001 reach more than one host on tcp 443.
+What keeps the traffic to InternetDB is the exporter: the host is fixed in its code, it
+verifies the certificate for that name, it sends only an address in the URL path, and it
+is the only process the rule applies to. Code running inside the exporter could use those
+addresses to reach another site on the same CDN; it can already reach S3.
+
+**Turning it on.** Rebuild and push the image, then update the stack with
+`InternetDbLookup=true` (the user data changes, so the instance is replaced). Answers
+appear after the first agents run and the next exporter pass (every 5 minutes), at most
+100 lookups a pass and 2000 a day. Check with
+`cat /var/lib/sensor-egress/exporter/internetdb-addresses`, `iptables -S SENSOR-UID` (the
+/32 rules at the end), and the `internetdb` key in the exporter's log lines. Rollback:
+`InternetDbLookup=false`; the security group rule, endpoint, role statement and host
+firewall go back to what `TailscaleEnabled` alone gives, and the bootstrap to exactly what
+it was.
+
+Not proven without a real deploy: the resolution on Amazon Linux 2023 (`getent
+ahostsv4`), the bind mount of the addresses directory, and lookups through the shared CDN
+addresses.
+
 ## Models on Bedrock (optional)
 
 Off by default. With it off the sensor has no model: the SSH persona gives canned replies
@@ -1056,11 +1121,12 @@ Still unproven:
 - Models only on Amazon Bedrock in the sensor's own account and region, and only through
   `models.yaml` (see [Models on Bedrock](#models-on-bedrock-optional)); no other model
   provider has an egress path. `[listeners] llm` stays off.
-- No direct Shodan InternetDB lookups (`[connector.internetdb]`, see the operations
-  guide). InternetDB is served from Cloudflare addresses shared with other sites, so an
-  address pin would not pin the destination, and this stack adds no path for it. Delivered
-  answers work instead ([above](#delivered-internetdb-answers-optional)): the lookup runs
-  outside the sensor and only objects in the events bucket move.
+- No direct Shodan InternetDB lookups from the agents container (`[connector.internetdb]`,
+  see the operations guide): it reads attacker-influenced text and runs the model, and
+  gets no egress. Either the exporter looks the addresses up
+  ([above](#the-exporter-asks-internetdb-optional); InternetDB's addresses are a shared
+  CDN's, so that rule is wider than one host) or the lookup runs outside the sensor
+  ([delivered answers](#delivered-internetdb-answers-optional)).
 - No address locations (`[geoip]`, see the operations guide, "Where addresses are"). The
   database files would have to reach the host, and the instance has no read path for that
   by design (its role writes events and, with delivered InternetDB answers, reads that

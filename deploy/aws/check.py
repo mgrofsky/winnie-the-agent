@@ -44,8 +44,10 @@ TAILSCALE_STATE = SSM_PARAMETER + "tailscale-state"
 TAILSCALE_READS = {TAILSCALE_STATE, SSM_PARAMETER + "tailscale-authkey",
                    SSM_PARAMETER + "ui-token"}
 TAILSCALE_SWITCHES = ("TailscaleEnabled", "UiTailnetSignIn", "UiActions")
-# The only egress rule to an address range: tcp 443 for tailscaled, under TailscaleOn.
+# The only egress rule to an address range: tcp 443 for tailscaled and the exporter's
+# InternetDB lookups, under HostEgressOn (TailscaleEnabled or InternetDbLookup).
 TAILSCALE_EGRESS = "InstanceEgressTailscale"
+HOST_EGRESS = "HostEgressOn"
 TAILSCALE_POLICY = "InstanceTailscaleParameters"
 # EC2 refuses user data over 16 KiB (raw, before base64), and CloudFormation an inline
 # template body over 51,200 bytes (strip_comments.py writes the deploy copy).
@@ -92,6 +94,30 @@ IDB_VARIABLES = {"IdbArgs": " true " + IDB_WANTED_KEY + " ${InternetDbAnswersKey
                  "IdbRead": "\n      - internetdb:/internetdb:ro",
                  "IdbWrite": "\n      - internetdb:/internetdb",
                  "IdbVolume": "\n  internetdb: {}"}
+# InternetDbLookup: the same volume, the exporter's lookup kind, and the directory where the
+# host firewall saves the addresses it pinned, read-only for the exporter alone.
+IDB_EGRESS_DIR = "/var/lib/sensor-egress/exporter"
+IDB_LOOKUP_VARIABLES = {**IDB_VARIABLES, "IdbArgs": " lookup",
+                        "IdbWrite": IDB_VARIABLES["IdbWrite"] + "\n      - " + IDB_EGRESS_DIR
+                        + ":/egress:ro"}
+# InternetDbLookup's switch for the host firewall, written before the egress step runs, in a
+# file of its own so the egress step itself is the same with the switch off.
+IDB_EGRESS_SWITCH = "echo INTERNETDB_LOOKUP=true > /etc/sensor-egress-idb.env\n"
+# Variables the same with either switch take IdbAnyOn; the others InternetDbOn, then
+# IdbLookupOn.
+IDB_SHARED = ("IdbRead", "IdbVolume")
+IDB_CONDITIONS = {
+    "InternetDbOn": {"Fn::Equals": [{"Ref": "InternetDbDelivered"}, "true"]},
+    "IdbLookupOn": {"Fn::Equals": [{"Ref": "InternetDbLookup"}, "true"]},
+    "IdbAnyOn": {"Fn::Or": [{"Condition": "InternetDbOn"},
+                                   {"Condition": "IdbLookupOn"}]},
+    HOST_EGRESS: {"Fn::Or": [{"Condition": "TailscaleOn"},
+                             {"Condition": "IdbLookupOn"}]},
+}
+IDB_RULE = {"RuleCondition": {"Fn::Equals": [{"Ref": "InternetDbLookup"}, "true"]},
+            "Assertions": [{"Assert": {"Fn::Not": [{"Fn::Equals": [
+                {"Ref": "InternetDbDelivered"}, "true"]}]},
+                "AssertDescription": "Not both InternetDbLookup and InternetDbDelivered."}]}
 # Who mounts the internetdb volume, where, and read-only or not; no other service may.
 IDB_MOUNTS = {"exporter": ("/internetdb", False), "agents": ("/internetdb", True),
               "ui": ("/internetdb", True)}
@@ -287,7 +313,7 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
         sub = base64_value.get("Fn::Sub") if isinstance(base64_value, dict) else None
         variables = sub[1] if isinstance(sub, list) and len(sub) == 2 else {}
         found: list[str] = []
-        for on in (False, True):
+        for on in (False, True, "lookup"):
             expanded, problems = internetdb_user_data(user_data, variables, on)
             found += problems + check_user_data(expanded, internetdb=on)
         errors += [f"launch template {name}: {e}" for e in dict.fromkeys(found)]
@@ -411,11 +437,12 @@ def mentions_tailscale(node) -> bool:
 
 
 def check_tailscale_egress(rule: dict) -> list[str]:
-    """tailscaled's way out: tcp 443 only, and only with TailscaleEnabled."""
+    """tailscaled's and the exporter's way out: tcp 443 only, and only with TailscaleEnabled
+    or InternetDbLookup (whose host firewall limits the exporter)."""
     props = rule.get("Properties") or {}
     errors: list[str] = []
-    if rule.get("Condition") != "TailscaleOn":
-        errors.append(f"egress rule {TAILSCALE_EGRESS} does not depend on TailscaleOn")
+    if rule.get("Condition") != HOST_EGRESS:
+        errors.append(f"egress rule {TAILSCALE_EGRESS} does not depend on {HOST_EGRESS}")
     if str(props.get("IpProtocol")) != "tcp" or props.get("FromPort") != 443 \
             or props.get("ToPort") != 443:
         errors.append(f"egress rule {TAILSCALE_EGRESS} allows more than tcp 443")
@@ -457,6 +484,10 @@ TAILSCALE_RULES = {
 # host firewall uses to read the S3 prefix list.
 EC2_ENDPOINT = "Ec2Endpoint"
 PREFIX_LIST_ARN = "arn:${AWS::Partition}:ec2:${AWS::Region}:aws:prefix-list/${S3PrefixListId}"
+# The host firewall's one read, in the role's own policy under HostEgressOn.
+PREFIX_ROLE_STATEMENT = {"Effect": "Allow",
+                         "Action": "ec2:GetManagedPrefixListEntries",
+                         "Resource": {"Fn::Sub": PREFIX_LIST_ARN}}
 EC2_ENDPOINT_POLICY = {"Version": "2012-10-17", "Statement": [
     {"Sid": "S3PrefixListOnly", "Effect": "Allow", "Principal": "*",
      "Action": "ec2:GetManagedPrefixListEntries", "Resource": {"Fn::Sub": PREFIX_LIST_ARN}}]}
@@ -465,8 +496,8 @@ EC2_ENDPOINT_POLICY = {"Version": "2012-10-17", "Statement": [
 def check_ec2_endpoint(res: dict) -> list[str]:
     props = res.get("Properties") or {}
     errors: list[str] = []
-    if res.get("Condition") != "TailscaleOn":
-        errors.append(f"endpoint {EC2_ENDPOINT} exists without TailscaleOn")
+    if res.get("Condition") != HOST_EGRESS:
+        errors.append(f"endpoint {EC2_ENDPOINT} exists without {HOST_EGRESS}")
     if props.get("ServiceName") != {"Fn::Sub": "com.amazonaws.${AWS::Region}.ec2"}:
         errors.append(f"endpoint {EC2_ENDPOINT} is not the EC2 API endpoint")
     if props.get("PolicyDocument") != EC2_ENDPOINT_POLICY:
@@ -578,6 +609,9 @@ EGRESS_RULES = [
     '$w -A SENSOR-UID -d "$VPC_CIDR" -p tcp --dport 443 -j ACCEPT',
     'for c in $(cat "$C" 2>/dev/null || :); do if good "$c"; then $w -A SENSOR-UID '
     '-d "$c" -p tcp --dport 443 -j ACCEPT; fi; done',
+    # INTERNETDB_LOOKUP=true only: one /32 per pinned InternetDB address, after the rest.
+    '[ "$IDB" != true ] || for a in $(head -n 8 "$I" 2>/dev/null || :); do if pub "$a"; then '
+    '$w -A SENSOR-UID -d "$a/32" -p tcp --dport 443 -j ACCEPT; fi; done',
 ]
 # The deny comes before the settings are read, so a bad or missing settings file leaves
 # uid 10001 with no egress at all.
@@ -751,7 +785,7 @@ def check_user_data_steps(doc: dict, base64_value) -> list[str]:
     if not isinstance(sub, list) or len(sub) != 2:
         return ["the user data is not a !Sub with variables"]
     variables = sub[1]
-    steps = {"EgressStep": "TailscaleOn", "ConsoleStep": "ConsoleStepOn",
+    steps = {"EgressStep": HOST_EGRESS, "ConsoleStep": "ConsoleStepOn",
              "TailscaleNodeStep": "TailscaleOn", "ModelStep": "ModelOn"}
     for step, cond in steps.items():
         value = variables.get(step)
@@ -759,10 +793,13 @@ def check_user_data_steps(doc: dict, base64_value) -> list[str]:
                 and value["Fn::If"][0] == cond and value["Fn::If"][2] == ""):
             errors.append(f"step {step} is not empty unless {cond}")
     lines = sub[0].splitlines()
-    if "${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service <<'EOF'" \
-            not in lines:
+    if "${IdbEgress}${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service "\
+            "<<'EOF'" not in lines:
         errors.append("the egress, console and model steps do not run, in that order, right "
                       "before the stack is started")
+    if variables.get("IdbEgress") != {"Fn::If": ["IdbLookupOn", IDB_EGRESS_SWITCH, ""]}:
+        errors.append("step IdbEgress is not exactly the InternetDB switch for the host "
+                      "firewall, and empty unless IdbLookupOn")
     if '${TailscaleNodeStep}echo "bootstrap complete"' not in lines:
         errors.append("the node step does not run after the stack is up")
     errors += check_egress_step(_step_body(variables, "EgressStep"))
@@ -814,29 +851,51 @@ RENDER_FACTS = {
 }
 
 
-def internetdb_user_data(user_data: str, variables: dict, on: bool) -> tuple[str, list[str]]:
-    """The user data with the InternetDbDelivered variables rendered for ``on``, and any
-    variable that is not exactly its expected value when on and "" when off."""
+def _branch(got, condition: str):
+    branch = got.get("Fn::If") if isinstance(got, dict) else None
+    if isinstance(branch, list) and len(branch) == 3 and branch[0] == condition:
+        return branch
+    return None
+
+
+def internetdb_user_data(user_data: str, variables: dict, on) -> tuple[str, list[str]]:
+    """The user data with the InternetDB variables rendered for ``on`` (False: both
+    switches off; True: InternetDbDelivered; "lookup": InternetDbLookup), and any variable
+    that is not exactly its expected value for each switch and "" with both off."""
     errors: list[str] = []
     for name, value in IDB_VARIABLES.items():
         got = variables.get(name)
-        branch = got.get("Fn::If") if isinstance(got, dict) else None
-        if not (isinstance(branch, list) and len(branch) == 3 and branch[0] == "InternetDbOn"
-                and text(branch[1]) == value and branch[2] == ""):
+        lookup = IDB_LOOKUP_VARIABLES[name]
+        if name in IDB_SHARED:
+            branch = _branch(got, "IdbAnyOn")
+            ok = branch is not None and value == lookup and text(branch[1]) == value \
+                and branch[2] == ""
+        else:
+            branch = _branch(got, "InternetDbOn")
+            inner = _branch(branch[2], "IdbLookupOn") if branch else None
+            ok = inner is not None and text(branch[1]) == value and text(inner[1]) == lookup \
+                and inner[2] == ""
+        if not ok:
             errors.append(f"user data variable {name} is not exactly its InternetDbDelivered "
-                          "value, and empty when off")
-        user_data = user_data.replace("${" + name + "}", value if on else "")
+                          "or InternetDbLookup value, and empty when off")
+        user_data = user_data.replace("${" + name + "}", lookup if on == "lookup"
+                                      else value if on else "")
     return user_data, errors
 
 
 def check_internetdb_switch(doc: dict) -> list[str]:
     errors: list[str] = []
     params = doc.get("Parameters") or {}
-    if (params.get("InternetDbDelivered") or {}).get("Default") != "false":
-        errors.append("parameter InternetDbDelivered is not off by default")
-    if (doc.get("Conditions") or {}).get("InternetDbOn") != \
-            {"Fn::Equals": [{"Ref": "InternetDbDelivered"}, "true"]}:
-        errors.append("condition InternetDbOn is not InternetDbDelivered=true")
+    for switch in ("InternetDbDelivered", "InternetDbLookup"):
+        if (params.get(switch) or {}).get("Default") != "false":
+            errors.append(f"parameter {switch} is not off by default")
+    conditions = doc.get("Conditions") or {}
+    for name, want in IDB_CONDITIONS.items():
+        if conditions.get(name) != want:
+            errors.append(f"condition {name} is not exactly as required")
+    if (doc.get("Rules") or {}).get("InternetDbOneWay") != IDB_RULE:
+        errors.append("rule InternetDbOneWay does not refuse InternetDbLookup with "
+                      "InternetDbDelivered")
     key = params.get("InternetDbAnswersKey") or {}
     pattern = key.get("AllowedPattern")
     if not isinstance(pattern, str) or any(re.search(pattern, k) for k in TRACKED_KEY_ESCAPES) \
@@ -868,7 +927,7 @@ def check_endpoint_policy(doc: dict) -> list[str]:
 
 
 def check_user_data(user_data: str, render_script: Optional[str] = None,
-                    dockerfile: Optional[str] = None, internetdb: bool = False) -> list[str]:
+                    dockerfile: Optional[str] = None, internetdb=False) -> list[str]:
     errors = [msg for msg, needle in USER_DATA_FACTS.items() if needle not in user_data]
     ships = re.findall(r"python -m agents ship[^\"\]]*", user_data)
     if not ships:
@@ -888,7 +947,7 @@ def check_user_data(user_data: str, render_script: Optional[str] = None,
 
 
 def check_render(user_data: str, script: Optional[str] = None,
-                 dockerfile: Optional[str] = None, internetdb: bool = False) -> list[str]:
+                 dockerfile: Optional[str] = None, internetdb=False) -> list[str]:
     """render_config.py as the image carries it, run on the repository's config template:
     the tracked export is on only when shipping and TrackedExport both are, and the agents'
     config.ini keeps every transport off (only config-ship.ini, the exporter's, ships)."""
@@ -907,7 +966,8 @@ def check_render(user_data: str, script: Optional[str] = None,
     except SyntaxError:
         errors.append("render_config.py does not parse as Python 3.9 (the host's python3)")
     errors += [msg for msg, needle in RENDER_FACTS.items() if needle not in script]
-    tail = re.escape(IDB_VARIABLES["IdbArgs"]) if internetdb else ""
+    tail = re.escape(IDB_LOOKUP_VARIABLES["IdbArgs"]) if internetdb == "lookup" else \
+        re.escape(IDB_VARIABLES["IdbArgs"]) if internetdb else ""
     calls = dict(re.findall(r'^python3 render_config\.py config\.ini\.TEMPLATE (\S+) \$ARGS '
                             r'"\$NEVER" (\S+)' + tail + '$', user_data, re.M))
     if not re.search(r'^NEVER="\$\{NeverActOn\}"$', user_data, re.M):
@@ -934,7 +994,24 @@ def check_render(user_data: str, script: Optional[str] = None,
                 if got.get((section, key)) != value:
                     errors.append(f"with shipping {ship} and TrackedExport {tracked} the "
                                   f"rendered [{section}] {key} is not {value}")
-    if internetdb:
+    if internetdb == "lookup":
+        for ship in ("true", "false"):
+            got = _render_internetdb(script, ship, "lookup")
+            want = {("connector.internetdb", "mode"): "delivered",
+                    ("connector.internetdb", "answers_file"): "/internetdb/internetdb.json",
+                    ("connector.internetdb", "wanted_file"):
+                        "/blocklist/internetdb_wanted.json" if ship == "true" else None,
+                    ("connector.internetdb_exchange", "enabled"): ship,
+                    ("connector.internetdb_exchange", "kind"): "lookup",
+                    ("connector.internetdb_exchange", "addresses_file"):
+                        "/egress/internetdb-addresses",
+                    ("connector.internetdb_exchange", "wanted_key"): None,
+                    ("connector.internetdb_exchange", "answers_key"): None}
+            if got is None or any(got.get(k) != v for k, v in want.items()):
+                errors.append(f"with shipping {ship} and InternetDbLookup the rendered "
+                              "InternetDB settings are not delivered mode with the lookup "
+                              "exchange on for the exporter only")
+    elif internetdb:
         for ship in ("true", "false"):
             got = _render_internetdb(script, ship)
             want = {("connector.internetdb", "mode"): "delivered",
@@ -951,8 +1028,8 @@ def check_render(user_data: str, script: Optional[str] = None,
     return errors
 
 
-@functools.lru_cache(maxsize=4)
-def _render_internetdb(script: str, ship: str) -> Optional[dict]:
+@functools.lru_cache(maxsize=8)
+def _render_internetdb(script: str, ship: str, kind: str = "s3") -> Optional[dict]:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "render_config.py"
         path.write_text(script, encoding="utf-8")
@@ -961,8 +1038,10 @@ def _render_internetdb(script: str, ship: str) -> Optional[dict]:
             subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),
                             "winnie-sensor", "example", "192.0.2.10", "false",
                             "example-events", "events", "us-east-1", "123456789012", "false",
-                            "events/tracked/tracked.json", "", ship, "true",
-                            "events/internetdb/wanted.json", "internetdb/answers.json"],
+                            "events/tracked/tracked.json", "", ship]
+                           + (["lookup"] if kind == "lookup" else
+                              ["true", "events/internetdb/wanted.json",
+                               "internetdb/answers.json"]),
                            check=True, capture_output=True, timeout=60, cwd=tmp)
         except (OSError, subprocess.SubprocessError):
             return None
@@ -973,6 +1052,8 @@ def _render_internetdb(script: str, ship: str) -> Optional[dict]:
                              ("connector.internetdb", "answers_file"),
                              ("connector.internetdb", "wanted_file"),
                              ("connector.internetdb_exchange", "enabled"),
+                             ("connector.internetdb_exchange", "kind"),
+                             ("connector.internetdb_exchange", "addresses_file"),
                              ("connector.internetdb_exchange", "wanted_key"),
                              ("connector.internetdb_exchange", "answers_key"))}
 
@@ -1068,13 +1149,16 @@ def _mounts(service: dict) -> list[tuple[str, str, bool]]:
     return out
 
 
-def check_exporter(compose: dict, internetdb: bool = False) -> list[str]:
+def check_exporter(compose: dict, internetdb=False) -> list[str]:
     """The exporter holds the instance role, so it mounts its own config and state, the
-    front-end log (read-only) and the blocklist directory (read-only), and with
-    InternetDbDelivered the internetdb volume it writes; nothing else."""
+    front-end log (read-only) and the blocklist directory (read-only), with
+    InternetDbDelivered or InternetDbLookup the internetdb volume it writes, and with
+    InternetDbLookup the host firewall's pinned addresses (read-only); nothing else."""
     allowed = dict(EXPORTER_MOUNTS)
     if internetdb:
         allowed["internetdb"] = IDB_MOUNTS["exporter"]
+    if internetdb == "lookup":
+        allowed[IDB_EGRESS_DIR] = ("/egress", True)
     exporter = (compose.get("services") or {}).get("exporter")
     if not isinstance(exporter, dict):
         return ["the embedded compose file has no exporter service"]
@@ -1097,17 +1181,20 @@ def check_exporter(compose: dict, internetdb: bool = False) -> list[str]:
     return errors
 
 
-def check_internetdb_volume(compose: dict, internetdb: bool) -> list[str]:
+def check_internetdb_volume(compose: dict, internetdb) -> list[str]:
     """Off: no internetdb volume anywhere. On: the exporter writes it, the agents and the
     console read it, each at /internetdb, and no other service mounts it."""
     errors: list[str] = []
     for name, service in (compose.get("services") or {}).items():
+        egress = [s for s, _, _ in _mounts(service or {}) if s.startswith("/var/lib/sensor-egress")]
+        if egress and (name != "exporter" or internetdb != "lookup"):
+            errors.append(f"the {name} service mounts the host firewall's files")
         got = [(t, ro) for s, t, ro in _mounts(service or {}) if s == "internetdb"]
         want = [IDB_MOUNTS[name]] if internetdb and name in IDB_MOUNTS else []
         if got != want:
             errors.append(f"the {name} service mounts the internetdb volume other than as "
                           "InternetDbDelivered requires")
-    if ("internetdb" in (compose.get("volumes") or {})) != internetdb:
+    if ("internetdb" in (compose.get("volumes") or {})) != bool(internetdb):
         errors.append("the internetdb volume is declared without InternetDbDelivered, or "
                       "missing with it")
     return errors
@@ -1150,11 +1237,13 @@ def check_role(doc: dict) -> list[str]:
         statements = []
         for item in as_list(policy["PolicyDocument"]["Statement"]):
             kind = _conditional(item, "InternetDbOn", IDB_ROLE_STATEMENT)
+            if kind is False:
+                kind = _conditional(item, HOST_EGRESS, PREFIX_ROLE_STATEMENT)
             if kind is None:
                 statements.append(item)
             elif kind is False:
                 errors.append(f"instance role {name} has a conditional statement other than "
-                              "the InternetDB answers read")
+                              "the InternetDB answers read and the S3 prefix list read")
         errors += _check_statements(name, statements)
     # A role can be named in many forms (Ref, a Sub of its name, a literal), so every
     # separate policy resource is suspect: only the one tailnet policy may exist.
@@ -1176,8 +1265,7 @@ def check_role(doc: dict) -> list[str]:
 
 def _check_statements(name: str, statements: list, tailscale: bool = False) -> list[str]:
     errors: list[str] = []
-    allowed = ROLE_ACTIONS | ({"ssm:GetParameter", "ssm:PutParameter",
-                               "ec2:GetManagedPrefixListEntries"} if tailscale else set())
+    allowed = ROLE_ACTIONS | ({"ssm:GetParameter", "ssm:PutParameter"} if tailscale else set())
     for st in statements:
         if st.get("Effect") != "Allow" or "NotAction" in st or "NotResource" in st:
             errors.append(f"instance role {name} has a statement that is not a plain Allow")
