@@ -564,6 +564,25 @@ def test_access_log_escapes_raw_terminal_control(console, caplog):
     assert any(r"\x1b" in line for line in lines)
 
 
+@pytest.mark.parametrize("control,escaped", [("\x1b", r"\x1b"), ("\x9b", r"\x9b")])
+def test_rejected_method_escapes_terminal_control_in_access_log(console, caplog,
+                                                                control, escaped):
+    caplog.set_level(logging.INFO, logger="agents.ui")
+    request = (f"BAD{control}[2J /api/items HTTP/1.1\r\n"
+               f"Host: {console.host}\r\n\r\n").encode("latin-1")
+    with socket.create_connection(("127.0.0.1", console.port), timeout=5) as sock:
+        sock.sendall(request)
+        response = b""
+        while chunk := sock.recv(4096):
+            response += chunk
+
+    assert response.startswith(b"HTTP/1.0 405 ")
+    lines = [r.getMessage() for r in caplog.records if r.name == "agents.ui"]
+    assert lines
+    assert all(control not in line for line in lines)
+    assert any(escaped in line for line in lines)
+
+
 def test_serve_logs_sign_in_url_once(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger="agents.ui")
     monkeypatch.setattr(ui.UiServer, "serve_forever", lambda self, *a, **k: None)

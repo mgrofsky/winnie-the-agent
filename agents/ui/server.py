@@ -476,7 +476,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         super().end_headers()
 
     def log_request(self, code: object = "-", size: object = "-") -> None:
-        log.info("%s %s %s", self.command or "-", self._log_path(), getattr(code, "value", code))
+        log.info("%s %s %s", _log_safe(self.command or "-"), self._log_path(),
+                 getattr(code, "value", code))
 
     def log_error(self, format: str, *args: object) -> None:
         log.info("request error on %s", self._log_path())  # args may carry the request line
@@ -527,7 +528,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if unread:
                 self._linger()
         except Exception:
-            log.exception("unhandled error on %s %s", self.command, self._log_path())
+            log.exception("unhandled error on %s %s", _log_safe(self.command or "-"),
+                          self._log_path())
             if not self._headers_sent:
                 self.close_connection = True
                 self._send_json(500, {"error": "internal error"})
@@ -633,7 +635,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError(f"route returned status {status!r}")
             body = encode_json(value)
         except Exception:
-            log.exception("route failed on %s %s", self.command, _log_safe(path))
+            log.exception("route failed on %s %s", _log_safe(self.command or "-"),
+                          _log_safe(path))
             self._send_json(500, {"error": "internal error"})
             return
         self._send(status, body, JSON_TYPE)
