@@ -385,3 +385,16 @@ def test_a_bare_line_equal_to_the_input_is_output_and_stays():
     cut = onereply.one_reply("root@srv01:~# whoami\nroot\nroot@srv01:~# ", "whoami",
                              interactive=True, **kw)
     assert cut is not None and cut.kept == "root\nroot@srv01:~# "
+
+
+@pytest.mark.parametrize("text", [
+    "cat n", "/bin/cat n", "sudo -u root cat n", "busybox cat n", "/bin/busybox head -1 n",
+    "ls | xargs cat", "sed -n 1p n", "sh n", "./n", "(cat n)", "true;cat n",
+])
+def test_any_way_of_printing_stored_text_counts_as_a_viewer(text):
+    assert hooks._may_show_text(text)
+
+
+@pytest.mark.parametrize("text", ["ls", "whoami", "uname -a", "cd /tmp", "ls /bin/category"])
+def test_plain_commands_are_not_viewers(text):
+    assert not hooks._may_show_text(text)

@@ -568,6 +568,26 @@ def _is_content_viewer(text: str) -> bool:
     return words[0] in CONTENT_VIEWERS or words[:2] == ["git", "log"]
 
 
+# Commands that can print text a session stored earlier. Wider than CONTENT_VIEWERS on
+# purpose: this only decides when a reply is left whole.
+_SHOWS_TEXT = CONTENT_VIEWERS | frozenset({
+    "sed", "awk", "nl", "tac", "cut", "sort", "uniq", "tee", "paste", "od", "xxd",
+    "hexdump", "base64", "vi", "vim", "nano", "ed", "source", ".", "sh", "bash", "ash",
+    "dash", "read", "diff", "cmp", "wc", "rev", "tr", "fold", "column", "egrep", "fgrep",
+    "zcat", "dd", "cp", "mv", "history",
+})
+_WORD_SPLIT = re.compile(r"""[\s"'`;|&(){}<>]+""")
+
+
+def _may_show_text(text: str) -> bool:
+    """True when any word of the input names such a command, by any path or wrapper
+    (``/bin/cat n``, ``sudo -u root cat n``, ``busybox cat n``, ``xargs cat``)."""
+    for word in _WORD_SPLIT.split(text):
+        if word.rpartition("/")[2] in _SHOWS_TEXT or word.startswith("./"):
+            return True
+    return False
+
+
 def breaks_character(reply: str, text: str) -> bool:
     """True when a model reply reads as the model talking, not as shell output.
 
@@ -770,7 +790,7 @@ def _cut_reply(history, response, *, session_id: str, text: str, interactive: bo
     cut = onereply.one_reply(
         reply, text, interactive=interactive, hosts=(host.hostname, noted),
         current_prompt=current, user=(username or "user")[:32],
-        viewer=_is_content_viewer(text),
+        viewer=_may_show_text(text),
         text_built_before=session_id in _session_built)
     if cut is None:
         return None
