@@ -47,6 +47,11 @@ _session_prompts: dict[str, tuple[str, Optional[str]]] = {}
 _session_keys: dict[str, str] = {}
 _LEFT = ""
 MAX_TRACKED_SESSIONS = 10_000   # per-session tables evict their oldest entry past this
+# What the canned shell keeps per session when it answers instead of the model (files the
+# session wrote, its directory): each holds up to ``shell.MAX_SCRATCH_BYTES``, so far fewer.
+_shell_sessions: dict[str, shell.Session] = {}
+_shell_stale: set[str] = set()    # sessions the model answered since their fallback ran
+MAX_SHELL_SESSIONS = 256
 _cache: Optional[ReplyCache] = None
 MAX_LOCAL_HISTORY = 4096   # characters of a local answer kept in the chat history
 MAX_LOCAL_DELAY_MS = 2000
@@ -203,26 +208,67 @@ _literal_output = shell.literal_output
 
 def fallback_reply(text: str, interactive: bool, username: Optional[str],
                    host: Optional[shell.Host] = None, src_ip: Optional[str] = None,
-                   prompt: Optional[str] = None) -> str:
+                   prompt: Optional[str] = None, session_id: Optional[str] = None) -> str:
     """A plausible shell reply when the model cannot answer: a prompt for the session
     opener, otherwise the deterministic shell's reply (``agents.shell.reply``: host facts
     from the profile, a builtin's own output, a known tool's own error, else 'command not
     found'), then the prompt. ``prompt`` is the one the model showed last, so a directory
-    the model moved to stays in the prompt (and is the working directory here)."""
+    the model moved to stays in the prompt (and is the working directory here).
+    ``session_id`` keeps the files the session wrote, and its directory, from one fallback
+    line to the next, as the Telnet canned shell does (``shell.Session``)."""
     host = host or shell_host()
     cwd = None
-    if interactive and prompt:
+    session = None
+    entered = False
+    if session_id is not None:
+        session = _shell_sessions.get(session_id)
+        # A model reply since the last fallback line may have moved the session: its
+        # prompt seeds the directory again.
+        entered = session is not None and session_id not in _shell_stale
+        _shell_stale.discard(session_id)
+        session = session or shell.Session()
+        _track_shell(session_id, session)
+    if interactive and prompt and entered:
+        # The model's last prompt seeded the directory on the first fallback line; from
+        # then on the session says where it is, and the prompt follows it.
+        cwd, prompt = session.cwd or None, None
+    elif interactive and prompt:
         cwd = prompt_directory(prompt, username)
+        if session is not None and cwd is not None:
+            session.cwd = cwd                # the model's prompt says where the session is
+    elif interactive:
+        prompt = None                        # where the session is once the line has run
     else:
-        prompt = shell_prompt(username, host.hostname) if interactive else ""
+        prompt = ""
     word = shell.clean_word(text)
-    if not word:
-        return prompt
+    if not word and not text.lstrip().startswith(">"):     # ``>f`` is a command too
+        return prompt if prompt is not None else _prompt_at(username, host, session)
     if word in ("exit", "logout") and interactive:
         return "YYY-END-OF-SESSION-YYY"   # same marker the model uses to end the session
     out = shell.reply(host, text, user=username or "user",
-                      interactive=interactive, cwd=cwd, src_ip=src_ip)
+                      interactive=interactive, cwd=cwd, src_ip=src_ip, session=session)
+    if prompt is None:
+        prompt = _prompt_at(username, host, session)
     return (out.replace("\n", "\r\n") if interactive else out) + prompt
+
+
+def _prompt_at(username: Optional[str], host: shell.Host,
+               session: Optional[shell.Session]) -> str:
+    """The prompt for the directory the canned shell's session is in."""
+    user = (username or "user")[:32]
+    if session is None or not session.cwd:
+        return shell_prompt(user, host.hostname)
+    home = "/root" if user == "root" else f"/home/{user}"
+    path = shell.prompt_path(session.cwd, home)
+    return f"{user}@{host.hostname}:{path}{'#' if user == 'root' else '$'} "
+
+
+def _track_shell(session_id: str, session: shell.Session) -> None:
+    _shell_sessions.pop(session_id, None)
+    _shell_sessions[session_id] = session
+    while len(_shell_sessions) > MAX_SHELL_SESSIONS:
+        _shell_stale.discard(next(iter(_shell_sessions)))
+        _shell_sessions.pop(next(iter(_shell_sessions)))
 
 
 def prompt_directory(prompt: str, username: Optional[str]) -> Optional[str]:
@@ -301,6 +347,8 @@ def reset() -> None:
     _cli_accounts.clear()
     _session_fragments.clear()
     _session_prompts.clear()
+    _shell_sessions.clear()
+    _shell_stale.clear()
 
 
 def set_budget(budget: Budget) -> None:
@@ -348,7 +396,9 @@ def get_scenario():
 # ---- input / sessions -------------------------------------------------------------------
 
 def clip_input(text: str) -> str:
+    """An input line within the line cap, any undecodable byte (a surrogate escape) replaced."""
     budget = _budget
+    text = text.encode("utf-8", "replace").decode("utf-8") if not text.isascii() else text
     return (budget or Budget(BudgetConfig())).clip(text)  # clipping never needs state
 
 
@@ -377,6 +427,8 @@ def session_close(session_id: str, history_store: Optional[MutableMapping] = Non
     _session_fragments.pop(session_id, None)
     _session_prompts.pop(session_id, None)
     _session_keys.pop(session_id, None)
+    _shell_sessions.pop(session_id, None)
+    _shell_stale.discard(session_id)
     if history_store is not None:
         history_store.pop(session_id, None)
 
@@ -582,6 +634,8 @@ def _note_prompt(session_id: str, content: str, username: Optional[str]) -> None
         cwd = None
     prompt = last + " " if last else (before[0] if before else "")
     _track(_session_prompts, session_id, (prompt, cwd))
+    if session_id in _shell_sessions:
+        _shell_stale.add(session_id)
 
 
 _FINAL_PROMPT = re.compile(r"^(?:\S*@\S*|\[\S+@\S+ \S+\])[$#]$")
@@ -728,15 +782,31 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         if with_model else None
     local = cached = None
     capped = False
+    owned = None
     if with_model:
         local_ok = prompt_state is None or prompt_state[1] is not None
         if _local_replies and counts_as_command and local_ok:
             cwd = prompt_state[1] if prompt_state else None
+            answered = budget.model_answered(session_id)
+            # While no model call has been made for a command (``model_answered``; a
+            # failed call counts), the only state is what ``fallback_reply`` keeps in
+            # ``_shell_sessions`` (as under a model cap of 0). Local
+            # answers read that state, on a copy kept only if the answer is used, so a
+            # line left to the fallback is not applied twice. Once a model call has been
+            # made (which never reverts), only FIXED answers are used, and no session
+            # state can change those: the state then lives in the model's history, or in
+            # the fallback session that the model path (cap, error) itself runs.
+            fallback = _shell_sessions.get(session_id) if not answered else None
+            scratch = fallback.copy() if fallback is not None else None
             answer = shell.answer(host, text, user=username or "user",
-                                  interactive=interactive, cwd=cwd, src_ip=src_ip)
+                                  interactive=interactive, cwd=cwd, src_ip=src_ip,
+                                  session=scratch)
             if answer is not None and (answer.scope == shell.FIXED or (
-                    answer.scope == shell.SESSION and not budget.model_answered(session_id))):
+                    answer.scope == shell.SESSION and not answered)):
                 local = answer
+                if scratch is not None:
+                    _track_shell(session_id, scratch)
+                    owned = scratch
         cache = reply_cache()
         if local is None and key is not None and cache is not None:
             cached = cache.get(key)
@@ -756,16 +826,18 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         return SimpleNamespace(content=canned, budget_exceeded=True)
     if _offline_reason:
         await _tarpit(src_ip)
-        return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip))
+        return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip,
+                                                      session_id=session_id))
     if local is not None:
         await _tarpit(src_ip)
         await _pause()
-        prompt = (shown_prompt or shell_prompt(username, host.hostname)) if interactive else ""
+        prompt = "" if not interactive else _prompt_at(username, host, owned) \
+            if owned is not None else (shown_prompt or shell_prompt(username, host.hostname))
 
         def shown(output: str) -> str:
             return (output.replace("\n", "\r\n") if interactive else output) + prompt
 
-        kept = shown(_clip_local(local.output))
+        kept = shown(_clip_local(shell.printable(local.output)))   # binary bytes as \xNN
         stored = _remember(history, session_id, text, kept)
         if stored is not None:
             budget.add_history(session_id, src_ip, text, stored)
@@ -790,9 +862,10 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         await _tarpit(src_ip)
         await _pause()
         _leave(session_id)
-        sent = fallback_reply(text, interactive, username, host, src_ip, shown_prompt)
+        sent = fallback_reply(text, interactive, username, host, src_ip, shown_prompt,
+                              session_id)
         if sent != "YYY-END-OF-SESSION-YYY":
-            stored = _remember(history, session_id, text, _clip_local(sent))
+            stored = _remember(history, session_id, text, _clip_local(shell.printable(sent)))
             if stored is not None:
                 budget.add_history(session_id, src_ip, text, stored)
         return SimpleNamespace(content=sent, model_capped=True)
@@ -813,7 +886,7 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         _leave(session_id)
         await _tarpit(src_ip)
         return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip,
-                                                      shown_prompt))
+                                                      shown_prompt, session_id))
     budget.commit(reservation, text, _content(response), usage_tokens=_usage_tokens(response))
     await _tarpit(src_ip)
     if breaks_character(_content(response), text):

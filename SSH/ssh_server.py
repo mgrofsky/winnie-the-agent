@@ -247,6 +247,12 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
     llm_config = {"configurable": {"session_id": task_uuid}}
     log_extra = get_session_log_extra(process, task_uuid)
 
+    # A reply can carry binary bytes as surrogate escapes (agents.shell.wire); this sends them
+    # as they are. Input that is not UTF-8 then arrives the same way, and clip_input replaces it.
+    channel = getattr(process, "channel", None)
+    if channel is not None and channel.get_encoding()[0]:
+        channel.set_encoding(channel.get_encoding()[0], "surrogateescape")
+
     # Agent layer: concurrency caps, and one budgeted path for every persona call.
     src_ip = str(log_extra.get("src_ip", "-"))
     refusal = agent_hooks.session_open(task_uuid, src_ip, logger, log_extra)
@@ -278,7 +284,7 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
             process.stdout.write(f"{llm_response.content}")
             logger.info(
                 "LLM response",
-                extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8')).decode('utf-8'), interactive=False)
+                extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8', 'surrogateescape')).decode('utf-8'), interactive=False)
             )
             await session_summary(process, llm_config, with_message_history, server, log_extra)
             process.exit(0)
@@ -289,7 +295,7 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
             process.stdout.write(f"{llm_response.content}")
             logger.info(
                 "LLM response",
-                extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8')).decode('utf-8'), interactive=True)
+                extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8', 'surrogateescape')).decode('utf-8'), interactive=True)
             )
             if getattr(llm_response, "budget_exceeded", False):  # canned reply, then close
                 return
@@ -323,7 +329,7 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
                     process.stdout.write(f"{llm_response.content}")
                     logger.info(
                         "LLM response",
-                        extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8')).decode('utf-8'), interactive=True)
+                        extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8', 'surrogateescape')).decode('utf-8'), interactive=True)
                     )
                     if getattr(llm_response, "budget_exceeded", False):  # canned reply, close
                         return

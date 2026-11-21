@@ -13,14 +13,26 @@ whole cost is bounded: see ``MAX_WORK``, ``MAX_STAGE_OUTPUT`` and ``MAX_FILES``.
 
 ``answer`` takes one input line: a simple command, a pipeline of our own output through
 ``grep``, ``head``, ``tail``, ``cut``, ``wc`` and ``awk '{print ...}'``, or a ``;`` / ``&&``
-/ ``||`` list of those. Anything it cannot evaluate exactly (redirection, substitution,
-globbing, variables, an unknown command, file or option) returns None, and the caller
-answers as it did before.
+/ ``||`` list of those. Redirections (``>``, ``>>``, ``<``, ``2>&1``) and the loop IoT
+loaders use to read a binary (``while read i; do echo $i; done < FILE``) are understood.
+Anything it cannot evaluate exactly (substitution, globbing, other variables, an unknown
+command, file or option) returns None, and the caller answers as it did before. ``reply``
+goes further for the canned shell: a list is answered part by part, each part it cannot
+evaluate getting what ``Shell.unhandled`` gives a whole line.
+
+Files a session writes (``>x``, ``cp``, ``echo -ne '...' >> x``) live in a ``Session``:
+in memory only, bounded by ``MAX_SCRATCH`` and ``MAX_SCRATCH_BYTES``, and never executed.
+Program files read as the start of an ELF image for the host's machine (``agents.elfimage``).
+
+Output is text, except that a byte 0x80 to 0xFF from a binary travels as the lone surrogate
+``chr(0xDC00 + byte)`` (Python's ``surrogateescape``): ``wire`` turns a reply into the exact
+bytes for the network, and ``printable`` into text that is safe to log or show.
 """
 
 from __future__ import annotations
 
 import datetime
+import functools
 import hashlib
 import logging
 import math
@@ -29,7 +41,7 @@ import random
 import re
 import shlex
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 from scenarios.schema import GPU_SPECS, HARDWARE_PRESETS, Hardware
@@ -40,12 +52,14 @@ MAX_LINE = 4096            # longer input is not evaluated
 MAX_WORD = 1024
 MAX_WORDS = 64             # per command
 MAX_STAGES = 8             # commands in one pipeline
-MAX_LIST = 8               # pipelines in one ; && || list
+MAX_LIST = 32              # pipelines in one ; && || list (loader lines run to ~20)
 MAX_PATTERN = 256          # grep pattern length
 MAX_FILES = 8              # file operands one command reads
 MAX_STAGE_OUTPUT = 128 * 1024  # characters one command may produce (a 64-CPU cpuinfo is 72k)
 MAX_OUTPUT = 128 * 1024    # characters the whole line may produce
 MAX_ECHO_OUTPUT = 4096
+MAX_SCRATCH = 4 * MAX_FILES     # files and directories one session may create
+MAX_SCRATCH_BYTES = MAX_OUTPUT  # characters all of a session's files may hold
 # Work is counted per line, across every command in it, in rough nanoseconds: a character
 # handled in C (split, find, join, slicing) costs 1, a step of a Python loop costs STEP and
 # a line of input LINE. Over budget, the line falls back as an unknown line does, so the
@@ -60,10 +74,14 @@ SHELL_BUILTINS = frozenset((
     "source", ".", "umask", "ulimit", "shopt", "trap", "wait", "read", "local", "declare",
     "typeset", "readonly", "eval", "exec", "hash", "history", "builtin", "command", "enable",
 ))
+# bash's reserved words: a line starting with one is shell syntax, never a missing command.
+SHELL_KEYWORDS = frozenset(("while", "until", "for", "if", "case", "select", "function",
+                            "time", "{", "[[", "!", "do", "done", "then", "fi", "esac"))
 BIN_DIRS = frozenset(("/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin",
                       "/usr/local/sbin"))
-# IoT botnet openers: a device CLI accepts these silently before the bot tries busybox.
-OPENERS = frozenset(("enable", "system", "shell", "linuxshell", "sh", "bash"))
+# Words IoT bots send first because a device CLI knows them. bash does not, so they are
+# "command not found" (``enable`` is a bash builtin and ``sh`` starts a nested shell).
+NOT_COMMANDS = frozenset(("system", "shell", "linuxshell"))
 DEFAULT_KERNEL = ("Linux srv01 5.15.0-105-generic #115-Ubuntu SMP Mon Apr 15 09:52:04 UTC "
                   "2024 x86_64 x86_64 x86_64 GNU/Linux")
 MACHINES = frozenset(("x86_64", "aarch64", "i686", "armv7l"))
@@ -112,26 +130,67 @@ def literal_output(text: str) -> Optional[str]:
         if re.search(r"%[^sd%]", fmt):
             return None
         out, i = "", 0
-        for part in re.split(r"(%[sd%])", fmt):
-            if part == "%%":
-                out += "%"
-            elif part in ("%s", "%d"):
-                value = args[i] if i < len(args) else ""
-                i += 1
-                if part == "%d":
-                    try:
-                        value = str(int(value or 0))
-                    except ValueError:
-                        return None
-                out += value
-            else:
-                out += part
+        parts = re.split(r"(%[sd%])", fmt)
+        takes = any(part in ("%s", "%d") for part in parts)
+        while True:                          # the format is used again for the rest
+            for part in parts:
+                if part == "%%":
+                    out += "%"
+                elif part in ("%s", "%d"):
+                    value = args[i] if i < len(args) else ""
+                    i += 1
+                    if part == "%d":
+                        try:
+                            value = str(int(value or 0))
+                        except ValueError:
+                            return None
+                    out += value
+                else:
+                    out += part
+            if not takes or i >= len(args) or len(out) > MAX_ECHO_OUTPUT:
+                break
     return "".join(c for c in out if c.isprintable() or c in "\n\t")[:MAX_ECHO_OUTPUT]
 
 
 def clean_word(text: str) -> str:
-    """The first word of ``text``, printable characters only, as a shell error names it."""
-    return "".join(c for c in (text.split() or [""])[0] if c.isprintable())[:64]
+    """The first word of ``text``, printable characters only, as a shell error names it
+    (``ping;`` is the word ``ping``: an operator ends a word)."""
+    first = (text.split() or [""])[0]
+    for op in ";|&<>":
+        first = first.split(op, 1)[0]
+    return "".join(c for c in first if c.isprintable())[:64]
+
+
+# ---- bytes in replies -----------------------------------------------------------------------
+
+def binary_text(data: bytes) -> str:
+    """Raw bytes as reply text: ASCII as itself, 0x80 to 0xFF as lone surrogates."""
+    return data.decode("ascii", "surrogateescape")
+
+
+def byte_char(value: int) -> str:
+    """One byte (``echo -e '\\xNN'``) as reply text."""
+    return chr(value) if value < 0x80 else chr(0xDC00 + value)
+
+
+def wire(text: str) -> bytes:
+    """The exact bytes a reply puts on the network: UTF-8 text, binary bytes as they were."""
+    return text.encode("utf-8", "surrogateescape")
+
+
+def printable(text: str) -> str:
+    """A reply as text that is safe to log, store or send to a model: line endings and tabs
+    kept, every other control character and binary byte written as ``\\xNN``."""
+    if text.isprintable():
+        return text
+    out = []
+    for c in text:
+        if c.isprintable() or c in "\r\n\t":
+            out.append(c)
+        else:
+            code = ord(c) - 0xDC00 if 0xDC80 <= ord(c) <= 0xDCFF else ord(c)
+            out.append(f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}")
+    return "".join(out)
 
 
 # ---- host profile -------------------------------------------------------------------------
@@ -337,6 +396,36 @@ class Host:
             del out["busybox"]
         return out
 
+    def bin_dirs(self) -> dict[str, tuple[str, ...]]:
+        """What ``ls`` shows in /usr/bin and /usr/sbin (/bin and /sbin point there): the
+        distribution's base system and every program ``bins`` names. Built once per kind of
+        host (``_bin_dirs``)."""
+        key = self.family if self.family in ("debian", "rhel") else \
+            "ubuntu-24" if self.family == "ubuntu" and self.release_id >= "24" else "ubuntu-22"
+        return _bin_dirs(key, tuple(sorted(self.bins().items())))[0]
+
+    def bin_sets(self) -> dict[str, frozenset]:
+        """``bin_dirs`` as sets, for lookups."""
+        key = self.family if self.family in ("debian", "rhel") else \
+            "ubuntu-24" if self.family == "ubuntu" and self.release_id >= "24" else "ubuntu-22"
+        return _bin_dirs(key, tuple(sorted(self.bins().items())))[1]
+
+
+@functools.lru_cache(maxsize=64)
+def _bin_dirs(key: str, bins: tuple) -> tuple[dict, dict]:
+    """(sorted names, name sets) per program directory for a base system and a host's
+    ``bins``; shared by every host of that kind."""
+    from agents.bin_lists import LISTS
+
+    base_bin, base_sbin = LISTS[key]
+    names = {"/usr/bin": set(base_bin), "/usr/sbin": set(base_sbin)}
+    for name, path in bins:
+        names[posixpath.dirname(path)].add(name)
+    if "busybox" not in dict(bins):
+        names["/usr/bin"].discard("busybox")
+    return ({d: tuple(sorted(v, key=_collate)) for d, v in names.items()},   # ls order
+            {d: frozenset(v) for d, v in names.items()})
+
 
 def _pages(kib: float) -> int:
     """Round kB down to whole 4 kB pages."""
@@ -345,7 +434,7 @@ def _pages(kib: float) -> int:
 
 _BINARIES = ("awk", "base64", "bash", "busybox", "cat", "chattr", "chmod", "cp", "curl",
              "cut", "df", "free", "grep", "gzip", "head", "hostname", "id", "kill", "ls",
-             "lscpu", "lspci", "mkdir", "mv", "nc", "nohup", "nproc", "perl", "ps",
+             "lscpu", "lspci", "mkdir", "mv", "nc", "nohup", "nproc", "perl", "ping", "ps",
              "python3", "rm", "scp", "sed", "sh", "ssh", "sudo", "tail", "tar", "tftp", "top",
              "uname", "uptime", "w", "wc", "wget", "which", "whoami", "crontab", "systemctl")
 _SBINARIES = ("sshd", "useradd", "usermod", "iptables", "ip")
@@ -431,8 +520,9 @@ _UNQUOTED_SPECIAL = set("$`\\<>(){}*?[]~#!\"'")
 
 
 def _tokenize(line: str) -> list:
-    """Words and the operators ``|``, ``;``, ``&&``, ``||``. Quotes are honoured; anything
-    a shell would expand or redirect raises ``_Unsupported``."""
+    """Words, the operators ``|``, ``;``, ``&&``, ``||``, redirections (``_Redir``) and a
+    bare ``$NAME`` (``_Var``, only the loop in ``_parse`` uses one). Quotes are honoured;
+    anything else a shell would expand raises ``_Unsupported``."""
     if len(line) > MAX_LINE or any(not c.isprintable() and c != "\t" for c in line):
         raise _Unsupported
     tokens: list = []
@@ -464,6 +554,32 @@ def _tokenize(line: str) -> list:
             word = word if word is not None else []
             word.append(inner)
             i = end + 1
+            continue
+        if c in "<>" or (c.isdigit() and word is None and line[i + 1:i + 2] == ">"):
+            fd = int(c) if c.isdigit() else (0 if c == "<" else 1)
+            i += 1 if c.isdigit() else 0
+            if word is not None:
+                tokens.append("".join(word))
+                word = None
+            op = line[i:i + 2] if line[i:i + 2] in (">>", ">&") else line[i]
+            i += len(op)
+            if op == ">&":
+                target = _leading(line[i:], "0123456789")
+                if target not in ("1", "2"):
+                    raise _Unsupported
+                tokens.append(_Redir(op, fd, target))
+                i += len(target)
+            else:
+                tokens.append(_Redir(op, fd))
+            continue
+        if c == "$" and word is None:
+            name = _leading(line[i + 1:], "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                          "0123456789_")
+            after = line[i + 1 + len(name):i + 2 + len(name)]
+            if not name or name[0].isdigit() or (after and after not in " \t;|&<>"):
+                raise _Unsupported
+            tokens.append(_Var(name))
+            i += 1 + len(name)
             continue
         if c in "|;&":
             if word is not None:
@@ -497,31 +613,100 @@ class _Op:
     op: str
 
 
-def _parse(line: str) -> list[tuple[str, list[list[str]]]]:
-    """[(operator before it, pipeline)], a pipeline being a list of argv lists."""
-    items: list[tuple[str, list[list[str]]]] = []
-    joiner, pipeline, argv = ";", [], []
-    for tok in _tokenize(line):
+@dataclass(frozen=True)
+class _Redir:
+    op: str                  # < > >> >&
+    fd: int
+    target: Optional[str] = None   # a word follows, except for >&N
+
+
+@dataclass(frozen=True)
+class _Var:
+    name: str
+
+
+@dataclass
+class _Simple:
+    """One command of a pipeline: its words, its redirections in order (op, fd, target),
+    and for ``while read NAME; do echo $NAME; done`` the loop's read options."""
+    argv: list
+    redirs: list = field(default_factory=list)
+    loop: Optional[tuple] = None     # (raw: bool,) for the read loop
+
+
+_LOOP = ("while", "read", None, ";", "do", "echo", "$", ";", "done")
+
+
+def _loop_at(tokens: list, i: int) -> Optional[tuple[int, bool]]:
+    """(index after ``done``, raw) when ``while read [-r] NAME; do echo $NAME; done`` starts
+    at ``tokens[i]``, else None."""
+    raw = tokens[i + 2:i + 3] == ["-r"]
+    seq = tokens[i:i + 2] + tokens[i + 2 + raw:i + 9 + raw]
+    if len(seq) != len(_LOOP):
+        return None
+    name = seq[2]
+    for want, got in zip(_LOOP, seq):
+        if want is None:
+            ok = isinstance(got, str) and got.isidentifier()
+        elif want == "$":
+            ok = isinstance(got, _Var) and got.name == name
+        elif want == ";":
+            ok = got == _Op(";")
+        else:
+            ok = got == want
+        if not ok:
+            return None
+    return i + 9 + raw, raw
+
+
+def _parse(line: str) -> list[tuple[str, list[_Simple]]]:
+    """[(operator before it, pipeline)], a pipeline being a list of ``_Simple``."""
+    items: list[tuple[str, list[_Simple]]] = []
+    joiner, pipeline, cmd = ";", [], _Simple([])
+    tokens = _tokenize(line)
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
         if isinstance(tok, _Op):
-            if not argv:
+            if not cmd.argv and not cmd.redirs and cmd.loop is None:
                 raise _Unsupported
-            pipeline.append(argv)
-            argv = []
+            pipeline.append(cmd)
+            cmd = _Simple([])
+            i += 1
             if tok.op == "|":
                 continue
             items.append((joiner, pipeline))
             joiner, pipeline = tok.op, []
             continue
-        if len(tok) > MAX_WORD:
+        if isinstance(tok, _Redir):
+            if tok.op == ">&":
+                cmd.redirs.append((tok.op, tok.fd, tok.target))
+                i += 1
+                continue
+            target = tokens[i + 1] if i + 1 < len(tokens) else None
+            if not isinstance(target, str) or len(target) > MAX_WORD:
+                raise _Unsupported
+            cmd.redirs.append((tok.op, tok.fd, target))
+            i += 2
+            continue
+        if tok == "while" and not cmd.argv and cmd.loop is None:
+            found = _loop_at(tokens, i)
+            if found is None:
+                raise _Unsupported
+            i, raw = found
+            cmd.loop = (raw,)
+            continue
+        if isinstance(tok, _Var) or cmd.loop is not None or len(tok) > MAX_WORD:
             raise _Unsupported
-        argv.append(tok)
-    if argv:
-        pipeline.append(argv)
+        cmd.argv.append(tok)
+        i += 1
+    if cmd.argv or cmd.redirs or cmd.loop is not None:
+        pipeline.append(cmd)
         items.append((joiner, pipeline))
     elif pipeline or joiner != ";":
         raise _Unsupported                   # ends in | && ||
     if not items or len(items) > MAX_LIST or any(len(p) > MAX_STAGES for _, p in items) \
-            or any(len(a) > MAX_WORDS for _, p in items for a in p):
+            or any(len(c.argv) + len(c.redirs) > MAX_WORDS for _, p in items for c in p):
         raise _Unsupported
     return items
 
@@ -550,6 +735,8 @@ class _Result:
     err: str = ""
     status: int = 0
     scope: int = 0
+    late: str = ""           # stderr written after the output (dd's record counts)
+    exact: bool = False      # a fallback answer whose stdout is exactly what bash would print
 
 
 Handler = Callable[["Shell", list[str], Optional[str]], Optional[_Result]]
@@ -568,21 +755,62 @@ class _OverBudget(_Unsupported):
     """The line needs more work or output than one line may cost."""
 
 
+@dataclass
+class _Scratch:
+    """A file a session wrote. ``data`` is reply text (``binary_text``)."""
+    data: str = ""
+    mode: int = 0o644
+    mtime: float = 0.0
+    program: Optional[str] = None    # a copy of this program file (``cp /bin/echo x``)
+
+
+@dataclass
+class Session:
+    """What one shell session has changed: its working directory and the files and
+    directories it made or removed. Kept in memory only, at most ``MAX_SCRATCH`` entries
+    and ``MAX_SCRATCH_BYTES`` characters; nothing is written to disk or executed."""
+    cwd: Optional[str] = None
+    files: dict = field(default_factory=dict)      # path -> _Scratch
+    dirs: dict = field(default_factory=dict)       # path -> mtime, directories it made
+    removed: set = field(default_factory=set)      # its own files it removed again
+    version: int = 0       # bumped whenever an entry is made or removed (listing caches)
+    modes: dict = field(default_factory=dict)      # its directories' modes, other than 755
+
+    def size(self) -> int:
+        return sum(len(f.data) for f in self.files.values())
+
+    def copy(self) -> "Session":
+        """An independent copy: a line may run on it and be kept only if its answer is."""
+        return Session(self.cwd, {p: replace(f) for p, f in self.files.items()},
+                       dict(self.dirs), set(self.removed), self.version, dict(self.modes))
+
+
+# Where a non-root login may create files.
+_OPEN_DIRS = frozenset(("/tmp", "/var/tmp", "/dev/shm"))
+
+
 class Shell:
     def __init__(self, host: Host, user: str, interactive: bool, cwd: Optional[str],
-                 now: float, src_ip: Optional[str]) -> None:
+                 now: float, src_ip: Optional[str], session: Optional[Session] = None) -> None:
         self.host = host
         self.user = user
         self.interactive = interactive
         self.home = "/root" if user == "root" else host.user(user).home
-        self.cwd = cwd or self.home
+        self.session = session if session is not None else Session()
+        self.cwd = self.session.cwd or cwd or self.home
         self._now = now
         self._src_ip = src_ip
         self.private = False                # the answer read the clock or the source address
         self.argv0 = ""
+        self.exe = "bash"                   # the program /proc/self/exe names
+        self.busybox = False                # an applet run as ``busybox APPLET``
+        self.raw = False                    # stdout goes to a file: keep every byte
         self.work = 0                       # see MAX_WORK
         self.stage_out = 0                  # characters the current command produced
         self.failed: Optional[list[str]] = None   # the command that could not be evaluated
+        self.stage = 0                      # the pipeline stage being evaluated
+        self.stage_fds: Optional[dict] = None     # its descriptors, once opened
+        self.stage_errs: list[str] = []     # what the stages before it wrote to stderr
         self._files: dict[str, Optional[str]] = {}
         self.memo: dict = {}                # seeded values reused within the line
 
@@ -618,7 +846,9 @@ class Shell:
             raise _OverBudget
         self.charge(chars)
 
-    def run(self, line: str) -> Optional[Answer]:
+    def run(self, line: str, partial: bool = False) -> Optional[Answer]:
+        """The answer to a line, or None when it needs a real shell. With ``partial`` a
+        list part this shell cannot evaluate gets ``_fallback`` and the rest still runs."""
         try:
             self.charge(len(line) * STEP)
             items = _parse(line)
@@ -626,8 +856,15 @@ class Shell:
             for joiner, pipeline in items:
                 if (joiner == "&&" and status != 0) or (joiner == "||" and status == 0):
                     continue
-                result = self._pipeline(pipeline)
-                out.append(result.err + result.out)
+                try:
+                    result = self._pipeline(pipeline)
+                except _OverBudget:
+                    raise
+                except _Unsupported:
+                    if not partial:
+                        raise
+                    result = self._fallback(pipeline)
+                out.append(result.err + result.out + result.late)
                 size += len(out[-1])
                 if size > MAX_OUTPUT:
                     raise _OverBudget
@@ -642,17 +879,307 @@ class Shell:
             log.exception("canned shell failed on a line; falling back")
             self.failed = None
             return None
+        finally:
+            self.session.cwd = self.cwd
         return Answer("".join(out), status, scope, shareable=not self.private)
 
-    def _pipeline(self, pipeline: list[list[str]]) -> _Result:
-        stdin: Optional[str] = None
-        errors, scope, result = [], FIXED, _Result()
-        for index, argv in enumerate(pipeline):
-            result = self._command(argv, stdin if index else None)
-            errors.append(result.err)
-            scope = max(scope, result.scope)
-            stdin = result.out
-        return _Result(result.out, "".join(errors), result.status, scope)
+    def _fallback(self, pipeline: list[_Simple]) -> _Result:
+        """What a list part this shell cannot evaluate prints, as ``unhandled`` does for a
+        whole line: the tool's own error, a builtin's literal output, nothing for a known
+        command, ``command not found`` for an unknown one. The stage that could not be
+        evaluated and every stage after it answer so, each through its own redirections like
+        any other output (bash starts every stage); what the stages before it wrote to
+        stderr stays."""
+        last = len(pipeline) - 1
+        while True:
+            failed, self.failed = self.failed, None
+            k, fds, before = self.stage, self.stage_fds, "".join(self.stage_errs)
+            out, errs, late, status, scope = "", [before], "", 0, STATE
+            exact = False                   # stage k's stdout is known: the next stage may run
+            for index in range(k, last + 1):
+                cmd = pipeline[index]
+                if index == k and fds is not None:
+                    opened = (fds, None, FIXED)
+                else:                       # not opened yet, or opening them was what failed
+                    opened = self._redirect(cmd, None, lenient=True)
+                if isinstance(opened, _Result):     # a redirection failed: it never ran
+                    routed, exact = opened, True
+                else:
+                    text = self._fallback_text(cmd, failed if index == k else None)
+                    routed, exact = self._route(opened[0], text, opened[2]), text.exact
+                errs.append(routed.err)
+                if index < last:
+                    errs.append(routed.late)    # its stdout went into the next stage
+                else:
+                    out, late, status = routed.out, routed.late, routed.status
+                scope = max(scope, routed.scope)
+                if index < last and exact:
+                    break
+            if not (index < last and exact):
+                return _Result(out, "".join(errs), status, scope, late)
+            # Literal output, or none at all (``command not found``): what follows reads it.
+            try:
+                # after the stage that just completed, so nothing before it runs twice
+                rest = self._pipeline(pipeline, index + 1, routed.out, "".join(errs))
+            except _OverBudget:
+                raise
+            except _Unsupported:
+                continue                    # a later stage: answered the same way
+            rest.scope = max(rest.scope, scope)
+            return rest
+
+    def _fallback_text(self, cmd: _Simple, failed: Optional[list[str]]) -> _Result:
+        """What the command that could not be evaluated prints, before its redirections."""
+        argv = cmd.argv
+        if not argv or cmd.loop is not None:
+            return _Result(scope=STATE)
+        name, words = self.resolve(argv[0]), argv
+        if name == "busybox" and len(argv) > 1 and argv[1] in ("echo", "printf") \
+                and self.installed("busybox"):
+            name, words = argv[1], argv[1:]
+        if name in ("echo", "printf"):
+            text = literal_output(shlex.join([name] + words[1:]))
+            return _Result(text or "", scope=STATE, exact=text is not None)
+        if failed is not None:
+            failed_name = self.resolve(failed[0])
+            if failed_name is not None and self.installed(failed_name):
+                text = _tool_error(self, failed_name, failed[1:])
+                return _Result(err=text, status=1 if text else 0, scope=STATE)
+        if name is None or self.installed(name) or name in SHELL_BUILTINS \
+                or name in SHELL_KEYWORDS:
+            return _Result(scope=STATE)
+        word = clean_word(argv[0])
+        return _Result(err=f"{self.prefix}: {word}: command not found\n", status=127,
+                       scope=STATE, exact=True)
+
+    def _pipeline(self, pipeline: list[_Simple], start: int = 0, stdin: Optional[str] = None,
+                  errs: str = "") -> _Result:
+        """Run the stages from ``start`` on, the first reading ``stdin`` (``_fallback`` resumes
+        a pipeline after a stage it answered) after ``errs`` already written to stderr."""
+        self.stage_errs = [errs]            # read by _fallback when a stage is unsupported
+        errors, scope, result = self.stage_errs, FIXED, _Result()
+        # Each stage of a real pipeline is a subshell: a ``cd`` in one moves nobody.
+        cwd = self.cwd if len(pipeline) > 1 else None
+        try:
+            for index in range(start, len(pipeline)):
+                cmd = pipeline[index]
+                self.stage, self.stage_fds = index, None
+                if cwd is not None:
+                    self.cwd = cwd
+                result = self._simple(cmd, stdin if index else None, index < len(pipeline) - 1)
+                errors.append(result.err)
+                if index < len(pipeline) - 1:
+                    errors.append(result.late)
+                scope = max(scope, result.scope)
+                stdin = result.out
+        finally:
+            if cwd is not None:
+                self.cwd = cwd
+        return _Result(result.out, "".join(errors), result.status, scope, result.late)
+
+    def _simple(self, cmd: _Simple, stdin: Optional[str], piped: bool = False) -> _Result:
+        """One command with its redirections, applied in order as bash applies them."""
+        self.exe = "bash"                   # the shell opens the redirections
+        opened = self._redirect(cmd, stdin)
+        if isinstance(opened, _Result):
+            return opened
+        fds, stdin, scope = opened
+        self.stage_fds = fds
+        self.raw = fds[1][0] == "file" or (piped and fds[1][0] == "out")
+        try:
+            if cmd.loop is not None:
+                result = _read_loop(self, cmd.loop[0], stdin)
+            elif not cmd.argv:
+                result = _Result()
+            else:
+                result = self._command(cmd.argv, stdin)
+        finally:
+            self.raw = False
+        return self._route(fds, result, scope)
+
+    def _redirect(self, cmd: _Simple, stdin: Optional[str], lenient: bool = False):
+        """Open ``cmd``'s redirections in order: (fds, stdin, scope), or the result of one
+        that fails, its message written where fd 2 points by then (``2>/dev/null </x`` is
+        silent). ``lenient`` (``_fallback``) skips a redirection this shell cannot open, and
+        discards output that would go there, instead of raising ``_Unsupported``."""
+        fds: dict[int, tuple] = {1: ("out",), 2: ("err",)}
+        scope = FIXED
+        for op, fd, target in cmd.redirs:
+            self.charge(COMMAND)
+            try:
+                if op == "<":
+                    if fd != 0:
+                        raise _Unsupported
+                    read = self.read_file(target)
+                    if read is None:
+                        raise _Unsupported
+                    if read.err:
+                        shown = _shown(target)
+                        scope = max(scope, SESSION)
+                        return self._route(fds, _Result(
+                            err=f"{self.prefix}: {shown}: No such file or directory\n",
+                            status=1, scope=scope), scope)
+                    self.charge(len(read.out))
+                    stdin, scope = read.out, max(scope, read.scope)
+                elif op == ">&":
+                    if fd not in (1, 2):
+                        raise _Unsupported
+                    fds[fd] = fds[int(target)]
+                else:
+                    if fd not in (1, 2):
+                        raise _Unsupported
+                    dest = self._open_write(target, append=op == ">>")
+                    if isinstance(dest, _Result):
+                        # an earlier one may have made a file
+                        return self._route(fds, dest, max(dest.scope, scope))
+                    fds[fd] = dest
+                    scope = max(scope, STATE if dest[0] == "file" else FIXED)
+            except _OverBudget:
+                raise
+            except _Unsupported:
+                if not lenient:
+                    raise
+                if op != "<" and fd in (1, 2):
+                    fds[fd] = ("null",)
+        return fds, stdin, scope
+
+    def _route(self, fds: dict[int, tuple], result: _Result, scope: int) -> _Result:
+        """``result`` sent where its descriptors point: to a session file (within the session
+        limits), nowhere, or back as the reply's output or error."""
+        routed = {"out": "", "err": "", "late": ""}
+        # in the order a command writes them (``run`` shows err, out, late): ``2>&1`` and
+        # ``>f 2>&1`` keep that order
+        for text, fd, stream in ((result.err, 2, "err"), (result.out, 1, "out"),
+                                 (result.late, 2, "late")):
+            dest = fds[fd]
+            if dest[0] == "file":
+                self._append(dest[1], text)
+            elif dest[0] == "out":
+                routed["out"] += text
+            elif dest[0] == "err":
+                routed["late" if stream == "late" else "err"] += text
+        return _Result(routed["out"], routed["err"], result.status,
+                       max(result.scope, scope), routed["late"])
+
+    # -- session files --
+
+    def path(self, word: str) -> str:
+        return posixpath.normpath(posixpath.join(self.cwd, word))
+
+    def directory(self, path: str) -> bool:
+        """True for a directory this shell knows (the host's or one the session made)."""
+        return path in self.session.dirs or path in _dirs(self) or path in _SYSTEM_DIRS
+
+    def scratch_entries(self, path: str) -> list[str]:
+        """Names of what the session made directly inside ``path``."""
+        out = [p for p in list(self.session.files) + list(self.session.dirs)
+               if posixpath.dirname(p) == path]
+        return [posixpath.basename(p) for p in out]
+
+    def writable(self, path: str) -> Optional[str]:
+        """Why a new entry at ``path`` cannot be made (an error tail), or None when it can.
+        Raises ``_Unsupported`` for a path whose parent this shell does not know."""
+        parent = posixpath.dirname(path)
+        if parent in self.session.removed and parent not in self.session.dirs:
+            return "No such file or directory"
+        if _below_file(self, path):
+            return "Not a directory"
+        if not self.directory(parent) and _absent(self, parent):
+            return "No such file or directory"
+        if parent in ("/bin", "/sbin", "/usr/bin", "/usr/sbin"):
+            # /bin and /sbin are /usr/bin and /usr/sbin under another name: a file made in
+            # one would be missing from the other's listing. Left to the model.
+            raise _Unsupported
+        if (parent not in _dirs(self) and parent not in self.session.dirs) or path in _FILES \
+                or self.program(path) or path in {posixpath.normpath(p) for p in self.host.lures}:
+            raise _Unsupported               # a host file, or a directory we cannot list
+        if _denied(self, path) or (self.user != "root" and parent not in _OPEN_DIRS
+                                   and parent != self.home
+                                   and not parent.startswith(self.home + "/")
+                                   and not any(parent == d or parent.startswith(d + "/")
+                                               for d in _OPEN_DIRS)):
+            return "Permission denied"
+        return None
+
+    def _open_write(self, target: str, append: bool):
+        """The destination of ``>``/``>>``: ("null",), ("file", path) or an error result."""
+        path = self.path(target)
+        shown = _shown(target)
+        if path == "/dev/null":
+            return ("null",)
+        existing = self.session.files.get(path)
+        if existing is None:
+            if self.directory(path):
+                return _Result(err=f"{self.prefix}: {shown}: Is a directory\n", status=1,
+                               scope=SESSION)
+            reason = self.writable(path)
+            if reason is not None:
+                return _Result(err=f"{self.prefix}: {shown}: {reason}\n", status=1,
+                               scope=SESSION)
+            self.store(path, _Scratch(mtime=self._now))
+        elif not append:
+            existing.data, existing.program, existing.mtime = "", None, self._now
+            self.session.version += 1
+        return ("file", path)
+
+    def store(self, path: str, entry: Optional[_Scratch]) -> None:
+        """Create or replace a session file (``entry``) or directory (None)."""
+        s = self.session
+        if path not in s.files and path not in s.dirs \
+                and len(s.files) + len(s.dirs) >= MAX_SCRATCH:
+            raise _OverBudget
+        if entry is None:
+            s.removed.discard(path)
+            s.dirs[path] = self._now
+            s.version += 1
+            return
+        if s.size() - len(s.files[path].data if path in s.files else "") \
+                + len(entry.data) > MAX_SCRATCH_BYTES:
+            raise _OverBudget
+        self.charge(len(entry.data) + STEP)
+        s.removed.discard(path)
+        s.files[path] = entry
+        s.version += 1
+
+    def _append(self, path: str, text: str) -> None:
+        entry = self.session.files.get(path)
+        if not text or entry is None:
+            return                          # removed while open: bash writes to the unlinked file
+        if self.session.size() + len(text) > MAX_SCRATCH_BYTES:
+            raise _OverBudget
+        self.charge(len(text))
+        entry.data += text
+        entry.program, entry.mtime = None, self._now
+        self.session.version += 1
+
+    def remove(self, path: str) -> None:
+        s = self.session
+        s.files.pop(path, None)
+        s.dirs.pop(path, None)
+        s.modes.pop(path, None)
+        if len(s.removed) >= MAX_SCRATCH:
+            s.removed.pop()
+        s.removed.add(path)
+        s.version += 1
+
+    def elf(self, program: str) -> str:
+        """The start of a program file on this host (``agents.elfimage``)."""
+        key = ("elf", program)
+        if key not in self.memo:
+            from agents import elfimage
+
+            self.charge(elfimage.SIZE * STEP)
+            self.memo[key] = binary_text(elfimage.image(self.host.machine,
+                                                        self.host.rng("elf", program)))
+        return self.memo[key]
+
+    def program(self, path: str) -> Optional[str]:
+        if "bin_dirs" not in self.memo:
+            self.charge(COMMAND)
+            self.memo["bin_dirs"] = self.host.bin_sets()
+        directory, name = posixpath.split(path)
+        directory = {"/bin": "/usr/bin", "/sbin": "/usr/sbin"}.get(directory, directory)
+        return name if name in self.memo["bin_dirs"].get(directory, ()) else None
 
     def resolve(self, word: str) -> Optional[str]:
         """The command a word runs: its name, or None for a path outside the bin dirs."""
@@ -661,26 +1188,35 @@ class Shell:
         directory, name = posixpath.split(posixpath.normpath(word))
         return name if directory in BIN_DIRS else None
 
+    def bins(self) -> dict[str, str]:
+        """``Host.bins``, built once per line."""
+        if "bins" not in self.memo:
+            self.charge(len(_BINARIES) * STEP)
+            self.memo["bins"] = self.host.bins()
+        return self.memo["bins"]
+
     def installed(self, name: str) -> bool:
         if name == "nvidia-smi":
             return bool(self.host.hardware.gpu)
         if name == "busybox":
             return self.host.busybox is not None
-        return name in self.host.bins() or name in _COMMANDS
+        return name in self.bins() or name in _COMMANDS \
+            or self.program("/usr/bin/" + name) is not None \
+            or self.program("/usr/sbin/" + name) is not None
 
     def _command(self, argv: list[str], stdin: Optional[str]) -> _Result:
         self.stage_out = 0
         self.charge(COMMAND + STEP * len(argv))
         word = argv[0]
         name = self.resolve(word)
-        if name is None:
-            raise _Unsupported
+        if name is None or ("/" in word and self.path(word) in self.session.files):
+            return self._execute(word, argv[1:], stdin)
         if not self.installed(name):
             # a download can put a program there, so these hold only until the model answers
             if "/" in word:
                 return _Result(err=f"{self.prefix}: {word}: No such file or directory\n",
                                status=127, scope=SESSION)
-            if name in ("nvidia-smi", "busybox"):
+            if name in ("nvidia-smi", "busybox") or name in NOT_COMMANDS:
                 return _Result(err=f"{self.prefix}: {word}: command not found\n", status=127,
                                scope=SESSION)
         entry = _COMMANDS.get(name)
@@ -689,22 +1225,75 @@ class Shell:
             raise _Unsupported
         handler, scope = entry
         self.argv0 = name
+        self.exe = "bash" if name in SHELL_BUILTINS or name == "kill" else name
         result = handler(self, argv[1:], stdin)
         if result is None:
             self.failed = argv
             raise _Unsupported
-        produced = len(result.out) + len(result.err)
+        produced = len(result.out) + len(result.err) + len(result.late)
         if produced > MAX_STAGE_OUTPUT:
             raise _OverBudget
         self.charge(max(0, produced - self.stage_out))   # what grow() has not charged yet
         result.scope = max(result.scope, scope)
         return result
 
+    def _execute(self, word: str, args: list[str], stdin: Optional[str] = None) -> _Result:
+        """``./x``: a file the session wrote. Nothing is ever run: an empty file is an empty
+        script, a copy of a program answers as that program, an ELF for another machine is
+        refused as the kernel refuses it. Anything else (a script, a program for this
+        machine) is unsupported."""
+        path = self.path(word)
+        entry = self.session.files.get(path)
+        if entry is None:
+            if path in self.session.dirs:
+                return _Result(err=f"{self.prefix}: {word}: Is a directory\n", status=126,
+                               scope=STATE)
+            if _below_file(self, path):
+                return _Result(err=f"{self.prefix}: {word}: Not a directory\n", status=126,
+                               scope=STATE)
+            if path in self.session.removed or _absent(self, path):
+                return _Result(err=f"{self.prefix}: {word}: No such file or directory\n",
+                               status=127, scope=STATE)
+            raise _Unsupported
+        if not entry.mode & (0o111 if self.user == "root" else 0o100):   # the session owns it
+            return _Result(err=f"{self.prefix}: {word}: Permission denied\n", status=126,
+                           scope=STATE)
+        if entry.program is not None and entry.data == self.elf(entry.program):
+            result = self._command([entry.program] + args, stdin)
+            result.scope = STATE
+            return result
+        if not entry.data:
+            return _Result(scope=STATE)
+        head = wire(entry.data[:64])
+        if head.startswith(b"\x7fELF") and len(head) >= 20:
+            order = "big" if head[5] == 2 else "little"
+            from agents import elfimage
+
+            if int.from_bytes(head[18:20], order) != elfimage.machine_field(self.host.machine):
+                return _Result(err=f"{self.prefix}: {word}: cannot execute binary file: "
+                                   "Exec format error\n", status=126, scope=STATE)
+        elif "\x00" not in entry.data.split("\n", 1)[0]:
+            raise _Unsupported               # a script: it would run its commands
+        else:
+            return _Result(err=f"{self.prefix}: {word}: cannot execute binary file: "
+                               "Exec format error\n", status=126, scope=STATE)
+        raise _Unsupported                   # a program for this machine: never run
+
     # -- helpers --
 
     def read_file(self, path: str) -> Optional[_Result]:
         """A virtual file's content, or an error result, or None when unknown."""
-        path = posixpath.normpath(posixpath.join(self.cwd, path))
+        path = self.path(path)
+        scratch = self.session.files.get(path)
+        if scratch is not None:
+            return _Result(scratch.data, scope=SESSION)
+        if path in self.session.removed:
+            return _Result(status=1, err=f"{{cmd}}: {path}: No such file or directory\n",
+                           scope=SESSION)
+        program = self.exe if path == "/proc/self/exe" else self.program(path)
+        if program is not None and path not in _FILES:
+            # A session could replace a program file, but no model can answer its bytes.
+            return _Result(self.elf(program), scope=FIXED)
         if path not in self._files:
             maker = _FILES.get(path)
             self._files[path] = maker(self) if maker is not None else None
@@ -714,37 +1303,48 @@ class Shell:
         if path in _ABSENT.get(self.host.family, ()):
             return _Result(status=1, err=f"{{cmd}}: {path}: No such file or directory\n",
                            scope=SESSION)
+        reason = "Is a directory" if self.directory(path) else \
+            "Not a directory" if _below_file(self, path) else \
+            "No such file or directory" if _absent(self, path) else None
+        if reason is not None:               # what the session's own listings say
+            return _Result(status=1, err=f"{{cmd}}: {path}: {reason}\n", scope=SESSION)
         return None
 
     def unhandled(self, line: str) -> str:
         """The reply to a line ``run`` could not evaluate: the failing tool's own error for an
         option or file it does not know, nothing when a known command was used in a way this
         shell cannot reproduce, and ``command not found`` only for an unknown command."""
+        self.work = 0                       # bounded on its own; the line's budget may be spent
         if self.failed is not None:
             name = self.resolve(self.failed[0])
             if name is not None and self.installed(name):
                 return _tool_error(self, name, self.failed[1:])
         word = clean_word(line)
+        if not word:
+            return ""                        # ``>f ...``: bash never names an empty command
         name = self.resolve(word)
-        if name is None or self.installed(name) or name in SHELL_BUILTINS:
+        if name is None or self.installed(name) or name in SHELL_BUILTINS \
+                or name in SHELL_KEYWORDS:
             return ""
         return f"{self.prefix}: {word}: command not found\n"
 
 
 def answer(host: Host, line: str, *, user: str = "root", interactive: bool = True,
            cwd: Optional[str] = None, now: Optional[float] = None,
-           src_ip: Optional[str] = None) -> Optional[Answer]:
-    """The deterministic answer to one input line, or None when it needs a real shell."""
-    return _shell(host, user, interactive, cwd, now, src_ip).run(line.strip())
+           src_ip: Optional[str] = None, session: Optional[Session] = None) -> Optional[Answer]:
+    """The deterministic answer to one input line, or None when it needs a real shell.
+    ``session`` is the state earlier lines left; a line that changes state changes it."""
+    return _shell(host, user, interactive, cwd, now, src_ip, session).run(line.strip())
 
 
 def _shell(host: Host, user: str, interactive: bool, cwd: Optional[str], now: Optional[float],
-           src_ip: Optional[str]) -> Shell:
+           src_ip: Optional[str], session: Optional[Session] = None) -> Shell:
     import time
 
     user = "".join(c for c in (user or "root") if c.isprintable() and c not in ":/ ")[:32] \
         or "root"
-    return Shell(host, user, interactive, cwd, time.time() if now is None else now, src_ip)
+    return Shell(host, user, interactive, cwd, time.time() if now is None else now, src_ip,
+                 session)
 
 
 def persona_facts(host: Host) -> str:
@@ -773,20 +1373,69 @@ def not_found(host: Host, interactive: bool, word: str) -> str:
 
 def reply(host: Host, text: str, *, user: str = "root", interactive: bool = True,
           cwd: Optional[str] = None, now: Optional[float] = None,
-          src_ip: Optional[str] = None) -> str:
+          src_ip: Optional[str] = None, session: Optional[Session] = None) -> str:
     """The canned shell's full reply (no prompt, ``\\n`` endings): the deterministic answer,
-    a builtin's own output (or none), a known tool's own error (or nothing), otherwise
-    ``command not found``."""
+    a list answered part by part, a builtin's own output (or none), a known tool's own error
+    (or nothing), otherwise ``command not found``. ``session`` keeps the working directory
+    and the files the session wrote from one line to the next."""
     word = clean_word(text)
-    if not word:
+    if not word and not text.strip().startswith(">"):
         return ""
-    sh = _shell(host, user, interactive, cwd, now, src_ip)
-    result = sh.run(text.strip())
+    sh = _shell(host, user, interactive, cwd, now, src_ip, session)
+    result = sh.run(text.strip(), partial=True)
     if result is not None:
         return result.output
     if word in SHELL_BUILTINS:
         return literal_output(text) or ""
-    return sh.unhandled(text)
+    return sh.unhandled(text) if _stderr_shown(text) else ""
+
+
+_LOOSE_REDIR = re.compile(r"(?:(?<![^ \t])([0-9]))?(&>>?|>>|>&|>|<)[ \t]*([^ \t;|&<>]*)")
+
+
+def _stderr_shown(line: str) -> bool:
+    """Whether the first command of a line ``run`` could not parse still writes its stderr
+    to the terminal, read loosely from its redirections (``foo $X 2>/dev/null`` is silent).
+    Quotes are honoured; the command ends at an unquoted ``;``, ``|`` or ``&&``."""
+    masked, quote, i = [], None, 0
+    while i < len(line):
+        c = line[i]
+        if quote is not None:
+            masked.append("x" if c != quote else c)
+            quote = None if c == quote else quote
+        elif c in "'\"":
+            quote = c
+            masked.append(c)
+        elif c == "\\":
+            masked.append("xx")
+            i += 1
+        else:
+            masked.append(c)
+        i += 1
+    text = "".join(masked)[:len(line)]
+    end = re.search(r"&&|[;|]|&(?![>])(?<!>&)", text)
+    fds = {1: "out", 2: "err"}
+    for m in _LOOSE_REDIR.finditer(text, 0, end.start() if end else len(text)):
+        op = m.group(2)
+        fd = int(m.group(1)) if m.group(1) else (0 if op == "<" else 1)
+        target = line[m.start(3):m.end(3)].replace("'", "").replace('"', "")
+        if op.startswith("&>"):
+            fds[1] = fds[2] = "away"
+        elif op == ">&":
+            if fd in (1, 2) and target in ("1", "2"):
+                fds[fd] = fds[int(target)]
+            elif fd in (1, 2) and target == "-":
+                fds[fd] = "away"
+        elif op != "<" and fd in (1, 2):
+            fds[fd] = "away"
+    return fds[2] != "away"
+
+
+def prompt_path(cwd: Optional[str], home: str) -> str:
+    """The directory a bash prompt shows: ``~`` for home and below it, else the path."""
+    if not cwd or cwd == home:
+        return "~"
+    return "~" + cwd[len(home):] if cwd.startswith(home + "/") else cwd
 
 
 # ---- small formatting helpers ---------------------------------------------------------------
@@ -806,22 +1455,27 @@ def _count(value: str) -> Optional[int]:
     return int(value)
 
 
-def _columns(names: list[str], width: int = 80) -> str:
-    """``ls`` output on a terminal: names in columns, filled top to bottom."""
+def _columns(names: list[str], width: int = 80, charge: Callable[[int], None] = lambda n: None
+             ) -> str:
+    """``ls`` output on a terminal: names in columns, filled top to bottom. Every column is
+    at least 3 wide (a name and two spaces), so no more than ``(width + 2) // 3`` columns
+    can fit and the search is linear in the number of names. ``charge`` is told the work."""
     if not names:
         return ""
+    lengths = [len(n) for n in names]
     best = [names]
-    for cols in range(len(names), 0, -1):
+    for cols in range(min(len(names), (width + 2) // 3), 0, -1):
+        charge(len(names) + cols * STEP)
         rows = math.ceil(len(names) / cols)
-        grid = [names[c * rows:(c + 1) * rows] for c in range(cols)]
-        if not grid[-1]:
-            continue
-        widths = [max(map(len, col)) for col in grid]
-        if sum(widths) + 2 * (len(grid) - 1) <= width:
-            best = grid
+        if (cols - 1) * rows >= len(names):
+            continue                         # the last column would be empty
+        widths = [max(lengths[c * rows:(c + 1) * rows]) for c in range(cols)]
+        if sum(widths) + 2 * (cols - 1) <= width:
+            best = [names[c * rows:(c + 1) * rows] for c in range(cols)]
             break
     rows = len(best[0])
     widths = [max(map(len, col)) + 2 for col in best]
+    charge(len(names) * STEP)
     out = []
     for r in range(rows):
         cells = [(col[r], w) for col, w in zip(best, widths) if r < len(col)]
@@ -1677,9 +2331,12 @@ def _files(sh: Shell, args: list[str], command: str) -> Optional[tuple]:
         sh.charge(len(result.out) + STEP)
         scope = max(scope, result.scope)
         if result.err:
-            errors += result.err.replace("{cmd}", command).replace(
-                posixpath.normpath(posixpath.join(sh.cwd, name)), name)
+            reason = result.err.rsplit(": ", 1)[1].strip()
+            if reason == "Is a directory" and command != "cat":
+                return None                  # head, wc and the rest word it their own way
+            errors += _missing(sh, command, _shown(name), reason)
             status = result.status
+            out.append((name, None))         # where the error falls among the outputs
             continue
         out.append((name, result.out))
     return out, errors, status, scope
@@ -1695,9 +2352,15 @@ def _cat(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     if read is None:
         return None
     files, errors, status, scope = read
+    order = "".join("e" if text is None else "o" for _, text in files if text != "")
+    if "oe" in order and "eo" in order:
+        return None                          # errors between outputs: not modelled
     for _, text in files:
-        sh.grow(len(text))
-    return _Result("".join(text for _, text in files), errors, status, scope)
+        sh.grow(len(text or ""))
+    out = "".join(text or "" for _, text in files)
+    if "oe" in order:                        # the errors follow the output on a terminal
+        return _Result(out, "", status, scope, late=errors)
+    return _Result(out, errors, status, scope)
 
 
 # ---- filters ----------------------------------------------------------------------------------
@@ -1709,7 +2372,11 @@ def _input(sh: Shell, files: list[str], stdin: Optional[str], command: str):
             return None                      # would wait on the terminal
         sh.charge(len(stdin))
         return [("", stdin)], "", 0, FIXED
-    return _files(sh, files, command)
+    read = _files(sh, files, command)
+    if read is None:
+        return None
+    texts, errors, status, scope = read
+    return [(n, t) for n, t in texts if t is not None], errors, status, scope
 
 
 class _Pattern:
@@ -2022,7 +2689,7 @@ def _wc(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     def counts(text: str) -> dict[str, int]:
         sh.charge(4 * len(text))
         return {"l": text.count("\n"), "w": len(text.split()), "m": len(text),
-                "c": len(text.encode("utf-8"))}
+                "c": len(wire(text))}
 
     rows = [(name, counts(text)) for name, text in texts]
     if not rows:                                    # every operand was unreadable
@@ -2134,15 +2801,96 @@ def _awk(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
 def _sh(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     """A shell fed nothing (a failed download piped into it) prints nothing; ``sh`` typed
     as a botnet opener starts a subshell that looks the same."""
-    if args or stdin:
+    if stdin or len(args) > 1 or args[:1] and args[0].startswith("-"):
         return None
+    if args:                            # a script a loader fetched: only a missing one
+        path = sh.path(args[0])
+        entry = sh.session.files.get(path)
+        if entry is not None and not entry.data:
+            return _Result(scope=STATE)
+        if entry is not None or not (path in sh.session.removed or _exists(sh, path) is False):
+            return None
+        shown = _shown(args[0])
+        if sh.busybox:                  # busybox ash, 1.30 to 1.36 alike
+            return _Result(err=f"sh: can't open '{shown}': No such file or directory\n",
+                           status=2, scope=STATE)
+        if sh.host.family == "rhel" or sh.argv0 == "bash":
+            return _Result(err=f"{sh.argv0}: {shown}: No such file or directory\n", status=127,
+                           scope=STATE)
+        return _Result(err=f"sh: 0: cannot open {shown}: No such file\n", status=2, scope=STATE)
     return _Result(scope=SESSION)
 
 
 # ---- builtins and navigation (session state) --------------------------------------------------
 
 def _dirs(sh: Shell) -> dict[str, list[str]]:
-    """Directories ``ls`` and ``cd`` know, with their visible entries."""
+    """Directories ``ls`` and ``cd`` know, with their visible entries: the host's, with what
+    the session made or removed."""
+    if "dirs" not in sh.memo:
+        sh.charge(2000 * STEP)               # the host's tables, bin lists included
+        sh.memo["dirs"] = _host_dirs(sh)
+    base = sh.memo["dirs"]
+    s = sh.session
+    if not (s.dirs or s.files or s.removed):
+        return base
+    key = ("dirs", s.version)
+    if key in sh.memo:
+        return sh.memo[key]
+    out = dict(base)
+    touched: dict[str, set] = {}
+
+    def names(path: str) -> set:
+        if path not in touched:
+            touched[path] = set(out.get(path, ()))
+            sh.charge(len(touched[path]) * STEP)
+        return touched[path]
+
+    for path in s.dirs:
+        names(path)
+    for path in list(s.dirs) + list(s.files):
+        names(posixpath.dirname(path)).add(posixpath.basename(path))
+    for path in s.removed:
+        # A removed entry leaves its parent's listing only while the parent still exists: a
+        # file removed with its directory must not bring the directory back.
+        parent, name = posixpath.split(path)
+        if parent in touched or parent in out:
+            names(parent).discard(name)
+    for path, entries in touched.items():
+        sh.charge(sum(map(len, entries)) * STEP)     # collation reads every character
+        out[path] = sorted(entries, key=_collate)
+    sh.charge(len(s.dirs) + len(s.files) + len(s.removed) * STEP)
+    sh.memo[key] = out
+    return out
+
+
+_ALNUM = "".join(chr(c) for c in range(128) if chr(c).isalnum())
+_PUNCT = "".join(chr(c) for c in range(128) if not chr(c).isalnum())
+_DROP_PUNCT = str.maketrans("", "", _PUNCT)
+_MARK_ALNUM = str.maketrans({c: "\U0010ffff" for c in _ALNUM})
+
+
+def _collate(name: str) -> tuple:
+    """``ls`` order in a glibc en_US.UTF-8 locale: letters and digits ignoring case first,
+    then lower case before upper, then punctuation (``.h`` before ``h``, ``-`` before
+    ``.``). String operations only: the host's tables sort a few thousand names a line.
+    Only short ASCII names are remembered: the host's own are all of that kind, and a name a
+    session made must not be able to fill a process-wide cache."""
+    if len(name) <= _COLLATE_CACHED and name.isascii():
+        return _collate_cached(name)
+    plain = name.translate(_DROP_PUNCT)
+    return plain.lower(), plain.swapcase(), name.translate(_MARK_ALNUM)
+
+
+_COLLATE_CACHED = 64
+
+
+@functools.lru_cache(maxsize=8192)
+def _collate_cached(name: str) -> tuple:
+    plain = name.translate(_DROP_PUNCT)
+    return plain.lower(), plain.swapcase(), name.translate(_MARK_ALNUM)
+
+
+def _host_dirs(sh: Shell) -> dict[str, list[str]]:
     h = sh.host
     root = {"ubuntu": "bin boot dev etc home lib lib64 lost+found media mnt opt proc root run "
                       "sbin snap srv sys tmp usr var",
@@ -2174,7 +2922,18 @@ def _dirs(sh: Shell) -> dict[str, list[str]]:
                 out[parent].append(name)
             if depth < len(parts) - 1:
                 out.setdefault("/" + "/".join(parts[:depth + 1]), [])
-    return {k: sorted(v, key=lambda s: s.lower().lstrip("._")) for k, v in out.items()}
+    ordered = {}                             # sorted once per kind of host
+    for directory, names in h.bin_dirs().items():
+        ordered[directory] = list(names)
+        ordered[directory.replace("/usr", "", 1)] = list(names)  # /bin and /sbin point there
+    out["/usr/local/bin"], out["/usr/local/sbin"] = [], []
+    return {**{k: sorted(v, key=_collate) for k, v in out.items() if k not in ordered},
+            **ordered}
+
+
+# Directories cd accepts whose contents ls does not list.
+_SYSTEM_DIRS = frozenset(("/etc", "/usr", "/var", "/proc", "/dev", "/run", "/var/run", "/sys",
+                          "/boot", "/usr/lib", "/usr/share", "/var/log", "/var/lib"))
 
 
 def _denied(sh: Shell, path: str) -> bool:
@@ -2183,32 +2942,168 @@ def _denied(sh: Shell, path: str) -> bool:
 
 @_command("ls", scope=SESSION)
 def _ls(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
-    one = False
-    paths = []
+    flags, operands = set(), []
     for arg in args:
-        if arg == "-1":
-            one = True
+        if arg.startswith("-") and len(arg) > 1 and not arg.startswith("--"):
+            flags |= set(arg[1:])
         elif arg.startswith("-"):
             return None
         else:
-            paths.append(posixpath.normpath(posixpath.join(sh.cwd, arg)))
+            operands.append(arg)
+    if flags - set("1alA") or {"a", "A"} <= flags or len(operands) > MAX_FILES:
+        return None
     dirs = _dirs(sh)
-    paths = paths or [sh.cwd]
-    out, err, status = [], "", 0
-    for index, path in enumerate(paths):
+    operands = operands or ["."]
+    files, out, err, status = [], [], "", 0
+    for word in operands:              # file operands are listed first, as typed
+        path = sh.path(word)
+        if path not in dirs and not _denied(sh, path):
+            if path not in sh.session.files:
+                reason = "Not a directory" if _below_file(sh, path) else \
+                    "No such file or directory" if _absent(sh, path) else None
+                if reason is None:
+                    return None
+                err += _missing(sh, "ls", _shown(word), reason)
+                status = 1 if sh.busybox else 2
+                continue
+            files.append((word, path))
+    if files:
+        if "l" in flags:
+            rows = [(word, _meta(sh, path)) for word, path in files]
+            out.append(_long(sh, rows))
+        else:
+            names = [word for word, _ in files]
+            out.append("\n".join(names) + "\n" if "1" in flags or not sh.interactive
+                       else _columns(names, charge=sh.charge))
+    listed = [w for w in operands if sh.path(w) in dirs or _denied(sh, sh.path(w))]
+    for index, word in enumerate(listed):
+        path = sh.path(word)
         if _denied(sh, path):
             err += f"ls: cannot open directory '{path}': Permission denied\n"
             status = 2
             continue
-        if path not in dirs:
+        listing = _listing(sh, path, dirs, flags)
+        if listing is None:
             return None
-        names = dirs[path]
-        listing = "\n".join(names) + "\n" if (one or not sh.interactive) and names else \
-            _columns(names)
-        if len(paths) > 1:
-            listing = ("\n" if index else "") + f"{path}:\n" + listing
+        sh.grow(len(listing))
+        if len(operands) > 1:
+            listing = ("\n" if index or files else "") + f"{word}:\n" + listing
         out.append(listing)
     return _Result("".join(out), err, status)
+
+
+def _listing(sh: Shell, path: str, dirs: dict, flags: set) -> Optional[str]:
+    """One directory as ``ls`` prints it, or None where this shell cannot. Built once per
+    line and session state: a line may name /usr/bin many times."""
+    key = ("ls", path, sh.session.version, "".join(sorted(flags)))
+    if key not in sh.memo:
+        sh.memo[key] = _list_dir(sh, path, dirs, flags)
+    return sh.memo[key]
+
+
+def _list_dir(sh: Shell, path: str, dirs: dict, flags: set) -> Optional[str]:
+    names = list(dirs[path])
+    sh.charge(len(names) * STEP)
+    if "a" in flags or "A" in flags:
+        if path not in _HIDDEN and path not in sh.session.dirs:
+            return None                  # dot files this shell does not know
+        names = ([".", ".."] if "a" in flags else []) + sorted(
+            names + _HIDDEN.get(path, []), key=_collate)
+    else:                                # a dot file the session made stays out of sight
+        names = [n for n in names if not n.startswith(".")]
+    if sh.busybox:                       # busybox ls sorts bytes, as in the C locale
+        names = sorted(names, key=lambda n: (n not in (".", ".."), n))
+    if "l" in flags:
+        rows = []
+        for name in names:
+            target = path if name == "." else posixpath.dirname(path) if name == ".." \
+                else posixpath.join(path, name)
+            meta = _meta(sh, target)
+            if meta is None:
+                return None
+            rows.append((name, meta))
+        blocks = sum(4 if m[0].startswith("d") else -(-m[3] // 4096) * 4 for _, m in rows)
+        return f"total {blocks}\n" + _long(sh, rows)
+    if ("1" in flags or not sh.interactive) and names:
+        return "\n".join(names) + "\n"
+    return _columns(names, charge=sh.charge)
+
+
+_PRIVATE_DIRS = ("systemd-private-", "snap-private-tmp")
+# Dot entries of the directories ``ls -a`` may list (systemd makes the X11 ones in /tmp).
+_X11 = [".font-unix", ".ICE-unix", ".Test-unix", ".X11-unix", ".XIM-unix"]
+_HIDDEN = {"/tmp": _X11, "/var/tmp": [], "/dev/shm": [], "/mnt": [], "/media": [],
+           "/opt": [], "/srv": []}
+
+
+def _meta(sh: Shell, path: str) -> Optional[tuple]:
+    """(mode, links, owner, size, mtime) for ``ls -l``, or None where this shell does not
+    know the entry well enough to show it: only directories and the session's own files.
+    Charged, and kept for the line while the session's entries stay the same."""
+    key = ("meta", path, sh.session.version)
+    if key not in sh.memo:
+        s = sh.session
+        sh.charge(COMMAND // 4 + (len(s.files) + len(s.dirs)) * STEP
+                  + len(s.files[path].data if path in s.files else ""))
+        sh.memo[key] = _stat(sh, path)
+    return sh.memo[key]
+
+
+def _stat(sh: Shell, path: str) -> Optional[tuple]:
+    entry = sh.session.files.get(path)
+    boot = sh.host.boot_time(sh.now)
+    if entry is not None:
+        return (_mode_string(entry.mode, "-"), 1, sh.user, len(wire(entry.data)), entry.mtime)
+    if path in sh.session.dirs:
+        sh.charge(len(sh.session.dirs) * STEP)
+        subdirs = sum(1 for d in sh.session.dirs if posixpath.dirname(d) == path)
+        return (_mode_string(sh.session.modes.get(path, 0o755), "d"), 2 + subdirs, sh.user, 4096,
+                sh.session.dirs[path])
+    if posixpath.basename(path).startswith(_PRIVATE_DIRS):
+        return ("drwx------", 3, "root", 4096, boot + 40)
+    if posixpath.basename(path) in _X11 and posixpath.dirname(path) == "/tmp":
+        return ("drwxrwxrwt", 2, "root", 4096, boot + 30)
+    dirs = _dirs(sh)
+    if path not in dirs and path not in _SYSTEM_DIRS:
+        return None
+    owner = next((u.name for u in sh.host.all_users(sh.user)
+                  if u.home == path and path.startswith("/home/")), "root")
+    mode = "drwxrwxrwt" if path in _OPEN_DIRS else \
+        "drwx------" if path == "/root" else \
+        "drwxr-x---" if path.startswith("/home/") and owner != "root" else "drwxr-xr-x"
+    sh.charge(len(dirs.get(path, ())) * STEP)
+    children = [n for n in list(dirs.get(path, ())) + _HIDDEN.get(path, [])
+                if posixpath.join(path, n) in dirs or n.startswith(_PRIVATE_DIRS) or n in _X11]
+    times = [f.mtime for p, f in sh.session.files.items() if posixpath.dirname(p) == path]
+    times += [t for p, t in sh.session.dirs.items() if posixpath.dirname(p) == path]
+    stamp = max([boot + (60 if path in _OPEN_DIRS else 0)] + times)
+    return (mode, 2 + len(children), owner, 4096, stamp)
+
+
+def _mode_string(mode: int, kind: str) -> str:
+    bits = "".join(c if mode & (1 << (8 - i)) else "-" for i, c in enumerate("rwxrwxrwx"))
+    return kind + bits
+
+
+def _long(sh: Shell, rows: list[tuple[str, tuple]]) -> str:
+    """``ls -l`` rows, each column as wide as its widest value, as GNU ls prints them."""
+    if not rows:
+        return ""
+    now = sh.now
+
+    def when(ts: float) -> str:
+        t = sh.host.local(ts)
+        return t.strftime("%b %e %H:%M") if abs(now - ts) < 15552000 else \
+            t.strftime("%b %e  %Y")
+
+    if sh.busybox:                           # busybox's fixed columns
+        return "".join(f"{m[0]} {m[1]:>4} {m[2]:<8} {m[2]:<8} {m[3]:>9} {when(m[4])} {name}\n"
+                       for name, m in rows)
+    links = max(len(str(m[1])) for _, m in rows)
+    owner = max(len(m[2]) for _, m in rows)
+    size = max(len(str(m[3])) for _, m in rows)
+    return "".join(f"{m[0]} {m[1]:>{links}} {m[2]:<{owner}} {m[2]:<{owner}} "
+                   f"{m[3]:>{size}} {when(m[4])} {name}\n" for name, m in rows)
 
 
 @_command("cd", scope=STATE)
@@ -2219,9 +3114,15 @@ def _cd(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         posixpath.normpath(posixpath.join(sh.cwd, args[0]))
     if _denied(sh, target):
         return _Result(err=f"{sh.prefix}: cd: {args[0]}: Permission denied\n", status=1)
-    if target not in _dirs(sh) and target not in ("/etc", "/usr", "/var", "/proc", "/dev",
-                                                   "/run", "/sys", "/boot"):
-        return None
+    if target not in _dirs(sh) and target not in _SYSTEM_DIRS:
+        if target in sh.session.files or _below_file(sh, target):
+            reason = "Not a directory"
+        elif target in sh.session.removed or (".." not in args[0].split("/")
+                                              and _absent(sh, target)):
+            reason = "No such file or directory"
+        else:
+            return None
+        return _Result(err=f"{sh.prefix}: cd: {args[0]}: {reason}\n", status=1)
     sh.cwd = target
     return _Result()
 
@@ -2275,11 +3176,11 @@ def _escapes(text: str) -> tuple[str, bool]:
                 out.append("\\x")
                 i += 2
             else:
-                out.append(chr(int(digits, 16)))
+                out.append(byte_char(int(digits, 16)))
                 i += 2 + len(digits)
         elif nxt == "0":
             digits = _leading(text[i + 2:i + 5], "01234567")
-            out.append(chr(int(digits or "0", 8)))
+            out.append(byte_char(int(digits or "0", 8) & 0xFF))
             i += 2 + len(digits)
         else:
             out.append("\\" + nxt)
@@ -2300,6 +3201,9 @@ def _echo(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         text, stopped = _escapes(text)
         newline = newline and not stopped
     text += "\n" if newline else ""
+    if sh.raw:          # into a file or a pipe: every byte, as written (a file's own
+        return _Result(text[:MAX_ECHO_OUTPUT])  # redirection makes the line STATE)
+    text = "".join(chr(ord(c) - 0xDC00) if 0xDC80 <= ord(c) <= 0xDCFF else c for c in text)
     return _Result("".join(c for c in text if c.isprintable() or c in "\n\t")[:MAX_ECHO_OUTPUT])
 
 
@@ -2309,7 +3213,7 @@ def _echo(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
 def _which(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     if not args or any(a.startswith("-") for a in args):
         return None
-    bins = sh.host.bins()
+    bins = sh.bins()
     found = [bins[a] for a in args if a in bins]
     return _Result("".join(p + "\n" for p in found), status=0 if len(found) == len(args) else 1)
 
@@ -2318,14 +3222,9 @@ def _which(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
 def _command_v(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     if len(args) < 2 or args[0] != "-v":
         return None
-    bins = sh.host.bins()
+    bins = sh.bins()
     out = [bins.get(a) or (a if a in SHELL_BUILTINS else None) for a in args[1:]]
     return _Result("".join(p + "\n" for p in out if p), status=0 if all(out) else 1)
-
-
-@_command(*OPENERS - {"sh", "bash", "enable"})
-def _opener(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
-    return None if args else _Result()
 
 
 # What bash's ``enable`` lists: every enabled builtin, in its table order.
@@ -2359,31 +3258,59 @@ _BUSYBOX_BANNER = ("BusyBox v{version} multi-call binary.\n"
                    "\tutilities into a single executable.  Most people will create a\n"
                    "\tlink to busybox for each function they wish to use and BusyBox\n"
                    "\twill act like whatever it was invoked as.\n")
+# Applets answered here; any other applet in the package's list is unsupported, and one not
+# in it is "applet not found" (``agents.busybox_text``).
 _APPLETS = frozenset(("cat", "echo", "uname", "id", "whoami", "hostname", "nproc", "free",
                       "df", "ps", "ls", "wget", "tftp", "head", "tail", "cut", "wc", "grep",
-                      "awk", "uptime", "sh", "true", "false", "pwd", "cd"))
+                      "awk", "uptime", "sh", "true", "false", "pwd", "cp", "mv", "rm", "mkdir",
+                      "touch", "chmod", "dd", "rmdir", "kill", "killall", "nc", "ftpget", "ftpput",
+                      "printf"))
+# Applets that print their usage when run without arguments (stderr, status 1).
+_USAGE_APPLETS = frozenset(("wget", "tftp", "cp", "chmod", "rm", "rmdir", "mkdir", "mv",
+                            "touch", "printf", "nc", "ftpget", "ftpput"))
+
+
+def _applet_usage(sh: Shell, applet: str) -> _Result:
+    from agents import busybox_text
+
+    text = busybox_text.USAGE[busybox_text.generation(sh.host.busybox or "")][applet]
+    return _Result(err=f"BusyBox v{sh.host.busybox} multi-call binary.\n\n{text}", status=1)
 
 
 @_command("busybox")
 def _busybox(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    from agents import busybox_text
+
     if sh.host.busybox is None:
         return None
     if not args:
         return _Result(_BUSYBOX_BANNER.format(version=sh.host.busybox))
+    applets = busybox_text.APPLETS[busybox_text.generation(sh.host.busybox)]
     applet = args[0]
-    if applet in _APPLETS:
-        entry = _COMMANDS.get(applet)
-        if entry is None:
-            return None
-        sh.argv0 = applet
-        result = entry[0](sh, args[1:], stdin)
-        if result is not None:
-            result.scope = max(result.scope, entry[1])
-        return result
+    if applet in ("--list", "-l") and len(args) == 1:
+        return _Result("".join(name + "\n" for name in sorted(applets)))
     if applet.startswith("-"):
         return None
-    name = "".join(c for c in applet if c.isprintable())[:64]
-    return _Result(err=f"{name}: applet not found\n", status=127)
+    if applet not in applets:
+        name = "".join(c for c in applet if c.isprintable())[:64]
+        return _Result(err=f"{name}: applet not found\n", status=127)
+    if applet not in _APPLETS:
+        return None
+    if applet in _USAGE_APPLETS and len(args) == 1:
+        return _applet_usage(sh, applet)
+    if applet in ("kill", "killall") and len(args) == 1:
+        return _Result(err=f"{applet}: you need to specify whom to kill\n", status=1)
+    entry = _COMMANDS.get(applet)
+    if entry is None or applet in ("killall", "ftpget", "ftpput"):
+        return None
+    sh.argv0, sh.exe, sh.busybox = applet, "busybox", True
+    try:
+        result = entry[0](sh, args[1:], stdin)
+    finally:
+        sh.busybox = False
+    if result is not None:
+        result.scope = max(result.scope, entry[1])
+    return result
 
 
 def _url(args: list[str], takes_value: set[str]) -> tuple[Optional[str], bool]:
@@ -2433,6 +3360,14 @@ def _wget(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         return _Result(err="wget: missing URL\nUsage: wget [OPTION]... [URL]...\n\n"
                            "Try `wget --help' for more options.\n", status=1)
     shown, host, port = _target(url)
+    if sh.busybox:
+        if not host:
+            return _Result(err="wget: bad address ''\n", status=1)
+        if not _is_ip(host):
+            return _Result(err=f"wget: bad address '{host}'\n", status=1)
+        connecting = "" if quiet else f"Connecting to {host}:{port} ({host}:{port})\n"
+        return _Result(err=connecting + f"wget: can't connect to remote host ({host}): "
+                                        "Network is unreachable\n", status=1)
     if quiet:
         return _Result(status=4)
     stamp = sh.host.local(sh.now).strftime("%Y-%m-%d %H:%M:%S")
@@ -2472,6 +3407,679 @@ def _tftp(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result(err="Transfer timed out.\n\n", status=1) if args else None
 
 
+# ---- the commands IoT loaders use: session files, dd, usage errors ----------------------------
+
+def _try(name: str) -> str:
+    return f"Try '{name} --help' for more information.\n"
+
+
+def _shown(word: str) -> str:
+    return "".join(c for c in word if c.isprintable())[:256]
+
+
+def _split_flags(args: list[str], allowed: str) -> Optional[tuple[set, list[str]]]:
+    """(short flags, operands); None for a flag outside ``allowed`` or a long option.
+    Options may follow operands (``mkdir d -p``), as GNU and busybox getopt permute them."""
+    flags, operands = set(), []
+    for arg in args:
+        if arg.startswith("-") and len(arg) > 1:
+            if arg.startswith("--") or set(arg[1:]) - set(allowed):
+                return None                  # ``--`` too: operands that look like options
+            flags |= set(arg[1:])
+        else:
+            operands.append(arg)
+    return flags, operands
+
+
+def _exists(sh: Shell, path: str) -> Optional[bool]:
+    """Whether ``path`` exists, or None when this shell cannot tell."""
+    if path in sh.session.files or sh.directory(path) or sh.program(path) or path in _FILES:
+        return True
+    parent, name = posixpath.split(path)
+    dirs = _dirs(sh)
+    if parent in dirs:
+        # Host listings leave out dot files, except where ``_HIDDEN`` names them all; a
+        # directory the session made holds only what the session put there.
+        if not name.startswith(".") or parent in _HIDDEN or parent not in sh.memo["dirs"]:
+            return name in dirs[parent] or name in _HIDDEN.get(parent, ())
+        return None
+    # Below something that is not there (below a file the error is another one: None).
+    sh.charge(STEP + len(path))
+    if parent != path and path.count("/") <= 64 and parent not in sh.session.files \
+            and _exists(sh, parent) is False:
+        return False
+    return None
+
+
+def _absent(sh: Shell, path: str) -> bool:
+    """Whether ``path`` is missing by what the session itself made: its nearest existing
+    directory is one the session made (the host has no other entries there). A path in, or
+    below a missing name in, one of the host's own directories stays unknown here: commands
+    that read or run it are left to the model, as before."""
+    if _exists(sh, path) is not False:
+        return False
+    parent = posixpath.dirname(path)
+    for _ in range(64):
+        sh.charge(STEP + len(parent))
+        if parent == "/" or sh.directory(parent):
+            break
+        parent = posixpath.dirname(parent)
+    _dirs(sh)
+    return parent in sh.session.dirs and parent not in sh.memo["dirs"]
+
+
+def _source(sh: Shell, word: str) -> Optional[_Scratch]:
+    """What ``cp`` copies from ``word``; None when unknown, an empty-data marker when it
+    does not exist (``mode`` 0)."""
+    path = sh.path(word)
+    entry = sh.session.files.get(path)
+    if entry is not None:
+        return _Scratch(entry.data, entry.mode, program=entry.program)
+    program = sh.program(path)
+    if program is not None:
+        return _Scratch(sh.elf(program), 0o755, program=program)
+    if path in _FILES and sh.read_file(path) is not None and not sh.read_file(path).err:
+        return _Scratch(sh.read_file(path).out, 0o644)
+    if _exists(sh, path) is False or path in sh.session.removed:
+        return _Scratch(mode=0)
+    return None
+
+
+def _below_file(sh: Shell, path: str) -> bool:
+    """Whether a file the session wrote stands where a directory of ``path`` would be."""
+    parent = posixpath.dirname(path)
+    while parent != "/" and parent:
+        sh.charge(STEP + len(parent))
+        if parent in sh.session.files:
+            return True
+        parent = posixpath.dirname(parent)
+    return False
+
+
+def _dest_word(sh: Shell, source: str, target: str) -> str:
+    """The destination as GNU cp and mv name it in errors: the target, or the source's
+    name inside it when it is a directory."""
+    if not sh.directory(sh.path(target)):
+        return target
+    return target.rstrip("/") + "/" + posixpath.basename(source.rstrip("/"))
+
+
+def _same_file(sh: Shell, word: str, target: str) -> Optional[_Result]:
+    if sh.busybox:
+        return _Result()                     # busybox renames it onto itself, silently
+    return _Result(err=f"mv: '{_shown(word)}' and '{_shown(_dest_word(sh, word, target))}' "
+                       "are the same file\n", status=1)
+
+
+def _destination(sh: Shell, source: str, target: str) -> str:
+    path = sh.path(target)
+    return posixpath.join(path, posixpath.basename(sh.path(source))) if sh.directory(path) \
+        else path
+
+
+@_command("cp", scope=STATE)
+def _cp(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    split = _split_flags(args, "afprRdHLPu")
+    if split is None:
+        return None
+    flags, operands = split
+    if len(operands) < 2:
+        if sh.busybox:
+            return _applet_usage(sh, "cp")
+        if not operands:
+            return _Result(err="cp: missing file operand\n" + _try("cp"), status=1)
+        return _Result(err=f"cp: missing destination file operand after '{_shown(operands[0])}'"
+                           "\n" + _try("cp"), status=1)
+    *sources, target = operands
+    if len(sources) > 1 and not sh.directory(sh.path(target)):
+        return None
+    if sh.busybox and len(sources) == 1 and _below_file(sh, sh.path(sources[0])):
+        # busybox stats a lone source before the destination (a missing one is no error yet)
+        return _Result(err=f"cp: can't stat '{_shown(sources[0])}': Not a directory\n",
+                       status=1)
+    if _below_file(sh, sh.path(target)):
+        return _Result(err=f"cp: can't stat '{_shown(target)}': Not a directory\n"
+                       if sh.busybox else
+                       f"cp: failed to access '{_shown(target)}': Not a directory\n", status=1)
+    err, status = "", 0
+    if len(sources) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in sources:
+        if _below_file(sh, sh.path(word)):
+            err += f"cp: can't stat '{_shown(word)}': Not a directory\n" if sh.busybox else \
+                f"cp: cannot stat '{_shown(word)}': Not a directory\n"
+            status = 1
+            continue
+        if sh.directory(sh.path(word)) and not flags & set("rRa"):
+            err += f"cp: omitting directory '{_shown(word)}'\n" if sh.busybox else \
+                f"cp: -r not specified; omitting directory '{_shown(word)}'\n"
+            status = 1
+            continue
+        src = _source(sh, word)
+        if src is None:
+            return None
+        if src.mode != 0 and _destination(sh, word, target) == sh.path(word):
+            err += f"cp: '{_shown(word)}' and '{_shown(_dest_word(sh, word, target))}' " \
+                   "are the same file\n"
+            status = 1
+            continue
+        if src.mode == 0:
+            err += (f"cp: can't stat '{_shown(word)}': No such file or directory\n"
+                    if sh.busybox else
+                    f"cp: cannot stat '{_shown(word)}': No such file or directory\n")
+            status = 1
+            continue
+        dest = _destination(sh, word, target)
+        if sh.directory(dest):               # a directory of that name is already there
+            if sh.busybox:
+                return None
+            err += f"cp: cannot overwrite directory '{_shown(_dest_word(sh, word, target))}' " \
+                   "with non-directory\n"
+            status = 1
+            continue
+        reason = sh.writable(dest) if dest not in sh.session.files else None
+        if reason is not None:
+            err += f"cp: can't create '{_shown(target)}': {reason}\n" if sh.busybox else \
+                f"cp: cannot create regular file '{_shown(target)}': {reason}\n"
+            status = 1
+            continue
+        old = sh.session.files.get(dest)
+        sh.store(dest, _Scratch(src.data, old.mode if old else src.mode, sh._now, src.program))
+    return _Result(err=err, status=status)
+
+
+@_command("mv", scope=STATE)
+def _mv(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    split = _split_flags(args, "fin")
+    if split is None:
+        return None
+    flags, operands = split
+    if len(operands) != 2:
+        if sh.busybox and len(operands) < 2:
+            return _applet_usage(sh, "mv")
+        if not operands:
+            return _Result(err="mv: missing file operand\n" + _try("mv"), status=1)
+        if len(operands) == 1:
+            return _Result(err=f"mv: missing destination file operand after "
+                               f"'{_shown(operands[0])}'\n" + _try("mv"), status=1)
+        return None
+    word, target = operands
+    path = sh.path(word)
+    entry = sh.session.files.get(path)
+    if _below_file(sh, sh.path(target)):     # both look at the destination first
+        return _Result(err=f"mv: can't stat '{_shown(target)}': Not a directory\n"
+                       if sh.busybox else
+                       f"mv: failed to access '{_shown(target)}': Not a directory\n", status=1)
+    if _below_file(sh, path):
+        return _Result(err=f"mv: can't rename '{_shown(word)}': Not a directory\n"
+                       if sh.busybox else
+                       f"mv: cannot stat '{_shown(word)}': Not a directory\n", status=1)
+    if entry is None and path in sh.session.dirs:
+        return _mv_dir(sh, word, target, path)
+    if entry is None:
+        if _exists(sh, path) is False or path in sh.session.removed:
+            return _Result(err=f"mv: can't rename '{_shown(word)}': No such file or directory\n"
+                           if sh.busybox else
+                           f"mv: cannot stat '{_shown(word)}': No such file or directory\n",
+                           status=1)
+        return None
+    dest = _destination(sh, word, target)
+    if dest == path:
+        return _same_file(sh, word, target)
+    if sh.directory(dest):                   # a directory of that name is already there
+        if sh.busybox:
+            return None
+        return _Result(err=f"mv: cannot overwrite directory "
+                           f"'{_shown(_dest_word(sh, word, target))}' with non-directory\n",
+                       status=1)
+    if "n" in flags:                         # no-clobber: an existing file stays as it is
+        if dest in sh.session.files:
+            return _Result()
+        if _exists(sh, dest) is not False:
+            return None
+    reason = sh.writable(dest) if dest not in sh.session.files else None
+    if reason is not None:
+        return _Result(err=f"mv: can't rename '{_shown(word)}': {reason}\n" if sh.busybox
+                       else f"mv: cannot move '{_shown(word)}' to '{_shown(target)}': {reason}\n",
+                       status=1)
+    sh.remove(path)
+    sh.store(dest, entry)
+    return _Result()
+
+
+def _mv_dir(sh: Shell, word: str, target: str, path: str) -> Optional[_Result]:
+    """``mv`` of a directory the session made: it and everything in it move."""
+    dest = _destination(sh, word, target)
+    if dest == path:
+        return _same_file(sh, word, target)
+    if dest.startswith(path + "/"):
+        if sh.busybox:
+            return _Result(err=f"mv: can't rename '{_shown(word)}': Invalid argument\n",
+                           status=1)
+        return _Result(err=f"mv: cannot move '{_shown(word)}' to a subdirectory of itself, "
+                           f"'{_shown(_dest_word(sh, word, target))}'\n", status=1)
+    if dest in sh.session.files and sh.busybox:
+        return _Result(err=f"mv: can't rename '{_shown(word)}': Not a directory\n", status=1)
+    if dest in sh.session.files:
+        return _Result(err=f"mv: cannot overwrite non-directory "
+                           f"'{_shown(_dest_word(sh, word, target))}' with "
+                           f"directory '{_shown(word)}'\n", status=1)
+    if sh.directory(dest):
+        if dest not in sh.session.dirs or sh.scratch_entries(dest):
+            return None                      # bash would merge or refuse: not followed
+    reason = sh.writable(dest)
+    if reason is not None:
+        return _Result(err=f"mv: can't rename '{_shown(word)}': {reason}\n" if sh.busybox
+                       else f"mv: cannot move '{_shown(word)}' to '{_shown(target)}': {reason}\n",
+                       status=1)
+    s = sh.session
+    inner = sorted(p for p in list(s.files) + list(s.dirs) if p.startswith(path + "/"))
+    sh.charge((len(s.files) + len(s.dirs)) * STEP)
+    moved = [(p, s.files.get(p), s.modes.get(p)) for p in [path] + inner]
+    for p, _, _ in reversed(moved):
+        sh.remove(p)
+    if dest in s.dirs:
+        sh.remove(dest)
+    for p, entry, mode in moved:
+        sh.store(dest + p[len(path):], entry)
+        if mode is not None:
+            s.modes[dest + p[len(path):]] = mode
+    return _Result()
+
+
+@_command("rmdir", scope=STATE)
+def _rmdir(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    split = _split_flags(args, "")
+    if split is None:
+        return None
+    operands = split[1]
+    if not operands:
+        if sh.busybox:
+            return _applet_usage(sh, "rmdir")
+        return _Result(err="rmdir: missing operand\n" + _try("rmdir"), status=1)
+    err, status = "", 0
+    if len(operands) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in operands:
+        path = sh.path(word)
+        if path in sh.session.dirs:
+            reason = "Directory not empty" if sh.scratch_entries(path) else None
+        elif path in sh.session.files or _below_file(sh, path):
+            reason = "Not a directory"
+        elif path in sh.session.removed or _exists(sh, path) is False:
+            reason = "No such file or directory"
+        else:
+            return None                      # a directory of the host
+        if reason is None:
+            sh.remove(path)
+            continue
+        err += f"rmdir: '{_shown(word)}': {reason}\n" if sh.busybox else \
+            f"rmdir: failed to remove '{_shown(word)}': {reason}\n"
+        status = 1
+    return _Result(err=err, status=status)
+
+
+@_command("rm", scope=STATE)
+def _rm(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    split = _split_flags(args, "frRid")
+    if split is None:
+        return None
+    flags, operands = split
+    if not operands:
+        if "f" in flags:
+            return _Result()
+        if sh.busybox:
+            return _applet_usage(sh, "rm")
+        return _Result(err="rm: missing operand\n" + _try("rm"), status=1)
+    err, status = "", 0
+    if len(operands) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in operands:
+        path = sh.path(word)
+        shown = _shown(word)
+        if path in sh.session.files:
+            sh.remove(path)
+        elif path in sh.session.dirs:
+            if not flags & set("rR"):
+                err += f"rm: '{shown}' is a directory\n" if sh.busybox else \
+                    f"rm: cannot remove '{shown}': Is a directory\n"
+                status = 1
+                continue
+            for inner in [p for p in list(sh.session.files) + list(sh.session.dirs)
+                          if p.startswith(path + "/")]:
+                sh.remove(inner)
+            sh.remove(path)
+        elif _below_file(sh, path):
+            if sh.busybox:                   # even with -f
+                err += f"rm: can't stat '{shown}': Not a directory\n"
+                status = 1
+            elif "f" not in flags:
+                err += f"rm: cannot remove '{shown}': Not a directory\n"
+                status = 1
+        elif path in sh.session.removed or _exists(sh, path) is False:
+            if "f" not in flags:
+                err += f"rm: can't remove '{shown}': No such file or directory\n" \
+                    if sh.busybox else f"rm: cannot remove '{shown}': No such file or directory\n"
+                status = 1
+        else:
+            return None                      # a file of the host: the model owns that change
+    return _Result(err=err, status=status)
+
+
+def _quoted(sh: Shell, word: str) -> str:
+    """A name as GNU tools quote it with the locale's quotes (a UTF-8 locale, the one
+    ``ls`` sorts by): mkdir's directory, chmod's mode. Busybox quotes plainly."""
+    return f"'{_shown(word)}'" if sh.busybox else f"\u2018{_shown(word)}\u2019"
+
+
+@_command("mkdir", scope=STATE)
+def _mkdir(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    split = _split_flags(args, "p")
+    if split is None:
+        return None
+    flags, operands = split
+    if not operands:
+        if sh.busybox:
+            return _applet_usage(sh, "mkdir")
+        return _Result(err="mkdir: missing operand\n" + _try("mkdir"), status=1)
+    err, status = "", 0
+    if len(operands) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in operands:
+        path = sh.path(word)
+        # GNU mkdir quotes with the locale's quotes (a UTF-8 one, as ``ls`` sorts by)
+        shown = _quoted(sh, word)
+        cannot = "can't" if sh.busybox else "cannot"
+        if sh.directory(path) or path in sh.session.files:
+            if "p" not in flags or path in sh.session.files:
+                err += f"mkdir: {cannot} create directory {shown}: File exists\n"
+                status = 1
+            continue
+        chain = [path]
+        while "p" in flags and not sh.directory(posixpath.dirname(chain[-1])) \
+                and len(chain) < MAX_FILES:
+            chain.append(posixpath.dirname(chain[-1]))
+        blocked = [c for c in chain[1:] + [posixpath.dirname(chain[-1])]
+                   if c in sh.session.files]
+        if blocked:                          # a file where a directory would go
+            if "p" in flags:
+                # the highest one, named as typed: mkdir -p makes the path top down
+                cut = len(path) - len(blocked[-1])
+                if "//" in word or "." in word.split("/") or ".." in word.split("/") \
+                        or cut <= 0 or not word.rstrip("/").endswith(path[-cut:]):
+                    return None
+                shown = _quoted(sh, word.rstrip("/")[:-cut].rstrip("/")
+                                + ("/" if sh.busybox else ""))
+            err += f"mkdir: {cannot} create directory {shown}: Not a directory\n"
+            status = 1
+            continue
+        if not sh.directory(posixpath.dirname(chain[-1])):
+            if len(chain) >= MAX_FILES:
+                return None                  # deeper than this shell follows
+            if _exists(sh, posixpath.dirname(chain[-1])) is False:
+                err += f"mkdir: {cannot} create directory {shown}: No such file or directory\n"
+                status = 1
+                continue
+            return None
+        for target in reversed(chain):
+            reason = sh.writable(target)
+            if reason is not None:
+                err += f"mkdir: {cannot} create directory {shown}: {reason}\n"
+                status = 1
+                break
+            sh.store(target, None)
+    return _Result(err=err, status=status)
+
+
+@_command("touch", scope=STATE)
+def _touch(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    split = _split_flags(args, "cam")
+    if split is None:
+        return None
+    flags, operands = split
+    if not operands:
+        if sh.busybox:
+            return _applet_usage(sh, "touch")
+        return _Result(err="touch: missing file operand\n" + _try("touch"), status=1)
+    err, status = "", 0
+    if len(operands) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in operands:
+        path = sh.path(word)
+        entry = sh.session.files.get(path)
+        if entry is not None:
+            entry.mtime = sh._now
+            sh.session.version += 1
+        elif path in sh.session.dirs:
+            sh.session.dirs[path] = sh._now
+            sh.session.version += 1
+        elif _exists(sh, path) is True:
+            continue                         # a host file: only its time changes
+        elif "c" not in flags:
+            reason = sh.writable(path)
+            if reason is not None:           # and the other operands are still made
+                err += f"touch: {_shown(word)}: {reason}\n" if sh.busybox else \
+                    f"touch: cannot touch '{_shown(word)}': {reason}\n"
+                status = 1
+                continue
+            sh.store(path, _Scratch(mtime=sh._now))
+    return _Result(err=err, status=status)
+
+
+def _parse_mode(spec: str, mode: int) -> Optional[int]:
+    """A chmod MODE applied to ``mode``: octal, or ``[ugoa]*[+-=][rwxXst]*`` clauses."""
+    if spec and len(spec) <= 4 and not set(spec) - set("01234567"):
+        return int(spec, 8)
+    for clause in spec.split(","):
+        who = _leading(clause, "ugoa")
+        rest = clause[len(who):]
+        if not rest or rest[0] not in "+-=" or set(rest[1:]) - set("rwxXst"):
+            return None
+        mask = 0
+        for w in who or "a":
+            mask |= {"u": 0o700, "g": 0o070, "o": 0o007, "a": 0o777}[w]
+        bits = 0
+        for p in rest[1:]:
+            bits |= {"r": 0o444, "w": 0o222, "x": 0o111, "X": 0o111, "s": 0, "t": 0}[p]
+        bits &= mask
+        mode = mode | bits if rest[0] == "+" else mode & ~bits if rest[0] == "-" else \
+            (mode & ~mask) | bits
+    return mode
+
+
+@_command("chmod", scope=STATE)
+def _chmod(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    flags = {a for a in args[:1] if a in ("-R", "-f", "-v", "-c")}
+    operands = args[len(flags):]
+    if len(operands) < 2:
+        if sh.busybox:
+            return _applet_usage(sh, "chmod")
+        if not operands:
+            return _Result(err="chmod: missing operand\n" + _try("chmod"), status=1)
+        return _Result(err=f"chmod: missing operand after {_quoted(sh, operands[0])}\n"
+                           + _try("chmod"), status=1)
+    spec, files = operands[0], operands[1:]
+    if _parse_mode(spec, 0) is None or "-v" in flags or "-c" in flags:
+        return None
+    err, status = "", 0
+    if len(files) > MAX_FILES:
+        return None                      # never a silent part of the operands
+    for word in files:
+        path = sh.path(word)
+        entry = sh.session.files.get(path)
+        if path in sh.session.dirs and sh.user != "root":
+            return None                      # a mode that would bar its owner: not followed
+        if "-R" in flags:                   # and what the session wrote below it
+            below = path.rstrip("/") + "/"
+            for name, inner in sh.session.files.items():
+                if name.startswith(below):
+                    inner.mode = _parse_mode(spec, inner.mode)
+                    sh.session.version += 1
+            for name in [d for d in sh.session.dirs if d.startswith(below)]:
+                _chmod_dir(sh, name, spec)
+        if path in sh.session.dirs:
+            _chmod_dir(sh, path, spec)
+        elif entry is not None:
+            entry.mode = _parse_mode(spec, entry.mode)
+            sh.session.version += 1
+        elif _below_file(sh, path):
+            if "-f" not in flags:
+                err += f"chmod: {_shown(word)}: Not a directory\n" if sh.busybox else \
+                    f"chmod: cannot access '{_shown(word)}': Not a directory\n"
+                status = 1
+        elif path in sh.session.removed or _exists(sh, path) is False:
+            if "-f" not in flags:
+                err += f"chmod: {_shown(word)}: No such file or directory\n" if sh.busybox \
+                    else f"chmod: cannot access '{_shown(word)}': No such file or directory\n"
+                status = 1
+        elif _exists(sh, path) is None:
+            return None
+    return _Result(err=err, status=status)
+
+
+def _chmod_dir(sh: Shell, path: str, spec: str) -> None:
+    """A session directory's new mode (``+X`` is ``+x`` on a directory)."""
+    mode = _parse_mode(spec, sh.session.modes.get(path, 0o755))
+    if mode == 0o755:
+        sh.session.modes.pop(path, None)
+    else:
+        sh.session.modes[path] = mode
+    sh.session.version += 1
+
+
+def _si(value: float, binary: bool = False) -> str:
+    """dd's human sizes: ``3.1 MB``, ``46 MB``, ``2.0 KiB``."""
+    base, units = (1024, ["B", "KiB", "MiB", "GiB"]) if binary else \
+        (1000, ["B", "kB", "MB", "GB"])
+    unit = 0
+    while value >= base and unit < len(units) - 1:
+        value /= base
+        unit += 1
+    if value < 10:
+        return f"{math.ceil(value * 10) / 10:.1f} {units[unit]}"
+    return f"{math.ceil(value):d} {units[unit]}"
+
+
+@_command("dd")
+def _dd(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    ops: dict[str, str] = {}
+    for arg in args:
+        key, sep, value = arg.partition("=")
+        if not sep or key not in ("if", "bs", "ibs", "count", "skip") or key in ops:
+            return None
+        ops[key] = value
+    sizes = {}
+    for key in ("bs", "ibs", "count", "skip"):
+        if key in ops:
+            n = _count(ops[key])
+            if n is None or (key in ("bs", "ibs") and not 0 < n <= MAX_STAGE_OUTPUT):
+                return None
+            sizes[key] = n
+    block = sizes.get("bs", sizes.get("ibs", 512))
+    if "if" in ops:
+        read = sh.read_file(ops["if"])
+        if read is None:
+            return None
+        if read.err:
+            return _Result(err=f"dd: can't open '{_shown(ops['if'])}': No such file or directory\n"
+                           if sh.busybox else f"dd: failed to open '{_shown(ops['if'])}': "
+                           "No such file or directory\n", status=1, scope=read.scope)
+        data, scope = read.out, read.scope
+    elif stdin is not None:
+        data, scope = stdin, FIXED
+    else:
+        return None                          # it would read the terminal
+    raw = wire(data)                         # dd counts bytes, not characters
+    start = sizes.get("skip", 0) * block
+    end = len(raw) if "count" not in sizes else start + sizes["count"] * block
+    piece = raw[start:end]
+    chunk = piece.decode("utf-8", "surrogateescape")
+    sh.grow(len(chunk))
+    length = len(piece)
+    full, part = length // block, 1 if length % block else 0
+    stats = f"{full}+{part} records in\n{full}+{part} records out\n"
+    if not sh.busybox:
+        seconds = sh.host.rng("dd", length).uniform(1.5e-05, 9e-05)
+        rate = _si(length / seconds) + "/s"
+        if length < 1000:
+            stats += f"{length} byte{'s' if length != 1 else ''} copied, {seconds:.5g} s, {rate}\n"
+        else:
+            stats += (f"{length} bytes ({_si(length)}, {_si(length, True)}) copied, "
+                      f"{seconds:.5g} s, {rate}\n")
+    return _Result(chunk, scope=scope, late=stats)
+
+
+def _read_loop(sh: Shell, raw: bool, stdin: Optional[str]) -> _Result:
+    """``while read [-r] i; do echo $i; done``: bash drops NUL bytes, reads to each newline
+    (a last line without one is read but not echoed), takes a backslash as an escape unless
+    ``-r``, and the unquoted ``$i`` is split into words that echo joins with one space."""
+    if stdin is None:
+        raise _Unsupported                   # it would read the terminal
+    sh.exe = "bash"
+    text = stdin.replace("\x00", "")
+    sh.charge(len(text) * STEP)
+    out, line, i = [], [], 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and not raw:
+            if i + 1 < len(text) and text[i + 1] != "\n":
+                line.append(text[i + 1])
+            i += 2
+            continue
+        if c == "\n":
+            words = [w for w in re.split("[ \t]+", "".join(line)) if w]   # IFS, not \v\f
+            newline = True
+            while words and len(words[0]) > 1 and words[0][0] == "-" \
+                    and not set(words[0][1:]) - set("neE"):
+                newline = newline and "n" not in words[0]
+                words = words[1:]
+            out.append(" ".join(words) + ("\n" if newline else ""))
+            sh.grow(len(out[-1]))
+            line = []
+        else:
+            line.append(c)
+        i += 1
+    return _Result("".join(out))
+
+
+@_command("kill", scope=SESSION)
+def _kill(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    if args:
+        return None
+    return _Result(err="kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... "
+                       "or kill -l [sigspec]\n", status=2)
+
+
+@_command("printf")
+def _printf(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    if args:
+        return None                          # the literal_output path answers these
+    return _Result(err="printf: usage: printf [-v var] format [arguments]\n", status=2)
+
+
+@_command("ping")
+def _ping(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    if args:
+        return None
+    return _Result(err="ping: usage error: Destination address required\n", status=1)
+
+
+_NC_USAGE = ("usage: nc [-46CDdFhklNnrStUuvZz] [-I length] [-i interval] [-M ttl]\n"
+             "\t  [-m minttl] [-O length] [-P proxy_username] [-p source_port]\n"
+             "\t  [-q seconds] [-s sourceaddr] [-T keyword] [-V rtable] [-W recvlimit]\n"
+             "\t  [-w timeout] [-X proxy_protocol] [-x proxy_address[:port]]\n"
+             "\t  [destination] [port]\n")
+
+
+@_command("nc")
+def _nc(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
+    if args or sh.busybox:
+        return None
+    if sh.host.family == "rhel":         # nmap's ncat
+        return _Result(err="Ncat: You must specify a host to connect to. QUITTING.\n", status=2)
+    return _Result(err=_NC_USAGE, status=1)
+
+
 # ---- a known tool used in a way this shell does not reproduce ---------------------------------
 
 # Short options the GNU tools accept; another letter gets the tool's own "invalid option".
@@ -2489,17 +4097,22 @@ _FILE_TOOLS = {"cat": 0, "head": 0, "tail": 0, "cut": 0, "wc": 0, "grep": 1, "eg
                "fgrep": 1, "awk": 1, "gawk": 1, "mawk": 1, "ls": 0, "df": 0}
 
 
-def _missing(sh: Shell, name: str, path: str) -> str:
+def _missing(sh: Shell, name: str, path: str, reason: str = "No such file or directory") -> str:
     """What the tool says about a path that is not on this host."""
+    if sh.busybox:                           # an applet: busybox 1.30 to 1.36 alike
+        if name == "cat" and reason == "Is a directory":
+            return "cat: read error: Is a directory\n"
+        return f"ls: {path}: {reason}\n" if name == "ls" else \
+            f"{name}: can't open '{path}': {reason}\n"
     if name == "ls":
-        return f"ls: cannot access '{path}': No such file or directory\n"
+        return f"ls: cannot access '{path}': {reason}\n"
     if name in ("head", "tail"):
-        return f"{name}: cannot open '{path}' for reading: No such file or directory\n"
+        return f"{name}: cannot open '{path}' for reading: {reason}\n"
     if name in ("awk", "gawk", "mawk"):
         if sh.host.family == "rhel" or name == "gawk":
-            return f"{name}: fatal: cannot open file `{path}' for reading: No such file or directory\n"
-        return f"{name}: cannot open {path} (No such file or directory)\n"
-    return f"{name}: {path}: No such file or directory\n"
+            return f"{name}: fatal: cannot open file `{path}' for reading: {reason}\n"
+        return f"{name}: cannot open {path} ({reason})\n"
+    return f"{name}: {path}: {reason}\n"
 
 
 def _tool_error(sh: Shell, name: str, args: list[str]) -> str:
@@ -2534,8 +4147,7 @@ def _tool_error(sh: Shell, name: str, args: list[str]) -> str:
         skip = _FILE_TOOLS[name]
         if name in ("grep", "egrep", "fgrep") and any(a.startswith("-e") for a in args):
             skip = 0
-        known = set(_dirs(sh)) | {"/etc", "/usr", "/var", "/proc", "/dev", "/run", "/sys",
-                                  "/boot", "-"}
+        known = set(_dirs(sh)) | _SYSTEM_DIRS | {"-"}
         lures = {posixpath.normpath(p) for p in sh.host.lures}
         out = []
         for path in operands[skip:skip + MAX_FILES]:
@@ -2543,7 +4155,10 @@ def _tool_error(sh: Shell, name: str, args: list[str]) -> str:
             shown_path = "".join(c for c in path if c.isprintable())[:256]
             if full in known and name not in ("ls", "df"):
                 out.append(f"{shown}: {shown_path}: Is a directory\n")
-            elif full not in known and full not in lures and full not in _FILES:
+            elif _below_file(sh, full):
+                out.append(_missing(sh, shown, shown_path, "Not a directory"))
+            elif full not in known and full not in lures and full not in _FILES \
+                    and full not in sh.session.files and sh.program(full) is None:
                 out.append(_missing(sh, shown, shown_path))
         return "".join(out)
     return ""

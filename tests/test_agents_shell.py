@@ -72,10 +72,16 @@ def test_miner_check_in_on_a_gpu_host():
     assert out(NVIDIA_PRODUCT, dc) == "NVIDIA A100-PCIE-40GB     \n"
 
 
-@pytest.mark.parametrize("line", ["system", "shell", "sh", "linuxshell"])
-def test_iot_botnet_openers_are_accepted_silently(line):
-    a = shell.answer(host(), line, now=NOW)
+def test_sh_opener_starts_a_nested_shell_silently():
+    a = shell.answer(host(), "sh", now=NOW)
     assert a is not None and a.output == "" and a.status == 0
+
+
+@pytest.mark.parametrize("line", ["system", "shell", "linuxshell"])
+def test_device_cli_words_are_not_bash_commands(line):
+    """A device CLI knows these; bash on a Linux host does not."""
+    a = shell.answer(host(), line, now=NOW)
+    assert a.output == f"-bash: {line}: command not found\n" and a.status == 127
 
 
 def test_enable_lists_bash_builtins_as_bash_does():
@@ -226,8 +232,8 @@ def test_pipelines_over_our_own_output(line, expected):
 
 
 @pytest.mark.parametrize("line", [
-    "cat /proc/cpuinfo > /tmp/x",          # redirection
-    "uname -a 2>/dev/null",
+    "cat /proc/cpuinfo > /etc/motd",       # redirection over a host file
+    "uname -a 2>/tmp/x/y",                 # into a directory we do not know
     "echo $(id)",                          # substitution
     "echo `id`",
     "echo $HOME",                          # variables
@@ -281,8 +287,8 @@ def test_huge_and_control_input_is_refused_quickly():
 def test_deep_and_long_pipelines_are_capped():
     assert out(" | ".join(["lspci"] + ["cat"] * 7)) is not None          # 8 stages
     assert out(" | ".join(["lspci"] + ["cat"] * 8)) is None              # 9 stages
-    assert out("; ".join(["true"] * 8)) == ""
-    assert out("; ".join(["true"] * 9)) is None
+    assert out("; ".join(["true"] * 32)) == ""
+    assert out("; ".join(["true"] * 33)) is None
     assert out("echo " + " ".join(["a"] * 70)) is None                  # words per command
 
 
@@ -442,7 +448,9 @@ async def _ask(history, text, interactive=True, sid="s1"):
 
 def test_fallback_reply_uses_the_shared_shell():
     assert hooks.fallback_reply("lspci | grep VGA -c", True, "root") == "1\r\nroot@srv01:~# "
-    assert hooks.fallback_reply("system", True, "root") == "root@srv01:~# "
+    assert hooks.fallback_reply("sh", True, "root") == "root@srv01:~# "
+    assert hooks.fallback_reply("system", True, "root") == \
+        "-bash: system: command not found\r\nroot@srv01:~# "
     assert hooks.fallback_reply("nproc", False, "root") == \
         f"{hooks.shell_host().hardware.cpus}\n"
     assert hooks.fallback_reply("frobnicate", True, "root") == \

@@ -208,10 +208,13 @@ async def test_telnet_iot_botnet_opener_gets_what_it_expects(telnet_server):
                  b"cat /proc/cpuinfo | grep name | wc -l"):
         w.write(line + b"\r\n")
         replies.append(await read_until(reader, b"root@srv01:~# "))
-    # enable is bash's builtin list (the bot reads nothing from it); the rest are silent
+    # enable is bash's builtin list (the bot reads nothing from it); bash knows neither
+    # system nor shell, and sh starts a nested shell
     assert replies[0].startswith(b"enable .\r\nenable :\r\n")
     assert replies[0].endswith(b"enable wait\r\nroot@srv01:~# ")
-    assert replies[1:4] == [b"root@srv01:~# "] * 3
+    assert replies[1:4] == [b"-bash: system: command not found\r\nroot@srv01:~# ",
+                            b"-bash: shell: command not found\r\nroot@srv01:~# ",
+                            b"root@srv01:~# "]
     assert replies[4] == b"ECCHI: applet not found\r\nroot@srv01:~# "
     cpus = shell.host_for(None, "test").hardware.cpus   # the sensor's own VM shape
     assert replies[5] == f"{cpus}\r\nroot@srv01:~# ".encode()

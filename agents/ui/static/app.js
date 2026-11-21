@@ -2242,9 +2242,15 @@
     }
     if (typeof it.sent === "string" && it.sent) {
       blocks.push(el("div", null, el("div", { cls: "label", text: "Sent" }), moreBlock(it.sent, it.sent_truncated, "attacker")));
+    } else if (typeof it.sent === "string" && it.kind === "input") {
+      blocks.push(el("div", null, el("div", { cls: "label", text: "Sent" }), el("p", { cls: "muted", text: "(empty line)" })));
     }
+    // A reply field that is present but empty is a real answer of nothing; a missing one
+    // means the log holds no reply for this event.
     if (typeof it.answered === "string" && it.answered) {
       blocks.push(el("div", null, el("div", { cls: "label", text: "Answered" }), moreBlock(it.answered, it.answered_truncated)));
+    } else if (typeof it.answered === "string") {
+      blocks.push(el("div", null, el("div", { cls: "label", text: "Answered" }), el("p", { cls: "muted", text: "Answered with nothing." })));
     } else if (it.kind === "input" || it.kind === "request") {
       blocks.push(el("p", { cls: "muted", text: "No reply is recorded in the log for this event." }));
     }

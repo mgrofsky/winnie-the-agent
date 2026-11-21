@@ -63,10 +63,11 @@ no subprocess:
 - `which`, `command -v`, `ls` (and `cd`, `pwd`) of `/`, `/home`, `/tmp`, `/var/tmp`,
   `/dev/shm`, `/root`, `/opt`, `/srv`, `/mnt`, `/media` and home directories, showing the
   scenario's lures where they live;
-- the IoT botnet openers `system`, `shell`, `sh` (no output), `enable` (bash's list of
+- the IoT botnet openers: `sh` (a nested shell, no output), `enable` (bash's list of
   builtins: both front ends present bash, and a bot sending it reads nothing from the
-  reply) and `busybox NAME` (`NAME: applet not found`), with the BusyBox version the
-  distribution release ships; RHEL and its rebuilds ship none, so there `busybox` is
+  reply), `system`, `shell` and `linuxshell` (`command not found`, as bash says), and
+  `busybox NAME` (`NAME: applet not found`), with the BusyBox version the distribution
+  release ships; RHEL and its rebuilds ship none, so there `busybox` is
   `command not found`;
 - `wget`, `curl` and `tftp`, which exist but fail (no route, or no name resolution) without
   any lookup or connection;
@@ -85,8 +86,8 @@ and filter charges one work counter per character and per loop step, every comma
 is capped at 128 KiB (the line's at 128 KiB too), and a command reads at most 8 files. A
 line over any of these limits falls back like an unknown line. The worst line we could
 construct on the largest valid profile (64 CPUs, 8 GPUs) costs about 12 ms. Input over
-4096 characters, more than 8 commands in a pipeline or list, control characters,
-redirection, substitution, variables, globbing, and any command, option or file it does not
+4096 characters, more than 8 commands in a pipeline or 32 in a list, control characters,
+substitution, variables, globbing, and any command, option or file it does not
 know fall back too: to the model; without one, to a builtin's own output, the known tool's
 own error for an option or file it does not handle (`invalid option`, `No such file or
 directory`) or no output, and `command not found` only for a command the host does not
@@ -94,6 +95,15 @@ have. Errors from the shell itself are worded as bash words them: `-bash: ...` i
 interactive session, and over SSH exec `bash: line 1: ...` (bash 5.1 and later, by the
 scenario's distribution release) or `bash: ...` (older bash). `/proc/meminfo` and `free`
 report whole 4 kB pages.
+
+The canned shell also answers what IoT loaders send (Mirai, Gafgyt-style droppers): a list
+runs part by part, `ping`, `nc` and bare `busybox APPLET` print their real usage (recorded
+from the distribution's busybox package), and `/bin/echo`, `/bin/busybox` and
+`/proc/self/exe` read as the start of an ELF image for the host's machine
+(`agents/elfimage.py`), the same bytes through `cat`, `dd` and a `while read` loop. Files a
+Telnet session writes (`>x`, `cp`, `chmod`, `echo -ne ... >> x`) are kept in memory for
+that session (32 entries, 128 KiB) and never run. Binary bytes leave as the exact bytes;
+the event log and the model's history keep `\xNN` text instead.
 
 With a model and `[llm] local_shell_replies = true` (the default), a line the shell can
 answer is answered from the profile, by how far its commands could disagree with what the
