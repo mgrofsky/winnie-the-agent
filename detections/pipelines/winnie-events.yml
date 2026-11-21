@@ -1,0 +1,81 @@
+# Sigma processing pipeline: the rules agents/detect.py drafts, onto Winnie's own events.
+#
+# Winnie's front-ends write one JSON object per line (listeners/events.py). Indexed as is,
+# the fields are top-level names (sensor_protocol, event, message, src_ip, ...) and
+# data.<key> for the protocol-specific details. Use this pipeline with a pySigma backend;
+# docs/portable-formats.md shows how, and lists the backends and versions it was tested with.
+#
+# What maps:
+# - Command-line rules (category process_creation, product linux: URLs and SSH keys) match
+#   the commands typed into the telnet shell, data.input of "command" events.
+# - Redis, SQL and Postfix behaviour rules keep their keywords and are limited to the
+#   command events of the matching front-end. Winnie logs a refused relay as the message
+#   "SMTP relay attempt", not Postfix's "Relay access denied", so that keyword is mapped.
+# What does not map:
+# - SSH: the SSH front-end logs each command base64-encoded in the "details" field, so no
+#   substring of a command can be matched there. Command-line rules cover telnet only.
+# - DNS rules (category network, service dns): Winnie records no DNS queries. Conversion of
+#   such a rule with this pipeline fails on purpose; run it against your own DNS logs.
+# - Values in Winnie's events have backslashes doubled and control characters written as
+#   \xNN (listeners/events.py clean()), so an indicator containing those does not match.
+name: winnie-events
+priority: 20
+transformations:
+  - id: winnie_dns_not_recorded
+    type: rule_failure
+    message: "Winnie records no DNS queries; run this rule against your own DNS logs."
+    rule_conditions:
+      - type: logsource
+        category: network
+        service: dns
+  - id: winnie_command_line
+    type: field_name_mapping
+    mapping:
+      CommandLine: data.input
+    rule_conditions:
+      - type: logsource
+        category: process_creation
+        product: linux
+  - id: winnie_command_line_events
+    type: add_condition
+    conditions:
+      sensor_protocol: telnet
+      event: command
+    rule_conditions:
+      - type: logsource
+        category: process_creation
+        product: linux
+  - id: winnie_redis_events
+    type: add_condition
+    conditions:
+      sensor_protocol: redis
+      event: command
+    rule_conditions:
+      - type: logsource
+        product: redis
+  - id: winnie_sql_events
+    type: add_condition
+    conditions:
+      sensor_protocol:
+        - postgres
+        - mysql
+        - mssql
+      event: command
+    rule_conditions:
+      - type: logsource
+        category: database
+  - id: winnie_smtp_relay_message
+    type: map_string
+    mapping:
+      Relay access denied: SMTP relay attempt
+    rule_conditions:
+      - type: logsource
+        product: postfix
+  - id: winnie_smtp_events
+    type: add_condition
+    conditions:
+      sensor_protocol: smtp
+      event: command
+    rule_conditions:
+      - type: logsource
+        product: postfix

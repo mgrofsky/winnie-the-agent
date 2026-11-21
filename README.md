@@ -36,7 +36,12 @@ On top of that SSH honeypot this project adds:
   public pulse shows that you run a honeypot; the pulse is private by default.
 - **Tuning**: a fenced tuner that adds the fake accounts, SIP extensions and lure files
   attackers actually go for, writing only to a versioned overlay file.
-- **Detections**: Sigma rule drafts and blocklist candidates for human review.
+- **Detections**: Sigma rule drafts and blocklist candidates for human review, with a
+  processing pipeline onto the sensor's own events.
+- **STIX 2.1 export** (optional, off by default): a local bundle of what the sensor saw,
+  with indicators only for sources and files that passed promotion or operator approval.
+  What has and has not been tested with other tools is in
+  [docs/portable-formats.md](docs/portable-formats.md).
 - **Response playbooks**: deterministic rules that react to triage records with local
   changes (tarpit, deeper or shallower interaction, per-source honeytokens), notifications
   through opt-in connectors, and enforcement actions that run only after a person approves

@@ -3,10 +3,17 @@
 Everything under `detections/pending/` is a **draft** written by `python -m agents detect`.
 Nothing here is deployed, sent, or enforced automatically.
 
-- `*.yml`: Sigma rules built from a fixed template in `agents/detect.py`. The model can only
-  supply the title and description, and those are length-capped and limited to a safe
-  character set. Indicator values come from regex extraction over attacker commands, so they
-  are attacker-controlled strings. Read each one before use.
+- `*.yml`: Sigma rules built from a fixed template in `agents/detect.py`, one file per rule
+  id (`<first 8 characters of the id>-<kind>.yml`). The model can only supply the title and
+  description of a new draft, and those are length-capped and limited to a safe character
+  set. Indicator values come from regex extraction over attacker commands, so they are
+  attacker-controlled strings; Sigma wildcards and backslashes in them are escaped, so they
+  match literally. Read each one before use. `date` is when a rule was first drafted and
+  `modified` when it last changed; a rule already in `approved/` is not drafted again.
+  Log sources, the pipeline in `pipelines/winnie-events.yml` and what was tested are in
+  [docs/portable-formats.md](../docs/portable-formats.md).
+- `provenance.json`: the triage record ids each pending draft was built from. The
+  `publish_detection` action uses it to pick the drafts for a record.
 - `blocklist-candidates.csv`: `ip, sessions, attempts, first_seen, last_seen, judgement,
   protocols, source_proven, reason, expires`, covering every protocol. The first seven
   columns are unchanged from earlier versions; new columns are only ever appended. Private

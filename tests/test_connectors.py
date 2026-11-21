@@ -750,3 +750,22 @@ def test_email_overall_deadline_stops_before_sending(tmp_path, monkeypatch):
     r = c.notify("email", note())
     assert r.status == "error: DeadlineExceeded"
     assert FakeSMTP.instances[-1].messages == []
+
+
+def test_every_connector_section_the_agents_read_is_known(tmp_path):
+    """A ``[connector.<name>]`` section read by another agents module (its ``SECTION``) is not
+    reported as an unknown connector; a misspelt one still is."""
+    import re
+    from pathlib import Path
+
+    import agents
+
+    names = set()
+    for path in Path(agents.__file__).parent.glob("*.py"):
+        names.update(re.findall(r'^SECTION = "connector\.([a-z0-9_]+)"$',
+                                path.read_text(encoding="utf-8"), re.M))
+    assert {"otx", "internetdb", "internetdb_exchange", "s3_events"} <= names
+    cp = configparser.ConfigParser()
+    for name in sorted(names) + ["otx_typo"]:
+        cp[f"connector.{name}"] = {"enabled": "false"}
+    assert Connectors(cp, tmp_path).errors == ["[connector.otx_typo]: unknown connector"]

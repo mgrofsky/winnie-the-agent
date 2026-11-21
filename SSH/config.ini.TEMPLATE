@@ -619,3 +619,32 @@ stale_hours = 48
 # Connect only to these IPv4 addresses (one per line, at most 8), the ones the host
 # firewall lets this process reach (deploy/aws/host/sensor-egress.sh).
 #addresses_file = /egress/otx-addresses
+
+# STIX 2.1 bundle in a local file (off by default): python -m agents stix, and run-all when
+# enabled. Nothing is sent anywhere and no credential is used. Observed-data for proven
+# source addresses and stored files; indicators only for sources and file hashes that pass
+# the OTX connector's promotion rules (proven source that did more than probe; the model can
+# only hold one back) or that an operator approved onto the blocklist. See
+# docs/portable-formats.md.
+#[stix]
+#enabled = false
+# Default: stix/bundle.json in the reports directory.
+#output_file = /reports/stix/bundle.json
+# The producing identity (identity_class system). A new name starts every object afresh.
+#identity_name = Honeypot sensor
+# white | green | amber | red: the standard STIX TLP marking on every object.
+#tlp = amber
+# Also the SHA-256 of whole files the quarantine kept.
+#hashes = true
+# Records and stored files seen in this window are considered.
+#lookback_days = 7
+# A rule-promoted indicator is valid until its last sighting plus this many days. An
+# operator-approved entry uses its own expires_at. A file hash does not move to another
+# owner the way an address does, so it is kept longer.
+#address_lifetime_days = 30
+#hash_lifetime_days = 365
+# Expired and revoked objects stay in the bundle this long, then are dropped.
+#keep_days = 30
+# Caps on the bundle: objects and bytes. Indicators are kept first when it is full.
+#max_objects = 5000
+#max_bytes = 8388608

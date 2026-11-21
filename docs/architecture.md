@@ -422,8 +422,10 @@ accounts.
 
 - Sigma rules for IOCs and high-signal behaviour seen across several sessions or sources.
   The rule body comes from a template in code; the model may only supply a title and
-  description, which are length-capped and limited to a safe character set. Each draft
-  lists the triage records it was built from.
+  description, which are length-capped and limited to a safe character set. Attacker values
+  are escaped for Sigma; each indicator type has its own log source, and addresses and
+  hashes get no rule. `pending/provenance.json` lists the triage records each draft was
+  built from. See [Portable formats](portable-formats.md).
 - `blocklist-candidates.csv`, one row per source across all protocols. Private, reserved
   and documentation addresses and unverified sources (see [Source proof](#source-proof))
   are skipped. Each row carries `source_proven`, a `reason` from a fixed vocabulary and an
@@ -432,6 +434,13 @@ accounts.
   before acting on it.
 
 See [detections/README.md](../detections/README.md).
+
+### STIX export
+
+`python -m agents stix` (and `run-all`, when `[stix]` is enabled; off by default) writes a
+STIX 2.1 bundle to a local file: observed-data for proven sources and stored files, and
+indicators only for what passed the OTX connector's promotion rules or an operator's
+approval. No network connection. See [Portable formats](portable-formats.md).
 
 ## Data flow and trust boundaries
 
