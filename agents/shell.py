@@ -2856,6 +2856,7 @@ def _dirs(sh: Shell) -> dict[str, list[str]]:
         if parent in touched or parent in out:
             names(parent).discard(name)
     for path, entries in touched.items():
+        sh.charge(sum(map(len, entries)) * STEP)     # collation reads every character
         out[path] = sorted(entries, key=_collate)
     sh.charge(len(s.dirs) + len(s.files) + len(s.removed) * STEP)
     sh.memo[key] = out
@@ -2868,11 +2869,23 @@ _DROP_PUNCT = str.maketrans("", "", _PUNCT)
 _MARK_ALNUM = str.maketrans({c: "\U0010ffff" for c in _ALNUM})
 
 
-@functools.lru_cache(maxsize=8192)
 def _collate(name: str) -> tuple:
     """``ls`` order in a glibc en_US.UTF-8 locale: letters and digits ignoring case first,
     then lower case before upper, then punctuation (``.h`` before ``h``, ``-`` before
-    ``.``). String operations only: the host's tables sort a few thousand names a line."""
+    ``.``). String operations only: the host's tables sort a few thousand names a line.
+    Only short ASCII names are remembered: the host's own are all of that kind, and a name a
+    session made must not be able to fill a process-wide cache."""
+    if len(name) <= _COLLATE_CACHED and name.isascii():
+        return _collate_cached(name)
+    plain = name.translate(_DROP_PUNCT)
+    return plain.lower(), plain.swapcase(), name.translate(_MARK_ALNUM)
+
+
+_COLLATE_CACHED = 64
+
+
+@functools.lru_cache(maxsize=8192)
+def _collate_cached(name: str) -> tuple:
     plain = name.translate(_DROP_PUNCT)
     return plain.lower(), plain.swapcase(), name.translate(_MARK_ALNUM)
 
@@ -3557,6 +3570,13 @@ def _cp(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
             status = 1
             continue
         dest = _destination(sh, word, target)
+        if sh.directory(dest):               # a directory of that name is already there
+            if sh.busybox:
+                return None
+            err += f"cp: cannot overwrite directory '{_shown(_dest_word(sh, word, target))}' " \
+                   "with non-directory\n"
+            status = 1
+            continue
         reason = sh.writable(dest) if dest not in sh.session.files else None
         if reason is not None:
             err += f"cp: can't create '{_shown(target)}': {reason}\n" if sh.busybox else \
@@ -3606,6 +3626,17 @@ def _mv(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     dest = _destination(sh, word, target)
     if dest == path:
         return _same_file(sh, word, target)
+    if sh.directory(dest):                   # a directory of that name is already there
+        if sh.busybox:
+            return None
+        return _Result(err=f"mv: cannot overwrite directory "
+                           f"'{_shown(_dest_word(sh, word, target))}' with non-directory\n",
+                       status=1)
+    if "n" in flags:                         # no-clobber: an existing file stays as it is
+        if dest in sh.session.files:
+            return _Result()
+        if _exists(sh, dest) is not False:
+            return None
     reason = sh.writable(dest) if dest not in sh.session.files else None
     if reason is not None:
         return _Result(err=f"mv: can't rename '{_shown(word)}': {reason}\n" if sh.busybox

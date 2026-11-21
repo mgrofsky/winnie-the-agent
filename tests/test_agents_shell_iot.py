@@ -1180,3 +1180,31 @@ def test_busybox_cp_and_mv_look_at_the_destination_first():
     assert out[5] == "mv: can't stat 'd/x': Not a directory\n"
     assert run(["mkdir /tmp/w; touch /tmp/f", "busybox mv /tmp/w /tmp/f"])[1] == \
         "mv: can't rename '/tmp/w': Not a directory\n"
+
+
+def test_a_file_never_lands_on_a_directory_of_the_same_name():
+    session = shell.Session()
+    out = run(["mkdir -p /tmp/d/x; echo hi >/tmp/x", "cp /tmp/x /tmp/d", "mv /tmp/x /tmp/d",
+               "cat /tmp/x", "cd /tmp/d/x; pwd"], session=session)
+    assert out[1] == "cp: cannot overwrite directory '/tmp/d/x' with non-directory\n"
+    assert out[2] == "mv: cannot overwrite directory '/tmp/d/x' with non-directory\n"
+    assert out[3] == "hi\n"
+    assert out[4] == "/tmp/d/x\n"
+    assert "/tmp/d/x" not in session.files
+
+
+def test_mv_no_clobber_keeps_both_files():
+    out = run(["echo old >/tmp/dst; echo new >/tmp/src", "mv -n /tmp/src /tmp/dst",
+               "cat /tmp/dst /tmp/src"])
+    assert out[1] == ""
+    assert out[2] == "old\nnew\n"
+
+
+def test_session_names_do_not_fill_the_shared_collation_cache():
+    shell._collate_cached.cache_clear()
+    name = "\u0130" * 200
+    run([f"touch /tmp/{name}", "ls /tmp", "touch /tmp/" + "a" * 200, "ls /tmp"])
+    before = shell._collate_cached.cache_info().currsize
+    shell._collate(name)
+    shell._collate("a" * 200)
+    assert shell._collate_cached.cache_info().currsize == before
