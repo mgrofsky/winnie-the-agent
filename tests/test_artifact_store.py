@@ -217,6 +217,23 @@ class FileBackend(Base):
         self.assertIn("put refused", out)
         self.assertEqual(os.listdir(self.root), [], "nothing may be written")
 
+    def test_source_mutation_after_initial_hash_writes_nothing(self):
+        # A local source changing after local_check must not poison an immutable key.
+        wrapper = os.path.join(self.bin, "sha256sum")
+        with open(wrapper, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     "python3 -c 'import hashlib,sys; p=sys.argv[1]; "
+                     "print(hashlib.sha256(open(p,\"rb\").read()).hexdigest()+\"  \"+p)' \"$1\"\n"
+                     'if [ "$1" = "$MUTATE_SRC" ] && [ ! -e "$MUTATE_MARKER" ]; then '
+                     'printf X >> "$1"; : > "$MUTATE_MARKER"; fi\n')
+        os.chmod(wrapper, 0o700)
+        rc, out = self.run_tool("put", self.url,
+                                env={"MUTATE_SRC": os.path.join(self.src, "city.mmdb"),
+                                     "MUTATE_MARKER": os.path.join(self.t, "mutated")})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("staged", out)
+        self.assertEqual(os.listdir(self.root), [], "nothing may be written")
+
     def test_put_refuses_missing_local_file(self):
         os.remove(os.path.join(self.src, "asn.mmdb"))
         rc, out = self.run_tool("put", self.url)
@@ -442,10 +459,9 @@ class CloudAdapters(Base):
                    "--query", "properties.contentLength", "-o", "tsv", "--only-show-errors"],
         }[scheme]
 
-    def exp_put(self, scheme, name):
+    def exp_put(self, scheme, name, f):
         import base64
         k, h = self.key(name), sha(FILES[name])
-        f = os.path.join(self.src, name)
         return {
             "s3": ["aws", "s3api", "put-object", "--bucket", "example-bucket", "--key", k, "--body", f,
                    "--checksum-algorithm", "SHA256",
@@ -490,9 +506,18 @@ class CloudAdapters(Base):
                 self.assertEqual(rc, 0, out)
                 c = self.calls()
                 self.assertEqual(len(c), 6, c)  # per file: exists, put, get (read-back)
+                staged_dir = None
                 for i, name in enumerate(FILES):
                     self.assertEqual(c[3 * i], self.exp_stat(scheme, name))
-                    self.assertEqual(c[3 * i + 1], self.exp_put(scheme, name))
+                    upload = c[3 * i + 1]
+                    f = upload[{"s3": 8, "gs": 3, "az": 11}[scheme]]
+                    self.assertEqual(os.path.basename(f), name)
+                    self.assertEqual(os.path.basename(os.path.dirname(f)), "staged")
+                    self.assertFalse(f.startswith(self.src + os.sep))
+                    if staged_dir is None:
+                        staged_dir = os.path.dirname(f)
+                    self.assertEqual(os.path.dirname(f), staged_dir)
+                    self.assertEqual(upload, self.exp_put(scheme, name, f))
                     self.assertTrue(c[3 * i + 1][0] in ("aws", "gcloud", "az"))
                     self.assert_get_shape(scheme, c[3 * i + 2], name)
 

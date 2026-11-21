@@ -327,6 +327,15 @@ case $MODE in
 
   put)
     local_check || die "put refused: local files do not match SHA256SUMS"
+    # The source may change after local_check. Copy every file into our private work
+    # directory and verify all staged bytes before touching the store. Only the
+    # staged copies are uploaded, so a later source edit cannot poison an immutable key.
+    mkdir "$WORK/staged"
+    while read -r h n <&3; do
+      [ ! -L "$SUMS_DIR/$n" ] && [ -f "$SUMS_DIR/$n" ] || die "put refused: source changed while staging $n"
+      cp "$SUMS_DIR/$n" "$WORK/staged/$n" || die "put refused: could not stage $n"
+      [ "$(sha "$WORK/staged/$n")" = "$h" ] || die "put refused: staged $n does not match SHA256SUMS"
+    done 3< "$ENTRIES"
     if [ $SCHEME = file ]; then file_store_check; fi
     while read -r h n <&3; do
       k=$(key_for "$h" "$n")
@@ -336,10 +345,10 @@ case $MODE in
         [ "$got" = "$h" ] || die "existing $(where "$k") does NOT match SHA256SUMS; not touched, investigate the store"
         say "skip     $n (already stored; bytes re-hashed and match)"; continue
       fi
-      st_put "$k" "$SUMS_DIR/$n" "$h"
+      st_put "$k" "$WORK/staged/$n" "$h"
       got=$(fetch_hash "$k") || die "read-back failed for $n: cannot download it after upload"
       [ "$got" = "$h" ] || die "read-back failed for $n: stored bytes do not match SHA256SUMS"
-      say "stored   $n  $(size "$SUMS_DIR/$n") bytes, read back and verified  $(where "$k")"
+      say "stored   $n  $(size "$WORK/staged/$n") bytes, read back and verified  $(where "$k")"
     done 3< "$ENTRIES"
     say "put: done" ;;
 

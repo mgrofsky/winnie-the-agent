@@ -23,6 +23,11 @@ operator or build identity with only the read and create permissions it needs. K
 store access away from the sensor. Configure and verify encryption, public access
 prevention, retention, and audit logging in the provider; the script cannot inspect
 these controls.
+If S3 objects use SSE-KMS with a customer-managed key, the helper's checksum-enabled
+`HeadObject` and `GetObject` calls and its `PutObject` call require
+`kms:GenerateDataKey` and `kms:Decrypt` on that key in the identity and key policies;
+see the [AWS HeadObject permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html)
+and [SSE-KMS permissions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html).
 
 For `file://`, set `ARTIFACT_STORE_MOUNT` to the expected mount point before `put`.
 The script checks that the store exists on that mount, rejects symlinks in the store
@@ -75,13 +80,16 @@ scripts/artifact-store.sh get --sums "$sums" --dataset dbip-lite --month 2026-11
 ```
 
 `plan` only checks local files and makes no store or network call. `put` refuses
-unless every local file matches the manifest, creates an object only if absent, then
+unless every local file matches the manifest. It stages and hashes private copies of
+all source files before any store write, creates an object only if absent, then
 downloads and hashes it. It also hashes any existing object before skipping it.
 `verify` downloads and hashes stored objects without changing the store. `get`
 requires an empty destination and removes every file restored by that run if any
 file fails. Objects are named
 `<prefix>/<dataset>/<YYYY-MM>/<sha256>/<filename>`. The script has no delete mode.
 Store metadata, ETags, and reported sizes are never trusted for integrity.
+Choose a destination directory and parent path you trust for `get`; the helper checks
+downloaded bytes, but it does not isolate the destination from other local users.
 
 Use `--store URL` instead of `ARTIFACT_STORE` if preferred. A config file passed
 with `--config FILE` (or `ARTIFACT_STORE_CONFIG`) may contain:
@@ -95,9 +103,11 @@ month=2026-11
 The config is parsed as data, not executed. The script requires Bash, Perl, and either
 `sha256sum` or `shasum`, plus the selected cloud CLI if applicable.
 
-The `file://` path has been exercised against temporary directories and connected
-encrypted drives. Automated S3, GCS, and Azure tests use stub CLIs to check commands,
-failure handling, and integrity behavior. **None of the three cloud backends has a
+The `file://` path has been exercised against temporary directories and a disposable
+encrypted macOS disk image mounted with ownership enabled. This does not validate a
+particular connected drive or its backup setup. Automated S3, GCS, and Azure tests
+use stub CLIs to check commands, failure handling, and integrity behavior.
+**None of the three cloud backends has a
 validated live upload in this project.** Use a current AWS CLI v2 that supports
 `s3api put-object --if-none-match`; check that your installed `gcloud storage cp`
 supports `--if-generation-match` and `az storage blob upload` supports
