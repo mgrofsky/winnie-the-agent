@@ -63,11 +63,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 
-import yaml
-
 from agents.addresses import is_public
 from agents.budget import ip_key
 from agents.connectors.base import Notification
+from agents.localfile import read_regular
 from agents.playbooks import (
     Playbook,
     derive_facts,
@@ -94,6 +93,9 @@ SAFE_CHARS = re.compile(r"[^A-Za-z0-9 .,:;()_/@#+=%?&'-]")
 MARKUP_CHARS = re.compile(r"[@#*_~`|<>\[\]{}!\\]")
 APPROVAL_ID_RE = r"a-[0-9a-f]{12}"
 DETECTION_FILE_RE = r"[0-9a-f]{8}-[a-z0-9-]{1,60}\.yml"
+# Written by agents/detect.py (PROVENANCE_FILE there) next to the drafts it describes.
+DETECTION_PROVENANCE_FILE = "provenance.json"
+MAX_PROVENANCE_BYTES = 4 * 1024 * 1024
 RESPONSE_FILE_RE = re.compile(r"^(\d{8}T\d{6}Z)-")
 DEFAULT_APPROVAL_TTL_HOURS = 72
 DEFAULT_LOOKBACK_HOURS = 48
@@ -388,19 +390,28 @@ def suppressed_notice(connector: str, count: int, since: Optional[str]) -> Notif
 
 
 def matching_detections(record: TriageRecord, detections_dir: Path) -> list[str]:
-    """Draft files in pending/ whose recorded provenance (``related_records``) includes this
-    record. Overlap with attacker-supplied values alone never selects a draft."""
+    """Draft files in pending/ whose recorded provenance includes this record: the record
+    ids ``agents/detect.py`` wrote for each draft to ``pending/provenance.json``. Overlap
+    with attacker-supplied values alone never selects a draft."""
+    pending = detections_dir / "pending"
+    try:
+        body = read_regular(pending / DETECTION_PROVENANCE_FILE, MAX_PROVENANCE_BYTES)
+        if len(body) > MAX_PROVENANCE_BYTES:
+            return []
+        doc = json.loads(body.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return []
+    drafts = doc.get("drafts") if isinstance(doc, dict) and doc.get("version") == 1 else None
+    if not isinstance(drafts, dict):
+        return []
     out = []
-    for path in sorted((detections_dir / "pending").glob("*.yml")):
-        if not re.fullmatch(DETECTION_FILE_RE, path.name):
+    for name in sorted(drafts):
+        related = drafts[name]
+        if not isinstance(name, str) or not re.fullmatch(DETECTION_FILE_RE, name):
             continue
-        try:
-            rule = yaml.safe_load(path.read_text(encoding="utf-8"))
-            related = rule.get("related_records")
-        except (OSError, yaml.YAMLError, AttributeError):
-            continue
-        if isinstance(related, list) and record.id in {str(r) for r in related}:
-            out.append(path.name)
+        if isinstance(related, list) and record.id in {str(r) for r in related} \
+                and (pending / name).is_file():
+            out.append(name)
     return out[:20]
 
 

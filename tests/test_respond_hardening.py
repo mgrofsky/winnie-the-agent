@@ -564,9 +564,12 @@ def test_concurrent_approvals_execute_once(tmp_path):
 def _draft(det: Path, name: str, values: list[str], related: list[str]):
     (det / "pending").mkdir(parents=True, exist_ok=True)
     rule = {"title": "t", "detection": {"selection": {"CommandLine|contains": values},
-                                         "condition": "selection"},
-            "related_records": related}
+                                         "condition": "selection"}}
     (det / "pending" / name).write_text(yaml.safe_dump(rule))
+    prov = det / "pending" / "provenance.json"
+    doc = json.loads(prov.read_text()) if prov.exists() else {"version": 1, "drafts": {}}
+    doc["drafts"][name] = related
+    prov.write_text(json.dumps(doc))
 
 
 def test_publish_detection_selects_by_recorded_provenance_only(tmp_path):
@@ -576,6 +579,17 @@ def test_publish_detection_selects_by_recorded_provenance_only(tmp_path):
     _draft(det, "bbbbbbbb-mine.yml", ["unrelated-value"], ["mine"])
     _draft(det, "cccccccc-unrelated.yml", ["http://198.51.100.9/bins/mirai.x86"], [])
     assert matching_detections(r, det) == ["bbbbbbbb-mine.yml"]
+    # A provenance entry without its file, a bad name or a wrong version selects nothing.
+    (det / "pending" / "bbbbbbbb-mine.yml").unlink()
+    assert matching_detections(r, det) == []
+    _draft(det, "dddddddd-mine.yml", ["x"], ["mine"])
+    doc = json.loads((det / "pending" / "provenance.json").read_text())
+    doc["drafts"]["../escape.yml"] = ["mine"]
+    (det / "pending" / "provenance.json").write_text(json.dumps(doc))
+    assert matching_detections(r, det) == ["dddddddd-mine.yml"]
+    doc["version"] = 2
+    (det / "pending" / "provenance.json").write_text(json.dumps(doc))
+    assert matching_detections(r, det) == []
 
 
 def test_detect_drafts_record_their_provenance(tmp_path):
@@ -586,11 +600,18 @@ def test_detect_drafts_record_their_provenance(tmp_path):
           rec(rid="d1", ip="198.51.100.1", kind="session", iocs=[("url", url)]),
           rec(rid="d2", ip="198.51.100.2", kind="session", iocs=[("url", url)]))
     run_detect(tmp_path / "reports", tmp_path / "det")
-    rules = [yaml.safe_load(p.read_text()) for p in (tmp_path / "det" / "pending").glob("*.yml")]
-    ioc_rule = next(r for r in rules if url in json.dumps(r["detection"]))
-    assert sorted(ioc_rule["related_records"]) == ["d1", "d2"]
-    signal_rule = next(r for r in rules if r["title"] == "Redis takeover command chain")
-    assert sorted(signal_rule["related_records"]) == ["d1", "d2"]
+    pending = tmp_path / "det" / "pending"
+    rules = {p.name: yaml.safe_load(p.read_text()) for p in pending.glob("*.yml")}
+    related = json.loads((pending / "provenance.json").read_text())["drafts"]
+    assert set(related) == set(rules)
+    ioc_name = next(n for n, r in rules.items() if url in json.dumps(r["detection"]))
+    assert related[ioc_name] == ["d1", "d2"]
+    signal_name = next(n for n, r in rules.items() if r["title"] == "Redis takeover command chain")
+    assert related[signal_name] == ["d1", "d2"]
+    # The rule itself carries no provenance: only keys the Sigma specification defines.
+    assert all("related_records" not in r for r in rules.values())
+    rec_d1 = rec(rid="d1", ip="198.51.100.1", kind="session", iocs=[("url", url)])
+    assert sorted(matching_detections(rec_d1, tmp_path / "det")) == sorted([ioc_name, signal_name])
 
 
 # ---- outbound deadline ---------------------------------------------------------------------
