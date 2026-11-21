@@ -493,6 +493,7 @@ def _cli(tmp_path, command, text, *extra):
     return cli_run([command, "--config", str(cfg_path), "--reports-dir",
                     str(tmp_path / "reports"), "--state-dir", str(tmp_path / "state"),
                     "--log", str(tmp_path / "x.log"), "--data-dir", str(tmp_path / "data"),
+                    "--detections-dir", str(tmp_path / "detections"),
                     "--no-llm", *extra])
 
 

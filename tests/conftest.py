@@ -76,3 +76,39 @@ def public_test_net():
 
     with public_for_tests("198.51.100.0/24"):
         yield
+
+
+# Folders the CLI writes to when no directory is passed. A test that runs a command without
+# its own --reports-dir / --detections-dir writes into the checkout; the run fails if any of
+# them changed.
+_RUNTIME_DIRS = ("detections/pending", "detections/approved", "reports", "quarantine")
+
+
+def _runtime_snapshot() -> dict:
+    out = {}
+    for rel in _RUNTIME_DIRS:
+        base = REPO_ROOT / rel
+        if base.exists():
+            for p in base.rglob("*"):
+                try:
+                    out[str(p.relative_to(REPO_ROOT))] = p.stat().st_mtime_ns
+                except OSError:
+                    continue
+    return out
+
+
+def pytest_sessionstart(session):
+    session.config._winnie_runtime_before = _runtime_snapshot()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    before = getattr(session.config, "_winnie_runtime_before", None)
+    if before is None:
+        return
+    after = _runtime_snapshot()
+    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    if changed:
+        session.config.get_terminal_writer().line(
+            "tests wrote into the checkout (pass a temporary directory): "
+            + ", ".join(changed[:10]), red=True)
+        session.exitstatus = 1
