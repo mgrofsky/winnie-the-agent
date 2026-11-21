@@ -5,6 +5,7 @@ Usage: fakecli.py <tool> <args...>. Every call is appended to $STUB_LOG as one J
   STUB_TAMPER=1     a download returns bytes that differ from what was stored
   STUB_BAD_STAT=1   stat reports a wrong sha256
   STUB_LEAK=1       a failure message contains a token-shaped string (must be masked)
+  STUB_S3_NO_LIST=1 S3 HeadObject on an absent key returns 403, as without ListBucket
 Never contacts a network.
 """
 import base64, hashlib, json, os, sys
@@ -79,6 +80,8 @@ if tool == "aws":
     p = path(o.get("--bucket", "?"), o.get("--key", "?"))
     if sub == "head-object":
         if not os.path.exists(p):
+            if os.environ.get("STUB_S3_NO_LIST") == "1":
+                fail("An error occurred (403) when calling the HeadObject operation: Forbidden", 254)
             fail("An error occurred (404) when calling the HeadObject operation: Not Found", 254)
         s = stat_sha(p)
         b64 = base64.b64encode(bytes.fromhex(s)).decode() if s != "-" else "None"

@@ -11,7 +11,7 @@ This helper is for pinned reference files, not event records, logs, or secrets.
 
 | URL | Backend CLI | Operator setup |
 | --- | --- | --- |
-| `s3://example-bucket/winnie-artifacts` | AWS CLI | Private bucket, builder-only read/create access, versioning or Object Lock, encryption, and data-event logs. |
+| `s3://example-bucket/winnie-artifacts` | AWS CLI | Dedicated private bucket, builder-only object read/create and bucket list access, versioning or Object Lock, encryption, and data-event logs. |
 | `gs://example-bucket/winnie-artifacts` | `gcloud` | Private bucket with public access prevention, builder-only read/create access, versioning or retention, encryption, and Data Access audit logs. |
 | `az://exampleaccount/artifacts/winnie` | Azure CLI `az` | Private container, Entra ID read/create access, blob versioning or immutability, encryption, and diagnostic logs. |
 | `file:///mnt/encrypted-artifacts/winnie` | None | Encrypted volume, restricted file permissions, a backup, and a checked mount point. |
@@ -23,6 +23,15 @@ operator or build identity with only the read and create permissions it needs. K
 store access away from the sensor. Configure and verify encryption, public access
 prevention, retention, and audit logging in the provider; the script cannot inspect
 these controls.
+For S3, grant the operator `s3:GetObject` and `s3:PutObject` on the artifact
+object prefix, plus `s3:ListBucket` on the dedicated bucket. The
+script checks for an existing object with `HeadObject` before each write;
+without `s3:ListBucket`, S3 can return 403 for a missing key, which the script
+correctly treats as an access failure rather than permission to upload.
+The `s3:prefix` condition is for listing requests and is not a substitute for
+the bucket permission in this `HeadObject` check. See
+[S3 HeadObject permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html)
+and [prefix condition examples](https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html).
 If S3 objects use SSE-KMS with a customer-managed key, the helper's checksum-enabled
 `HeadObject` and `GetObject` calls and its `PutObject` call require
 `kms:GenerateDataKey` and `kms:Decrypt` on that key in the identity and key policies;

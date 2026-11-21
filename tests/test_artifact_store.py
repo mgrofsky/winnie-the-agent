@@ -586,6 +586,14 @@ class CloudAdapters(Base):
         self.assertNotEqual(rc, 0)
         self.assertIn("ABSENT", out)
 
+    def test_s3_missing_key_without_list_permission_fails_closed(self):
+        rc, out = self.run_tool("put", CLOUD["s3"], env={"STUB_S3_NO_LIST": "1"})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("access denied", out)
+        self.assertNotIn("stored", out)
+        self.assertEqual([c[2] for c in self.calls()], ["head-object"])
+        self.assertEqual(os.listdir(self.stub_store), [])
+
     def test_provider_error_masks_tokens(self):
         rc, out = self.run_tool("get", CLOUD["s3"], "--dest", os.path.join(self.t, "r"),
                                 env={"STUB_LEAK": "1"})
