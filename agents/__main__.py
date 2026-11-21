@@ -16,6 +16,8 @@ export when ``[connector.tracked_export]`` is, fetches sightings when
 ``[connector.internetdb_exchange]`` moves it and the answers through the object store
 (``kind = s3``) or, with ``kind = lookup``, asks InternetDB itself in the process that runs
 it (on AWS the exporter, never the agents container).
+With ``[connector.otx]`` enabled ``run-all`` writes the OTX candidates file and the
+process with ``submit = true`` (on AWS the exporter) adds them to the day's OTX pulse.
 
 ``enforce <address>`` moves one tracked blocklist entry to enforced (``[respond]
 track_before_enforce``).
@@ -399,6 +401,49 @@ def _run(argv=None) -> dict:
             results["sightings_fetch"] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
             log.error("sightings fetch failed: %s", results["sightings_fetch"]["error"])
         _internetdb_stage()
+        _otx_stage()
+
+    def _otx_stage() -> None:
+        """Indicators to AlienVault OTX. Off unless ``[connector.otx]`` is enabled. run-all
+        writes the candidates (it has the records); the submission runs where ``submit`` is
+        on (on AWS the exporter only). A failure never stops a run."""
+        from agents import otx
+        from agents.respond import tracked_target
+        from agents.triage import load_records
+
+        try:
+            settings = otx.OtxSettings.from_config(cp)
+            if not settings.enabled:
+                return
+            out: dict = {}
+            results["otx"] = out
+            try:
+                networks = _settings().networks() + otx.own_networks(cp)
+                blocklist_file = _settings().blocklist_file
+            except ValueError as exc:
+                # Without a valid never_act_on list no address is safe to send.
+                out["error"] = f"[respond]: {str(exc)[:160]}; nothing submitted"
+                log.error("otx: %s", out["error"])
+                return
+            path = otx.candidates_path(settings, tracked_target(reports, blocklist_file).parent)
+            if args.command == "run-all":
+                out["candidates"] = otx.write_candidates(
+                    settings, load_records(reports), networks, path,
+                    uploads_dir=otx.quarantine_dir(cp, base, args.data_dir),
+                    cap=otx.max_file_bytes(cp), dry_run=args.dry_run)
+                if "error" in out["candidates"]:
+                    out["error"] = out["candidates"]["error"]
+            if settings.submit:
+                out["submit"] = otx.run_submit(settings, path, state, networks,
+                                               cli_dry_run=args.dry_run)
+                if "error" in out["submit"] and "error" not in out:
+                    out["error"] = out["submit"]["error"]
+        except otx.ConfigError as exc:
+            results["otx"] = {"error": f"[{otx.SECTION}]: {exc}"}
+            log.error("%s", results["otx"]["error"])
+        except Exception as exc:  # noqa: BLE001 - the submission never stops the other stages
+            results["otx"] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            log.error("otx failed: %s", results["otx"]["error"])
 
     def _internetdb_stage() -> None:
         """What Shodan InternetDB knows about interesting sources, into a local file. Off

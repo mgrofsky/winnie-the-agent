@@ -884,6 +884,112 @@ Delivered through the object store when nothing on the sensor may reach Internet
 want the lookups to come from another network (`InternetDbDelivered` and a producer such as
 the reference Lambda function).
 
+## Indicators to OTX
+
+The sensor can give confirmed indicators back to the community as an AlienVault OTX pulse:
+the addresses of sources that did real harm, and the SHA-256 of files they uploaded. It is
+off by default, and even when turned on it only writes what it would send to a file until
+you turn sending on.
+
+**A public pulse is public.** Anyone can read it, so it shows that whoever owns the OTX
+account runs a honeypot, and roughly when each listed source hit it (the pulse is one per
+UTC day). Sources that check OTX can learn that the sensor's own traffic is being
+reported. The pulse is private (`public = false`) unless you change that.
+
+### What is sent, and what is not
+
+Only indicators from a source whose address is proven **and** that did something past
+probing. Proven: not `unverified_source`, so the address completed a TCP exchange or a SIP
+nonce round trip. Past probing, from facts the code counted (never from model output):
+
+| Class | Meaning |
+|---|---|
+| `logged_in` | an accepted login, or an accepted SIP REGISTER |
+| `honeytoken` | used a planted credential |
+| `download_execute`, `persistence`, `credential_file_read`, `hardware_recon` | ran commands that do these |
+| `redis_takeover`, `sql_exec_attempt`, `sql_cred_dump` | took over a service or ran commands through it |
+| `smtp_relay_attempt`, `sip_dialed_number` | tried to relay mail or place outside calls |
+| `s3_bulk_download`, `s3_upload`, `s3_planted_key`, `ftp_upload`, `quarantine_quota` | took or uploaded files, or used a planted storage key |
+
+Failed logins alone, `ftp_active_mode` and `http_proxy_attempt` (probes scanners send) do
+not count. A record the model judged BENIGN is not sent: the model can hold a source back
+but never put one forward.
+
+Two indicator types, nothing else:
+
+- `IPv4`: the source address, global unicast only.
+- `FileHash-SHA256`: the hash of a file such a source uploaded, as the front-end computed it
+  while storing the file in the quarantine (read from the quarantine's own metadata, never
+  from attacker text). A file that reached the quarantine's per-file cap may have been cut,
+  so its hash is left out. `hashes = false` turns these off.
+
+No URLs, domains, commands, passwords, user names, user agents or anything else the
+attacker wrote: an attacker could name an innocent host to get it listed. Each indicator's
+title and description are fixed text plus the protocol and class names, for example
+"Source address seen on a honeypot over SSH. Logged in or registered; Tried to fetch a file
+and run it."
+
+Never sent: an address inside `[respond] never_act_on` (list your own and allow-listed
+addresses there), a private or other non-global address, the sensor's own address
+(`[listeners] ftp_pasv_address`, which the AWS deployment sets to the Elastic IP), an
+unverified UDP source, and IPv6 addresses (not in this version). The check runs when the
+candidates are written and again when they are read. With a `never_act_on` that does not
+parse, nothing is sent.
+
+### How it runs
+
+1. `run-all` (it has the triage records) writes the candidates to `otx_candidates.json` next
+   to the blocklist file: addresses, hashes, protocol and class names, timestamps. Records
+   seen in the last 7 days, at most 1000 indicators.
+2. `ship` (or `run-all` when `submit = true`) reads that file with the same care as the
+   InternetDB wanted list: a regular file only (no FIFO, no symlink), at most 256 KB, every
+   field checked, the whole file refused on any problem. It adds what it has not sent
+   before to the day's pulse: `POST /api/v1/pulses/create` the first time in a UTC day,
+   `PATCH /api/v1/pulses/<id>` with the new indicators after that.
+
+The request goes to `https://otx.alienvault.com` only (fixed in the code), with the
+certificate and name checked, no redirects, no proxy, a 15 second deadline and a 1 MB
+answer cap. At most 200 indicators per run (one request) and 1000 per UTC day. A 429, a
+server error, a redirect, a refused key, any other unexpected status or a network failure
+stops the run and backs off for 15 minutes, doubling up to a day. If the day's pulse was
+deleted on OTX, the next run creates a new one. Only the new pulse's id is read from an
+answer, and only when it is 24 letters or digits.
+
+Every indicator sent is remembered in `<state-dir>/otx_state.json` (at most 20000, oldest
+dropped first), so nothing is sent twice. Each run adds one `otx_submit` event with the
+counts (sent, failed, skipped as already sent, excluded, hashes off or over the cap) to
+`<state-dir>/ship_events.jsonl`. A failure never stops the event export or the other
+stages.
+
+### Turning it on
+
+Make an OTX account, copy its API key from the settings page, and keep it out of
+`config.ini`:
+
+```ini
+[connector.otx]
+enabled = true
+secret_env = WINNIE_OTX_KEY       ; or secret_file = /run/otx-key (one line)
+#tags = honeypot
+#tlp = green                      ; white | green | amber | red
+#public = false
+#expiration_days = 30
+```
+
+With only that, it runs **dry**: each run writes the request it would make, with the
+indicators, to `<state-dir>/otx_dry_run.json`, and sends nothing (no key is read). Read
+that file. When it is what you want to share, set `dry_run = false`. The indicators held
+back during the dry run are sent then, within the caps. `python -m agents ship --dry-run`
+reports how many would be sent and writes nothing.
+
+The key is read only when a request is about to be sent. It is never logged and never
+written to the state, the dry-run file, the events or an error message.
+
+A process that must not send (the agents container on AWS) gets `submit = false`: it
+writes the candidates and does nothing else. The process that sends needs tcp 443 to
+`otx.alienvault.com`. `addresses_file` limits it to the addresses listed there, as for the
+exporter's InternetDB lookups; on AWS the host firewall writes it.
+
 ## Using the intelligence outside the sensor
 
 The sensor produces addresses and indicators: `detections/pending/blocklist-candidates.csv`,

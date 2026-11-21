@@ -38,10 +38,11 @@ def _lt(doc):
     return doc["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]
 
 
-def _user_data(doc, internetdb=False):
-    """The user data template with the InternetDbDelivered variables rendered."""
+def _user_data(doc, internetdb=False, otx=False):
+    """The user data template with the InternetDbDelivered and OtxSubmit variables rendered."""
     ud, variables = _lt(doc)["UserData"]["Fn::Base64"]["Fn::Sub"]
-    return check.internetdb_user_data(ud, variables, internetdb)[0]
+    ud = check.internetdb_user_data(ud, variables, internetdb)[0]
+    return check.otx_user_data(ud, variables, otx, internetdb)[0]
 
 
 def _bucket_statements(doc):
@@ -315,18 +316,18 @@ def _agents_mount_ship_config(d):
 
 
 def _exporter_without_blocklist(d):
-    _service_edit(d, "exporter", "\n      - blocklist:/blocklist:ro${IdbWrite}\n",
+    _service_edit(d, "exporter", "\n      - blocklist:/blocklist:ro${IdbWrite}${OtxMount}\n",
                   "${IdbWrite}\n")
 
 
 def _exporter_blocklist_twice(d):
-    _service_edit(d, "exporter", "- blocklist:/blocklist:ro${IdbWrite}\n",
-                  "- blocklist:/blocklist:ro${IdbWrite}\n      - blocklist:/more:ro\n")
+    _service_edit(d, "exporter", "- blocklist:/blocklist:ro${IdbWrite}${OtxMount}\n",
+                  "- blocklist:/blocklist:ro${IdbWrite}${OtxMount}\n      - blocklist:/more:ro\n")
 
 
 def _exporter_mounts_agent_state(d):
-    _service_edit(d, "exporter", "- blocklist:/blocklist:ro${IdbWrite}\n",
-                  "- blocklist:/blocklist:ro${IdbWrite}\n      - agentdata:/agents/state:ro\n")
+    _service_edit(d, "exporter", "- blocklist:/blocklist:ro${IdbWrite}${OtxMount}\n",
+                  "- blocklist:/blocklist:ro${IdbWrite}${OtxMount}\n      - agentdata:/agents/state:ro\n")
 
 
 def _tracked_key_numeric(d):
@@ -1184,7 +1185,7 @@ def test_internetdb_lookup_bootstrap_is_valid_shell(sensor, tmp_path, tailscale)
     (a, b, c) for a in ("true", "false") for b in ("true", "false") for c in ("true", "false")])
 def test_internetdb_switches_conditions_and_the_rule(sensor, lookup, delivered, tailscale):
     values = {"InternetDbLookup": lookup, "InternetDbDelivered": delivered,
-              "TailscaleEnabled": tailscale}
+              "TailscaleEnabled": tailscale, "OtxSubmit": "false"}
 
     def cond(name):
         return check.evaluate({"Condition": name}, sensor, values)
@@ -1292,16 +1293,19 @@ SAMPLE = {"AWS::Region": "us-east-1", "AWS::AccountId": "123456789012",
           "VpcCidr": "10.64.0.0/16", "InternetDbAnswersKey": "internetdb/answers.json"}
 
 
-def _rendered(sensor, tailscale, actions, sign_in, persona="", analyst="", internetdb="false"):
+def _rendered(sensor, tailscale, actions, sign_in, persona="", analyst="", internetdb="false",
+              otx="false"):
     """The user data CloudFormation would produce for these switches and SAMPLE values."""
     delivered, lookup = internetdb == "true", internetdb == "lookup"
     values = dict(SAMPLE, TailscaleEnabled=tailscale, UiActions=actions, UiTailnetSignIn=sign_in,
                   PersonaModelId=persona, AnalystModelId=analyst,
-                  InternetDbDelivered=str(delivered).lower(), InternetDbLookup=str(lookup).lower())
+                  InternetDbDelivered=str(delivered).lower(), InternetDbLookup=str(lookup).lower(),
+                  OtxSubmit=otx)
     on = {"TailscaleOn": tailscale == "true", "UiActionsOn": actions == "true",
           "ConsoleStepOn": "true" in (tailscale, actions), "ModelOn": bool(persona or analyst),
-          "InternetDbOn": delivered, "IdbLookupOn": lookup,
-          "IdbAnyOn": delivered or lookup, "HostEgressOn": tailscale == "true" or lookup}
+          "InternetDbOn": delivered, "IdbLookupOn": lookup, "OtxOn": otx != "false",
+          "IdbAnyOn": delivered or lookup,
+          "HostEgressOn": tailscale == "true" or lookup or otx != "false"}
 
     def render(v):
         if isinstance(v, str):
@@ -1426,7 +1430,8 @@ def test_the_prefix_list_read_comes_with_the_host_firewall(sensor):
     assert items == [{"Fn::If": ["HostEgressOn", check.PREFIX_ROLE_STATEMENT,
                                  {"Ref": "AWS::NoValue"}]}]
     assert sensor["Conditions"]["HostEgressOn"] == {
-        "Fn::Or": [{"Condition": "TailscaleOn"}, {"Condition": "IdbLookupOn"}]}
+        "Fn::Or": [{"Condition": "TailscaleOn"}, {"Condition": "IdbLookupOn"},
+                   {"Condition": "OtxOn"}]}
     for name in ("Ec2Endpoint", "InstanceEgressTailscale"):
         assert sensor["Resources"][name]["Condition"] == "HostEgressOn"
 
@@ -1450,7 +1455,8 @@ exit 0
 
 
 def _run_egress(tmp_path, answer, *, saved=None, vpc="10.64.0.0/16", aws_fails=False,
-                refresh=True, args=None, env_file_present=True, idb=None, dns=None):
+                refresh=True, args=None, env_file_present=True, idb=None, dns=None,
+                otx=None, otx_dns=None):
     """Run host/sensor-egress.sh with fake iptables, ip6tables, aws and getent on PATH.
     ``idb`` is the INTERNETDB_LOOKUP line's value (None: no such line), ``dns`` what getent
     answers for the InternetDB name (None: it fails). Returns (exit code, stderr, the OUTPUT
@@ -1462,8 +1468,14 @@ def _run_egress(tmp_path, answer, *, saved=None, vpc="10.64.0.0/16", aws_fails=F
         (bin_ / name).chmod(0o755)
     (tmp_path / "dns").write_text("".join(f"{a} STREAM internetdb.shodan.io\n"
                                           f"{a} DGRAM\n{a} RAW\n" for a in dns or []))
+    (tmp_path / "otx-dns").write_text("".join(f"{a} STREAM otx.alienvault.com\n"
+                                              for a in otx_dns or []))
     (bin_ / "getent").write_text(
         "#!/bin/bash\n"
+        'if [ "$*" = "ahostsv4 otx.alienvault.com" ]; then\n'
+        f'echo otx >> {tmp_path / "getent-calls"}\n'
+        + ("exit 2\n" if otx_dns is None else f"cat {tmp_path / 'otx-dns'}; exit 0\n")
+        + "fi\n"
         '[ "$*" = "ahostsv4 internetdb.shodan.io" ] || exit 9\n'
         f'echo getent >> {tmp_path / "getent-calls"}\n'
         + ("exit 2\n" if dns is None else f"cat {tmp_path / 'dns'}\n"))
@@ -1483,13 +1495,16 @@ def _run_egress(tmp_path, answer, *, saved=None, vpc="10.64.0.0/16", aws_fails=F
     idb_file = tmp_path / "egress-idb.env"
     if idb is not None:
         idb_file.write_text(f"INTERNETDB_LOOKUP={idb}\n")
+    otx_file = tmp_path / "egress-otx.env"
+    if otx is not None:
+        otx_file.write_text(f"OTX_SUBMIT={otx}\n")
     log = tmp_path / "log"
     log.write_text("")
     import os
     env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", LOG=str(log),
                SENSOR_EGRESS_ENV=str(env_file), SENSOR_EGRESS_DIR=str(state),
                SENSOR_EGRESS_RETRY_SECONDS="0", SENSOR_EGRESS_TEST_DOC_RANGES="1",
-               SENSOR_EGRESS_IDB_ENV=str(idb_file))
+               SENSOR_EGRESS_IDB_ENV=str(idb_file), SENSOR_EGRESS_OTX_ENV=str(otx_file))
     args = ["bash", str(AWS / "host" / "sensor-egress.sh")] + (
         args if args is not None else ["refresh"] if refresh else [])
     result = subprocess.run(args, env=env, capture_output=True, text=True)
@@ -1708,6 +1723,86 @@ def test_internetdb_a_bad_setting_leaves_only_the_deny(tmp_path, value):
     code, err, output, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", idb=value,
                                               dns=IDB_EDGES)
     assert code != 0 and "bad INTERNETDB_LOOKUP" in err
+    assert output == [f"iptables {UID} -j REJECT", f"ip6tables {UID} -j REJECT"]
+    assert chain == []
+
+
+OTX_EDGES = ["203.0.113.70", "203.0.113.71"]
+
+
+def _otx_file(tmp_path):
+    path = tmp_path / "state" / "exporter" / "otx-addresses"
+    return path.read_text() if path.exists() else None
+
+
+@pytest.mark.parametrize("args", [["refresh"], [], ["deny"]])
+@pytest.mark.parametrize("idb", [None, "true"])
+def test_otx_off_leaves_every_rule_exactly_as_before(tmp_path, args, idb):
+    # No OTX_SUBMIT line (every existing install) and an explicit false give the same rules
+    # as each other, with InternetDB on or off; otx.alienvault.com is never resolved.
+    runs = []
+    for i, otx in enumerate((None, "false")):
+        d = tmp_path / str(i)
+        d.mkdir()
+        runs.append(_run_egress(d, "198.51.100.0/24", saved="198.51.100.0/24\n", args=args,
+                                idb=idb, dns=IDB_EDGES, otx=otx, otx_dns=OTX_EDGES))
+        calls = (d / "getent-calls").read_text() if (d / "getent-calls").exists() else ""
+        assert "otx" not in calls and _otx_file(d) is None
+    assert runs[0][0] == 0 and runs[0][1:] == runs[1][1:]
+
+
+def test_otx_on_only_adds_accepts_after_the_other_rules(tmp_path):
+    for name in ("off", "on", "both"):
+        (tmp_path / name).mkdir()
+    off = _run_egress(tmp_path / "off", "198.51.100.0/24", idb="false")
+    code, err, output, chain, cache = _run_egress(tmp_path / "on", "198.51.100.0/24",
+                                                  otx="true", otx_dns=OTX_EDGES)
+    assert code == 0, err
+    assert output == off[2] and cache == off[4]
+    assert chain[:len(off[3])] == off[3]
+    assert chain[len(off[3]):] == [f"-d {a}/32 -p tcp --dport 443 -j ACCEPT" for a in OTX_EDGES]
+    assert _otx_file(tmp_path / "on") == "203.0.113.70\n203.0.113.71\n"
+    assert _idb_file(tmp_path / "on") is None
+    mode = (tmp_path / "on" / "state" / "exporter" / "otx-addresses").stat().st_mode
+    assert mode & 0o777 == 0o644
+    # With both, InternetDB's accepts come first, then OTX's.
+    code, err, _, chain, _ = _run_egress(tmp_path / "both", "198.51.100.0/24", idb="true",
+                                         dns=IDB_EDGES, otx="true", otx_dns=OTX_EDGES)
+    assert code == 0, err
+    assert chain[len(off[3]):] == [f"-d {a}/32 -p tcp --dport 443 -j ACCEPT"
+                                   for a in IDB_EDGES + OTX_EDGES]
+
+
+@pytest.mark.parametrize("dns", [None, [], ["10.0.0.5"], ["203.0.113.70", "127.0.0.1"],
+                                 ["203.0.113.070"], ["203.0.113.70;reboot"], ["2001:db8::1"]])
+def test_otx_a_bad_or_failed_lookup_keeps_the_last_set(tmp_path, dns):
+    (tmp_path / "state" / "exporter").mkdir(parents=True)
+    (tmp_path / "state" / "exporter" / "otx-addresses").write_text("203.0.113.90\n")
+    code, err, _, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", otx="true", otx_dns=dns)
+    assert code == 0, err
+    assert "otx: lookup failed, keeping the last addresses" in err
+    assert _otx_file(tmp_path) == "203.0.113.90\n"
+    assert _idb_accepts(chain) == ["203.0.113.90/32"]
+
+
+def test_otx_keeps_at_most_eight_and_checks_the_saved_set(tmp_path):
+    edges = [f"203.0.113.{i}" for i in range(1, 13)]
+    code, err, _, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", otx="true", otx_dns=edges)
+    assert code == 0, err
+    assert _idb_accepts(chain) == [f"{a}/32" for a in edges[:8]]
+    (tmp_path / "state" / "exporter" / "otx-addresses").write_text(
+        "203.0.113.80\n10.0.0.1\n0.0.0.0/0\n")
+    code, err, _, chain, _ = _run_egress(tmp_path, "", refresh=False, otx="true",
+                                         saved="198.51.100.0/24\n")
+    assert code == 0, err
+    assert _idb_accepts(chain) == ["203.0.113.80/32"]
+
+
+@pytest.mark.parametrize("value", ["yes", "1", "TRUE"])
+def test_otx_a_bad_setting_leaves_only_the_deny(tmp_path, value):
+    code, err, output, chain, _ = _run_egress(tmp_path, "198.51.100.0/24", otx=value,
+                                              otx_dns=OTX_EDGES)
+    assert code != 0 and "bad OTX_SUBMIT" in err
     assert output == [f"iptables {UID} -j REJECT", f"ip6tables {UID} -j REJECT"]
     assert chain == []
 
@@ -2650,3 +2745,200 @@ def test_every_geographic_prefix_passes_the_host_script(tmp_path, prefix):
     code, err, _, home, _, _ = _run_model(tmp_path, persona=f"{prefix}.anthropic.claude-x")
     assert code == 0, err
     assert _cfg(home).get("llm", "model_name") == f"{prefix}.anthropic.claude-x"
+
+
+# ---- OtxSubmit: confirmed indicators to an OTX pulse ----------------------------------------
+
+def _without_otx(sensor):
+    """The sensor template as it was before OtxSubmit: its three user data variables gone."""
+    import copy
+
+    doc = copy.deepcopy(sensor)
+    sub = _lt(doc)["UserData"]["Fn::Base64"]["Fn::Sub"]
+    for name in ("OtxArgs", "OtxMount", "OtxStep"):
+        sub[0] = sub[0].replace("${" + name + "}", "")
+        del sub[1][name]
+    return doc
+
+
+@pytest.mark.parametrize("internetdb", ["false", "true", "lookup"])
+@pytest.mark.parametrize("switches", SWITCHES)
+def test_with_otx_off_the_bootstrap_is_byte_for_byte_as_before(sensor, switches, internetdb):
+    off = _rendered(sensor, *switches, internetdb=internetdb)
+    assert off == _rendered(_without_otx(sensor), *switches, internetdb=internetdb)
+    assert "otx" not in off.lower()
+
+
+def test_with_otx_off_nothing_else_in_the_template_mentions_it(sensor):
+    for name, res in sensor["Resources"].items():
+        if name != "LaunchTemplate":
+            assert "Otx" not in str(res), name
+    # No role statement or policy for it: the managed SSM policy already allows the read.
+    assert "otx" not in str(_role_statements(sensor)).lower()
+    assert sensor["Parameters"]["OtxSubmit"]["Default"] == "false"
+    assert sensor["Parameters"]["OtxSubmit"]["AllowedValues"] == ["false", "dry-run", "send"]
+
+
+@pytest.mark.parametrize("otx,tailscale,lookup", [
+    (o, t, i) for o in ("false", "dry-run", "send") for t in ("true", "false")
+    for i in ("true", "false")])
+def test_otx_conditions(sensor, otx, tailscale, lookup):
+    values = {"OtxSubmit": otx, "TailscaleEnabled": tailscale, "InternetDbLookup": lookup}
+
+    def cond(name):
+        return check.evaluate({"Condition": name}, sensor, values)
+
+    assert cond("OtxOn") == (otx != "false")
+    assert cond("HostEgressOn") == ("true" in (tailscale, lookup) or otx != "false")
+
+
+@pytest.mark.parametrize("otx", ["dry-run", "send"])
+@pytest.mark.parametrize("internetdb", ["false", "true", "lookup"])
+def test_with_otx_on_the_exporter_alone_gets_the_key_and_the_pinned_addresses(
+        sensor, tmp_path, otx, internetdb):
+    on = _rendered(sensor, "false", "false", "false", internetdb=internetdb, otx=otx)
+    compose = check.embedded_compose(on)
+    services = compose["services"]
+    exporter = services["exporter"]["volumes"]
+    assert exporter.count("./otx-key:/run/otx-key:ro") == 1
+    assert exporter.count("/var/lib/sensor-egress/exporter:/egress:ro") == 1
+    for name in ("ssh", "listeners", "agents", "ui"):
+        assert not any("otx" in str(v) or "sensor-egress" in str(v)
+                       for v in services[name]["volumes"]), name
+    assert check.check_exporter(compose, internetdb if internetdb != "false" else False,
+                                otx) == []
+    lines = on.splitlines()
+    tail = {"false": "", "true": " true events/internetdb/wanted.json internetdb/answers.json",
+            "lookup": " lookup"}[internetdb]
+    assert [line for line in lines if line.startswith("python3 render_config.py")] == [
+        f'python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "$NEVER" false{tail} '
+        f"otx-{otx}",
+        f'python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "$NEVER" true{tail} '
+        f"otx-{otx}"]
+    # The switch and the key file come before the host firewall is installed and run, and
+    # all of it before the stack starts.
+    switch = lines.index("echo OTX_SUBMIT=true > /etc/sensor-egress-otx.env")
+    assert lines[switch + 1:switch + 3] == [line.replace("${NamePrefix}", "winnie-sensor")
+                                            for line in check.OTX_STEP_LINES[1:]]
+    assert switch < lines.index("/usr/local/sbin/sensor-egress.sh refresh") < \
+        lines.index("systemctl enable --now sensor.service")
+    assert "/winnie-sensor/otx-api-key" in lines[switch + 1]
+    path = tmp_path / "user-data"
+    path.write_text(on)
+    result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_otx_key_step_never_echoes_the_key_and_always_leaves_a_file(tmp_path):
+    # Run the step's lines with a fake aws that fails, then one that answers.
+    import os
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    step = "\n".join(line.replace("/etc/sensor-egress-otx.env", str(tmp_path / "switch.env"))
+                     .replace("${NamePrefix}", "winnie-sensor")
+                     for line in check.OTX_STEP_LINES)
+    step = step.replace("chown 10001:10001 otx-key", "true")
+    for answer, code in (("", 255), ("k" * 40, 0)):
+        (bin_ / "aws").write_text(f"#!/bin/bash\n[ -n '{answer}' ] && echo '{answer}'\n"
+                                  f"exit {code}\n")
+        (bin_ / "aws").chmod(0o755)
+        result = subprocess.run(["bash", "-euo", "pipefail", "-c", step], cwd=tmp_path,
+                                env={**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}",
+                                     "REGION": "us-east-1"},
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        key = tmp_path / "otx-key"
+        assert key.is_file() and oct(key.stat().st_mode & 0o777) == "0o600"
+        assert key.read_text() == (answer + "\n" if answer else "")
+        assert answer == "" or answer not in result.stdout + result.stderr
+        assert ("otx key: FAILED" in result.stdout) == (code != 0)
+        assert (tmp_path / "switch.env").read_text() == "OTX_SUBMIT=true\n"
+
+
+def test_rendered_configs_with_otx(tmp_path):
+    from agents.otx import OtxSettings
+
+    for otx in ("otx-dry-run", "otx-send"):
+        for internetdb in ((), ("lookup",), IDB_ARGS):
+            configs = {}
+            for dst, ship in (("config.ini", "false"), ("config-ship.ini", "true")):
+                out = tmp_path / dst
+                subprocess.run(_render_args(out, ship, (*internetdb, otx)), check=True,
+                               capture_output=True)
+                cp = configparser.ConfigParser(interpolation=None, strict=False)
+                cp.read(out, encoding="utf-8")
+                configs[dst] = OtxSettings.from_config(cp)
+            agents, ship = configs["config.ini"], configs["config-ship.ini"]
+            dry = otx == "otx-dry-run"
+            # The agents write the candidates next to the blocklist and never submit.
+            assert agents.enabled and not agents.submit and agents.secret_file is None
+            assert agents.candidates_file is None and agents.addresses_file is None
+            assert ship == OtxSettings(enabled=True, submit=True, dry_run=dry,
+                                       secret_file="/run/otx-key",
+                                       candidates_file="/blocklist/otx_candidates.json",
+                                       addresses_file="/egress/otx-addresses")
+            assert agents.dry_run == dry
+
+
+@pytest.mark.parametrize("ship", ["true", "false"])
+@pytest.mark.parametrize("internetdb", [(), ("lookup",), IDB_ARGS])
+def test_with_otx_off_the_rendered_configs_are_byte_for_byte_as_before(tmp_path, ship,
+                                                                        internetdb):
+    script = tmp_path / "main_render_config.py"
+    # The renderer as it was before OtxSubmit (from the repository's history would need git;
+    # instead: the same call without the argument must not change with the feature present).
+    out = tmp_path / "a.ini"
+    subprocess.run(_render_args(out, ship, internetdb), check=True, capture_output=True)
+    text_ = out.read_text()
+    assert "\n[connector.otx]\n" not in text_ and "\nenabled = true\nsubmit" not in text_
+    template = (ROOT / "SSH" / "config.ini.TEMPLATE").read_text()
+    assert text_[text_.index("#[connector.otx]"):].startswith(
+        template[template.index("#[connector.otx]"):template.index("#[connector.otx]") + 200])
+    assert not script.exists()
+
+
+def test_render_refuses_a_bad_otx_argument(tmp_path):
+    for bad in (("otx-maybe",), ("otx",), ("otx-send", "otx-send"), ("otx-send", "lookup")):
+        result = subprocess.run(_render_args(tmp_path / "x.ini", "true", bad),
+                                capture_output=True, text=True)
+        assert result.returncode != 0, bad
+
+
+@pytest.mark.parametrize("mutate,message", [
+    (lambda v: v.__setitem__("OtxMount", {"Fn::If": ["OtxOn", "\n      - ./otx-key:/run/otx-key",
+                                                     ""]}), "OtxMount"),
+    (lambda v: v.__setitem__("OtxArgs", {"Fn::If": ["OtxOn", " otx-send", ""]}), "OtxArgs"),
+    (lambda v: v["OtxStep"]["Fn::If"].__setitem__(2, "echo hi\n"), "OtxStep"),
+    (lambda v: v["OtxStep"]["Fn::If"][1].__setitem__(
+        "Fn::Sub", v["OtxStep"]["Fn::If"][1]["Fn::Sub"].replace("umask 077; ", "")), "OtxStep"),
+])
+def test_check_refuses_a_changed_otx_variable(sensor, mutate, message):
+    import copy
+
+    doc = copy.deepcopy(sensor)
+    mutate(_lt(doc)["UserData"]["Fn::Base64"]["Fn::Sub"][1])
+    assert any(message in e for e in check.check_sensor(doc))
+
+
+def test_check_refuses_the_key_file_in_another_service(sensor):
+    import copy
+
+    doc = copy.deepcopy(sensor)
+    sub = _lt(doc)["UserData"]["Fn::Base64"]["Fn::Sub"]
+    anchor = "      - overlay:/overlay${IdbRead}\n  exporter:"
+    assert anchor in sub[0]
+    sub[0] = sub[0].replace(anchor, "      - overlay:/overlay${IdbRead}${OtxMount}\n  exporter:", 1)
+    errors = check.check_sensor(doc)
+    assert any("the agents service mounts the OTX key file" in e for e in errors), errors
+
+
+def test_check_refuses_the_otx_condition_or_default_changed(sensor):
+    import copy
+
+    doc = copy.deepcopy(sensor)
+    doc["Conditions"]["HostEgressOn"]["Fn::Or"].pop()
+    assert any("HostEgressOn" in e for e in check.check_sensor(doc))
+    doc = copy.deepcopy(sensor)
+    doc["Parameters"]["OtxSubmit"]["Default"] = "send"
+    assert any("OtxSubmit is not off by default" in e for e in check.check_sensor(doc))

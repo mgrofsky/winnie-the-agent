@@ -30,6 +30,10 @@ On top of that SSH honeypot this project adds:
   by the agents (never a honeypot container), or delivered through the object store by a
   lookup outside the sensor, checked as untrusted data and shown in the console. Free for
   non-commercial use.
+- **Indicators to OTX** (optional, off by default, dry run until you turn sending on): the
+  addresses of proven sources that did more than probe, and the SHA-256 of files they
+  uploaded, added to one AlienVault OTX pulse per day. Never attacker-written text. A
+  public pulse shows that you run a honeypot; the pulse is private by default.
 - **Tuning**: a fenced tuner that adds the fake accounts, SIP extensions and lure files
   attackers actually go for, writing only to a versioned overlay file.
 - **Detections**: Sigma rule drafts and blocklist candidates for human review.
@@ -141,6 +145,7 @@ section after `[user_accounts]` is optional and has safe defaults.
 | `[agents]` | Analyst model and call caps per run and per day, tuner changes per run, triage records per run and record retention. |
 | `[respond]` | Response engine: enforcement queue, approval expiry, blocklist file and format, `never_act_on` ranges, proxy guard, notification caps, retention. |
 | `[connector.*]` | Outbound connectors (webhook, siem_http, email, enrich, ticket, block_webhook). All off by default. |
+| `[connector.otx]` | Indicators to an AlienVault OTX pulse: proven, active source addresses and upload hashes only. Off by default, and a dry run (written to a file, nothing sent) until `dry_run = false`. See [docs/operations.md](docs/operations.md#indicators-to-otx). |
 | `[connector.s3_events]` | Event export: ships the event log to an S3 bucket as JSON lines for a SIEM S3 reader (`python -m agents ship`, also the last step of `run-all`). Off by default; passwords are hashed unless configured otherwise. See [docs/operations.md](docs/operations.md#event-export-to-s3). |
 
 Secrets are never written to the config. API keys and connector credentials are read from

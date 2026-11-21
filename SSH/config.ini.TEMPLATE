@@ -579,3 +579,43 @@ stale_hours = 48
 #interval_minutes = 15
 #max_bytes = 4194304
 #max_entries = 1000
+
+# Confirmed indicators to an AlienVault OTX pulse (off by default). run-all writes the
+# candidates (source addresses and upload hashes only, from sources whose address is proven
+# and that did more than probe) to candidates_file; the process with submit = true adds what
+# it has not sent before to one pulse per UTC day. The destination is fixed in code
+# (otx.alienvault.com). A public pulse shows anyone that this operator runs a honeypot and
+# roughly when each source hit it. See docs/operations.md, "Indicators to OTX".
+#[connector.otx]
+#enabled = false
+# true: write what would be sent to otx_dry_run.json in the state directory and send
+# nothing. Sending needs enabled = true and dry_run = false.
+#dry_run = true
+# false: only write the candidates (the agents container on AWS, which has no egress).
+#submit = true
+# Also submit the SHA-256 of whole files the quarantine kept from those sources.
+#hashes = true
+# The API key: an environment variable name or a file (one line), not both.
+#secret_env = WINNIE_OTX_KEY
+#secret_file = /run/otx-key
+# The pulse is named "<pulse_name> <YYYY-MM-DD>".
+#pulse_name = Honeypot sources
+#description = Source addresses and uploaded file hashes seen by a honeypot sensor.
+#tags = honeypot
+# white | green | amber | red; a public pulse cannot be amber or red.
+#tlp = green
+#public = false
+# Days until each indicator expires on OTX.
+#expiration_days = 30
+# Indicators per run (one request) and per UTC day.
+#max_per_run = 200
+#max_per_day = 1000
+# Records seen in this window are considered.
+#lookback_days = 7
+# Indicators remembered as sent, so none is sent twice; the oldest are dropped first.
+#max_entries = 20000
+# Default: otx_candidates.json next to the blocklist file (as tracked.json).
+#candidates_file = /blocklist/otx_candidates.json
+# Connect only to these IPv4 addresses (one per line, at most 8), the ones the host
+# firewall lets this process reach (deploy/aws/host/sensor-egress.sh).
+#addresses_file = /egress/otx-addresses
