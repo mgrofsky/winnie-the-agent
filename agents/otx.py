@@ -453,6 +453,31 @@ def candidates_document(items: list[dict], now: datetime.datetime) -> bytes:
                        separators=(",", ":")) + "\n").encode()
 
 
+def fit_candidates(items: list[dict], now: datetime.datetime,
+                   budget: int = MAX_CANDIDATES_BYTES) -> tuple[list[dict], int]:
+    """``(kept, dropped)``: the items whose document fits ``budget`` bytes, the size the
+    reader accepts. When they do not all fit, addresses are kept before hashes, and within
+    each the most recently seen first; the kept items stay in their original order."""
+    if len(candidates_document(items, now)) <= budget:
+        return items, 0
+    room = budget - len(candidates_document([], now))
+    # Addresses first; within a type, newest first (UTC ISO timestamps sort as text).
+    order = []
+    for kind in (IPV4, SHA256):
+        order += sorted((i for i in range(len(items)) if items[i]["type"] == kind),
+                        key=lambda i: items[i]["last_seen"], reverse=True)
+    chosen: set = set()
+    for i in order:
+        size = len(json.dumps(items[i], separators=(",", ":")).encode()) + (1 if chosen else 0)
+        if size <= room:
+            chosen.add(i)
+            room -= size
+    kept = [item for i, item in enumerate(items) if i in chosen]
+    while kept and len(candidates_document(kept, now)) > budget:
+        kept.pop()                       # not reached: the sizes above are exact
+    return kept, len(items) - len(kept)
+
+
 def write_candidates(settings: OtxSettings, records: Iterable[TriageRecord], networks: list,
                      path, *, uploads_dir=None, cap: int = 0,
                      now: Optional[datetime.datetime] = None, dry_run: bool = False) -> dict:
@@ -464,7 +489,11 @@ def write_candidates(settings: OtxSettings, records: Iterable[TriageRecord], net
         and cap > 0 else []
     items = select_candidates(records, networks, now, settings.lookback_days, uploads,
                               settings.hashes)
-    summary = {"candidates": len(items),
+    items, dropped = fit_candidates(items, now)
+    if dropped:
+        log.warning("OTX: %d candidates left out to keep the file under %d bytes", dropped,
+                    MAX_CANDIDATES_BYTES)
+    summary = {"candidates": len(items), "dropped_for_size": dropped,
                "addresses": sum(1 for i in items if i["type"] == IPV4),
                "hashes": sum(1 for i in items if i["type"] == SHA256)}
     if dry_run:
@@ -642,12 +671,7 @@ def load_state(path: Path) -> dict:
     return out
 
 
-def save_state(path: Path, state: dict, max_entries: int) -> None:
-    """Bounded (oldest sent indicators dropped first) and written atomically, owner only."""
-    sent = state["sent"]
-    if len(sent) > max_entries:
-        for key in sorted(sent, key=lambda k: sent[k])[:len(sent) - max_entries]:
-            del sent[key]
+def _state_bytes(state: dict, sent: dict) -> bytes:
     until = state.get("backoff_until")
     doc = {"version": VERSION, "day": state["day"], "day_count": state["day_count"],
            "pulse_day": state["pulse_day"] if state["pulse_id"] else "",
@@ -655,8 +679,40 @@ def save_state(path: Path, state: dict, max_entries: int) -> None:
            "backoff_until": _iso(until) if until else None,
            "backoff_minutes": state["backoff_minutes"],
            "sent": {k: _iso(v) for k, v in sent.items()}}
-    _atomic_write(path, (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n")
-                  .encode())
+    return (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def save_state(path: Path, state: dict, max_entries: int) -> int:
+    """Bounded and written atomically, owner only. The oldest sent indicators are dropped
+    first: beyond ``max_entries``, and then until the file is no larger than what
+    ``load_state`` reads, so a saved state is never refused on the next load (which would
+    send everything again). Returns how many were dropped."""
+    sent = state["sent"]
+    # Newest first; among equal times the one recorded later counts as newer.
+    newest = [k for _, k in sorted(enumerate(sent), key=lambda p: (sent[p[1]], p[0]),
+                                   reverse=True)]
+    dropped = newest[max_entries:]
+    newest = newest[:max_entries]
+    room = MAX_STATE_BYTES - len(_state_bytes(state, {}))
+    keep = 0
+    for key in newest:
+        size = len(json.dumps(key)) + 1 + len(json.dumps(_iso(sent[key]))) + (1 if keep else 0)
+        if size > room:
+            break
+        room -= size
+        keep += 1
+    dropped += newest[keep:]
+    for key in dropped:
+        del sent[key]
+    body = _state_bytes(state, sent)
+    while len(body) > MAX_STATE_BYTES and sent:    # not reached: the sizes above are exact
+        del sent[min(sent, key=lambda k: sent[k])]
+        dropped.append(None)
+        body = _state_bytes(state, sent)
+    if dropped:
+        log.info("OTX: %d oldest sent indicators dropped from the state", len(dropped))
+    _atomic_write(path, body)
+    return len(dropped)
 
 
 # ---- the run (ship) ------------------------------------------------------------------------

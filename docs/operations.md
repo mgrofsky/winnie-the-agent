@@ -940,7 +940,8 @@ parse, nothing is sent.
 
 1. `run-all` (it has the triage records) writes the candidates to `otx_candidates.json` next
    to the blocklist file: addresses, hashes, protocol and class names, timestamps. Records
-   seen in the last 7 days, at most 1000 indicators.
+   seen in the last 7 days, at most 1000 indicators and 256 KB (when they do not
+   fit, hashes go before addresses, the oldest first).
 2. `ship` (or `run-all` when `submit = true`) reads that file with the same care as the
    InternetDB wanted list: a regular file only (no FIFO, no symlink), at most 256 KB, every
    field checked, the whole file refused on any problem. It adds what it has not sent
@@ -955,10 +956,10 @@ stops the run and backs off for 15 minutes, doubling up to a day. If the day's p
 deleted on OTX, the next run creates a new one. Only the new pulse's id is read from an
 answer, and only when it is 24 letters or digits.
 
-Every indicator sent is remembered in `<state-dir>/otx_state.json` (at most 20000, oldest
-dropped first), so nothing is sent twice. Each run adds one `otx_submit` event with the
-counts (sent, failed, skipped as already sent, excluded, hashes off or over the cap) to
-`<state-dir>/ship_events.jsonl`. A failure never stops the event export or the other
+Every indicator sent is remembered in `<state-dir>/otx_state.json` (at most 20000, and never
+more than the 8 MB the state reader accepts; oldest dropped first), so nothing is sent
+twice. Each run adds one `otx_submit` event with the counts (sent, failed, skipped as
+already sent, excluded, hashes off or over the cap) to `<state-dir>/ship_events.jsonl`. A failure never stops the event export or the other
 stages.
 
 ### Turning it on

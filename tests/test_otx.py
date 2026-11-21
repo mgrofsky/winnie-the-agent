@@ -374,7 +374,8 @@ def test_write_candidates_and_its_format(tmp_path):
     path = tmp_path / "bl" / otx.CANDIDATES_FILE
     records = [rec(A, protocol="ftp", auth_successes=0, high_signal={"ftp_upload": 1})]
     out = otx.write_candidates(settings(), records, [], path, uploads_dir=q, cap=1000, now=NOW)
-    assert out == {"candidates": 2, "addresses": 1, "hashes": 1, "status": "written"}
+    assert out == {"candidates": 2, "dropped_for_size": 0, "addresses": 1, "hashes": 1,
+                   "status": "written"}
     doc = json.loads(path.read_text())
     assert set(doc) == {"version", "generated_at", "indicators"}
     assert all(set(i) == {"type", "indicator", "protocol", "classes", "last_seen"}
@@ -874,8 +875,8 @@ def test_cli_run_all_writes_candidates_and_dry_runs_by_default(tmp_path, monkeyp
             stored_at=now.isoformat())
     out = _cli(tmp_path, "run-all", f"[{otx.SECTION}]\nenabled = true\n"
                                     f"[listeners]\nftp_pasv_address = {OWN}\n")
-    assert out["otx"]["candidates"] == {"candidates": 2, "addresses": 1, "hashes": 1,
-                                        "status": "written"}
+    assert out["otx"]["candidates"] == {"candidates": 2, "dropped_for_size": 0, "addresses": 1,
+                                        "hashes": 1, "status": "written"}
     assert out["otx"]["submit"]["status"] == "dry run: written, nothing sent"
     preview = json.loads((tmp_path / "state" / otx.DRY_RUN_FILE).read_text())
     assert [i["indicator"] for i in preview["body"]["indicators"]] == [A, H1]
@@ -921,3 +922,118 @@ def test_cli_with_the_section_off_adds_nothing(tmp_path, monkeypatch):
     _no_network(monkeypatch)
     for text in ("", f"[{otx.SECTION}]\nenabled = false\n"):
         assert "otx" not in _cli(tmp_path, "ship", text)
+
+
+# ---- size limits: the writer never produces what the reader refuses ------------------------
+
+ALL_CLASSES = dict(auth_successes=1, honeytokens=["planted-key"],
+                   high_signal={name: 1 for name in otx.ACTIVE_SIGNALS})
+
+
+def fake_hash(n):
+    return hashlib.sha256(f"test upload {n}".encode()).hexdigest()
+
+
+def test_the_reported_case_one_source_every_class_999_hashes(tmp_path, key, monkeypatch):
+    # One source with every class and 999 uploads: 273,004 bytes before the fix.
+    uploads = [upload(fake_hash(n), A, NOW - datetime.timedelta(seconds=n)) for n in range(999)]
+    monkeypatch.setattr(otx, "read_uploads", lambda *a, **k: uploads)
+    path = tmp_path / "bl" / otx.CANDIDATES_FILE
+    out = otx.write_candidates(settings(), [rec(A, protocol="postgres", **ALL_CLASSES)], [],
+                               path, uploads_dir=tmp_path, cap=1000, now=NOW)
+    body = path.read_bytes()
+    assert len(body) <= otx.MAX_CANDIDATES_BYTES
+    assert out["dropped_for_size"] > 0 and out["candidates"] + out["dropped_for_size"] == 1000
+    assert out["addresses"] == 1                       # the address is never the one dropped
+    kept = [i for i in json.loads(body)["indicators"] if i["type"] == otx.SHA256]
+    # The newest uploads are kept.
+    assert {i["indicator"] for i in kept} == {fake_hash(n) for n in range(len(kept))}
+    fake = Fake()
+    result = submit(tmp_path, fake, s=settings(max_per_run=500, max_per_day=5000))
+    assert "error" not in result and result["candidates"] == out["candidates"]
+
+
+def _largest_items(n_addresses):
+    # Every field at its longest: all classes, the longest protocol name, an offset
+    # timestamp; hashes are longer than addresses, so the rest are hashes.
+    seen = NOW.isoformat()
+    longest = max(otx.PROTOCOLS, key=len)
+    items = [item(otx.IPV4, f"198.51.{100 + i // 250}.{1 + i % 250}", protocol=longest,
+                  classes=tuple(otx.CLASSES), seen=NOW) for i in range(n_addresses)]
+    items += [item(otx.SHA256, fake_hash(i), protocol=longest, classes=tuple(otx.CLASSES),
+                   seen=NOW) for i in range(otx.MAX_CANDIDATES - n_addresses)]
+    for i in items:
+        i["last_seen"] = seen
+    return items
+
+
+@pytest.mark.parametrize("n_addresses", [0, 1, 500, otx.MAX_CANDIDATES])
+def test_the_largest_document_the_writer_can_produce_is_accepted(n_addresses):
+    items = _largest_items(n_addresses)
+    assert len(otx.candidates_document(items, NOW)) > otx.MAX_CANDIDATES_BYTES or \
+        n_addresses == otx.MAX_CANDIDATES
+    kept, dropped = otx.fit_candidates(items, NOW)
+    body = otx.candidates_document(kept, NOW)
+    assert len(body) <= otx.MAX_CANDIDATES_BYTES
+    parsed, excluded = otx.parse_candidates(body, [])
+    assert len(parsed) == len(kept) == otx.MAX_CANDIDATES - dropped and excluded == 0
+    # Addresses are dropped last of all.
+    assert sum(1 for i in kept if i["type"] == otx.IPV4) == min(n_addresses, len(kept))
+    # It uses the budget: one more item would not have fitted.
+    if dropped:
+        assert len(otx.candidates_document(kept + [items[-1]], NOW)) > otx.MAX_CANDIDATES_BYTES
+
+
+def test_fitting_keeps_addresses_then_the_newest_hashes_in_their_order():
+    old, new = NOW - datetime.timedelta(days=1), NOW
+    items = ([item(otx.SHA256, fake_hash(i), seen=old) for i in range(5)]
+             + [ip(A, seen=old)]
+             + [item(otx.SHA256, fake_hash(10 + i), seen=new) for i in range(5)])
+    one = len(json.dumps(items[0], separators=(",", ":"))) + 1
+    budget = len(otx.candidates_document([], NOW)) \
+        + len(json.dumps(items[5], separators=(",", ":"))) + 2 * one
+    kept, dropped = otx.fit_candidates(items, NOW, budget)
+    assert dropped == 8 and len(otx.candidates_document(kept, NOW)) == budget
+    assert [i["indicator"] for i in kept] == [A, fake_hash(10), fake_hash(11)]
+    assert otx.fit_candidates(items, NOW) == (items, 0)
+
+
+def _hash_state(n, start=NOW):
+    return {"day": TODAY, "day_count": 0, "pulse_day": "", "pulse_id": None,
+            "backoff_until": None, "backoff_minutes": 0,
+            "sent": {f"FileHash-SHA256|{fake_hash(i)}": start - datetime.timedelta(seconds=i)
+                     for i in range(n)}}
+
+
+def test_a_full_state_at_the_largest_max_entries_is_never_refused(tmp_path):
+    top = otx.BOUNDS["max_entries"][1]
+    path = tmp_path / otx.STATE_FILE
+    st = _hash_state(top)
+    dropped = otx.save_state(path, st, top)
+    assert path.stat().st_size <= otx.MAX_STATE_BYTES
+    loaded = otx.load_state(path)
+    assert len(loaded["sent"]) == top - dropped > 0
+    # The oldest were dropped; the newest are all still known, so they are not resent.
+    assert f"FileHash-SHA256|{fake_hash(0)}" in loaded["sent"]
+    assert f"FileHash-SHA256|{fake_hash(top - 1)}" not in loaded["sent"] or dropped == 0
+    assert set(loaded["sent"]) == {f"FileHash-SHA256|{fake_hash(i)}"
+                                   for i in range(top - dropped)}
+
+
+def test_a_full_state_does_not_resend_what_it_kept(tmp_path, key):
+    top = otx.BOUNDS["max_entries"][1]
+    path = tmp_path / "state" / otx.STATE_FILE
+    path.parent.mkdir()
+    otx.save_state(path, _hash_state(top), top)
+    write_candidates(tmp_path, [sha(fake_hash(i)) for i in range(5)])
+    fake = Fake()
+    out = submit(tmp_path, fake, s=settings(max_entries=top))
+    assert out["status"] == "nothing new" and fake.calls == []
+    assert path.stat().st_size <= otx.MAX_STATE_BYTES
+
+
+def test_a_small_state_is_not_pruned(tmp_path):
+    path = tmp_path / otx.STATE_FILE
+    assert otx.save_state(path, _hash_state(50), 100) == 0
+    assert len(otx.load_state(path)["sent"]) == 50
+    assert otx.save_state(path, _hash_state(150), 100) == 50
