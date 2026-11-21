@@ -233,7 +233,14 @@ def one_reply(reply: str, text: str, *, interactive: bool, hosts: Iterable[str],
             pieces.append(token + " ")
             removed += reply[line.start + len(token):]
         else:
-            removed += reply[line.start:]
+            # Output with no newline runs into the prompt (``printf hello`` gives
+            # ``helloroot@srv01:~# ``): what stands in front of the session's user is output.
+            glued = _prompt(line.text).user  # type: ignore[union-attr]
+            keep = 0
+            if user and glued != user and glued.endswith(user) and token.startswith(glued):
+                keep = len(glued) - len(user)
+            pieces.append(reply[line.start:line.start + keep])
+            removed += reply[line.start + keep:]
     else:
         pieces.append(reply[pos:])
         reason = "echo"

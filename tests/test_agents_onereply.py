@@ -364,3 +364,16 @@ def test_reply_cut_record_is_not_an_input(tmp_path):
     assert session.commands == ["id"]
     assert all("shadow" not in c for camp in parsed.campaigns.values() for c in camp.commands)
     assert activity.classify(recs[2])[3] == "other"
+
+
+def test_exec_output_glued_to_the_prompt_is_kept():
+    cut = onereply.one_reply("helloroot@srv01:~# ", "printf hello", interactive=False,
+                             hosts=("srv01",), current_prompt="root@srv01:~# ", user="root")
+    assert cut is not None and cut.kept == "hello"
+    cut = onereply.one_reply("a\nhelloroot@srv01:~# id\nuid=0\n", "printf 'a\\nhello'",
+                             interactive=False, hosts=("srv01",),
+                             current_prompt="root@srv01:~# ", user="root")
+    assert cut is None      # the input has a backslash: left whole
+    cut = onereply.one_reply("root@srv01:~# ", "true", interactive=False, hosts=("srv01",),
+                             current_prompt="root@srv01:~# ", user="root")
+    assert cut is not None and cut.kept == ""
