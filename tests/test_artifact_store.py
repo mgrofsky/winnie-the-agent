@@ -227,6 +227,24 @@ class FileBackend(Base):
         self.assertIn("world-writable", out)
         self.assertEqual(os.listdir(self.root), [])
 
+    def test_group_writable_store_put_refused_get_warns(self):
+        self.run_tool("put", self.url)
+        os.chmod(self.root, 0o770)
+        rc, out = self.run_tool("put", self.url)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("group-writable", out)
+        dest = os.path.join(self.t, "restore")
+        rc, out = self.run_tool("get", self.url, "--dest", dest)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("group-writable", out)
+
+    def test_group_writable_parent_refused_for_put(self):
+        os.chmod(os.path.dirname(self.root), 0o775)
+        rc, out = self.run_tool("put", self.url)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("group-writable", out)
+        self.assertEqual(os.listdir(self.root), [])
+
     def test_get_partway_failure_removes_everything(self):
         self.run_tool("put", self.url)
         p = self.obj("asn.mmdb")  # second file in SHA256SUMS order

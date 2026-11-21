@@ -26,8 +26,13 @@ these controls.
 
 For `file://`, set `ARTIFACT_STORE_MOUNT` to the expected mount point before `put`.
 The script checks that the store exists on that mount, rejects symlinks in the store
-path, and refuses world-writable parent directories for writes. If you deliberately
-use a folder on the machine's own disk, set `ARTIFACT_STORE_LOCAL_DISK_OK=1` instead.
+path, and refuses group- or world-write mode bits from the store root up to `/`
+for writes. A private store subdirectory is insufficient if a group member can rename
+it from a writable parent; restrict the mount root and every ancestor as well.
+For `get` and `verify`, these permissions produce a warning while the downloaded
+bytes are still checked against the manifest. Review ACLs separately. If you
+deliberately use a folder on the machine's own disk, set
+`ARTIFACT_STORE_LOCAL_DISK_OK=1` instead.
 That is an explicit waiver of the connected-drive check, not proof of a backup.
 The script cannot determine whether a drive is encrypted or backed up.
 
