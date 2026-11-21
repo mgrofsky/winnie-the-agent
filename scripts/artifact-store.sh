@@ -158,10 +158,16 @@ where() {
 # ---------------------------------------------------------------- file:// checks
 # What the tool can check on a local or connected drive: the path exists; with
 # ARTIFACT_STORE_MOUNT set, that the path is on that mount point (df); that no directory from
-# the store up to / has group- or world-write mode bits (put refuses, get and verify warn:
-# they hash everything anyway); that nothing under the store root is a symlink. It cannot
-# check encryption, ACLs, who else can read the drive, or whether the drive is backed up.
+# the store up to / has group- or world-write mode bits or a foreign owner (put refuses,
+# get and verify warn: they hash everything anyway); that nothing under the store root is
+# a symlink. It cannot check encryption, ACLs, or whether the drive is backed up.
 mount_of() { df -P "$1" 2>/dev/null | awk 'NR==2 { for (i=6; i<=NF; i++) printf "%s%s", $i, (i<NF?" ":"") }'; }
+owner_uid() {
+  local uid
+  uid=$(stat -c '%u' "$1" 2>/dev/null) || uid=$(stat -f '%u' "$1" 2>/dev/null) || return 1
+  case "$uid" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$uid"
+}
 file_store_check() {
   [ -d "$ROOT" ] || die "file store not present: $ROOT"
   # The path must be canonical: no symlink as the store root or any directory above it.
@@ -176,19 +182,23 @@ file_store_check() {
   else
     warn "file store: no ARTIFACT_STORE_MOUNT, so this may be an ordinary folder on the boot disk (it is on ${m:-unknown}); it is not proof of an off-host copy"
   fi
-  local d=$ROOT bad= scope= perms=
+  local d=$ROOT bad= reason= perms= owner=
   while :; do
-    # A group member can swap a child directory between the canonical check and a write.
-    # Sticky world-writable directories (like /tmp) are also refused conservatively.
+    # Anyone who can write or owns an ancestor can swap its child between the canonical
+    # check and a write. Sticky world-writable parents are also refused conservatively.
     perms=$(ls -ld "$d")
-    if [ "${perms:8:1}" = w ]; then bad=$d; scope=world; break; fi
-    if [ "${perms:5:1}" = w ]; then bad=$d; scope=group; break; fi
+    if [ "${perms:8:1}" = w ]; then bad=$d; reason='is world-writable'; break; fi
+    if [ "${perms:5:1}" = w ]; then bad=$d; reason='is group-writable'; break; fi
+    owner=$(owner_uid "$d") || die "file store refused: cannot check owner of $d"
+    if [ "$owner" != 0 ] && [ "$owner" != "$EUID" ]; then
+      bad=$d; reason='is owned by another user'; break
+    fi
     [ "$d" = / ] && break
     d=$(dirname "$d")
   done
   if [ -n "$bad" ]; then
-    [ "$MODE" = put ] && die "file store refused: $bad is $scope-writable"
-    warn "file store: $bad is $scope-writable; every file is still verified against SHA256SUMS"
+    [ "$MODE" = put ] && die "file store refused: $bad $reason"
+    warn "file store: $bad $reason; every file is still verified against SHA256SUMS"
   fi
   if [ "$MODE" = put ] && [ ! -w "$ROOT" ]; then die "file store is read-only: $ROOT"; fi
 }

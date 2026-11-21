@@ -27,12 +27,15 @@ these controls.
 For `file://`, set `ARTIFACT_STORE_MOUNT` to the expected mount point before `put`.
 The script checks that the store exists on that mount, rejects symlinks in the store
 path, and refuses group- or world-write mode bits from the store root up to `/`
-for writes. A private store subdirectory is insufficient if a group member can rename
-it from a writable parent; restrict the mount root and every ancestor as well.
+for writes. Every directory in that chain must also be owned by the process user or root.
+A private store subdirectory is insufficient if another user owns or can write its parent;
+restrict the mount root and every ancestor as well.
 For example, `/tmp` is world-writable on Linux, so a store beneath it is refused
 even if the store directory itself has private permissions.
 For `get` and `verify`, these permissions produce a warning while the downloaded
-bytes are still checked against the manifest. Review ACLs separately. If you
+bytes are still checked against the manifest. Review ACLs separately. On macOS, turn
+off [Ignore ownership on this volume](https://support.apple.com/en-ie/guide/mac-help/mchlp1204/27/mac/27)
+for the connected drive; that setting treats files as owned by the current user. If you
 deliberately use a folder on the machine's own disk, set
 `ARTIFACT_STORE_LOCAL_DISK_OK=1` instead.
 That is an explicit waiver of the connected-drive check, not proof of a backup.

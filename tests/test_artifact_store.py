@@ -52,8 +52,7 @@ class Base(unittest.TestCase):
                 fh.write(f"{sha(b)}  {n}\n")
         self.sums = os.path.join(self.src, "SHA256SUMS")
         # stub bin dir: every network-capable CLI is a logging stub
-        self.bin = os.path.join(self.t, "bin")
-        os.makedirs(self.bin)
+        self.bin = tempfile.mkdtemp(prefix="artifact-store-cli-")
         for tool in STUBBED:
             p = os.path.join(self.bin, tool)
             with open(p, "w") as fh:
@@ -69,6 +68,7 @@ class Base(unittest.TestCase):
             for d in dirs:
                 os.chmod(os.path.join(root, d), 0o700)
         shutil.rmtree(self.t, ignore_errors=True)
+        shutil.rmtree(self.bin, ignore_errors=True)
 
     def run_tool(self, mode, store, *extra, env=None):
         e = {
@@ -267,6 +267,31 @@ class FileBackend(Base):
         rc, out = self.run_tool("put", self.url)
         self.assertNotEqual(rc, 0)
         self.assertIn("group-writable", out)
+        self.assertEqual(os.listdir(self.root), [])
+
+    def _fake_foreign_owner(self):
+        # Simulate a shared-drive owner without requiring root in the test runner.
+        wrapper = os.path.join(self.bin, "stat")
+        with open(wrapper, "w") as fh:
+            fh.write('#!/bin/sh\nfor arg do path=$arg; done\n'
+                     'if [ "$path" = "$FAKE_FOREIGN_OWNER_PATH" ]; then echo 90001; exit 0; fi\n'
+                     'exec /usr/bin/stat "$@"\n')
+        os.chmod(wrapper, 0o700)
+
+    def test_foreign_owned_store_refused_for_put(self):
+        self._fake_foreign_owner()
+        rc, out = self.run_tool("put", self.url,
+                                env={"FAKE_FOREIGN_OWNER_PATH": self.root})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("owned by another user", out)
+        self.assertEqual(os.listdir(self.root), [])
+
+    def test_foreign_owned_parent_refused_for_put(self):
+        self._fake_foreign_owner()
+        rc, out = self.run_tool("put", self.url,
+                                env={"FAKE_FOREIGN_OWNER_PATH": os.path.dirname(self.root)})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("owned by another user", out)
         self.assertEqual(os.listdir(self.root), [])
 
     def test_get_partway_failure_removes_everything(self):
