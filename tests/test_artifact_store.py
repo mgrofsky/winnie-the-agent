@@ -1,14 +1,15 @@
 """Tests for scripts/artifact-store.sh.
 
-file:// is exercised for real in temporary directories. The S3, GCS and Azure adapters run
-against stub CLIs (tests/stubs/fakecli.py) that log every call; nothing reaches a network.
+file:// is exercised for real under a private test directory. The S3, GCS and Azure
+adapters run against stub CLIs (tests/stubs/fakecli.py) that log every call; nothing
+reaches a network. Set ARTIFACT_STORE_TEST_TMPDIR to a private writable mount when
+the checkout is read-only.
 Run: python3 -m unittest discover -s tests -v
 """
 import hashlib
 import json
 import os
 import shutil
-import stat
 import subprocess
 import tempfile
 import unittest
@@ -36,8 +37,11 @@ def sha(b):
 
 
 class Base(unittest.TestCase):
+    def temp_parent(self):
+        return None
+
     def setUp(self):
-        self.t = os.path.realpath(tempfile.mkdtemp())  # canonical: macOS /var is a symlink
+        self.t = os.path.realpath(tempfile.mkdtemp(dir=self.temp_parent()))
         self.src = os.path.join(self.t, "geoip")
         os.makedirs(self.src)
         for n, b in FILES.items():
@@ -54,7 +58,7 @@ class Base(unittest.TestCase):
             p = os.path.join(self.bin, tool)
             with open(p, "w") as fh:
                 fh.write(f'#!/bin/sh\nexec python3 -I "{FAKE}" {tool} "$@"\n')
-            os.chmod(p, 0o755)
+            os.chmod(p, 0o700)
         self.log = os.path.join(self.t, "calls.log")
         open(self.log, "w").close()
         self.stub_store = os.path.join(self.t, "stubstore")
@@ -63,7 +67,7 @@ class Base(unittest.TestCase):
     def tearDown(self):
         for root, dirs, files in os.walk(self.t):
             for d in dirs:
-                os.chmod(os.path.join(root, d), 0o755)
+                os.chmod(os.path.join(root, d), 0o700)
         shutil.rmtree(self.t, ignore_errors=True)
 
     def run_tool(self, mode, store, *extra, env=None):
@@ -90,6 +94,26 @@ class Base(unittest.TestCase):
 
 # ---------------------------------------------------------------- file://
 class FileBackend(Base):
+    def temp_parent(self):
+        # file:// refuses a world-writable ancestor such as Linux /tmp. Keep these
+        # fixtures under the ignored checkout cache, or a private read-only-Docker mount.
+        parent = os.environ.get("ARTIFACT_STORE_TEST_TMPDIR") or os.path.join(
+            HERE, "..", ".pytest_cache", "artifact-store"
+        )
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        parent = os.path.realpath(parent)
+        ancestor = parent
+        while True:
+            if os.stat(ancestor).st_mode & 0o022:
+                raise RuntimeError(
+                    "artifact-store tests need a temp directory without group- or "
+                    "world-writable ancestors; set ARTIFACT_STORE_TEST_TMPDIR"
+                )
+            if ancestor == os.path.sep:
+                break
+            ancestor = os.path.dirname(ancestor)
+        return parent
+
     def setUp(self):
         super().setUp()
         self.root = os.path.join(self.t, "Secure Drive", "store")  # spaces in mount names
@@ -155,7 +179,7 @@ class FileBackend(Base):
     def test_tampered_store_fails_get_and_deletes(self):
         self.run_tool("put", self.url)
         p = self.obj("city.mmdb")
-        os.chmod(p, 0o644)
+        os.chmod(p, 0o600)
         with open(p, "r+b") as fh:
             fh.write(b"X")
         dest = os.path.join(self.t, "restore")
@@ -178,7 +202,7 @@ class FileBackend(Base):
     def test_existing_corrupt_artifact_fails_put(self):
         self.run_tool("put", self.url)
         p = self.obj("asn.mmdb")
-        os.chmod(p, 0o644)
+        os.chmod(p, 0o600)
         with open(p, "r+b") as fh:
             fh.write(b"Z")
         rc, out = self.run_tool("put", self.url)
@@ -211,7 +235,7 @@ class FileBackend(Base):
 
     def test_world_writable_store_put_refused_get_warns(self):
         self.run_tool("put", self.url)
-        os.chmod(self.root, 0o777)
+        os.chmod(self.root, 0o777)  # intentional: put must reject a world-writable root
         rc, out = self.run_tool("put", self.url)
         self.assertNotEqual(rc, 0)
         self.assertIn("world-writable", out)
@@ -221,7 +245,7 @@ class FileBackend(Base):
         self.assertIn("warning", out)
 
     def test_sticky_world_writable_parent_refused_for_put(self):
-        os.chmod(os.path.dirname(self.root), 0o1777)  # like /tmp
+        os.chmod(os.path.dirname(self.root), 0o1777)  # intentional: reject a sticky parent
         rc, out = self.run_tool("put", self.url)
         self.assertNotEqual(rc, 0)
         self.assertIn("world-writable", out)
@@ -229,7 +253,7 @@ class FileBackend(Base):
 
     def test_group_writable_store_put_refused_get_warns(self):
         self.run_tool("put", self.url)
-        os.chmod(self.root, 0o770)
+        os.chmod(self.root, 0o770)  # intentional: put must reject a group-writable root
         rc, out = self.run_tool("put", self.url)
         self.assertNotEqual(rc, 0)
         self.assertIn("group-writable", out)
@@ -239,7 +263,7 @@ class FileBackend(Base):
         self.assertIn("group-writable", out)
 
     def test_group_writable_parent_refused_for_put(self):
-        os.chmod(os.path.dirname(self.root), 0o775)
+        os.chmod(os.path.dirname(self.root), 0o775)  # intentional: reject a writable parent
         rc, out = self.run_tool("put", self.url)
         self.assertNotEqual(rc, 0)
         self.assertIn("group-writable", out)
@@ -248,8 +272,8 @@ class FileBackend(Base):
     def test_get_partway_failure_removes_everything(self):
         self.run_tool("put", self.url)
         p = self.obj("asn.mmdb")  # second file in SHA256SUMS order
-        os.chmod(os.path.dirname(p), 0o755)
-        os.chmod(p, 0o644)
+        os.chmod(os.path.dirname(p), 0o700)
+        os.chmod(p, 0o600)
         os.remove(p)
         dest = os.path.join(self.t, "restore")
         rc, out = self.run_tool("get", self.url, "--dest", dest)

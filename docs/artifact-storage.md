@@ -29,6 +29,8 @@ The script checks that the store exists on that mount, rejects symlinks in the s
 path, and refuses group- or world-write mode bits from the store root up to `/`
 for writes. A private store subdirectory is insufficient if a group member can rename
 it from a writable parent; restrict the mount root and every ancestor as well.
+For example, `/tmp` is world-writable on Linux, so a store beneath it is refused
+even if the store directory itself has private permissions.
 For `get` and `verify`, these permissions produce a warning while the downloaded
 bytes are still checked against the manifest. Review ACLs separately. If you
 deliberately use a folder on the machine's own disk, set
@@ -89,7 +91,10 @@ The config is parsed as data, not executed. The script requires Bash, Perl, and 
 
 The `file://` path has been exercised against temporary directories and connected
 encrypted drives. Automated S3, GCS, and Azure tests use stub CLIs to check commands,
-failure handling, and integrity behavior; this repository has not validated a live
-cloud upload for all three providers. Before depending on a cloud backend in
-production, test `put`, `verify`, and `get` with a dedicated private test
-bucket or container and confirm provider-side policy and audit records.
+failure handling, and integrity behavior. **None of the three cloud backends has a
+validated live upload in this project.** Use a current AWS CLI v2 that supports
+`s3api put-object --if-none-match`; check that your installed `gcloud storage cp`
+supports `--if-generation-match` and `az storage blob upload` supports
+`--overwrite false`. Before production use, test `put`, a second `put` (which should
+skip without overwriting), `verify`, and `get` in a dedicated private test bucket or
+container, then confirm provider-side access, retention, encryption, and audit records.

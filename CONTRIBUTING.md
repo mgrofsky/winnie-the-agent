@@ -15,6 +15,12 @@ uv run pytest -m "slow or not slow"  # everything, as CI runs it
 `requirements.txt`. CI runs `uv sync --frozen` and the full suite on Python 3.11, 3.12 and
 3.13 for pushes and pull requests to `main` and `dev`.
 
+The artifact-store tests put temporary files under the ignored `.pytest_cache/` directory
+because `file://` writes reject world-writable ancestors such as Linux `/tmp`. When the
+checkout is read-only, set `ARTIFACT_STORE_TEST_TMPDIR` to a writable private mount with
+no group- or world-writable ancestors. A Docker tmpfs at `/artifact-test-tmp` with mode
+`0700` and ownership matching the test user works.
+
 Rules for tests:
 
 - **No network.** Tests may use loopback only. Nothing calls a real model or a real
