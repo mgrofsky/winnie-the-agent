@@ -3,7 +3,7 @@
 - Sigma rules for IOCs and high-signal behaviours seen across several sessions or source
   IPs. The rule body comes from a template in code; the model may only supply a title and
   description for a new draft, which are length-capped and stripped to a safe character
-  set. Indicator values are attacker-chosen and are escaped (``*``, ``?``, ``\``) so they
+  set. Indicator values are attacker-chosen and are escaped (``*``, ``?``, ``\\``) so they
   match literally. Each indicator type has its own log source and field (``IOC_RULES``);
   addresses and hashes get no Sigma rule. One file per rule id, named from the id; a draft
   keeps its ``date`` and gets ``modified`` when its content changes; a rule already in
