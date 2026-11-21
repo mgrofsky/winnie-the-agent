@@ -316,7 +316,11 @@ seen and what is still unproven. In short:
 - **Image size.** The Docker image is about 650 MB on disk, mostly the Python base image
   and the model provider client libraries. See
   [docs/operations.md](docs/operations.md#image-size-and-token-counting).
-- The model sometimes invents the attacker's next command and answers it too.
+- The model sometimes invents the attacker's next command and answers it too. The persona
+  cuts such a reply back to the output and one prompt before anyone sees it, and logs a
+  `Reply cut` event with how much was dropped, so you can see how often it happens. A
+  reply to an input that could print a prompt itself (it contains `@`, `$`, a backtick, a
+  backslash or `%`) is left whole, so some invented rounds still get through.
 - The daily budget is shared between processes on one host through a file lock; several
   hosts do not share one cap.
 - Changing the SSH banner or the active scenario needs a restart.

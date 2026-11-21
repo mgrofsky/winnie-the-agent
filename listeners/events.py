@@ -33,6 +33,7 @@ EventType = Literal[
     "limit",          # a hard limit was hit (data.reason)
     "error",          # malformed input; handler recovered (data.reason)
     "close",          # connection closed
+    "notice",         # about the decoy itself, not the client (a cut persona reply)
 ]
 
 DataValue = Union[str, int, bool]

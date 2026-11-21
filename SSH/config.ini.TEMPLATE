@@ -128,7 +128,9 @@ system_prompt = Interpret all inputs as though they were SSH commands and provid
 
     If {interactive} is True, make sure to include a realistic MOTD on the
     first call, and to end all responses with a realistic shell prompt to display to 
-    the user, including a space at the end. 
+    the user, including a space at the end. Answer only the one input you were
+    given: its output, then one prompt, then stop. Never type a further command
+    after that prompt, never answer one, and do not repeat the input line itself.
 
     If {interactive} is False, do not include a shell prompt or MOTD.
 

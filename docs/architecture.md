@@ -156,6 +156,26 @@ the attacker typed themselves is allowed through. The check is a short list of p
 `agents/hooks.py`; it catches the common ways a model steps out of the role, not every
 one.
 
+A model reply is first cut back to the one round the input asked for (`agents/onereply.py`),
+before it is sent, kept in the history or the reply cache, logged, or read for the prompt.
+The first line that starts with the session's prompt (`user@host:dir#`, or `[user@host
+dir]#` on RHEL; the host is the scenario's, the one in the prompt noted for the session,
+or the one the reply ends with, or any host when the prompt shows the session's own user)
+and has a command or more output after it ends the reply:
+an interactive reply keeps that prompt and nothing after it, an exec reply loses the prompt
+too. The attacker's own line echoed back at the start of a reply, with or without a prompt
+in front, and a bare prompt in front of the output are dropped (a bare echo followed only
+by the prompt is kept: it may be the output). A reply is left whole when
+the input could print a prompt-shaped line itself (it contains `@`, a backtick, a
+backslash, `%` or a `$` expansion), and for content viewers only the session's exact
+current prompt counts, and nothing at all once the session has typed such an input. Each
+cut logs one `Reply cut` event (`cut_reason`, `dropped_chars`, `cuts_in_session` and a
+`dropped_sample` of at most 120 escaped characters; telnet: a `notice` event with the same
+`data`); the dropped text is never recorded as input. The template system prompt also asks
+for one round, and `[llm] max_tokens` caps the reply on the anthropic provider. No stop
+sequence is used: the prompt the model must print is the same text that starts an
+invented round.
+
 Sessions have a login timeout (60 s), an idle timeout (300 s) and an absolute lifetime
 (1800 s); each frees a concurrency slot. Chat history is dropped when a session closes. The
 session summary at the end uses the same budget and is skipped when the session ran no
@@ -467,7 +487,7 @@ SSH `message` values include `SSH connection received`, `User attempting to auth
 `details`), `Session summary` (summary in `details`, `judgement` field: `BENIGN`,
 `SUSPICIOUS`, `MALICIOUS`, or `UNKNOWN` when no summary was made, for example without a
 model), `Budget exceeded`
-(with `reason`), `Model error`, `Persona break`, `Session timeout` and
+(with `reason`), `Model error`, `Persona break`, `Reply cut`, `Session timeout` and
 `SSH connection closed`.
 
 Listener events add:
@@ -475,7 +495,7 @@ Listener events add:
 | Field | Meaning |
 |---|---|
 | `sensor_protocol` | `sip`, `ftp`, `telnet`, `postgres`, `mysql`, `mssql`, `redis`, `smtp`, `http`, `mllp`, `s3` (SSH lines carry `ssh`). |
-| `event` | `connection`, `auth_attempt`, `command`, `register`, `invite`, `options`, `limit`, `error`, `close`. |
+| `event` | `connection`, `auth_attempt`, `command`, `register`, `invite`, `options`, `limit`, `error`, `close`, `notice` (about the decoy itself, such as a cut persona reply). |
 | `transport` | `tcp` or `udp`. |
 | `username`, `password` | Submitted credentials, when the protocol reveals them. |
 | `client` | Client software string (User-Agent, connect attributes). |

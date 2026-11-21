@@ -373,3 +373,57 @@ async def test_concurrent_connections_keep_log_source_ports_separate(connect, lo
     first_session_id = assert_single_session_id(first_port_records)
     second_session_id = assert_single_session_id(second_port_records)
     assert first_session_id != second_session_id
+
+
+class InventingMessageHistory(ScriptedMessageHistory):
+    """Answers ``systemctl status nginx`` with a second, invented round after its own."""
+
+    async def ainvoke(self, payload, config=None):
+        message = payload["messages"][-1].content
+        if message == "systemctl status nginx":
+            tail = PROMPT if payload["interactive"] else ""
+            return FakeLLMResponse(f"inactive\n{PROMPT}cat /etc/shadow\n"
+                                   f"root:$6$x:19000::::::\n{tail}")
+        return await super().ainvoke(payload, config)
+
+
+@pytest.mark.asyncio
+async def test_interactive_reply_is_cut_to_one_round(connect, log_records, configured_runtime):
+    ssh_server.with_message_history = InventingMessageHistory()
+    async with await connect() as conn:
+        process = await conn.create_process(term_type="xterm")
+        await asyncio.wait_for(process.stdout.readuntil(PROMPT), timeout=2)
+        process.stdin.write("systemctl status nginx\n")
+        output = await asyncio.wait_for(process.stdout.readuntil(PROMPT), timeout=2)
+        assert "inactive" in output
+        process.stdin.write("exit\n")
+        rest = await asyncio.wait_for(process.stdout.read(), timeout=2)
+        await asyncio.wait_for(process.wait(), timeout=2)
+    assert "shadow" not in output + rest
+
+    records = await wait_for_log_messages(log_records, SESSION_LOG_MESSAGES | {"Reply cut"})
+    (cut,) = [r for r in records if r["message"] == "Reply cut"]
+    assert cut["cut_reason"] == "next_command" and cut["dropped_chars"] > 0
+    assert cut["task_name"].startswith("session-")
+    assert "details" not in cut
+    responses = [b64decode(r["details"]).decode() for r in records
+                 if r["message"] == "LLM response"]
+    assert all("shadow" not in text for text in responses)
+
+    # the dropped text is not an input anywhere triage or the console reads
+    from agents.sessions import parse_log
+
+    parsed = parse_log(configured_runtime["log_file"])
+    (session,) = parsed.sessions.values()
+    assert session.commands == ["systemctl status nginx", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_exec_reply_is_cut_without_a_prompt(connect, log_records):
+    ssh_server.with_message_history = InventingMessageHistory()
+    async with await connect() as conn:
+        result = await conn.run("systemctl status nginx")
+    assert result.stdout == "inactive\n"
+    records = await wait_for_log_messages(log_records, SESSION_LOG_MESSAGES | {"Reply cut"})
+    (cut,) = [r for r in records if r["message"] == "Reply cut"]
+    assert cut["cut_reason"] == "next_command"

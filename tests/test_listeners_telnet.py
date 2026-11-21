@@ -233,3 +233,39 @@ async def test_telnet_persona_answers_host_facts_without_the_model(telnet_server
     w.write(b"logout\r\n")
     assert await read_until(reader, b"__never__") == b""
     assert [c[0]["messages"][0].content for c in fake.calls] == ["", "logout"]
+
+
+async def test_telnet_persona_reply_is_cut_to_one_round(telnet_server, tmp_path):
+    fake = FakeHistory({"": "Last login: Mon Mar  2 09:14:01 2026\nroot@db01:~# ",
+                        "systemctl is-active nginx":
+                            "inactive\nroot@db01:~# cat /etc/shadow\nroot:$6$x::\n"
+                            "root@db01:~# ",
+                        "logout": "YYY-END-OF-SESSION-YYY"})
+    writer, reader, w = await telnet_server(persona=fake, accept="all")
+    await login(reader, w, b"root", b"root")
+    await read_until(reader, b"root@db01:~# ")
+    w.write(b"systemctl is-active nginx\r\n")
+    out = await read_until(reader, b"root@db01:~# ")
+    assert b"inactive" in out
+    w.write(b"logout\r\n")
+    rest = await read_until(reader, b"__never__")
+    assert b"shadow" not in out + rest
+    (notice,) = events(writer, "notice")
+    assert notice["message"] == "Reply cut"
+    assert notice["data"]["cut_reason"] == "next_command"
+    assert notice["data"]["dropped_chars"] > 0
+    assert notice["task_name"].startswith("telnet-")
+    cmds = events(writer, "command")
+    assert [c["data"]["input"] for c in cmds] == ["systemctl is-active nginx", "logout"]
+    assert "shadow" not in cmds[0]["data"]["response"]
+
+    # triage reads only what the client typed
+    import json
+
+    from agents.sessions import parse_log
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("".join(json.dumps(e) + "\n" for e in writer.events))
+    parsed = parse_log(log)
+    commands = [c for camp in parsed.campaigns.values() for c in camp.commands]
+    assert commands == ["systemctl is-active nginx", "logout"]
