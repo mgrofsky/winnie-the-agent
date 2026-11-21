@@ -17,9 +17,9 @@ a command after it, or more output after it, ends the reply: interactive replies
 prompt and lose everything after it; exec replies lose the prompt too.
 
 Before that, at the very start of the reply, up to ``MAX_LEADING`` lines are dropped when
-they are the attacker's own line echoed back (with or without a prompt in front: the
-terminal already echoed it), or a bare prompt with more output after it. A bare echo is
-kept when only the final prompt follows it: then it may be the output itself.
+they are the attacker's own line echoed back after a prompt (the terminal already echoed
+it), or a bare prompt with more output after it. A line that is only the input, with no
+prompt in front, is kept: it may be the output itself.
 
 Left whole, because the output itself could hold prompt-shaped lines:
 
@@ -171,16 +171,7 @@ def one_reply(reply: str, text: str, *, interactive: bool, hosts: Iterable[str],
     def more_after(index: int) -> bool:
         return any(not _filler(lines[j].text) for j in range(index + 1, len(lines)))
 
-    def _only_final_prompt(index: int) -> bool:
-        """True when all that follows line ``index`` is one bare session prompt."""
-        k = next((j for j in range(index + 1, len(lines)) if not _filler(lines[j].text)),
-                 None)
-        if k is None:
-            return True
-        p = session_prompt(lines[k])
-        return p is not None and not p.rest.strip() and not more_after(k)
-
-    # Leading lines: the attacker's own line echoed back, with or without a prompt, and a
+    # Leading lines: the attacker's own line echoed back after a prompt, and a
     # bare prompt in front of the output. Never the reply's last line of content.
     drop: list[int] = []
     i = 0
@@ -192,12 +183,11 @@ def one_reply(reply: str, text: str, *, interactive: bool, hosts: Iterable[str],
         if not more_after(i):
             break
         p = session_prompt(line)
-        echo = typed and (plain(line.text).strip() == typed
-                          or (p is not None and plain(p.rest).strip() == typed))
+        # A line that is only the input, with no prompt in front, may be output (``ls``
+        # where a file is named ``ls``): it stays.
+        echo = typed and p is not None and plain(p.rest).strip() == typed
         if not echo and (p is None or p.rest.strip()):
             break
-        if echo and p is None and _only_final_prompt(i):
-            break      # ``ls`` in a directory holding only a file named ``ls`` prints "ls"
         drop.append(i)
         i += 1
     first_kept = i

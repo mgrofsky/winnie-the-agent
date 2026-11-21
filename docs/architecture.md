@@ -163,9 +163,9 @@ dir]#` on RHEL; the host is the scenario's, the one in the prompt noted for the 
 or the one the reply ends with, or any host when the prompt shows the session's own user)
 and has a command or more output after it ends the reply:
 an interactive reply keeps that prompt and nothing after it, an exec reply loses the prompt
-too. The attacker's own line echoed back at the start of a reply, with or without a prompt
-in front, and a bare prompt in front of the output are dropped (a bare echo followed only
-by the prompt is kept: it may be the output). A reply is left whole when
+too. The attacker's own line echoed back after a prompt at the start of a reply, and a
+bare prompt in front of the output, are dropped (a line that is only the input, with no
+prompt in front, is kept: it may be the output). A reply is left whole when
 the input could print a prompt-shaped line itself (it contains `@`, a backtick, a
 backslash, `%` or a `$` expansion), and for content viewers only the session's exact
 current prompt counts, and nothing at all once the session has typed such an input. Each

@@ -44,7 +44,6 @@ CUT = [
     ("whoami", "root\nroot@srv01:~# \nbin  etc\nroot@srv01:~# ", True,
      "root\nroot@srv01:~# ", "extra_prompt"),
     # the attacker's own line echoed back, with and without a prompt in front
-    ("whoami", "whoami\nroot\nroot@srv01:~# ", True, "root\nroot@srv01:~# ", "echo"),
     ("whoami", "root@srv01:~# whoami\r\nroot\r\nroot@srv01:~# ", True,
      "root\r\nroot@srv01:~# ", "echo"),
     # a reply that starts with a bare prompt
@@ -82,7 +81,6 @@ CUT = [
     # exec: no prompt at all
     ("whoami", "root\nroot@srv01:~# ", False, "root\n", "prompt_in_exec"),
     ("whoami", "root\nroot@srv01:~# id\nuid=0(root)\n", False, "root\n", "next_command"),
-    ("whoami", "whoami\nroot\n", False, "root\n", "echo"),
     # output without a newline runs into the prompt, as in a real shell
     ("printf root", "rootroot@srv01:~# ls\nbin\nroot@srv01:~# ", True,
      "rootroot@srv01:~# ", "next_command"),
@@ -377,3 +375,13 @@ def test_exec_output_glued_to_the_prompt_is_kept():
     cut = onereply.one_reply("root@srv01:~# ", "true", interactive=False, hosts=("srv01",),
                              current_prompt="root@srv01:~# ", user="root")
     assert cut is not None and cut.kept == ""
+
+
+def test_a_bare_line_equal_to_the_input_is_output_and_stays():
+    kw = dict(hosts=("srv01",), current_prompt="root@srv01:~# ", user="root")
+    assert onereply.one_reply("ls\nnotes\n", "ls", interactive=False, **kw) is None
+    assert onereply.one_reply("whoami\nroot\nroot@srv01:~# ", "whoami", interactive=True,
+                              **kw) is None
+    cut = onereply.one_reply("root@srv01:~# whoami\nroot\nroot@srv01:~# ", "whoami",
+                             interactive=True, **kw)
+    assert cut is not None and cut.kept == "root\nroot@srv01:~# "
