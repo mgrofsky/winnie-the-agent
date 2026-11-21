@@ -37,7 +37,7 @@ Log sources and fields follow the Sigma taxonomy appendix where it has one
 Postfix have no taxonomy entry; their product names are used as the specification's log
 source rules describe.
 
-No Sigma rule is written for an IPv4 address or for an MD5, SHA-1 or SHA-256 found in
+No Sigma rule is written for an IP address or for an MD5, SHA-1 or SHA-256 found in
 command text. An address is a source or a destination, not a command-line string; the STIX
 export carries addresses. A hash in command text is not known to be the hash of any file.
 
