@@ -267,6 +267,11 @@ def parse_target(target: str) -> Optional[tuple[str, dict[str, str]]]:
     return path, query
 
 
+def _log_safe(path: str) -> str:
+    """Keep request paths on one log line, including decoded Unicode separators."""
+    return ascii(path[:200])[1:-1]
+
+
 def is_loopback(bind: str) -> bool:
     if bind.lower() == "localhost":
         return True
@@ -492,8 +497,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def _log_path(self) -> str:
         path = getattr(self, "path", None) or "-"
-        path = path.split("?", 1)[0][:200]  # the query can carry the token
-        return path.encode("ascii", "backslashreplace").decode("ascii")
+        return _log_safe(path.split("?", 1)[0])  # the query can carry the token
 
     def _send(self, status: int, body: bytes, content_type: Optional[str],
               headers: tuple[tuple[str, str], ...] = ()) -> None:
@@ -629,7 +633,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError(f"route returned status {status!r}")
             body = encode_json(value)
         except Exception:
-            log.exception("route failed on %s %s", self.command, path[:200])
+            log.exception("route failed on %s %s", self.command, _log_safe(path))
             self._send_json(500, {"error": "internal error"})
             return
         self._send(status, body, JSON_TYPE)

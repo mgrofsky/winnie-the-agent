@@ -535,6 +535,35 @@ def test_access_log_has_method_path_status_without_query(console, caplog):
     assert not any("search" in line for line in lines)
 
 
+@pytest.mark.parametrize("separator,escaped", [
+    ("\u0085", r"\x85"), ("\u2028", r"\u2028"), ("\u2029", r"\u2029"),
+])
+def test_route_failure_escapes_unicode_line_separators(active, caplog, separator, escaped):
+    caplog.set_level(logging.ERROR, logger="agents.ui")
+    active.routes.error = RuntimeError("route failed")
+    path = "/api/item" + urllib.parse.quote(separator)
+
+    assert active.request("GET", path).status == 500
+    lines = [r.getMessage() for r in caplog.records if r.name == "agents.ui"]
+    assert lines
+    assert all(separator not in line for line in lines)
+    assert any(escaped in line for line in lines)
+
+
+def test_access_log_escapes_raw_terminal_control(console, caplog):
+    caplog.set_level(logging.INFO, logger="agents.ui")
+    request = (f"GET /api/\x1b[31mitem HTTP/1.1\r\nHost: {console.host}\r\n\r\n").encode()
+    with socket.create_connection(("127.0.0.1", console.port), timeout=5) as sock:
+        sock.sendall(request)
+        while sock.recv(4096):
+            pass
+
+    lines = [r.getMessage() for r in caplog.records if r.name == "agents.ui"]
+    assert lines
+    assert all("\x1b" not in line for line in lines)
+    assert any(r"\x1b" in line for line in lines)
+
+
 def test_serve_logs_sign_in_url_once(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger="agents.ui")
     monkeypatch.setattr(ui.UiServer, "serve_forever", lambda self, *a, **k: None)
