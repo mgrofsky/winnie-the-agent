@@ -42,6 +42,7 @@ from typing import Optional
 from agents.connectors.base import DestinationError
 from agents.connectors.http import ConfigError as HttpConfigError
 from agents.connectors.http import EndpointConfig, HttpEndpoint, UrlTransport, load_endpoint
+from agents.localfile import read_regular
 from agents.objectstore import ConfigError as StoreConfigError
 from agents.objectstore import S3Target, error_code, put_object
 from agents.ship import _record_event
@@ -157,8 +158,8 @@ def run_export(settings: ExportSettings, default_file, state_dir, *, dry_run: bo
     path = Path(settings.file) if settings.file else Path(default_file)
     summary: dict = {"kind": settings.kind}
     try:
-        with open(path, "rb") as f:
-            body = f.read(MAX_DOCUMENT_BYTES + 1)
+        # A FIFO, symlink or directory here is unreadable, like any other read failure.
+        body = read_regular(path, MAX_DOCUMENT_BYTES)
     except FileNotFoundError:
         log.info("no tracked export at %s yet; nothing to send", path)
         return {**summary, "status": "no_file"}

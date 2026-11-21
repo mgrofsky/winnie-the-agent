@@ -216,6 +216,32 @@ def test_an_oversized_file_never_leaves(tmp_path, monkeypatch):
     assert "larger than" in res["error"] and created == []
 
 
+@pytest.mark.parametrize("kind", ["fifo", "symlink", "directory"])
+def test_a_tracked_export_that_is_not_a_regular_file_is_unreadable(tmp_path, kind):
+    import os
+
+    path = tmp_path / "reports" / "blocklist" / "tracked.json"
+    path.parent.mkdir(parents=True)
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "symlink":
+        real = tmp_path / "elsewhere.json"
+        write_tracked(real, ENTRIES, NOW, "sensor-a")
+        path.symlink_to(real)
+    else:
+        path.mkdir()
+    res, created = _send(tmp_path, _s3())    # a FIFO would block here with a plain open()
+    assert res["error"].startswith("cannot read the tracked export (") and created == []
+    assert (tmp_path / "state" / "ship_events.jsonl").exists()
+
+
+def test_a_normal_tracked_export_is_sent_byte_for_byte(tmp_path):
+    path = _file(tmp_path)
+    s3 = FakeS3()
+    res, _ = _send(tmp_path, _s3(), s3)
+    assert res["status"] == "sent" and s3.puts[0]["Body"] == path.read_bytes()
+
+
 def test_file_setting_reads_another_path(tmp_path):
     other = tmp_path / "mounted" / "tracked.json"
     write_tracked(other, ENTRIES, NOW, "s")

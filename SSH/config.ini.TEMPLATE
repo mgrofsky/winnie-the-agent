@@ -553,12 +553,21 @@ stale_hours = 48
 # A delivered answer older than this is not accepted.
 #max_age_days = 30
 
-# Delivered mode only: PutObject of the wanted list to one key, GetObject of the answers from
-# another, run by ship / run-all in the process that has the credentials. The answers object
-# is refused whole above max_bytes or max_entries; each answer is checked on its own.
+# Delivered mode only, run by ship / run-all in the process with the credentials or egress. s3:
+# PutObject of the wanted list to one key, GetObject of the answers from another; the
+# answers object is refused whole above max_bytes or max_entries; each answer is checked on
+# its own. kind = lookup: no object store and nothing outside the sensor; this process reads
+# the wanted list and asks InternetDB itself, with the caps, pacing and cache set above, and
+# keeps its own state in its state directory; it writes the checked answers to
+# answers_file. Put it in the exporter's config only (on AWS, InternetDbLookup does), never
+# in the config of a process that must not reach the internet. See docs/operations.md,
+# "The exporter asks InternetDB".
 #[connector.internetdb_exchange]
 #enabled = false
 #kind = s3
+# kind = lookup only: connect only to these IPv4 addresses (one per line, at most 8), the
+# ones the host firewall lets this process reach (deploy/aws/host/sensor-egress.sh).
+#addresses_file = /egress/internetdb-addresses
 #bucket = example-honeypot-events
 #wanted_key = events/internetdb/wanted.json
 #answers_key = internetdb/answers.json
