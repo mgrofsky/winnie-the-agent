@@ -267,6 +267,29 @@ authentication only and are never rendered into a prompt.
     answers stay display only. A sensor that is taken over learns nothing new from it and
     can write only the wanted list (on AWS the answers key is outside the prefix it may
     write, so it cannot write its own answers).
+  - *The exporter's own lookups* (`[connector.internetdb_exchange] kind = lookup`, see
+    [operations.md](operations.md#the-exporter-asks-internetdb); on AWS `InternetDbLookup`).
+    The exporter gains one outbound destination, `internetdb.shodan.io`, carrying exactly
+    what a direct lookup carries (one GET per address, the address in the path and nothing
+    else) under the same caps, pacing, cache and back-off. The agents container still has
+    no egress and gets none: it reads attacker-influenced text and runs the model, so it
+    only writes the wanted list and reads the answers file, as in delivered mode. The
+    wanted list is untrusted input to the exporter: it is read with a size cap, must be a
+    version 1 list of at most 500 distinct canonical global addresses or it is refused
+    whole, `never_act_on` is applied again, and only a checked address reaches the request,
+    as the path of a fixed URL; nothing in the file chooses the host, a header or any other
+    content. What a taken-over agents container can do through it is choose which public
+    addresses the exporter asks about, within `max_per_run` and `max_per_day`. The
+    exporter's cache, counters and back-off are in its own state volume, which the agents
+    container cannot write; answers reach the shared answers file only through the same
+    checks as answers from the store. On AWS the host firewall lets uid 10001 reach tcp 443
+    only on the IPv4 addresses `internetdb.shodan.io` resolved to (at most 8, refreshed
+    every 15 minutes by root, global unicast only), and the exporter connects only to those
+    addresses, verifying the certificate for the fixed name. InternetDB sits behind a
+    shared CDN, so those addresses also serve other sites: the rule is wider than one host,
+    and what keeps it to InternetDB is that the exporter, the only process allowed, has the
+    host fixed in code and checks the certificate. Code execution inside the exporter could
+    use those addresses to reach other sites on that CDN; it could already reach S3.
 - **Notification content.** Built from structured fields; attacker-derived URLs, domains,
   addresses and `@` are defanged in chat, email and ticket outputs; the enrichment
   response is treated as untrusted and flattened to a few short scalar fields.
@@ -334,12 +357,14 @@ loopback, and the bind guard is unchanged. What changes:
   `UiTailnetSignIn`) removes the token as a second check: whoever the access rules let
   reach the node is signed in, and with actions on can approve blocks. The console itself
   still trusts no header; the page simply gives every admitted visitor the token.
-- Opening tcp 443 for the VPN client opens it for every process on the host network. On
+- Opening tcp 443 for the VPN client (or for the exporter's InternetDB lookups,
+  `InternetDbLookup`) opens it for every process on the host network. On
   the AWS template that would include the exporter, the one container with the instance
   role, which reads attacker-written data; the template therefore limits its user (uid
   10001) with host `OUTPUT` rules to what it reached before the option (its endpoints, the
   S3 prefix list's CIDRs, the metadata service, DNS) and nothing over the tunnel, and
-  rejects the rest. Those rules fail closed: a missing or stale prefix list stops the
+  rejects the rest; with `InternetDbLookup` also InternetDB's pinned addresses (one /32
+  each, after the other rules). Those rules fail closed: a missing or stale prefix list stops the
   export, it never widens the reach. They are applied before Docker starts at every boot,
   because Docker restarts the containers itself, and Docker does not start without at
   least the exporter's `REJECT`. They depend on the exporter running as uid 10001 and

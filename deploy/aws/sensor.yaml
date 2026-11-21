@@ -169,6 +169,16 @@ Parameters:
     Default: internetdb/answers.json
     MaxLength: 128
     AllowedPattern: '^[a-z][a-z0-9]*([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*){0,3}\.json$'
+  # The exporter asks InternetDB itself (docs/operations.md, "The exporter asks InternetDB"):
+  # nothing outside the sensor and no object store. The agents container still has no
+  # egress; it writes the wanted list and reads the answers, as with InternetDbDelivered.
+  # On: tcp 443 out in the security group (InstanceEgressTailscale), the host firewall for uid 10001 (EgressStep, Ec2Endpoint) with
+  # INTERNETDB_LOOKUP=true, so uid 10001 reaches only internetdb.shodan.io's addresses
+  # besides what it reached before, and the internetdb volume. Not with InternetDbDelivered.
+  InternetDbLookup:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
   AgentsIntervalSeconds:
     Type: Number
     Default: 3600
@@ -266,6 +276,10 @@ Conditions:
   UiActionsOn: !Equals [!Ref UiActions, "true"]
   TailscaleOn: !Equals [!Ref TailscaleEnabled, "true"]
   InternetDbOn: !Equals [!Ref InternetDbDelivered, "true"]
+  IdbLookupOn: !Equals [!Ref InternetDbLookup, "true"]
+  # tcp 443 out to anywhere, and so the host firewall for the exporter.
+  HostEgressOn: !Or [!Condition TailscaleOn, !Condition IdbLookupOn]
+  IdbAnyOn: !Or [!Condition InternetDbOn, !Condition IdbLookupOn]
   ConsoleStepOn: !Or [!Condition TailscaleOn, !Condition UiActionsOn]
   PersonaOn: !Not [!Equals [!Ref PersonaModelId, ""]]
   AnalystOn: !Not [!Equals [!Ref AnalystModelId, ""]]
@@ -317,6 +331,9 @@ Rules:
     Assertions:
       - Assert: !Equals [!Ref TailscaleEnabled, "true"]
         AssertDescription: UiTailnetSignIn=true needs TailscaleEnabled=true (it is a tailnet page).
+  InternetDbOneWay:
+    RuleCondition: !Equals [!Ref InternetDbLookup, "true"]
+    Assertions: [{Assert: !Not [!Equals [!Ref InternetDbDelivered, "true"]], AssertDescription: "Not both InternetDbLookup and InternetDbDelivered."}]
   UiActionsNeedUi:
     RuleCondition: !Equals [!Ref UiActions, "true"]
     Assertions:
@@ -482,14 +499,7 @@ Resources:
             Principal: "*"
             Action: s3:PutObject
             Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${EventsPrefix}/*
-          - !If
-            - InternetDbOn
-            - Sid: InternetDbAnswers
-              Effect: Allow
-              Principal: "*"
-              Action: s3:GetObject
-              Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${InternetDbAnswersKey}
-            - !Ref AWS::NoValue
+          - !If [InternetDbOn, {Sid: InternetDbAnswers, Effect: Allow, Principal: "*", Action: "s3:GetObject", Resource: !Sub "arn:${AWS::Partition}:s3:::${EventsBucketName}/${InternetDbAnswersKey}"}, !Ref AWS::NoValue]
           - Sid: Al2023Repositories
             Effect: Allow
             Principal: "*"
@@ -598,14 +608,17 @@ Resources:
       DestinationSecurityGroupId: !Ref EndpointSecurityGroup
       Description: interface endpoints
 
-  # TailscaleEnabled only. The coordination server, the DERP relays and the certificate
-  # service all answer on tcp 443; with no UDP out the node always relays through DERP over
-  # HTTPS, which is enough for the console. A separate rule, so the group itself is untouched.
-  # Host-network processes can use it (tailscaled, the exporter); bridged containers cannot,
-  # because the DOCKER-USER rules drop their new connections whatever the destination.
+  # TailscaleEnabled or InternetDbLookup. The coordination server, the DERP relays and the
+  # certificate service all answer on tcp 443; with no UDP out the node always relays
+  # through DERP over HTTPS, which is enough for the console. InternetDbLookup needs the same
+  # rule for the exporter's lookups, so it shares this one (its name and description are
+  # kept so that a stack with TailscaleEnabled sees no change). A separate rule, so the group
+  # itself is untouched. Host-network processes can use it (tailscaled, the exporter, whom
+  # the host firewall limits); bridged containers cannot, because the DOCKER-USER rules drop
+  # their new connections whatever the destination.
   InstanceEgressTailscale:
     Type: AWS::EC2::SecurityGroupEgress
-    Condition: TailscaleOn
+    Condition: HostEgressOn
     Properties:
       GroupId: !Ref InstanceSecurityGroup
       IpProtocol: tcp
@@ -614,14 +627,14 @@ Resources:
       CidrIp: 0.0.0.0/0
       Description: Tailscale coordination, DERP relays and certificates over 443
 
-  # TailscaleEnabled only: the EC2 API, for one call. The host firewall limits the exporter
-  # (uid 10001) to the S3 prefix list's CIDRs once the 443 rule above exists, and reads
-  # them with ec2:GetManagedPrefixListEntries. The endpoint policy allows that one call on
-  # that one list; the role allows nothing else on EC2. About 7 USD a month in a typical
-  # region, like each of the other interface endpoints.
+  # TailscaleEnabled or InternetDbLookup: the EC2 API, for one call. The host firewall limits
+  # the exporter (uid 10001) to the S3 prefix list's CIDRs once a 443 rule above exists, and
+  # reads them with ec2:GetManagedPrefixListEntries. The endpoint policy allows that one
+  # call on that one list; the role allows nothing else on EC2. About 7 USD a month in a
+  # typical region, like each of the other interface endpoints.
   Ec2Endpoint:
     Type: AWS::EC2::VPCEndpoint
-    Condition: TailscaleOn
+    Condition: HostEgressOn
     Properties:
       VpcId: !Ref Vpc
       VpcEndpointType: Interface
@@ -862,13 +875,10 @@ Resources:
                 Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${EventsPrefix}/*
-              - !If
-                - InternetDbOn
-                - Sid: GetInternetDbAnswers
-                  Effect: Allow
-                  Action: s3:GetObject
-                  Resource: !Sub arn:${AWS::Partition}:s3:::${EventsBucketName}/${InternetDbAnswersKey}
-                - !Ref AWS::NoValue
+              - !If [InternetDbOn, {Sid: GetInternetDbAnswers, Effect: Allow, Action: "s3:GetObject", Resource: !Sub "arn:${AWS::Partition}:s3:::${EventsBucketName}/${InternetDbAnswersKey}"}, !Ref AWS::NoValue]
+              # The host firewall's allow-list for the exporter (see EgressStep). AWS-managed
+              # prefix lists are owned by "aws", hence that account field.
+              - !If [HostEgressOn, {Effect: Allow, Action: "ec2:GetManagedPrefixListEntries", Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:aws:prefix-list/${S3PrefixListId}"}, !Ref AWS::NoValue]
 
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -905,12 +915,6 @@ Resources:
             Resource:
               - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/tailscale-authkey
               - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/ui-token
-          # The host firewall's allow-list for the exporter (see EgressStep). AWS-managed
-          # prefix lists are owned by "aws", hence that account field.
-          - Sid: ReadS3PrefixList
-            Effect: Allow
-            Action: ec2:GetManagedPrefixListEntries
-            Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:aws:prefix-list/${S3PrefixListId}
 
   # ---------------------------------------------------------------- host
   LaunchTemplate:
@@ -1187,7 +1191,7 @@ Resources:
                 for p in $PORTS; do echo "      - \"$p\""; done
               } > docker-compose.override.yml
 
-              ${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service <<'EOF'
+              ${IdbEgress}${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service <<'EOF'
               [Unit]
               Description=Winnie the Agent sensor stack
               After=docker.service sensor-firewall.service
@@ -1219,15 +1223,22 @@ Resources:
                   - !If [MllpOn, mllp, ""]
                   - !If [S3On, s3, ""]
               UiProfiles: !If [UiOn, ui, ""]
-              # InternetDbDelivered only: the render arguments and the internetdb volume,
-              # written by the exporter and read by the agents and the console. Off, each
-              # renders to "" and the script is byte for byte what it was without them.
-              IdbArgs: !If [InternetDbOn, !Sub " true ${EventsPrefix}/internetdb/wanted.json ${InternetDbAnswersKey}", ""]
-              IdbRead: !If [InternetDbOn, "\n      - internetdb:/internetdb:ro", ""]
-              IdbWrite: !If [InternetDbOn, "\n      - internetdb:/internetdb", ""]
-              IdbVolume: !If [InternetDbOn, "\n  internetdb: {}", ""]
-              # TailscaleEnabled only, before the stack starts, and not allowed to fail: an
-              # error here stops the bootstrap, so the stack never runs without these rules.
+              # InternetDbDelivered or InternetDbLookup only: the render arguments and the
+              # internetdb volume, written by the exporter and read by the agents and the
+              # console; with InternetDbLookup the exporter also reads the addresses the host
+              # firewall pinned (sensor-egress.sh). Off, each renders to "" and the script is
+              # byte for byte what it was without them.
+              IdbArgs: !If [InternetDbOn, !Sub " true ${EventsPrefix}/internetdb/wanted.json ${InternetDbAnswersKey}", !If [IdbLookupOn, " lookup", ""]]
+              IdbRead: !If [IdbAnyOn, "\n      - internetdb:/internetdb:ro", ""]
+              IdbWrite: !If [InternetDbOn, "\n      - internetdb:/internetdb", !If [IdbLookupOn, "\n      - internetdb:/internetdb\n      - /var/lib/sensor-egress/exporter:/egress:ro", ""]]
+              IdbVolume: !If [IdbAnyOn, "\n  internetdb: {}", ""]
+              # InternetDbLookup only, before EgressStep: the host firewall's switch for the
+              # InternetDB addresses, in a settings file of its own that sensor-egress.sh
+              # reads after its main one, so the egress step is unchanged when off.
+              IdbEgress: !If [IdbLookupOn, "echo INTERNETDB_LOOKUP=true > /etc/sensor-egress-idb.env\n", ""]
+              # TailscaleEnabled or InternetDbLookup, before the stack starts, and not allowed to
+              # fail: an error here stops the bootstrap, so the stack never runs without these
+              # rules. INTERNETDB_LOOKUP adds only InternetDB's addresses for uid 10001.
               # sensor-egress.sh (deploy/aws/host in the image; its header explains the rules)
               # limits the exporter, uid 10001, to what it reached before InstanceEgressTailscale
               # existed, and its timer refreshes the S3 prefix list every 15 minutes. At every
@@ -1237,7 +1248,7 @@ Resources:
               # also drops tailscale0 traffic in DOCKER-USER, so no tailnet device reaches the
               # honeypot ports.
               EgressStep: !If
-                - TailscaleOn
+                - HostEgressOn
                 - !Sub |
                   printf 'REGION=%s\nPREFIX_LIST=%s\nVPC_CIDR=%s\n' ${AWS::Region} ${S3PrefixListId} ${VpcCidr} > /etc/sensor-egress.env
                   H=/app/deploy/aws/host
