@@ -688,3 +688,80 @@ def test_cli_stix_and_run_all_write_the_file_and_open_no_socket(tmp_path, monkey
     assert _cli(tmp_path, "run-all", "[stix]\nenabled = true\ntlp = green\n")["stix"][
         "status"] == "unchanged"
     assert (reports / "stix" / "bundle.json").read_bytes() == body
+
+
+# ---- the unblock audit trail ---------------------------------------------------------------
+
+def _promoted_and_approved(tmp_path):
+    """A rule-promoted source the operator also approved; one live indicator written."""
+    approve(tmp_path / "state", A, NOW - datetime.timedelta(days=1),
+            NOW + datetime.timedelta(days=29), status="enforced")
+    _, body, bundle = export(tmp_path, [rec(A)])
+    (ind,) = objects(bundle, "indicator")
+    assert "revoked" not in ind
+    return body, ind
+
+
+def test_a_failed_unblock_audit_leaves_the_blocklist_unchanged(tmp_path, monkeypatch):
+    from agents import respond
+
+    _promoted_and_approved(tmp_path)
+    before = (tmp_path / "state" / "approved_blocklist.json").read_bytes()
+    real = respond._atomic_json
+
+    def failing(path, payload, mode=0o600):
+        if "-unblock-" in path.name:
+            raise OSError("disk full")
+        return real(path, payload, mode)
+
+    monkeypatch.setattr(respond, "_atomic_json", failing)
+    with pytest.raises(OSError):
+        respond.unblock(A, tmp_path / "state", tmp_path / "reports",
+                        now=NOW + datetime.timedelta(hours=1), by="test")
+    # No removal happened without its record: the entry is still approved.
+    assert (tmp_path / "state" / "approved_blocklist.json").read_bytes() == before
+    assert A in respond.peek_blocklist(tmp_path / "state", NOW + datetime.timedelta(hours=1))
+
+
+def test_every_unblock_record_is_read_not_only_the_newest(tmp_path):
+    from agents.respond import unblock
+
+    _, ind = _promoted_and_approved(tmp_path)
+    reports = tmp_path / "reports"
+    # The real removal first, then 501 later records for other addresses.
+    unblock(A, tmp_path / "state", reports, now=NOW + datetime.timedelta(minutes=10), by="t")
+    for i in range(501):
+        at = NOW + datetime.timedelta(minutes=20, seconds=i)
+        (reports / "response" / f"{at.strftime('%Y%m%dT%H%M%SZ')}-unblock-{i:06x}.json"
+         ).write_text(json.dumps({"timestamp": at.isoformat(),
+                                  "unblock": {"target": "198.51.100.200",
+                                              "removed": [], "by": "t"}}))
+    later = NOW + datetime.timedelta(hours=2)
+    _, body, bundle = export(tmp_path, [rec(A, seen=later)], now=later)
+    assert [(o["id"], o.get("revoked")) for o in objects(bundle, "indicator")] == \
+        [(ind["id"], True)]
+    assert validate(body) == []
+
+
+@pytest.mark.parametrize("damage", ["malformed", "not json", "unreadable", "too many"])
+def test_an_untrustworthy_audit_trail_stops_the_export(tmp_path, monkeypatch, damage):
+    from agents.respond import unblock
+
+    first, _ = _promoted_and_approved(tmp_path)
+    reports = tmp_path / "reports"
+    unblock(A, tmp_path / "state", reports, now=NOW + datetime.timedelta(minutes=10), by="t")
+    (record,) = (reports / "response").glob("*-unblock-*.json")
+    if damage == "malformed":
+        record.write_text(json.dumps({"timestamp": "yesterday", "unblock": {"removed": [A]}}))
+    elif damage == "not json":
+        record.write_text("{trunc")
+    elif damage == "unreadable":
+        record.unlink()
+        record.mkdir()
+    else:
+        monkeypatch.setattr(stix, "MAX_AUDIT_FILES", 0)
+    later = NOW + datetime.timedelta(hours=2)
+    out = stix.run_export(settings(), [rec(A, seen=later)], reports, tmp_path / "state", [],
+                          now=later)
+    assert "unblock record" in out["error"] and "nothing written" in out["error"]
+    assert (reports / "stix" / "bundle.json").read_bytes() == first

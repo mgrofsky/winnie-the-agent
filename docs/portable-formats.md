@@ -137,8 +137,9 @@ Withdrawal and expiry:
 - When the operator removes an address from the blocklist (`python -m agents unblock` or the
   console), its indicator is set to `revoked: true` on the next export, even if the
   automatic rule would still promote the address. The removal is read from the audit
-  record in `reports/response`; run the export (or `run-all`) more often than
-  `[respond] retention_days`, so the record is still there.
+  record in `reports/response`, which `unblock` writes before it changes the blocklist (if
+  the record cannot be written, the unblock fails and nothing is removed). Run the export
+  (or `run-all`) more often than `[respond] retention_days`, so the record is still there.
 - Revocation is permanent: STIX 2.1 section 3.6 says that once an object is revoked, "later
   versions of that object MUST NOT be created". So the revoked id is never written live
   again. While the withdrawal stands (`keep_days`, 30, from the removal) the automatic rule
@@ -166,6 +167,9 @@ when:
 - the state file is missing while a bundle from the same identity exists;
 - the state would grow past what the next run may read (lower `lookback_days` or
   `keep_days`);
+- an unblock record in `reports/response` cannot be read or is not in the expected form, or
+  there are more than 20,000 of them (the export reads every one, so that no withdrawal is
+  missed; `[respond] retention_days` removes old ones);
 - a reference would not resolve.
 
 This prevents an id that was revoked from being written live again. To recover, restore

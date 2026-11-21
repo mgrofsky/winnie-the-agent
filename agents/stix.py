@@ -118,7 +118,7 @@ KNOWN_KEYS = {"enabled", "output_file", "identity_name", "tlp", "hashes", *DEFAU
 DEFAULT_IDENTITY = "Honeypot sensor"
 MAX_STATE_BYTES = 16 * 1024 * 1024
 MAX_GENERATION = 10 ** 6
-MAX_AUDIT_FILES = 500
+MAX_AUDIT_FILES = 20000
 MAX_AUDIT_BYTES = 64 * 1024
 MAX_SIGHTING_REFS = 10
 
@@ -407,28 +407,39 @@ def indicators_now(candidates: Iterable[dict], approved: dict, networks: list,
 
 def unblocked(reports_dir, now: datetime.datetime) -> dict[str, datetime.datetime]:
     """``{blocklist key: latest time}`` of the operator's removals recorded in
-    ``reports/response`` (``*-unblock-*.json``, the newest ``MAX_AUDIT_FILES``)."""
+    ``reports/response`` (``*-unblock-*.json``; ``respond.unblock`` writes the record before
+    it changes the blocklist). Every record is read. One that cannot be read or is not in
+    the expected form, or more than ``MAX_AUDIT_FILES`` of them, raises ExportRefused: a
+    withdrawal that cannot be seen must not leave an indicator live."""
     out: dict[str, datetime.datetime] = {}
     directory = Path(reports_dir) / "response"
     try:
         names = sorted(n for n in os.listdir(directory) if _UNBLOCK_FILE_RE.fullmatch(n))
-    except OSError:
+    except FileNotFoundError:
         return out
-    for name in names[-MAX_AUDIT_FILES:]:
+    except OSError as exc:
+        raise ExportRefused(f"unblock records cannot be listed ({type(exc).__name__})") \
+            from None
+    if len(names) > MAX_AUDIT_FILES:
+        raise ExportRefused(f"more than {MAX_AUDIT_FILES} unblock records to read")
+    for name in names:
         try:
             body = read_regular(directory / name, MAX_AUDIT_BYTES)
-            doc = json.loads(body.decode("utf-8")) if len(body) <= MAX_AUDIT_BYTES else None
+            if len(body) > MAX_AUDIT_BYTES:
+                raise ValueError("too large")
+            doc = json.loads(body.decode("utf-8"))
         except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+            raise ExportRefused(f"unblock record {name} cannot be read") from None
+        unblock = doc.get("unblock") if isinstance(doc, dict) else None
+        when = _parse_ts(doc.get("timestamp")) if isinstance(doc, dict) else None
+        removed = unblock.get("removed") if isinstance(unblock, dict) else None
+        if when is None or not isinstance(removed, list) or \
+                not all(isinstance(k, str) and len(k) <= 64 for k in removed):
+            raise ExportRefused(f"unblock record {name} is not in the expected form")
+        if when > now:
             continue
-        if not isinstance(doc, dict) or not isinstance(doc.get("unblock"), dict):
-            continue
-        when = _parse_ts(doc.get("timestamp"))
-        removed = doc["unblock"].get("removed")
-        if when is None or when > now or not isinstance(removed, list):
-            continue
-        for key in removed[:10000]:
-            if isinstance(key, str) and len(key) <= 64:
-                out[key] = max(out.get(key, when), when)
+        for key in removed:
+            out[key] = max(out.get(key, when), when)
     return out
 
 

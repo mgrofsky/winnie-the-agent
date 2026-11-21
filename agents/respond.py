@@ -781,11 +781,13 @@ def unblock(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike 
     """Remove an address (its IPv4 address or IPv6 /64 key) or every entry inside a
     network from the approved blocklist, tracked or enforced, then rewrite the blocklist
     file (and, with ``track_before_enforce``, the tracked export). An audit record goes to
-    ``<reports_dir>/response``."""
+    ``<reports_dir>/response`` first: the STIX export revokes from it, so when it cannot be
+    written the unblock fails and the blocklist is left as it was."""
     state_dir, reports_dir = Path(state_dir), Path(reports_dir)
     now = now or _now()
     value = str(target).strip()
     net = _target_network(value)
+    who = sanitize(by or getpass.getuser(), 64)
     with _locked(state_dir):
         entries, _ = _load_blocklist(state_dir, now, ttl_days)
         removed = []
@@ -794,15 +796,15 @@ def unblock(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike 
             if k.version == net.version and (k == net or k.subnet_of(net)):
                 removed.append(key)
                 del entries[key]
+        # "unblock" never matches APPROVAL_ID_RE, so this cannot overwrite an approval
+        # record; the leading stamp keeps it under apply_retention.
+        _atomic_json(reports_dir / "response" /
+                     f"{now.strftime('%Y%m%dT%H%M%SZ')}-unblock-{secrets.token_hex(3)}.json",
+                     {"timestamp": _iso(now),
+                      "unblock": {"target": sanitize(value, 64), "removed": sorted(removed),
+                                  "by": who}})
         path = _write_blocklist_files(state_dir, reports_dir, entries, blocklist_file,
                                       blocklist_format, track_before_enforce, now, sensor)
-    # "unblock" never matches APPROVAL_ID_RE, so this cannot overwrite an approval record;
-    # the leading stamp keeps it under apply_retention.
-    _atomic_json(reports_dir / "response" /
-                 f"{now.strftime('%Y%m%dT%H%M%SZ')}-unblock-{secrets.token_hex(3)}.json",
-                 {"timestamp": _iso(now),
-                  "unblock": {"target": sanitize(value, 64), "removed": sorted(removed),
-                              "by": sanitize(by or getpass.getuser(), 64)}})
     return {"removed": sorted(removed), "entries": len(entries), "file": path.name}
 
 
