@@ -1208,3 +1208,22 @@ def test_session_names_do_not_fill_the_shared_collation_cache():
     shell._collate(name)
     shell._collate("a" * 200)
     assert shell._collate_cached.cache_info().currsize == before
+
+
+def test_the_fallback_follows_the_model_after_the_model_answers_again():
+    sid = "fallback-resync-test"
+    try:
+        hooks.fallback_reply("cd /tmp", True, "root", host(), None,
+                             prompt="root@app01:~# ", session_id=sid)
+        hooks._note_prompt(sid, "root@app01:/opt# ", "root")      # the model moved it
+        out = hooks.fallback_reply("pwd", True, "root", host(), None,
+                                   prompt="root@app01:/opt# ", session_id=sid)
+        assert out.startswith("/opt\r\n")
+        hooks.fallback_reply("cd /tmp", True, "root", host(), None,
+                             prompt="root@app01:/opt# ", session_id=sid)
+        out = hooks.fallback_reply("pwd", True, "root", host(), None,
+                                   prompt="root@app01:/opt# ", session_id=sid)
+        assert out.startswith("/tmp\r\n")
+    finally:
+        hooks.session_close(sid, None)
+    assert sid not in hooks._shell_stale

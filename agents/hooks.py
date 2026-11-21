@@ -50,6 +50,7 @@ MAX_TRACKED_SESSIONS = 10_000   # per-session tables evict their oldest entry pa
 # What the canned shell keeps per session when it answers instead of the model (files the
 # session wrote, its directory): each holds up to ``shell.MAX_SCRATCH_BYTES``, so far fewer.
 _shell_sessions: dict[str, shell.Session] = {}
+_shell_stale: set[str] = set()    # sessions the model answered since their fallback ran
 MAX_SHELL_SESSIONS = 256
 _cache: Optional[ReplyCache] = None
 MAX_LOCAL_HISTORY = 4096   # characters of a local answer kept in the chat history
@@ -221,7 +222,10 @@ def fallback_reply(text: str, interactive: bool, username: Optional[str],
     entered = False
     if session_id is not None:
         session = _shell_sessions.get(session_id)
-        entered = session is not None
+        # A model reply since the last fallback line may have moved the session: its
+        # prompt seeds the directory again.
+        entered = session is not None and session_id not in _shell_stale
+        _shell_stale.discard(session_id)
         session = session or shell.Session()
         _track_shell(session_id, session)
     if interactive and prompt and entered:
@@ -263,6 +267,7 @@ def _track_shell(session_id: str, session: shell.Session) -> None:
     _shell_sessions.pop(session_id, None)
     _shell_sessions[session_id] = session
     while len(_shell_sessions) > MAX_SHELL_SESSIONS:
+        _shell_stale.discard(next(iter(_shell_sessions)))
         _shell_sessions.pop(next(iter(_shell_sessions)))
 
 
@@ -343,6 +348,7 @@ def reset() -> None:
     _session_fragments.clear()
     _session_prompts.clear()
     _shell_sessions.clear()
+    _shell_stale.clear()
 
 
 def set_budget(budget: Budget) -> None:
@@ -422,6 +428,7 @@ def session_close(session_id: str, history_store: Optional[MutableMapping] = Non
     _session_prompts.pop(session_id, None)
     _session_keys.pop(session_id, None)
     _shell_sessions.pop(session_id, None)
+    _shell_stale.discard(session_id)
     if history_store is not None:
         history_store.pop(session_id, None)
 
@@ -627,6 +634,8 @@ def _note_prompt(session_id: str, content: str, username: Optional[str]) -> None
         cwd = None
     prompt = last + " " if last else (before[0] if before else "")
     _track(_session_prompts, session_id, (prompt, cwd))
+    if session_id in _shell_sessions:
+        _shell_stale.add(session_id)
 
 
 _FINAL_PROMPT = re.compile(r"^(?:\S*@\S*|\[\S+@\S+ \S+\])[$#]$")
