@@ -78,6 +78,7 @@ import datetime
 import ipaddress
 import json
 import logging
+import heapq
 import os
 import re
 import socket
@@ -370,15 +371,23 @@ def read_uploads(directory, cap: int, since: datetime.datetime,
     """The quarantine's metadata files (``<name>.bin.json``, written by the front-ends when
     they stored an upload): ``{"sha256", "src", "stored_at"}`` for each whole file stored
     since ``since``. A file whose size reaches ``cap`` may have been cut and is left out;
-    anything malformed is skipped."""
+    anything malformed is skipped. At most ``limit`` metadata files are read, the most
+    recently written first, so a large quarantine of old uploads cannot hide new ones."""
     out: list[dict] = []
+    found: list[tuple[float, str]] = []
     try:
-        names = sorted(os.listdir(directory))
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                name = entry.name
+                if not name.endswith(".bin.json") or name.startswith("."):
+                    continue
+                try:
+                    found.append((entry.stat(follow_symlinks=False).st_mtime, name))
+                except OSError:
+                    continue
     except OSError:
         return out
-    for name in names[:limit]:
-        if not name.endswith(".bin.json") or name.startswith("."):
-            continue
+    for name in sorted(name for _, name in heapq.nlargest(limit, found)):
         try:
             body = read_regular(Path(directory) / name, MAX_SIDECAR_BYTES)
             if len(body) > MAX_SIDECAR_BYTES:

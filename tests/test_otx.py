@@ -1037,3 +1037,23 @@ def test_a_small_state_is_not_pruned(tmp_path):
     assert otx.save_state(path, _hash_state(50), 100) == 0
     assert len(otx.load_state(path)["sent"]) == 50
     assert otx.save_state(path, _hash_state(150), 100) == 50
+
+
+def test_read_uploads_limit_counts_metadata_files_and_prefers_recent(tmp_path):
+    """Old uploads that sort first, each with its data file beside it, do not use up the
+    scan limit: the newest metadata files are the ones read."""
+    q = tmp_path / "q"
+    q.mkdir()
+    old = (NOW - datetime.timedelta(days=30)).timestamp()
+    stamp = (NOW - datetime.timedelta(hours=1)).isoformat()
+    for i in range(6):
+        (q / f"a{i}.bin").write_bytes(b"x")
+        side = q / f"a{i}.bin.json"
+        side.write_text(json.dumps({"sha256": f"{i:064x}", "src": "203.0.113.5", "size": 1,
+                                    "stored_at": "2000-01-01T00:00:00+00:00"}))
+        os.utime(side, (old, old))
+    (q / "z.bin").write_bytes(b"x")
+    (q / "z.bin.json").write_text(json.dumps(
+        {"sha256": "f" * 64, "src": "203.0.113.5", "size": 1, "stored_at": stamp}))
+    got = otx.read_uploads(q, 1000, NOW - datetime.timedelta(days=7), limit=3)
+    assert [u["sha256"] for u in got] == ["f" * 64]
