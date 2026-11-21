@@ -112,7 +112,8 @@ IDB_CONDITIONS = {
     "IdbAnyOn": {"Fn::Or": [{"Condition": "InternetDbOn"},
                                    {"Condition": "IdbLookupOn"}]},
     HOST_EGRESS: {"Fn::Or": [{"Condition": "TailscaleOn"},
-                             {"Condition": "IdbLookupOn"}]},
+                             {"Condition": "IdbLookupOn"}, {"Condition": "OtxOn"}]},
+    "OtxOn": {"Fn::Not": [{"Fn::Equals": [{"Ref": "OtxSubmit"}, "false"]}]},
 }
 IDB_RULE = {"RuleCondition": {"Fn::Equals": [{"Ref": "InternetDbLookup"}, "true"]},
             "Assertions": [{"Assert": {"Fn::Not": [{"Fn::Equals": [
@@ -121,6 +122,26 @@ IDB_RULE = {"RuleCondition": {"Fn::Equals": [{"Ref": "InternetDbLookup"}, "true"
 # Who mounts the internetdb volume, where, and read-only or not; no other service may.
 IDB_MOUNTS = {"exporter": ("/internetdb", False), "agents": ("/internetdb", True),
               "ui": ("/internetdb", True)}
+# OtxSubmit: the render argument (otx-dry-run or otx-send), the key file for the exporter
+# alone and, unless InternetDbLookup already mounts it, the host firewall's pinned
+# addresses; each "" when the switch is off. OtxStep writes the host firewall's switch and
+# the key file before the egress step.
+OTX_VALUES = ("dry-run", "send")
+OTX_KEY_FILE = "./otx-key"
+OTX_KEY_MOUNT = "\n      - " + OTX_KEY_FILE + ":/run/otx-key:ro"
+OTX_EGRESS_MOUNT = "\n      - " + IDB_EGRESS_DIR + ":/egress:ro"
+OTX_VARIABLES = {
+    "OtxArgs": {"Fn::If": ["OtxOn", {"Fn::Sub": " otx-${OtxSubmit}"}, ""]},
+    "OtxMount": {"Fn::If": ["OtxOn", {"Fn::If": ["IdbLookupOn", OTX_KEY_MOUNT,
+                                                 OTX_KEY_MOUNT + OTX_EGRESS_MOUNT]}, ""]},
+}
+OTX_STEP_LINES = [
+    "echo OTX_SUBMIT=true > /etc/sensor-egress-otx.env",
+    "(umask 077; aws ssm get-parameter --region $REGION --name /${NamePrefix}/otx-api-key "
+    "--with-decryption --query Parameter.Value --output text > otx-key) || "
+    'echo "otx key: FAILED ($?)"',
+    "chown 10001:10001 otx-key",
+]
 # Literal parameter defaults: project or example names, scenario names, instance types,
 # public SSM parameter paths, addresses, numbers and switches. Nothing that could name an
 # organisation.
@@ -314,8 +335,10 @@ def check_sensor(doc: dict, raw: str = "") -> list[str]:
         variables = sub[1] if isinstance(sub, list) and len(sub) == 2 else {}
         found: list[str] = []
         for on in (False, True, "lookup"):
-            expanded, problems = internetdb_user_data(user_data, variables, on)
-            found += problems + check_user_data(expanded, internetdb=on)
+            for otx in (False,) + OTX_VALUES:
+                expanded, problems = internetdb_user_data(user_data, variables, on)
+                expanded, more = otx_user_data(expanded, variables, otx, on)
+                found += problems + more + check_user_data(expanded, internetdb=on, otx=otx)
         errors += [f"launch template {name}: {e}" for e in dict.fromkeys(found)]
         errors += [f"launch template {name}: {e}"
                    for e in check_user_data_steps(doc, (data.get("UserData") or {})
@@ -612,6 +635,9 @@ EGRESS_RULES = [
     # INTERNETDB_LOOKUP=true only: one /32 per pinned InternetDB address, after the rest.
     '[ "$IDB" != true ] || for a in $(head -n 8 "$I" 2>/dev/null || :); do if pub "$a"; then '
     '$w -A SENSOR-UID -d "$a/32" -p tcp --dport 443 -j ACCEPT; fi; done',
+    # OTX_SUBMIT=true only: the same for the pinned OTX addresses, last.
+    '[ "$OTX" != true ] || for a in $(head -n 8 "$O" 2>/dev/null || :); do if pub "$a"; then '
+    '$w -A SENSOR-UID -d "$a/32" -p tcp --dport 443 -j ACCEPT; fi; done',
 ]
 # The deny comes before the settings are read, so a bad or missing settings file leaves
 # uid 10001 with no egress at all.
@@ -793,10 +819,17 @@ def check_user_data_steps(doc: dict, base64_value) -> list[str]:
                 and value["Fn::If"][0] == cond and value["Fn::If"][2] == ""):
             errors.append(f"step {step} is not empty unless {cond}")
     lines = sub[0].splitlines()
-    if "${IdbEgress}${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service "\
-            "<<'EOF'" not in lines:
+    if "${IdbEgress}${OtxStep}${EgressStep}${ConsoleStep}${ModelStep}cat > "\
+            "/etc/systemd/system/sensor.service <<'EOF'" not in lines:
         errors.append("the egress, console and model steps do not run, in that order, right "
                       "before the stack is started")
+    otx_step = variables.get("OtxStep")
+    if not (isinstance(otx_step, dict) and _branch(otx_step, "OtxOn")
+            and otx_step["Fn::If"][2] == ""
+            and [line for line in _step_body(variables, "OtxStep").splitlines()
+                 if line.strip()] == OTX_STEP_LINES):
+        errors.append("step OtxStep is not exactly the host firewall switch and the key file, "
+                      "and empty unless OtxOn")
     if variables.get("IdbEgress") != {"Fn::If": ["IdbLookupOn", IDB_EGRESS_SWITCH, ""]}:
         errors.append("step IdbEgress is not exactly the InternetDB switch for the host "
                       "firewall, and empty unless IdbLookupOn")
@@ -883,12 +916,24 @@ def internetdb_user_data(user_data: str, variables: dict, on) -> tuple[str, list
     return user_data, errors
 
 
+def otx_user_data(user_data: str, variables: dict, otx, internetdb=False) -> tuple[str, list[str]]:
+    """The user data with the OTX variables rendered for ``otx`` (False: OtxSubmit off, or
+    its value), and a problem for any variable that is not exactly as required."""
+    errors = [f"user data variable {name} is not exactly its OtxSubmit value, and empty "
+              "when off" for name, want in OTX_VARIABLES.items() if variables.get(name) != want]
+    mount = OTX_KEY_MOUNT + ("" if internetdb == "lookup" else OTX_EGRESS_MOUNT)
+    user_data = user_data.replace("${OtxArgs}", f" otx-{otx}" if otx else "")
+    return user_data.replace("${OtxMount}", mount if otx else ""), errors
+
+
 def check_internetdb_switch(doc: dict) -> list[str]:
     errors: list[str] = []
     params = doc.get("Parameters") or {}
-    for switch in ("InternetDbDelivered", "InternetDbLookup"):
+    for switch in ("InternetDbDelivered", "InternetDbLookup", "OtxSubmit"):
         if (params.get(switch) or {}).get("Default") != "false":
             errors.append(f"parameter {switch} is not off by default")
+    if (params.get("OtxSubmit") or {}).get("AllowedValues") != ["false", *OTX_VALUES]:
+        errors.append("parameter OtxSubmit allows other values than false, dry-run and send")
     conditions = doc.get("Conditions") or {}
     for name, want in IDB_CONDITIONS.items():
         if conditions.get(name) != want:
@@ -927,7 +972,7 @@ def check_endpoint_policy(doc: dict) -> list[str]:
 
 
 def check_user_data(user_data: str, render_script: Optional[str] = None,
-                    dockerfile: Optional[str] = None, internetdb=False) -> list[str]:
+                    dockerfile: Optional[str] = None, internetdb=False, otx=False) -> list[str]:
     errors = [msg for msg, needle in USER_DATA_FACTS.items() if needle not in user_data]
     ships = re.findall(r"python -m agents ship[^\"\]]*", user_data)
     if not ships:
@@ -939,15 +984,15 @@ def check_user_data(user_data: str, render_script: Optional[str] = None,
     compose = embedded_compose(user_data)
     errors += check_ui(compose)
     if compose is not None:
-        errors += check_exporter(compose, internetdb) + check_blocklist(compose) \
-            + check_configs(compose) + check_internetdb_volume(compose, internetdb)
-    errors += check_render(user_data, render_script, dockerfile, internetdb)
+        errors += check_exporter(compose, internetdb, otx) + check_blocklist(compose) \
+            + check_configs(compose) + check_internetdb_volume(compose, internetdb, otx)
+    errors += check_render(user_data, render_script, dockerfile, internetdb, otx)
     errors += check_host_files(dockerfile=dockerfile)
     return errors
 
 
 def check_render(user_data: str, script: Optional[str] = None,
-                 dockerfile: Optional[str] = None, internetdb=False) -> list[str]:
+                 dockerfile: Optional[str] = None, internetdb=False, otx=False) -> list[str]:
     """render_config.py as the image carries it, run on the repository's config template:
     the tracked export is on only when shipping and TrackedExport both are, and the agents'
     config.ini keeps every transport off (only config-ship.ini, the exporter's, ships)."""
@@ -968,6 +1013,7 @@ def check_render(user_data: str, script: Optional[str] = None,
     errors += [msg for msg, needle in RENDER_FACTS.items() if needle not in script]
     tail = re.escape(IDB_LOOKUP_VARIABLES["IdbArgs"]) if internetdb == "lookup" else \
         re.escape(IDB_VARIABLES["IdbArgs"]) if internetdb else ""
+    tail += re.escape(f" otx-{otx}") if otx else ""
     calls = dict(re.findall(r'^python3 render_config\.py config\.ini\.TEMPLATE (\S+) \$ARGS '
                             r'"\$NEVER" (\S+)' + tail + '$', user_data, re.M))
     if not re.search(r'^NEVER="\$\{NeverActOn\}"$', user_data, re.M):
@@ -1025,7 +1071,45 @@ def check_render(user_data: str, script: Optional[str] = None,
                 errors.append(f"with shipping {ship} and InternetDbDelivered the rendered "
                               "InternetDB settings are not delivered mode with the exchange "
                               "on for the exporter only")
+    if otx:
+        kind = "lookup" if internetdb == "lookup" else "s3" if internetdb else None
+        for ship in ("true", "false"):
+            got = _render_otx(script, ship, otx, kind)
+            on_ship = ship == "true"
+            want = {"enabled": "true", "submit": ship,
+                    "dry_run": "false" if otx == "send" else "true",
+                    "secret_file": "/run/otx-key" if on_ship else None,
+                    "candidates_file": "/blocklist/otx_candidates.json" if on_ship else None,
+                    "addresses_file": "/egress/otx-addresses" if on_ship else None,
+                    "secret_env": None}
+            if got is None or any(got.get(k) != v for k, v in want.items()):
+                errors.append(f"with shipping {ship} and OtxSubmit {otx} the rendered OTX "
+                              "settings do not submit from the exporter only, with its key "
+                              "file and pinned addresses")
     return errors
+
+
+@functools.lru_cache(maxsize=24)
+def _render_otx(script: str, ship: str, otx: str, kind: Optional[str]) -> Optional[dict]:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "render_config.py"
+        path.write_text(script, encoding="utf-8")
+        out = Path(tmp) / "config.ini"
+        idb = [] if kind is None else ["lookup"] if kind == "lookup" else \
+            ["true", "events/internetdb/wanted.json", "internetdb/answers.json"]
+        try:
+            subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),
+                            "winnie-sensor", "example", "192.0.2.10", "false",
+                            "example-events", "events", "us-east-1", "123456789012", "false",
+                            "events/tracked/tracked.json", "", ship, *idb, f"otx-{otx}"],
+                           check=True, capture_output=True, timeout=60, cwd=tmp)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.read(out, encoding="utf-8")
+        return {k: cp.get("connector.otx", k, fallback=None)
+                for k in ("enabled", "submit", "dry_run", "secret_file", "secret_env",
+                          "candidates_file", "addresses_file")}
 
 
 @functools.lru_cache(maxsize=8)
@@ -1149,7 +1233,7 @@ def _mounts(service: dict) -> list[tuple[str, str, bool]]:
     return out
 
 
-def check_exporter(compose: dict, internetdb=False) -> list[str]:
+def check_exporter(compose: dict, internetdb=False, otx=False) -> list[str]:
     """The exporter holds the instance role, so it mounts its own config and state, the
     front-end log (read-only) and the blocklist directory (read-only), with
     InternetDbDelivered or InternetDbLookup the internetdb volume it writes, and with
@@ -1157,8 +1241,10 @@ def check_exporter(compose: dict, internetdb=False) -> list[str]:
     allowed = dict(EXPORTER_MOUNTS)
     if internetdb:
         allowed["internetdb"] = IDB_MOUNTS["exporter"]
-    if internetdb == "lookup":
+    if internetdb == "lookup" or otx:
         allowed[IDB_EGRESS_DIR] = ("/egress", True)
+    if otx:
+        allowed[OTX_KEY_FILE] = ("/run/otx-key", True)
     exporter = (compose.get("services") or {}).get("exporter")
     if not isinstance(exporter, dict):
         return ["the embedded compose file has no exporter service"]
@@ -1181,14 +1267,17 @@ def check_exporter(compose: dict, internetdb=False) -> list[str]:
     return errors
 
 
-def check_internetdb_volume(compose: dict, internetdb) -> list[str]:
+def check_internetdb_volume(compose: dict, internetdb, otx=False) -> list[str]:
     """Off: no internetdb volume anywhere. On: the exporter writes it, the agents and the
     console read it, each at /internetdb, and no other service mounts it."""
     errors: list[str] = []
     for name, service in (compose.get("services") or {}).items():
         egress = [s for s, _, _ in _mounts(service or {}) if s.startswith("/var/lib/sensor-egress")]
-        if egress and (name != "exporter" or internetdb != "lookup"):
+        if egress and (name != "exporter" or not (internetdb == "lookup" or otx)):
             errors.append(f"the {name} service mounts the host firewall's files")
+        if any(s == OTX_KEY_FILE for s, _, _ in _mounts(service or {})) \
+                and (name != "exporter" or not otx):
+            errors.append(f"the {name} service mounts the OTX key file")
         got = [(t, ro) for s, t, ro in _mounts(service or {}) if s == "internetdb"]
         want = [IDB_MOUNTS[name]] if internetdb and name in IDB_MOUNTS else []
         if got != want:

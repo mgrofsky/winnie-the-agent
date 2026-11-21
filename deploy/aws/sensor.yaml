@@ -133,14 +133,13 @@ Parameters:
     Description: >-
       Also run the read-only operator console, published on the host's 127.0.0.1:8480 only
       and reached through SSM port forwarding. No security group, role or endpoint change.
+  # Approving export_blocklist only tracks the address ([respond] track_before_enforce),
+  # and the exporter puts the tracked list (tracked.json) to EventsPrefix/TrackedKey. No
+  # role, endpoint or bucket policy change: the key is under the events prefix.
   TrackedExport:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: >-
-      Approving export_blocklist only tracks the address ([respond] track_before_enforce),
-      and the exporter puts the tracked list (tracked.json) to EventsPrefix/TrackedKey. No
-      role, endpoint or bucket policy change: the key is under the events prefix.
   TrackedKey:
     Type: String
     Default: tracked/tracked.json
@@ -179,14 +178,26 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
+  # Confirmed indicators to an AlienVault OTX pulse (docs/operations.md, "Indicators to OTX"):
+  # run-all writes the candidates next to tracked.json and the exporter submits them. The
+  # agents container still has no egress and never sees the key. dry-run: the exporter
+  # writes what it would send to its state volume and sends nothing; send: it sends. On:
+  # tcp 443 out in the security group (InstanceEgressTailscale), the host firewall for uid
+  # 10001 (EgressStep, Ec2Endpoint) with OTX_SUBMIT=true, so uid 10001 reaches only
+  # otx.alienvault.com's addresses besides what it reached before, and the key from the
+  # SecureString /NamePrefix/otx-api-key, read at boot into a root-written file only the
+  # exporter mounts (OtxStep). Off: nothing here changes.
+  OtxSubmit:
+    Type: String
+    Default: "false"
+    AllowedValues: ["false", "dry-run", "send"]
+  # Seconds between analysis passes (run-all) in the agents container. Records are written
+  # per closed hour, so a shorter interval only shortens the wait after each hour ends.
   AgentsIntervalSeconds:
     Type: Number
     Default: 3600
     MinValue: 60
     MaxValue: 86400
-    Description: >-
-      Seconds between analysis passes (run-all) in the agents container. Records are written
-      per closed hour, so a shorter interval only shortens the wait after each hour ends.
   UiActions:
     Type: String
     Default: "false"
@@ -202,15 +213,14 @@ Parameters:
     Description: Name recorded with console decisions (as ui:<name>) when UiActions is true.
   # Mesh VPN (Tailscale): everything below is off unless TailscaleEnabled is "true". See the
   # README, "Console over a tailnet".
+  # Join the host to a tailnet and serve the console on its tailnet HTTPS name, nothing
+  # else. Needs UiEnabled, TailscaleImageTag, TailscaleHostname and TailnetSuffix. Adds tcp
+  # 443 out, Get/Put on one SSM parameter (the node state) and the bootstrap steps; no
+  # inbound rule.
   TailscaleEnabled:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: >-
-      Join the host to a tailnet and serve the console on its tailnet HTTPS name, nothing
-      else. Needs UiEnabled, TailscaleImageTag, TailscaleHostname and TailnetSuffix. Adds tcp
-      443 out, Get/Put on one SSM parameter (the node state) and the bootstrap steps; no
-      inbound rule.
   TailscaleImageTag:
     Type: String
     Default: ""
@@ -233,13 +243,12 @@ Parameters:
     MaxLength: 63
     AllowedPattern: '^([a-z0-9-]+\.ts\.net)?$'
     Description: The tailnet's DNS name, for example example-tailnet.ts.net.
+  # Also serve /go on the tailnet name, a page that signs the visitor in with the console
+  # token. The tailnet's access rules are then the only gate. Needs TailscaleEnabled=true.
   UiTailnetSignIn:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: >-
-      Also serve /go on the tailnet name, a page that signs the visitor in with the console
-      token. The tailnet's access rules are then the only gate. Needs TailscaleEnabled=true.
   # Models on Amazon Bedrock: both empty (the default) adds nothing here. Deploy models.yaml
   # with the same two values first; see the README, "Models on Bedrock". A model id is
   # provider.name[:version]; an inference profile id adds a geographic prefix (us., us-gov.,
@@ -277,8 +286,10 @@ Conditions:
   TailscaleOn: !Equals [!Ref TailscaleEnabled, "true"]
   InternetDbOn: !Equals [!Ref InternetDbDelivered, "true"]
   IdbLookupOn: !Equals [!Ref InternetDbLookup, "true"]
-  # tcp 443 out to anywhere, and so the host firewall for the exporter.
-  HostEgressOn: !Or [!Condition TailscaleOn, !Condition IdbLookupOn]
+  # tcp 443 out to anywhere, and so the host firewall for the exporter: TailscaleEnabled,
+  # InternetDbLookup or OtxSubmit.
+  OtxOn: !Not [!Equals [!Ref OtxSubmit, "false"]]
+  HostEgressOn: !Or [!Condition TailscaleOn, !Condition IdbLookupOn, !Condition OtxOn]
   IdbAnyOn: !Or [!Condition InternetDbOn, !Condition IdbLookupOn]
   ConsoleStepOn: !Or [!Condition TailscaleOn, !Condition UiActionsOn]
   PersonaOn: !Not [!Equals [!Ref PersonaModelId, ""]]
@@ -1063,8 +1074,8 @@ Resources:
               docker run --rm --network none --entrypoint cat "$IMAGE" /app/deploy/aws/render_config.py > render_config.py
               ARGS="${NamePrefix} ${Scenario} ${ElasticIp} ${SmtpEnabled} ${EventsBucketName} ${EventsPrefix} $REGION ${EventsBucketOwner} ${TrackedExport} ${EventsPrefix}/${TrackedKey}"
               NEVER="${NeverActOn}"
-              python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "$NEVER" false${IdbArgs}
-              python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "$NEVER" true${IdbArgs}
+              python3 render_config.py config.ini.TEMPLATE config.ini $ARGS "$NEVER" false${IdbArgs}${OtxArgs}
+              python3 render_config.py config.ini.TEMPLATE config-ship.ini $ARGS "$NEVER" true${IdbArgs}${OtxArgs}
               chown 10001:10001 config.ini config-ship.ini ssh_host_key
               chmod 0400 config.ini config-ship.ini ssh_host_key
 
@@ -1133,7 +1144,7 @@ Resources:
                     - ./config-ship.ini:/config/config.ini:ro
                     - frontend:/data:ro
                     - exportstate:/agents
-                    - blocklist:/blocklist:ro${IdbWrite}
+                    - blocklist:/blocklist:ro${IdbWrite}${OtxMount}
                 ui:
                   <<: *hardening
                   profiles: [ui]
@@ -1191,7 +1202,7 @@ Resources:
                 for p in $PORTS; do echo "      - \"$p\""; done
               } > docker-compose.override.yml
 
-              ${IdbEgress}${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service <<'EOF'
+              ${IdbEgress}${OtxStep}${EgressStep}${ConsoleStep}${ModelStep}cat > /etc/systemd/system/sensor.service <<'EOF'
               [Unit]
               Description=Winnie the Agent sensor stack
               After=docker.service sensor-firewall.service
@@ -1236,6 +1247,24 @@ Resources:
               # InternetDB addresses, in a settings file of its own that sensor-egress.sh
               # reads after its main one, so the egress step is unchanged when off.
               IdbEgress: !If [IdbLookupOn, "echo INTERNETDB_LOOKUP=true > /etc/sensor-egress-idb.env\n", ""]
+              # OtxSubmit only, each "" when off. OtxArgs: the render argument (otx-dry-run or
+              # otx-send). OtxMount: the key file, read-only, for the exporter alone, and the
+              # host firewall's pinned addresses (already mounted with InternetDbLookup).
+              # OtxStep, before EgressStep: the host firewall's switch in a file of its own,
+              # then the key from /NamePrefix/otx-api-key (decrypted through SSM, which the
+              # managed policy already allows) into otx-key, owner 10001, mode 0600, never
+              # echoed. A missing parameter leaves the file empty and is logged; the exporter
+              # then sends nothing and says the key is missing. The file always exists, so
+              # Docker never creates a directory in its place.
+              OtxArgs: !If [OtxOn, !Sub " otx-${OtxSubmit}", ""]
+              OtxMount: !If [OtxOn, !If [IdbLookupOn, "\n      - ./otx-key:/run/otx-key:ro", "\n      - ./otx-key:/run/otx-key:ro\n      - /var/lib/sensor-egress/exporter:/egress:ro"], ""]
+              OtxStep: !If
+                - OtxOn
+                - !Sub |
+                  echo OTX_SUBMIT=true > /etc/sensor-egress-otx.env
+                  (umask 077; aws ssm get-parameter --region $REGION --name /${NamePrefix}/otx-api-key --with-decryption --query Parameter.Value --output text > otx-key) || echo "otx key: FAILED ($?)"
+                  chown 10001:10001 otx-key
+                - ""
               # TailscaleEnabled or InternetDbLookup, before the stack starts, and not allowed to
               # fail: an error here stops the bootstrap, so the stack never runs without these
               # rules. INTERNETDB_LOOKUP adds only InternetDB's addresses for uid 10001.

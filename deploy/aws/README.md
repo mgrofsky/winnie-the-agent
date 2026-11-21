@@ -813,6 +813,78 @@ Not proven without a real deploy: the resolution on Amazon Linux 2023 (`getent
 ahostsv4`), the bind mount of the addresses directory, and lookups through the shared CDN
 addresses.
 
+## Indicators to OTX (optional)
+
+With `OtxSubmit=dry-run` or `OtxSubmit=send` the sensor gives confirmed indicators back as
+an AlienVault OTX pulse: the addresses of proven sources that did more than probe, and the
+SHA-256 of files they uploaded (see "Indicators to OTX" in the
+[operations guide](../../docs/operations.md#indicators-to-otx) for what is and is not
+sent). The agents container writes the candidates next to `tracked.json`; the exporter
+reads them from its read-only `/blocklist` mount and submits. The agents container still
+has no egress and never sees the key. A public pulse shows anyone that the account's owner
+runs a honeypot and roughly when each source hit it; the rendered config keeps
+`public = false`.
+
+`dry-run` writes the request the exporter would make to its state volume
+(`/agents/state/otx_dry_run.json` inside the exporter) and sends nothing. `send` sends.
+Start with `dry-run`, read the file
+(`sudo docker compose -f /opt/sensor/docker-compose.yml exec exporter cat /agents/state/otx_dry_run.json`),
+then update the stack with `send`.
+
+**The key.** One SecureString under the default `aws/ssm` key, read without echo and sent on
+stdin, like the tailnet secrets:
+
+```bash
+read -rs OTX_KEY; echo
+printf '{"Name":"/winnie-sensor/otx-api-key","Type":"SecureString","Value":"%s"}' "$OTX_KEY" \
+  | aws ssm put-parameter --cli-input-json file:///dev/stdin $S
+unset OTX_KEY
+```
+
+At boot root reads it (`OtxStep`) into `/opt/sensor/otx-key`, owner 10001, mode 0600, and
+only the exporter mounts it, read-only, at `/run/otx-key`. It is never echoed. A missing
+parameter leaves the file empty and logs `otx key: FAILED`; the exporter then sends nothing
+and reports the key missing. A new key needs a reboot or a rebuild (the file is written at
+the bootstrap only). The role gains nothing: `AmazonSSMManagedInstanceCore` already allows
+`ssm:GetParameter`, and the default key lets the account's principals decrypt through SSM.
+
+**What changes on the stack.**
+
+- Security group: `InstanceEgressTailscale` (tcp 443 to anywhere, no UDP, no IPv6), and
+  `Ec2Endpoint` with the role's one prefix list read, now come with `TailscaleEnabled`,
+  `InternetDbLookup` or `OtxSubmit`.
+- The host firewall (`sensor-egress.sh`, `EgressStep`) is installed. The bootstrap writes
+  `OTX_SUBMIT=true` to `/etc/sensor-egress-otx.env` first; on every `refresh` root resolves
+  `otx.alienvault.com` with the same checks as for InternetDB, keeps at most 8 addresses in
+  `/var/lib/sensor-egress/exporter/otx-addresses` and adds one `/32 tcp 443 ACCEPT` each for
+  uid 10001, after every other rule. The exporter connects only to those, checking the
+  certificate for `otx.alienvault.com`. With the switch off that line and file do not exist
+  and every rule is exactly as before.
+- Config: `config.ini` gets `[connector.otx] enabled = true, submit = false` (write the
+  candidates only); `config-ship.ini` gets `submit = true`, `secret_file = /run/otx-key`,
+  `candidates_file = /blocklist/otx_candidates.json`,
+  `addresses_file = /egress/otx-addresses`. Both get `dry_run = true` for `dry-run` and
+  `false` for `send`.
+- Compose: for the exporter alone, `./otx-key:/run/otx-key:ro` and (unless
+  `InternetDbLookup` already mounts it) `/var/lib/sensor-egress/exporter:/egress:ro`.
+
+**Turning it on.** Store the key, rebuild and push the image, then update the stack with
+`OtxSubmit=dry-run` (the user data changes, so the instance is replaced). Candidates appear
+after the first agents run; the exporter runs every 5 minutes. Check with
+`cat /var/lib/sensor-egress/exporter/otx-addresses`, `iptables -S SENSOR-UID`, and the
+`otx_submit` events in the exporter's `ship_events.jsonl`. Rollback: `OtxSubmit=false`;
+the bootstrap, firewall rules and configs go back to exactly what they were. Pulses
+already created stay on OTX; delete them there.
+
+**Template size.** To fit this switch under the 51,200-byte deploy limit, the long
+`Description` text of `TrackedExport`, `AgentsIntervalSeconds`, `TailscaleEnabled` and
+`UiTailnetSignIn` moved into YAML comments above each parameter, as the InternetDB
+switches already do. The CloudFormation console no longer shows those four descriptions;
+nothing else changed. The deploy copy has about 180 bytes left.
+
+Not proven without a real deploy: the SecureString read at boot, the bind mount of the key
+file, the resolution of `otx.alienvault.com` on Amazon Linux 2023, and a real submission.
+
 ## Models on Bedrock (optional)
 
 Off by default. With it off the sensor has no model: the SSH persona gives canned replies

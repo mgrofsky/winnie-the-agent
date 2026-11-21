@@ -39,6 +39,12 @@
 # none saved nothing is opened. Each is one /32 ACCEPT after all the rules above. Those
 # addresses are a shared CDN's, so they also serve other sites: the exporter, the only
 # process allowed, sends nothing but an address in the path. Off, nothing here changes.
+#
+# OTX_SUBMIT=true in /etc/sensor-egress-otx.env (sensor.yaml writes it only with OtxSubmit;
+# absent means false) does the same for otx.alienvault.com, for the exporter's OTX
+# submissions ([connector.otx]): the same checks, at most 8 addresses saved as
+# exporter/otx-addresses, one /32 tcp 443 ACCEPT each after every rule above. Off, nothing
+# here changes.
 set -euo pipefail
 w="iptables -w"
 u="-m owner --uid-owner 10001"
@@ -57,6 +63,11 @@ good() { [[ $1 =~ $ip4 ]] && [ "${1#*/}" -ge 8 ] && [ "${1#*/}" -le 32 ]; }
 IDB=${INTERNETDB_LOOKUP:-false}
 [[ $IDB = true || $IDB = false ]] || { echo "sensor-egress: bad INTERNETDB_LOOKUP" >&2; exit 1; }
 I=${SENSOR_EGRESS_DIR:-/var/lib/sensor-egress}/exporter/internetdb-addresses
+Y=${SENSOR_EGRESS_OTX_ENV:-/etc/sensor-egress-otx.env}
+[ ! -f "$Y" ] || . "$Y"
+OTX=${OTX_SUBMIT:-false}
+[[ $OTX = true || $OTX = false ]] || { echo "sensor-egress: bad OTX_SUBMIT" >&2; exit 1; }
+O=${I%/*}/otx-addresses
 # One global unicast IPv4 address, written canonically (no leading zeros). The documentation
 # ranges count as public only for the tests (SENSOR_EGRESS_TEST_DOC_RANGES=1).
 pub() {
@@ -71,6 +82,22 @@ pub() {
   if [ "$a" = 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ]; then return 1; fi
   if [ "$a" = 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; then return 1; fi
   return 0
+}
+# Resolve name $1 as root, save its addresses to $2 for the exporter; $3 names it in errors.
+pin() {
+  install -d -m 0755 "${2%/*}"
+  local n=() bad="" a _
+  while read -r a _; do
+    pub "$a" || bad=1
+    [[ " ${n[*]:-} " = *" $a "* ]] || n+=("$a")
+  done < <(getent ahostsv4 "$1" 2>/dev/null || :)
+  if [ -z "$bad" ] && [ "${#n[@]}" -gt 0 ]; then
+    printf '%s\n' "${n[@]:0:8}" > "$2.new"
+    chmod 0644 "$2.new"
+    mv -f "$2.new" "$2"
+  else
+    echo "$3: lookup failed, keeping the last addresses" >&2
+  fi
 }
 if [ "${1:-}" = refresh ]; then
   mkdir -p "${C%/*}"
@@ -88,22 +115,8 @@ if [ "${1:-}" = refresh ]; then
   else
     echo "s3 prefix list: lookup failed, keeping the last list" >&2
   fi
-  if [ "$IDB" = true ]; then
-    install -d -m 0755 "${I%/*}"
-    n=()
-    bad=""
-    while read -r a _; do
-      pub "$a" || bad=1
-      [[ " ${n[*]:-} " = *" $a "* ]] || n+=("$a")
-    done < <(getent ahostsv4 internetdb.shodan.io 2>/dev/null || :)
-    if [ -z "$bad" ] && [ "${#n[@]}" -gt 0 ]; then
-      printf '%s\n' "${n[@]:0:8}" > "$I.new"
-      chmod 0644 "$I.new"
-      mv -f "$I.new" "$I"
-    else
-      echo "internetdb: lookup failed, keeping the last addresses" >&2
-    fi
-  fi
+  [ "$IDB" != true ] || pin internetdb.shodan.io "$I" internetdb
+  [ "$OTX" != true ] || pin otx.alienvault.com "$O" otx
 fi
 $w -N SENSOR-UID 2>/dev/null || $w -F SENSOR-UID
 $w -C OUTPUT $u -j SENSOR-UID 2>/dev/null || $w -I OUTPUT 1 $u -j SENSOR-UID
@@ -116,3 +129,4 @@ $w -A SENSOR-UID -d "$VPC_CIDR" -p udp --dport 53 -j ACCEPT
 $w -A SENSOR-UID -d "$VPC_CIDR" -p tcp --dport 443 -j ACCEPT
 for c in $(cat "$C" 2>/dev/null || :); do if good "$c"; then $w -A SENSOR-UID -d "$c" -p tcp --dport 443 -j ACCEPT; fi; done
 [ "$IDB" != true ] || for a in $(head -n 8 "$I" 2>/dev/null || :); do if pub "$a"; then $w -A SENSOR-UID -d "$a/32" -p tcp --dport 443 -j ACCEPT; fi; done
+[ "$OTX" != true ] || for a in $(head -n 8 "$O" 2>/dev/null || :); do if pub "$a"; then $w -A SENSOR-UID -d "$a/32" -p tcp --dport 443 -j ACCEPT; fi; done

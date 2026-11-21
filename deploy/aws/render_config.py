@@ -1,7 +1,8 @@
 """Render a sensor config file from the image's config template (AWS bootstrap).
 
     python3 render_config.py SRC DST NAME SCENARIO PUBLIC_IP SMTP BUCKET PREFIX REGION OWNER \\
-        TRACKED TRACKED_KEY NEVER_ACT_ON SHIP [INTERNETDB WANTED_KEY ANSWERS_KEY | lookup]
+        TRACKED TRACKED_KEY NEVER_ACT_ON SHIP [INTERNETDB WANTED_KEY ANSWERS_KEY | lookup] \\
+        [otx-dry-run | otx-send]
     python3 render_config.py models DST PERSONA_MODEL ANALYST_MODEL REGION
 
 deploy/aws/sensor.yaml copies this file out of the image (/app/deploy/aws/render_config.py)
@@ -20,6 +21,13 @@ same, except that the exporter's exchange is kind = lookup: it asks InternetDB i
 connecting only to the addresses the host firewall pinned (/egress/internetdb-addresses),
 and has no object store keys. Without them, or with INTERNETDB false, nothing about
 InternetDB is written, so both files are exactly as before.
+
+A last argument otx-dry-run or otx-send (OtxSubmit) turns on [connector.otx] in both files:
+config.ini only writes the candidates (submit = false), config-ship.ini reads them from the
+exporter's read-only blocklist mount and submits, with the key from /run/otx-key and only to
+the addresses the host firewall pinned (/egress/otx-addresses). otx-dry-run keeps dry_run =
+true (written to a file, nothing sent); otx-send sets it false. Without it nothing about OTX
+is written.
 
 The models form edits DST in place (the model step, PersonaModelId / AnalystModelId): a
 non-empty persona model id sets [llm] to Bedrock with that model, a non-empty analyst model
@@ -40,9 +48,11 @@ else:
     (src, dst, name, scenario, public_ip, smtp, bucket, prefix, region, owner, tracked,
      tracked_key, never, ship) = sys.argv[1:15]
     internetdb = sys.argv[15:]
+    otx = internetdb.pop() if internetdb[-1:] in (["otx-dry-run"], ["otx-send"]) else None
     if internetdb not in ([], ["false"], ["lookup"]) and not (len(internetdb) == 3
                                                               and internetdb[0] == "true"):
-        sys.exit("usage: INTERNETDB WANTED_KEY ANSWERS_KEY, lookup, or nothing")
+        sys.exit("usage: INTERNETDB WANTED_KEY ANSWERS_KEY, lookup, or nothing, then "
+                 "otx-dry-run, otx-send or nothing")
     want = None
 lines = open(src, encoding="utf-8").read().splitlines()
 if want is None:
@@ -73,6 +83,13 @@ if want is None:
         want["connector.internetdb_exchange"] = {
             "enabled": ship, "kind": "lookup",
             "addresses_file": "/egress/internetdb-addresses"}
+    if otx is not None:
+        want["connector.otx"] = {"enabled": "true", "submit": ship,
+                                 "dry_run": "false" if otx == "otx-send" else "true"}
+        if ship == "true":
+            want["connector.otx"].update(secret_file="/run/otx-key",
+                                         candidates_file="/blocklist/otx_candidates.json",
+                                         addresses_file="/egress/otx-addresses")
     if smtp != "true":
         want["listeners"]["smtp_enabled"] = "false"
     if never.strip():

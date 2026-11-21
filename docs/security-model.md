@@ -290,6 +290,46 @@ authentication only and are never rendered into a prompt.
     and what keeps it to InternetDB is that the exporter, the only process allowed, has the
     host fixed in code and checks the certificate. Code execution inside the exporter could
     use those addresses to reach other sites on that CDN; it could already reach S3.
+- **Indicators to OTX.** One more outbound destination, off by default and dry by default
+  even when enabled (`[connector.otx]`, see
+  [operations.md](operations.md#indicators-to-otx); on AWS `OtxSubmit`). It is the only
+  flow that hands sensor findings to a public service.
+  - *What leaves.* IPv4 source addresses and, if `hashes` is on, SHA-256 hashes of
+    quarantined uploads, added to one pulse per UTC day on `otx.alienvault.com`. Each
+    indicator's title and description are fixed text plus a protocol name and class names
+    from fixed lists. Also the pulse name, description and tags from config, and the API
+    key in one header. Nothing an attacker wrote: no URL, domain, command, credential,
+    user name, user agent or file name.
+  - *Why attacker text cannot steer it.* An attacker could otherwise name an innocent host
+    in a command and get it listed. The address sent is the source's own, and only when the
+    source is proven (TCP, or a SIP nonce round trip) and global unicast, outside
+    `never_act_on` and not the sensor's own address. The hash sent is the one the front-end
+    computed over bytes the source itself uploaded, taken from the quarantine's metadata
+    (written only by the front-ends), never a hash quoted in text; a file cut at the
+    quarantine cap is left out. Whether a source qualifies comes from counted facts
+    (accepted logins, planted credentials used, high-signal events the code assigns); the
+    model's judgement can only veto. The worst a source can do on purpose is get its own
+    address, or the hash of a file it uploaded, published, which is the point.
+  - *The hand-off.* `run-all` writes the candidates file (addresses, hashes, fixed names,
+    timestamps); the sender reads it as untrusted input: a regular file only, at most
+    256 KB, every field checked against its pattern or list, the whole file refused on any
+    problem, `never_act_on` applied again. What a taken-over agents container can do
+    through it is choose which global IPv4 addresses and well-formed hashes are submitted,
+    within `max_per_run` and `max_per_day`, under the operator's OTX account. That is a
+    reputation risk (an innocent address could be listed), bounded by the caps and visible
+    in the pulse and the events. The dry run, on by default, lets the operator read every
+    request before any is sent.
+  - *The call.* Host fixed in code, pinned public address, certificate and name checked,
+    no redirects, no proxy, 15 second deadline, 1 MB cap, back-off on any failure. Only the
+    new pulse's id is read from an answer, and only in the shape OTX uses. Sent indicators
+    are remembered so none is sent twice.
+  - *The key.* From an environment variable or a key file, read only when a request is
+    about to be sent; never logged and never written to state, events, the dry-run file or
+    an error message (errors carry the exception type only). On AWS it is a SecureString
+    read at boot by root into a file only the exporter mounts.
+  - *What a pulse reveals.* A public pulse tells anyone that the account's owner runs a
+    honeypot and roughly when each listed source hit it. Private (`public = false`) is the
+    default.
 - **Notification content.** Built from structured fields; attacker-derived URLs, domains,
   addresses and `@` are defanged in chat, email and ticket outputs; the enrichment
   response is treated as untrusted and flattened to a few short scalar fields.
@@ -358,13 +398,14 @@ loopback, and the bind guard is unchanged. What changes:
   reach the node is signed in, and with actions on can approve blocks. The console itself
   still trusts no header; the page simply gives every admitted visitor the token.
 - Opening tcp 443 for the VPN client (or for the exporter's InternetDB lookups,
-  `InternetDbLookup`) opens it for every process on the host network. On
+  `InternetDbLookup`, or its OTX submissions, `OtxSubmit`) opens it for every process on
+  the host network. On
   the AWS template that would include the exporter, the one container with the instance
   role, which reads attacker-written data; the template therefore limits its user (uid
   10001) with host `OUTPUT` rules to what it reached before the option (its endpoints, the
   S3 prefix list's CIDRs, the metadata service, DNS) and nothing over the tunnel, and
-  rejects the rest; with `InternetDbLookup` also InternetDB's pinned addresses (one /32
-  each, after the other rules). Those rules fail closed: a missing or stale prefix list stops the
+  rejects the rest; with `InternetDbLookup` also InternetDB's pinned addresses, and with
+  `OtxSubmit` OTX's (one /32 each, after the other rules). Those rules fail closed: a missing or stale prefix list stops the
   export, it never widens the reach. They are applied before Docker starts at every boot,
   because Docker restarts the containers itself, and Docker does not start without at
   least the exporter's `REJECT`. They depend on the exporter running as uid 10001 and
