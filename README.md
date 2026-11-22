@@ -48,7 +48,9 @@ On top of that SSH honeypot this project adds:
   changes (tarpit, deeper or shallower interaction, per-source honeytokens), notifications
   through opt-in connectors, and enforcement actions that run only after a person approves
   them. Optionally in two steps: a blocklist entry is tracked first, for your cloud to
-  watch and report sightings of, and blocked only on a second decision.
+  watch and report sightings of, and blocked only on a second decision. Winnie publishes
+  the lists and your systems pull them; [docs/blocking.md](docs/blocking.md) explains
+  Approve and Enforce and how to set up the pull.
 
 > Winnie is used in a live production environment. Review the [deployment guidance](#deployment)
 > before setting up your own instance.
@@ -229,7 +231,7 @@ section after `[user_accounts]` is optional and has safe defaults.
 | `[scenario]` | Active scenario, optional fixed seed, overlay path. |
 | `[listeners]` | Bind address, per-service overrides (`<service>_enabled`, `_port`, `_accept`), connection and rate limits (including the global inbound SIP UDP limit), quarantine caps, FTP passive ports and their timeout and per-source limit, PostgreSQL auth method, SIP UDP slack, optional model fallback for unknown SQL and API requests. |
 | `[agents]` | Analyst model and call caps per run and per day, tuner changes per run, triage records per run and record retention. |
-| `[respond]` | Response engine: enforcement queue, approval expiry, blocklist file and format, `never_act_on` ranges, proxy guard, notification caps, retention. |
+| `[respond]` | Response engine: enforcement queue, approval expiry, blocklist file and format, `never_act_on` ranges, proxy guard, notification caps, retention. See [docs/blocking.md](docs/blocking.md) for the blocklist files and how to consume them. |
 | `[connector.*]` | Outbound connectors (webhook, siem_http, email, enrich, ticket, block_webhook). All off by default. |
 | `[connector.otx]` | Indicators to an AlienVault OTX pulse: proven, active source addresses and upload hashes only. Off by default, and a dry run (written to a file, nothing sent) until `dry_run = false`. See [docs/operations.md](docs/operations.md#indicators-to-otx). |
 | `[connector.s3_events]` | Event export: ships the event log to an S3 bucket as JSON lines for a SIEM S3 reader (`python -m agents ship`, also the last step of `run-all`). Off by default; passwords are hashed unless configured otherwise. See [docs/operations.md](docs/operations.md#event-export-to-s3). |
