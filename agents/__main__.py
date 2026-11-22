@@ -56,8 +56,11 @@ def _load_config(path: Optional[str]) -> tuple[ConfigParser, Path, Optional[str]
         return cp, target.resolve().parent, f"config not found: {path}"
     if target.exists():
         try:
-            cp.read(target)
-        except (ConfigParserError, UnicodeDecodeError) as exc:
+            # read_file, not read(): read() silently skips a file it cannot open (a directory,
+            # no permission), which would look like an empty config.
+            with open(target) as handle:
+                cp.read_file(handle, source=str(target))
+        except (ConfigParserError, UnicodeDecodeError, OSError) as exc:
             return ConfigParser(), target.resolve().parent, \
                 f"config not readable: {type(exc).__name__}"
     return cp, target.resolve().parent, None

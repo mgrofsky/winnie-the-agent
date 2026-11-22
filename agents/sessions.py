@@ -666,6 +666,9 @@ class Cursor:
             return 0
         if self.offset <= 0 or self.inode != st.st_ino or st.st_size < self.offset:
             return 0
+        if self.size == st.st_size and self.mtime_ns is not None \
+                and self.mtime_ns != st.st_mtime_ns:
+            return 0      # same length but modified since saved: rewritten in place, read it all
         if self.head is not None and self.head != self._head(log_path):
             return 0
         with open(log_path, "rb") as f:
@@ -677,6 +680,23 @@ class Cursor:
             if found is None or found.tails.get(self.offset) != self.tail:
                 return 0
         return self.offset
+
+    def adopt_handled(self, parsed: ParsedLog, before: Optional[LogSample], recorded) -> None:
+        """Before a reread from the start of the same file (it was rewritten at the same
+        length, so ``start_offset`` refused the offset): an item that ends at or before the
+        old offset and whose record ``recorded(kind, id)`` already exists was handled, and is
+        not triaged again (a second model call each). That is the only evidence taken. An
+        item without a record, for instance a session id the rewrite introduced, is
+        processed: replaying is the conservative side. A different file, or one whose first
+        line changed, is a new generation and is read in full."""
+        if self.offset > 0 and before is not None and self.inode == before.inode \
+                and self.head == before.head:
+            for s in parsed.sessions.values():
+                if s.last_offset <= self.offset and recorded("session", s.session_id):
+                    self.done.setdefault(s.session_id, s.last_offset)
+            for c in parsed.campaigns.values():
+                if c.last_offset <= self.offset and recorded("campaign", c.campaign_id):
+                    self.done.setdefault(c.campaign_id, c.last_offset)
 
     def seen_session(self, sid: str) -> bool:
         return sid in self.done

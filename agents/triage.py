@@ -1434,6 +1434,22 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
     before = Cursor.sample(log_path)              # the file this run is about to read
     parsed = parse_log(log_path, window_minutes=window_minutes,
                        start_offset=cursor.start_offset(log_path))
+    if parsed.start_offset == 0:
+        # A reread of the same file: skip only what shows evidence of having been handled
+        # (a saved record, the aggregate record an unverified campaign was folded into, or a
+        # recorded failure). Anything else, such as a session id the rewrite introduced, is
+        # triaged.
+        aggregate_of = {m: c.campaign_id for c, members in
+                        fold_unverified(list(parsed.campaigns.values())) for m in members}
+
+        def recorded(kind: str, item_id: str) -> bool:
+            if item_id in cursor.failed:
+                return True
+            sub, rid = ("sessions", item_id) if kind == "session" else \
+                ("campaigns", aggregate_of.get(item_id, item_id))
+            return (reports_dir / sub / f"{_safe_filename(rid)}.json").is_file()
+
+        cursor.adopt_handled(parsed, before, recorded)
     sessions, campaigns = pending(parsed, cursor, now=now)
     # Built once per run: one lookup per position of each input, whatever the token count.
     ht_values = TokenIndex(load_honeytoken_values(reports_dir / "honeytokens.json"))

@@ -537,6 +537,152 @@ def test_a_same_size_rewrite_away_from_the_first_line_and_the_tail_is_caught(
     assert any("rewritten in place" in p for p in status["pending"])
 
 
+def _middle_rewrite(log, old=b"pw0040", new=b"px0040"):
+    """Rewrite one line in the middle in place: same inode and length, first line and last
+    4 KiB untouched."""
+    data = log.read_bytes()
+    before = log.stat()
+    log.write_bytes(data.replace(old, new))
+    assert (log.stat().st_ino, log.stat().st_size) == (before.st_ino, before.st_size)
+    _bump_mtime(log)
+
+
+def test_triage_and_shipping_reread_after_a_same_length_middle_rewrite(tmp_path, monkeypatch):
+    """Both readers must notice on entry, not only the rotation check: otherwise a reader reads
+    0 bytes, re-stamps the new modification time and the rewrite is declared handled."""
+    from agents.sessions import Cursor
+
+    args, s3 = _export_setup(tmp_path, monkeypatch)
+    log = _big_log(tmp_path)
+    assert _rotation("run-all", args)["safe"] is True
+    size = log.stat().st_size
+    state = tmp_path / "reports" / "state"
+    assert cli.run(["triage", *args])["triage"]["bytes_read"] == 0       # nothing new: resumes
+    s3.puts.clear()
+
+    _middle_rewrite(log, b'"f40"', b'"g40"')               # an externally visible field
+    triage = cli.run(["triage", *args])
+    assert triage["triage"]["bytes_read"] == size                          # read it all again
+    assert triage["triage"]["written"] == [] and triage["triage"]["llm_calls"] == 0   # no replay
+    assert triage["log_rotation"]["readers"]["triage"]["state"] == "confirmed"
+    shipped = cli.run(["ship", *args])
+    assert shipped["ship"]["start_offset"] == 0 and s3.puts
+    uploaded = [json.loads(line) for p in s3.puts for line in p["Body"].decode().splitlines()]
+    names = {event["detail"]["task_name"] for event in uploaded}
+    assert "g40" in names and "f40" not in names           # the changed field was exported
+    assert shipped["log_rotation"]["safe"] is True
+    assert Cursor(state / "ship_cursor.json").offset == size
+
+
+def _ssh_log(tmp_path, n=30):
+    recs = []
+    for i in range(n):
+        recs += ssh_session(f"session-{i:04d}", f"203.0.113.{i + 1}", ["id", "uname -a"], start=i)
+    first = datetime.datetime.fromisoformat(recs[0]["timestamp"])
+    old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
+           ).replace(minute=5, second=0, microsecond=0)
+    for r in recs:
+        r["timestamp"] = (old + (datetime.datetime.fromisoformat(r["timestamp"]) - first)
+                          ).isoformat()
+    return write_log(tmp_path / "log.jsonl", recs)
+
+
+def test_a_session_id_introduced_by_a_middle_rewrite_gets_its_record_before_safe(
+        tmp_path, monkeypatch):
+    """The rewrite changes one session id to another of the same length, so the log keeps its
+    size, first line and tail. The new id was never handled: it must be triaged and exported
+    before the log is declared safe to rotate, while the sessions that already have records
+    are not triaged again."""
+    args, s3 = _export_setup(tmp_path, monkeypatch)
+    log = _ssh_log(tmp_path)
+    first = cli.run(["run-all", *args])
+    assert first["log_rotation"]["safe"] is True and len(first["triage"]["written"]) >= 30
+    sessions = tmp_path / "reports" / "sessions"
+    assert not (sessions / "session-0099.json").exists()
+    s3.puts.clear()
+
+    _middle_rewrite(log, b"session-0020", b"session-0099")
+    second = cli.run(["run-all", *args])
+    assert second["triage"]["written"] == ["session-0099"]               # only the new id
+    assert second["triage"]["llm_calls"] == 0
+    assert (sessions / "session-0099.json").exists()                     # its record exists ...
+    assert second["log_rotation"]["safe"] is True                        # ... before safe
+    uploaded = [json.loads(line) for p in s3.puts for line in p["Body"].decode().splitlines()]
+    assert "session-0099" in {event["detail"]["task_name"] for event in uploaded}
+
+
+def test_a_true_append_still_resumes_from_each_cursor(tmp_path, monkeypatch):
+    args, s3 = _export_setup(tmp_path, monkeypatch)
+    log = _big_log(tmp_path)
+    assert _rotation("run-all", args)["safe"] is True
+    offset = log.stat().st_size
+    s3.puts.clear()
+    with open(log, "ab") as f:
+        f.write(log.read_bytes().splitlines(keepends=True)[-1])           # one more line
+    added = log.stat().st_size - offset
+    triage = cli.run(["triage", *args])
+    assert triage["triage"]["bytes_read"] == added                         # only the new line
+    shipped = cli.run(["ship", *args])
+    assert shipped["ship"]["start_offset"] == offset and len(s3.puts) == 1
+    assert shipped["log_rotation"]["safe"] is True
+
+
+def test_start_offset_distrusts_a_same_size_file_with_a_new_modification_time(tmp_path):
+    from agents.sessions import Cursor
+
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b"first\nsecond\n")
+    cursor = Cursor(tmp_path / "cursor.json")
+    cursor.set_position(13, log, Cursor.sample(log))
+    assert cursor.start_offset(log) == 13
+    _bump_mtime(log)
+    assert cursor.start_offset(log) == 0                                   # same size, touched
+    with open(log, "ab") as f:
+        f.write(b"third\n")
+    assert cursor.start_offset(log) == 13                                  # a true append resumes
+
+
+def _bounded(fn, seconds=15):
+    import threading
+
+    box = {}
+    worker = threading.Thread(target=lambda: box.update(result=fn()), daemon=True)
+    worker.start()
+    worker.join(seconds)
+    assert not worker.is_alive(), "the command blocked on the event log"
+    return box["result"]
+
+
+@pytest.mark.parametrize("command", ["triage", "ship", "run-all"])
+def test_a_fifo_event_log_is_rejected_before_any_reader_opens_it(tmp_path, monkeypatch, command):
+    import os
+
+    args, s3 = _export_setup(tmp_path, monkeypatch)
+    fifo = tmp_path / "events.fifo"
+    os.mkfifo(fifo)
+    summary = _bounded(lambda: cli.run([command, *args, "--log", str(fifo)]))
+    errors = [summary[k]["error"] for k in ("triage", "ship") if k in summary]
+    assert errors and all("not a regular file" in e for e in errors)
+    if command == "run-all":
+        assert len(errors) == 2                            # triage and the enabled export
+    assert summary["log_rotation"]["safe"] is False and s3.puts == []
+
+
+def test_event_log_state_rejects_non_regular_paths_and_keeps_its_other_messages(tmp_path):
+    import os
+
+    from agents.runtime import event_log_state
+
+    fifo = tmp_path / "f"
+    os.mkfifo(fifo)
+    assert event_log_state(fifo) == ("error", f"event log path is not a regular file: {fifo}")
+    assert event_log_state(tmp_path) == ("error", f"event log path is a directory: {tmp_path}")
+    assert event_log_state(tmp_path / "none") == ("missing", None)
+    ok = tmp_path / "ok.jsonl"
+    ok.write_text("")
+    assert event_log_state(ok) == ("ok", None)
+
+
 def test_a_rewrite_during_the_pre_and_post_samples_fails_closed_at_equal_size(
         tmp_path, monkeypatch):
     import agents.rotation as rotation
@@ -728,6 +874,48 @@ def test_a_configuration_error_withholds_the_all_clear(tmp_path):
     status = cli.log_rotation_status({}, log_path=tmp_path / "gone.jsonl", state=tmp_path,
                                      readers=["triage"], config_error="bad")
     assert status["safe"] is False
+
+
+def test_a_config_that_cannot_be_opened_is_a_configuration_error(tmp_path):
+    """A directory or an unreadable file given as --config used to read as an empty config, so a
+    nonempty --log was judged against triage alone and could be called safe."""
+    import os
+
+    log = tmp_path / "log.jsonl"
+    log.write_text('{"a": 1}\n')
+    unreadable = tmp_path / "unreadable.ini"
+    unreadable.write_text("[connector.s3_events]\nenabled = true\n")
+    unreadable.chmod(0)
+    bad = {"directory": tmp_path / "conf.d", "unreadable": unreadable}
+    (tmp_path / "conf.d").mkdir()
+    try:
+        for name, config in bad.items():
+            if name == "unreadable" and os.access(config, os.R_OK):
+                continue                                   # permissions are not enforced here
+            summary = cli.run(["triage", "--config", str(config), "--log", str(log), "--no-llm",
+                               "--reports-dir", str(tmp_path / "r"),
+                               "--detections-dir", str(tmp_path / "det"),
+                               "--overlay", str(tmp_path / "overlay.json"),
+                               "--data-dir", str(tmp_path / "data")])
+            assert summary["config_error"].startswith("config not readable"), name
+            assert summary["log_rotation"]["safe"] is False, name
+            assert any("configuration could not be read" in p
+                       for p in summary["log_rotation"]["pending"]), name
+    finally:
+        unreadable.chmod(0o600)
+
+
+def test_a_config_that_is_not_a_regular_readable_file_is_reported_by_the_loader(tmp_path):
+    (tmp_path / "dir").mkdir()
+    _cp, base, error = cli._load_config(str(tmp_path / "dir"))
+    assert error and error.startswith("config not readable: ")
+    assert base == (tmp_path).resolve()
+    _cp, _base, error = cli._load_config(str(tmp_path / "absent.ini"))
+    assert error == f"config not found: {tmp_path / 'absent.ini'}"
+    good = tmp_path / "good.ini"
+    good.write_text("[honeypot]\nlog_file = x.log\n")
+    cp, _base, error = cli._load_config(str(good))
+    assert error is None and cp["honeypot"]["log_file"] == "x.log"
 
 
 def test_a_log_that_moves_between_the_two_samples_fails_closed(tmp_path, monkeypatch):
