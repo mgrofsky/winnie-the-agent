@@ -17,7 +17,10 @@ COPY pyproject.toml uv.lock .python-version ./
 # --extra geoip: the reader for the optional [geoip] database files (no network use).
 RUN uv sync --frozen --no-dev --extra geoip --no-install-project --no-cache
 
-COPY SSH ./SSH
+# Only the files the honeypot loads; nothing else under SSH/ (keys, local config, deploy notes).
+COPY SSH/ssh_server.py SSH/prompt.txt SSH/config.ini.TEMPLATE /app/SSH/
+# The full license text, with both copyright notices, travels with the image.
+COPY LICENSE /app/LICENSE
 COPY agents ./agents
 COPY listeners ./listeners
 COPY scenarios ./scenarios

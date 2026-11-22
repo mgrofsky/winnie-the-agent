@@ -18,6 +18,8 @@ from typing import Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from agents.eventlog import open_event_log
+
 MAX_VALUE_CHARS = 512
 MAX_DATA_KEYS = 32
 
@@ -132,8 +134,9 @@ class EventWriter:
                 self.events.append(json.loads(line))
                 return event
             try:
-                # O_APPEND keeps whole-line writes from interleaving with the SSH process.
-                fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+                # O_APPEND keeps whole-line writes from interleaving with the SSH process;
+                # a log created here is owner-only, like one the SSH server creates.
+                fd = open_event_log(self.path)
                 try:
                     os.write(fd, (line + "\n").encode("utf-8"))
                 finally:

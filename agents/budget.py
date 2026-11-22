@@ -8,8 +8,14 @@ is hit the caller does not call the model; it returns a canned response.
   read-modify-write under an exclusive file lock, so several processes on one host (SSH
   server, listeners) share one daily cap and a restart does not reset the day.
 - Tokens are reserved (charged) before the call from an estimate and corrected afterwards,
-  so concurrent sessions cannot overshoot a cap by more than one estimate's error. Failed
-  and timed-out calls keep their reserved charge.
+  so admission is exact against estimates: the daily caps are checked and the estimate
+  charged in one locked transaction, and processes sharing the state file cannot both take
+  the last of a cap. A call's real usage can differ from its estimate, and the correction
+  is applied after the call, so with several calls in flight a cap can be passed by the sum
+  of their estimate errors (up to the number of simultaneous calls times one error).
+  Failed and timed-out calls keep their reserved charge. The limits count estimated
+  tokens, not provider billing. If the state file cannot be written, charges accepted here
+  are kept in memory and added back on every later read of the file.
 - IPv6 sources are keyed on their /64.
 - Per session, at most ``max_model_commands_per_session`` commands are answered by the
   model; after that the deterministic shell answers (the session stays open). Answers
@@ -21,6 +27,7 @@ is hit the caller does not call the model; it returns a canned response.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import fcntl
 import ipaddress
@@ -137,6 +144,13 @@ def _valid_count(value) -> bool:
         isinstance(value, float) and math.isfinite(value) and value >= 0 and value.is_integer())
 
 
+def _prune(counters: dict, key) -> None:
+    """Keep at most MAX_IP_ENTRIES entries, dropping those with the smallest ``key``."""
+    if len(counters) > MAX_IP_ENTRIES:
+        for k, _ in sorted(counters.items(), key=key)[: len(counters) - MAX_IP_ENTRIES]:
+            counters.pop(k, None)
+
+
 class DailyState:
     """{day, global_tokens, ip_tokens} shared through a locked JSON file (or memory only)."""
 
@@ -146,6 +160,8 @@ class DailyState:
         self.global_tokens = 0
         self.ip_tokens: dict[str, int] = {}
         self._last_error_log = float("-inf")
+        self._unsaved_global = 0                 # accepted here, not yet in the state file
+        self._unsaved_ip: dict[str, int] = {}
 
     def _error(self, message: str, *args) -> None:
         now = time.monotonic()
@@ -172,59 +188,110 @@ class DailyState:
 
     def update(self, ip: Optional[str], delta: int) -> None:
         """Add ``delta`` tokens (may be negative) and refresh the in-memory view."""
-        today = _today()
-        if today != self.day:
-            self.day, self.global_tokens, self.ip_tokens = today, 0, {}
+        self.transact(ip, delta)
+
+    def transact(self, ip: Optional[str], delta: int, check=None) -> Optional[str]:
+        """Charge ``delta`` tokens in one exclusive transaction on the shared lock file.
+
+        Under the lock the day's counters are reloaded, ``check(global_used, ip_used)``
+        (when given) decides from those fresh counters, and only an accepted charge is
+        persisted. Returns the refusal reason from ``check``, or None once charged. A
+        refusal writes nothing.
+
+        If the state cannot be read or written, the decision is made on the in-memory
+        counters, the failure is logged, and every accepted charge that is not on disk is
+        remembered (``_unsaved``) and added back whenever the file is read again, so a
+        later reload of an older file cannot reset spend this process already accepted.
+        """
+        self._new_day()
         if not self.path:
-            self._apply(ip, delta)
-            return
+            return self._admit(ip, delta, check, remember=False)
+        decided = False
+        reason: Optional[str] = None
         try:
             directory = os.path.dirname(os.path.abspath(self.path))
             os.makedirs(directory, exist_ok=True)
             with open(self.path + ".lock", "a+") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
+                fcntl.flock(lock, fcntl.LOCK_EX)      # released when the file is closed
                 try:
-                    text = open(self.path, encoding="utf-8").read() if os.path.exists(self.path) else ""
-                    try:
-                        self.global_tokens, self.ip_tokens = self._parse(text)
-                    except (ValueError, TypeError):
-                        log.warning("budget state %s is malformed; starting the day from zero",
-                                    self.path)
-                        self.global_tokens, self.ip_tokens = 0, {}
-                    self.day = today
-                    self._apply(ip, delta)
-                    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".budget-", suffix=".tmp")
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump({"day": self.day, "global_tokens": self.global_tokens,
-                                   "ip_tokens": self.ip_tokens}, f)
-                    os.replace(tmp, self.path)
-                finally:
-                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    with open(self.path, encoding="utf-8") as f:
+                        text = f.read()
+                except FileNotFoundError:
+                    text = ""
+                self._load(text)
+                reason = self._admit(ip, delta, check)
+                decided = True
+                if reason is None:
+                    self._write(directory)
         except OSError as exc:
-            # Limits are still enforced in memory, but the day will reset on restart and
-            # other processes will not see this spend. Make that loud.
-            self._apply(ip, delta)
-            self._error("BUDGET STATE NOT PERSISTED: cannot write %s (%s); daily caps reset "
-                        "on restart and are not shared across processes", self.path, exc)
+            if not decided:
+                reason = self._admit(ip, delta, check)
+            if reason is None:
+                # Enforced in memory, but the day resets on restart and other processes do
+                # not see this spend. Make that loud.
+                self._error("BUDGET STATE NOT PERSISTED: cannot write %s (%s); daily caps "
+                            "reset on restart and are not shared across processes",
+                            self.path, exc)
+        return reason
 
-    def refresh(self) -> None:
-        """Re-read the shared file (other processes' spend). Never writes or creates files."""
+    def _new_day(self) -> None:
         today = _today()
         if today != self.day:
             self.day, self.global_tokens, self.ip_tokens = today, 0, {}
+            self._unsaved_global, self._unsaved_ip = 0, {}
+
+    def _load(self, text: str) -> None:
+        """Counters from the file's text, plus charges accepted here but never saved."""
+        try:
+            g, ips = self._parse(text)
+        except (ValueError, TypeError):
+            log.warning("budget state %s is malformed; starting the day from zero", self.path)
+            g, ips = 0, {}
+        self.day = _today()
+        self.global_tokens = max(0, g + self._unsaved_global)
+        self.ip_tokens = ips
+        for key, delta in self._unsaved_ip.items():
+            self.ip_tokens[key] = max(0, self.ip_tokens.get(key, 0) + delta)
+
+    def _admit(self, ip: Optional[str], delta: int, check, remember: bool = True) -> Optional[str]:
+        """Check, then charge, the in-memory counters. The charge is remembered as unsaved
+        until a write succeeds."""
+        if check is not None:
+            reason = check(self.global_tokens, self.ip_tokens.get(ip, 0) if ip is not None else 0)
+            if reason is not None:
+                return reason
+        self._apply(ip, delta)
+        if remember:
+            self._unsaved_global += delta
+            if ip is not None:
+                self._unsaved_ip[ip] = self._unsaved_ip.get(ip, 0) + delta
+                _prune(self._unsaved_ip, key=lambda kv: abs(kv[1]))
+        return None
+
+    def _write(self, directory: str) -> None:
+        """Replace the state file atomically; a failed write leaves no temporary file."""
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".budget-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"day": self.day, "global_tokens": self.global_tokens,
+                           "ip_tokens": self.ip_tokens}, f)
+            os.replace(tmp, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        self._unsaved_global, self._unsaved_ip = 0, {}
+
+    def refresh(self) -> None:
+        """Re-read the shared file (other processes' spend). Never writes or creates files."""
+        self._new_day()
         if not self.path or not os.path.exists(self.path):
             return
         try:
             with open(self.path, encoding="utf-8") as f:
                 fcntl.flock(f, fcntl.LOCK_SH)
-                try:
-                    text = f.read()
-                finally:
-                    fcntl.flock(f, fcntl.LOCK_UN)
-            self.global_tokens, self.ip_tokens = self._parse(text)
-        except (ValueError, TypeError):
-            log.warning("budget state %s is malformed; starting the day from zero", self.path)
-            self.global_tokens, self.ip_tokens = 0, {}
+                text = f.read()
+            self._load(text)
         except OSError as exc:
             self._error("cannot read budget state %s: %s", self.path, exc)
 
@@ -232,10 +299,7 @@ class DailyState:
         self.global_tokens = max(0, self.global_tokens + delta)
         if ip is not None:
             self.ip_tokens[ip] = max(0, self.ip_tokens.get(ip, 0) + delta)
-            if len(self.ip_tokens) > MAX_IP_ENTRIES:
-                smallest = sorted(self.ip_tokens.items(), key=lambda kv: kv[1])
-                for k, _ in smallest[: len(self.ip_tokens) - MAX_IP_ENTRIES]:
-                    self.ip_tokens.pop(k, None)
+            _prune(self.ip_tokens, key=lambda kv: kv[1])
 
 
 @dataclass
@@ -369,8 +433,9 @@ class Budget:
             return "normal"
         return mode if mode in ("normal", "deep", "shallow") else "normal"
 
-    def _limit_reason(self, state: _SessionState, counts_as_command: bool,
-                      extra_tokens: int = 0) -> Optional[str]:
+    def _session_reason(self, state: _SessionState, counts_as_command: bool,
+                        extra_tokens: int = 0) -> Optional[str]:
+        """Caps that depend only on this process's view of the session and the source mode."""
         mode = self.mode(state.ip)
         if mode == "shallow":
             return "shallow_source"
@@ -380,12 +445,17 @@ class Budget:
         session_cap = self.config.max_tokens_per_session * factor
         if state.tokens + extra_tokens > session_cap or state.tokens >= session_cap:
             return "max_tokens_per_session"
+        return None
+
+    def _daily_reason(self, state: _SessionState, global_used: int, ip_used: int,
+                      extra_tokens: int = 0) -> Optional[str]:
+        """The per-source and host-wide daily caps, judged from the given counters."""
+        factor = 2 if self.mode(state.ip) == "deep" else 1
         ip_cap = self.config.max_tokens_per_ip_per_day * factor
-        ip_used = self.daily.ip_tokens.get(state.ip, 0)
         if ip_used >= ip_cap or ip_used + extra_tokens > ip_cap:
             return "max_tokens_per_ip_per_day"
-        if self.daily.global_tokens >= self.config.max_tokens_per_day or \
-                self.daily.global_tokens + extra_tokens > self.config.max_tokens_per_day:
+        if global_used >= self.config.max_tokens_per_day or \
+                global_used + extra_tokens > self.config.max_tokens_per_day:
             return "max_tokens_per_day"
         return None
 
@@ -395,17 +465,24 @@ class Budget:
 
     def reserve(self, session_id: str, ip: str, input_text: str,
                 counts_as_command: bool = True) -> tuple[Optional[str], Optional[Reservation]]:
-        """Check every cap against the estimated cost and charge the estimate up front."""
+        """Check every cap against the estimated cost and charge the estimate up front.
+
+        The daily caps are checked and the estimate charged in one transaction on the shared
+        state file, so concurrent processes cannot both take the last of a cap. The
+        session's own counters change only once the charge is accepted."""
         state = self._session(session_id, ip)
         est = self.estimate(session_id, ip, input_text)
-        self.daily.refresh()
-        reason = self._limit_reason(state, counts_as_command, est)
+        reason = self._session_reason(state, counts_as_command, est)
+        if reason is not None:
+            return reason, None
+        reason = self.daily.transact(
+            state.ip, est,
+            lambda global_used, ip_used: self._daily_reason(state, global_used, ip_used, est))
         if reason is not None:
             return reason, None
         if counts_as_command:
             state.commands += 1
         state.tokens += est
-        self.daily.update(state.ip, est)
         return None, Reservation(session_id, state.ip, est, counts_as_command)
 
     def count_command(self, session_id: str, ip: str, cached: bool = False) -> Optional[str]:

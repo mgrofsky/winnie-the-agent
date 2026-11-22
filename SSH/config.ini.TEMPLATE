@@ -308,6 +308,12 @@ record_retention_days = 90
 # login or used a planted credential keep the longer period.
 blocklist_expiry_days = 14
 blocklist_access_expiry_days = 30
+# Readers that must have handled the event log before it is rotated (the log_rotation result
+# of triage, ship and run-all). triage always counts, and so does the export when
+# [connector.s3_events] is enabled in this same config. List a reader that runs in another
+# container, with its own state directory, so this container never reports an all-clear for
+# a log that reader has not finished: log_readers = triage, ship
+#log_readers =
 
 # Response playbooks (playbooks/*.toml; python -m agents respond / queue / approve / reject).
 # Local steps (tarpit, deepen, shallow, plant_token, tag_source, capture_more) change only

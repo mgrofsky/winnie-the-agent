@@ -566,3 +566,152 @@ def test_temperature_is_not_sent_unless_configured(ssh_module, monkeypatch):
     ssh_module.config["llm"]["temperature"] = "0.4"
     ssh_module.choose_llm()
     assert captured["temperature"] == 0.4
+
+
+# ---- event log permissions -------------------------------------------------------------------
+
+def _log_event(ssh_module, log_file, message):
+    _configure_minimal_logging(ssh_module, log_file)
+    ssh_module.logger.info(message)
+    for handler in ssh_module.logger.handlers:
+        handler.flush()
+        handler.close()
+
+
+def _mode(path):
+    return path.stat().st_mode & 0o777
+
+
+def _listener_event(path, message="from listener"):
+    from listeners.events import EventWriter
+
+    event = EventWriter(str(path), "unit").emit(
+        task_name="t1", src_ip="203.0.113.1", src_port=4000, dst_port=21, message=message,
+        sensor_protocol="ftp", event="connection")
+    assert event is not None
+
+
+def _write_as(writer, ssh_module, path, message):
+    if writer == "ssh":
+        _log_event(ssh_module, path, message)
+    else:
+        _listener_event(path, message)
+
+
+def _messages(path):
+    return [json.loads(line)["message"] for line in path.read_text().splitlines()]
+
+
+@pytest.fixture
+def umask():
+    """Set the process umask for a test and restore it."""
+    import os
+
+    original = os.umask(0o022)
+    os.umask(original)
+
+    def apply(value):
+        os.umask(value)
+
+    yield apply
+    os.umask(original)
+
+
+@pytest.mark.parametrize("writer", ["ssh", "listener"])
+@pytest.mark.parametrize("mask", [0o000, 0o022, 0o077])
+def test_new_event_log_is_owner_only_whichever_writer_creates_it(
+        tmp_path, ssh_module, umask, writer, mask):
+    log_file = tmp_path / "ssh_log.log"
+    umask(mask)
+    _write_as(writer, ssh_module, log_file, "first")
+    assert _mode(log_file) == 0o600                  # a permissive umask can not widen it
+    assert _messages(log_file) == ["first"]
+
+
+@pytest.mark.parametrize("first, second", [("ssh", "listener"), ("listener", "ssh")])
+@pytest.mark.parametrize("mask", [0o000, 0o022, 0o077])
+def test_either_writer_may_create_the_log_first_and_the_other_appends(
+        tmp_path, ssh_module, umask, first, second, mask):
+    log_file = tmp_path / "ssh_log.log"
+    umask(mask)
+    _write_as(first, ssh_module, log_file, "one")
+    _write_as(second, ssh_module, log_file, "two")
+    _write_as(first, ssh_module, log_file, "three")
+    assert _messages(log_file) == ["one", "two", "three"]       # appended, never rewritten
+    assert _mode(log_file) == 0o600
+
+
+@pytest.mark.parametrize("writer", ["ssh", "listener"])
+def test_creating_the_log_never_widens_or_chmods_it(tmp_path, ssh_module, umask, monkeypatch,
+                                                    writer):
+    """The mode is set by the creating open itself: no later chmod, so no window in which a
+    file with a wider mode exists."""
+    import os
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the writer must not chmod the event log")
+
+    monkeypatch.setattr(os, "chmod", forbidden)
+    monkeypatch.setattr(os, "fchmod", forbidden, raising=False)
+    umask(0o000)
+    log_file = tmp_path / "ssh_log.log"
+    _write_as(writer, ssh_module, log_file, "first")
+    assert _mode(log_file) == 0o600
+
+
+@pytest.mark.parametrize("writer", ["ssh", "listener"])
+@pytest.mark.parametrize("mode", [0o600, 0o640, 0o644])
+def test_an_existing_log_keeps_its_mode_and_is_appended_to(tmp_path, ssh_module, umask,
+                                                           writer, mode):
+    """A log the operator pre-created 0640 for a reader group stays 0640; an older permissive
+    log is left as it is (the operator tightens it, see docs/operations.md)."""
+    log_file = tmp_path / "ssh_log.log"
+    log_file.write_text(json.dumps({"message": "old"}) + "\n")
+    log_file.chmod(mode)
+    umask(0o000)
+    _write_as(writer, ssh_module, log_file, "new")
+    assert _messages(log_file) == ["old", "new"]
+    assert _mode(log_file) == mode
+
+
+def test_reopening_the_event_log_appends_and_keeps_an_operators_mode(tmp_path, ssh_module):
+    import os
+
+    log_file = tmp_path / "ssh_log.log"
+    previous = os.umask(0o022)
+    try:
+        _log_event(ssh_module, log_file, "before restart")
+        assert _mode(log_file) == 0o600
+        log_file.chmod(0o640)                       # the operator opted in to a reader group
+        _log_event(ssh_module, log_file, "after restart")
+    finally:
+        os.umask(previous)
+    assert _messages(log_file) == ["before restart", "after restart"]
+    assert _mode(log_file) == 0o640
+
+
+def test_preexisting_private_log_stays_private(tmp_path, ssh_module):
+    import os
+
+    log_file = tmp_path / "ssh_log.log"
+    log_file.write_text("")
+    log_file.chmod(0o600)
+    previous = os.umask(0o000)
+    try:
+        _log_event(ssh_module, log_file, "kept private")
+    finally:
+        os.umask(previous)
+    assert _mode(log_file) == 0o600
+
+
+def test_open_event_log_survives_rotation_by_rename(tmp_path, ssh_module):
+    log_file = tmp_path / "ssh_log.log"
+    _configure_minimal_logging(ssh_module, log_file)
+    ssh_module.logger.info("one")
+    log_file.rename(tmp_path / "ssh_log.log.1")     # rotation while the handler holds it open
+    ssh_module.logger.info("two")
+    for handler in ssh_module.logger.handlers:
+        handler.flush()
+        handler.close()
+    rotated = (tmp_path / "ssh_log.log.1").read_text()
+    assert "one" in rotated and "two" in rotated

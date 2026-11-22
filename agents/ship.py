@@ -454,7 +454,13 @@ def run_ship(settings: ShipSettings, log_path, state_dir, *, seed: Optional[str]
     now = now or datetime.datetime.now(datetime.timezone.utc)
     factory = client_factory or default_client_factory
     cursor = Cursor(state_dir / CURSOR_FILE)
+    before = Cursor.sample(log_path)              # the file this run is about to read
     start = cursor.start_offset(log_path)
+    if start > 0 and cursor.tail is None:
+        # Saved by an older version: nothing proves the bytes before the offset are the ones
+        # that were shipped. Send the log again once, from the start (delivery is at least
+        # once), and the cursor then records the fingerprint it lacks.
+        start = 0
     summary: dict = {"objects": 0, "events": 0, "bytes": 0, "skipped_malformed": 0,
                      "skipped_oversized": 0, "more_pending": False, "keys": [],
                      "start_offset": start}
@@ -484,7 +490,7 @@ def run_ship(settings: ShipSettings, log_path, state_dir, *, seed: Optional[str]
                     "event": "s3_put_failed", "key": obj_key, "error": code,
                     "lines": len(batch.lines)})
                 return False
-            cursor.set_position(batch.end, log_path)
+            cursor.set_position(batch.end, log_path, before)
             cursor.save()
         summary["objects"] += 1
         summary["events"] += len(batch.lines)
@@ -526,7 +532,7 @@ def run_ship(settings: ShipSettings, log_path, state_dir, *, seed: Optional[str]
                 return summary
         elif batch.end > start and not dry_run:
             # Only skipped lines since the last object: move past them.
-            cursor.set_position(batch.end, log_path)
+            cursor.set_position(batch.end, log_path, before)
             cursor.save()
     summary["dry_run"] = dry_run
     return summary

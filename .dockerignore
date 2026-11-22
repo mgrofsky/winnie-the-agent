@@ -6,6 +6,7 @@
 reports
 quarantine
 detections/pending
+SSH/DEPLOY/
 SSH/config.ini
 SSH/*host_key*
 SSH/*.pub

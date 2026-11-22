@@ -19,8 +19,10 @@ On top of that SSH honeypot this project adds:
 - **Scenarios**: one TOML file describes the whole fake target (organisation, host, users,
   services, banners, accounts, fake data, HTTP pages and APIs, honeytokens), so every
   protocol on a sensor tells the same story. Six scenarios ship with the project.
-- **Budgets**: hard limits on model spend and concurrency, enforced in code before any
-  model call.
+- **Budgets**: every model call first reserves its estimated tokens against per-session,
+  per-source and daily token budgets, with concurrency limits, all enforced in code. They
+  are estimates, not provider billing, and calls in flight can pass a limit by the
+  estimate error.
 - **Triage**: one validated record per SSH session or per trap campaign, plus a daily digest.
 - **Where addresses are** (optional): country, city and network owner of each source,
   read from GeoLite2 or DB-IP Lite database files on disk (no network call), stored on
@@ -64,18 +66,23 @@ to attackers, and front-ends never write anything the agents produce. Details ar
 
 ## Quick start (local lab)
 
-Requirements: Docker with Compose v2, `ssh-keygen`, and about 1 GB of disk for the image
-(see [Known issues](#known-issues)).
+The lab is a demo on your own machine. Every port is bound to 127.0.0.1, it needs no
+provider keys or cloud accounts, and the walkthrough below takes you from a clone to one
+SSH session you can see in the operator console. It is not a deployment: for a sensor on the
+internet, read the [isolated-host guidance](docs/operations.md#before-you-deploy) and the
+[AWS deployment guide](deploy/aws/README.md).
+
+Requirements: Docker with Compose 2.24.4 or newer (the lab override uses `!override`; check
+with `docker compose version`), `ssh-keygen`, and about 1 GB of disk for the image (see
+[Known issues](#known-issues)).
 
 ```bash
-git clone <this repository>
-cd <repository directory>
+git clone https://github.com/mgrofsky/winnie-the-agent.git
+cd winnie-the-agent
 
 # Configuration and SSH host key (both are gitignored)
 cp SSH/config.ini.TEMPLATE SSH/config.ini
 ssh-keygen -t rsa -b 4096 -N "" -f SSH/ssh_host_key
-# The containers run as uid 10001 and read SSH/ through a read-only bind mount.
-sudo chown 10001 SSH/config.ini SSH/ssh_host_key   # Linux; Docker Desktop maps ownership itself
 ```
 
 Edit `SSH/config.ini`:
@@ -89,14 +96,80 @@ Edit `SSH/config.ini`:
   own error (or nothing) when it is used in a way the shell does not reproduce, and
   `command not found` only for unknown commands, and triage writes deterministic records.
 
-Then start the stack with the lab override, which binds every port to 127.0.0.1 on a high
-port:
+**Linux only, after you have finished editing.** The containers run as uid 10001 and read
+`SSH/` through a read-only bind mount, so that user must own the files. Once you hand them
+over you need `sudo` to edit them again, which is why this comes last. On macOS and Windows
+(Docker Desktop) skip it: Docker Desktop maps ownership itself.
 
 ```bash
-# Optional: export the [llm] provider's key, e.g. OPENAI_API_KEY=...  (passed by name)
-docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml up -d
-ssh -p 12222 guest@127.0.0.1
+sudo chown 10001 SSH/config.ini SSH/ssh_host_key
 ```
+
+Define one shell function and use it for every command below. It works in bash and zsh and
+keeps the stack, the console, the logs and the teardown on the same project (`winnie-lab`)
+and the same volumes. Run it in each new shell, since a function does not outlive the
+shell:
+
+```bash
+lab() { docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml "$@"; }
+```
+
+For the no-key demo, make sure no provider key is set in this shell. Compose passes these
+four through by name, and with one set the lab would call that provider (and bill you):
+
+```bash
+unset ANTHROPIC_API_KEY OPENAI_API_KEY GOOGLE_API_KEY AZURE_OPENAI_API_KEY
+```
+
+(Compose also reads a `.env` file in the repository directory; make sure it sets none of
+them.) Then start the stack and the operator console. The lab override binds every port to
+127.0.0.1 on a high port:
+
+```bash
+lab --profile ui up -d --build
+```
+
+*Optional, separate from this walkthrough:* to use a real model, export the key of the
+provider you chose in `[llm]` (and `[agents]`) in the shell that runs `lab ... up`, for
+example `export OPENAI_API_KEY=...`. It is passed by name and never written to a file. That
+path makes paid model calls, and the "zero model calls" result below no longer applies.
+
+Open one SSH session. The `guest` account has an empty password: press Enter when asked.
+The first connection also asks you to accept the host key.
+
+```bash
+ssh -p 12222 guest@127.0.0.1 'uname -s'      # prints: Linux
+```
+
+Then run one analysis pass. The agents container does this every hour; run it now so the
+session is processed. Without a provider key it makes no model calls:
+
+```bash
+lab exec agents python -m agents run-all --config /config/config.ini --log /data/ssh_log.log --data-dir /data --reports-dir /agents/reports --state-dir /agents/state --detections-dir /agents/detections
+```
+
+The summary it prints has `"llm_calls": 0` under `triage`, and the session's id in
+`triage.written`: that id is the session record. Note it. To see the record, print the
+console's sign-in link and open it in your browser (the console is
+`http://127.0.0.1:8480`):
+
+```bash
+lab logs ui
+```
+
+On the console's Records page, open the record whose id is the one from `triage.written`.
+Do not look for a source address: Docker may record its gateway address instead of
+`127.0.0.1` for your connection. The Activity page lists the same session's events,
+including the `uname -s` input and the answer; search it for the session id. The link
+carries a token that signs anyone in, so keep it out of screenshots, issues and chat.
+
+If a lab port is already taken on your machine (HTTP 18080 is a common one; `up` then fails
+to bind it), change only the host side (the number before
+the container port) of that mapping in `docker-compose.lab.yml`, for example
+`"127.0.0.1:12222:8022"` to `"127.0.0.1:12223:8022"`, and use the new number everywhere
+below (`ssh -p 12223`, or the console's port in the browser). Running `ssh` against a new
+host key later, after `down -v` and a new `ssh-keygen`, warns that the key changed; clear
+the old one with `ssh-keygen -R "[127.0.0.1]:12222"`.
 
 | Service | Lab port | Service | Lab port |
 |---|---|---|---|
@@ -108,9 +181,17 @@ ssh -p 12222 guest@127.0.0.1
 | MSSQL | 11433 | S3 | 19000 |
 
 Only the services enabled by the active scenario answer; nothing listens behind the other ports.
-The agents container runs `python -m agents run-all` every hour. Tear down with
-`docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml down -v`
-(`-v` deletes the volumes, including captured data).
+
+Stop the demo with:
+
+```bash
+lab --profile ui down
+```
+
+That removes the containers and keeps the volumes, so the captured log, the triage records
+and the sensor seed are still there the next time you run `lab --profile ui up -d`. Adding
+`-v` (`lab --profile ui down -v`) also deletes the volumes, and with them everything the lab
+captured.
 
 ### Without Docker
 
@@ -235,8 +316,12 @@ read-only by default, listens on 127.0.0.1:8480 only, and never calls a model.
 
 ```bash
 python -m agents ui                       # without Docker
-docker compose --profile ui up -d ui      # with Docker; sign-in link: docker compose logs ui
+lab --profile ui up -d ui                 # the lab, with the `lab` function from the quick start
+lab logs ui                               # prints the sign-in link (a secret: keep it out of screenshots)
 ```
+
+For a stack started without the lab override, use `docker compose --profile ui up -d ui` and
+`docker compose logs ui` from the same directory and project.
 
 On a remote host, reach it with `ssh -L 8480:127.0.0.1:8480 <host>`. Sign-in, actions
 (approve, reject, unblock) and the AWS setup are in
@@ -253,7 +338,8 @@ On a remote host, reach it with `ssh -L 8480:127.0.0.1:8480 <host>`. Sign-in, ac
   history trimming are counted locally, so no tokenizer is ever downloaded.
 - **Uploads are quarantined.** FTP uploads are stored once per SHA-256 with mode 0600,
   under per-file, per-source and total caps, and are never read back or executed.
-- **Budgets in code.** Every model call reserves its estimated cost first; when a limit is
+- **Budgets in code.** Every model call reserves its estimated token cost first, against
+  per-session, per-source and host-wide daily limits (estimates, not provider billing); when a limit is
   reached the model is not called and the attacker gets a canned error. Known commands are
   answered by a deterministic shell without the model, a session gets at most 50 model
   answers (then the shell answers the rest), and a bot replaying a script another session

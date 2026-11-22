@@ -495,3 +495,213 @@ def test_session_budget_charges_non_ascii_history_by_weight(tmp_path):
     assert reason is None                       # 1,200 ASCII characters: about 300 tokens
     reason, _ = b.reserve("s2", "203.0.113.5", "\u6587" * 1200, True)
     assert reason is not None                   # 1,200 CJK characters exceed 1,500 tokens
+
+
+# ---- atomic reservation across processes -----------------------------------------------------
+
+# Each child builds its Budget (so its view of the day is already loaded and empty), then
+# reports "ready" immediately before it asks for the exclusive lock and prints its result.
+_RESERVE_WORKER = """
+import fcntl, json, sys
+import agents.budget as budget_module
+from agents.budget import Budget, BudgetConfig
+
+state_file, ip, sid, limits = sys.argv[1:5]
+budget = Budget(BudgetConfig(state_file=state_file, **json.loads(limits)))
+real_flock = fcntl.flock
+
+def flock(handle, operation):
+    if operation & fcntl.LOCK_EX:
+        print("ready", flush=True)
+    return real_flock(handle, operation)
+
+fcntl.flock = flock
+reason, res = budget.reserve(sid, ip, "ls")
+print(json.dumps({"reason": reason, "tokens": res.tokens if res else None,
+                  "commands": budget._sessions[sid].commands,
+                  "session_tokens": budget._sessions[sid].tokens}), flush=True)
+"""
+
+ONE_RESERVATION = 1 + OUTPUT_ESTIMATE_TOKENS    # "ls" with an empty history
+WAIT = 30                                       # seconds any step may take
+
+
+def _contend(tmp_path, limits, ips):
+    """Two processes reserve against one state file while the parent holds the sidecar lock.
+
+    The parent takes the exclusive lock first and releases it only after both children have
+    said they are about to ask for it, so both decide from a view loaded before either
+    charge. Returns the state file and each child's result."""
+    import fcntl
+    import select
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    state = tmp_path / "budget_state.json"
+    procs = []
+    try:
+        with open(str(state) + ".lock", "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for i, ip in enumerate(ips):
+                procs.append(subprocess.Popen(
+                    [sys.executable, "-c", _RESERVE_WORKER, str(state), ip, f"s{i}",
+                     json.dumps(limits)],
+                    cwd=root, stdout=subprocess.PIPE, text=True))
+            deadline = time.monotonic() + WAIT
+            for proc in procs:
+                ready, _, _ = select.select([proc.stdout], [], [], max(0, deadline - time.monotonic()))
+                assert ready, "a child never reached the lock"
+                assert proc.stdout.readline().strip() == "ready"
+            assert not state.exists(), "nothing may be decided before the lock is released"
+        results = []                                    # lock released with the file closed
+        for proc in procs:
+            out, _ = proc.communicate(timeout=WAIT)
+            assert proc.returncode == 0
+            results.append(json.loads(out.strip().splitlines()[-1]))
+        return state, results
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
+
+
+def _one_winner(results, reason):
+    won = [r for r in results if r["reason"] is None]
+    lost = [r for r in results if r["reason"] is not None]
+    assert len(won) == 1 and len(lost) == 1 and lost[0]["reason"] == reason
+    # The rejected request took neither tokens nor command allowance.
+    assert lost[0]["tokens"] is None and lost[0]["commands"] == 0 and lost[0]["session_tokens"] == 0
+    assert won[0]["commands"] == 1 and won[0]["session_tokens"] == ONE_RESERVATION
+
+
+def test_two_processes_cannot_both_take_the_last_of_the_global_cap(tmp_path):
+    state, results = _contend(tmp_path, {"max_tokens_per_day": ONE_RESERVATION + 100},
+                              ["203.0.113.1", "203.0.113.2"])        # different sources
+    _one_winner(results, "max_tokens_per_day")
+    assert json.loads(state.read_text())["global_tokens"] == ONE_RESERVATION
+
+
+def test_two_processes_cannot_both_take_the_last_of_a_source_cap(tmp_path):
+    state, results = _contend(tmp_path, {"max_tokens_per_ip_per_day": ONE_RESERVATION + 100},
+                              ["203.0.113.7", "203.0.113.7"])        # one shared source
+    _one_winner(results, "max_tokens_per_ip_per_day")
+    saved = json.loads(state.read_text())
+    assert saved["global_tokens"] == ONE_RESERVATION
+    assert saved["ip_tokens"] == {"203.0.113.7": ONE_RESERVATION}
+
+
+def test_different_sources_do_not_share_a_source_cap(tmp_path):
+    state, results = _contend(tmp_path, {"max_tokens_per_ip_per_day": ONE_RESERVATION + 100},
+                              ["203.0.113.7", "203.0.113.8"])
+    assert [r["reason"] for r in results] == [None, None]
+    assert json.loads(state.read_text())["global_tokens"] == 2 * ONE_RESERVATION
+
+
+def _break_replace(monkeypatch):
+    import agents.budget as budget_module
+
+    def fail(src, dst):
+        raise PermissionError(13, "replace refused")
+
+    monkeypatch.setattr(budget_module.os, "replace", fail)
+
+
+def test_a_failed_atomic_replace_keeps_accepted_usage_and_leaves_no_temp_file(
+        tmp_path, monkeypatch, caplog):
+    state = tmp_path / "budget_state.json"
+    budget = Budget(BudgetConfig(state_file=str(state), max_tokens_per_day=2 * ONE_RESERVATION + 10))
+    _break_replace(monkeypatch)
+    caplog.set_level("ERROR")
+    assert budget.reserve("a", "203.0.113.1", "ls")[0] is None
+    assert any("BUDGET STATE NOT PERSISTED" in r.getMessage() for r in caplog.records)
+    assert not state.exists() and list(tmp_path.glob(".budget-*")) == []   # no temp file left
+    # The lock opens and the file can be read again, yet the accepted charge is not forgotten:
+    assert budget.reserve("b", "203.0.113.2", "ls")[0] is None
+    assert budget.reserve("c", "203.0.113.3", "ls")[0] == "max_tokens_per_day"
+    assert budget.global_tokens == 2 * ONE_RESERVATION
+    assert list(tmp_path.glob(".budget-*")) == []
+
+
+def test_unsaved_usage_is_added_back_to_an_older_file_once_writing_recovers(
+        tmp_path, monkeypatch):
+    state = tmp_path / "budget_state.json"
+    budget = Budget(BudgetConfig(state_file=str(state)))
+    other = Budget(BudgetConfig(state_file=str(state)))
+    assert other.reserve("o", "203.0.113.9", "ls")[0] is None            # on disk
+    with monkeypatch.context() as m:
+        _break_replace(m)
+        assert budget.reserve("a", "203.0.113.1", "ls")[0] is None       # accepted, unsaved
+        assert budget.reserve("b", "203.0.113.1", "ls")[0] is None
+    assert json.loads(state.read_text())["global_tokens"] == ONE_RESERVATION
+    assert budget.reserve("c", "203.0.113.2", "ls")[0] is None           # writes recover
+    saved = json.loads(state.read_text())
+    assert saved["global_tokens"] == 4 * ONE_RESERVATION
+    assert saved["ip_tokens"] == {"203.0.113.9": ONE_RESERVATION,
+                                  "203.0.113.1": 2 * ONE_RESERVATION,
+                                  "203.0.113.2": ONE_RESERVATION}
+    assert list(tmp_path.glob(".budget-*")) == []
+
+
+def test_reconciliation_survives_a_failed_write_too(tmp_path, monkeypatch):
+    state = tmp_path / "budget_state.json"
+    budget = Budget(BudgetConfig(state_file=str(state)))
+    reason, res = budget.reserve("s", "203.0.113.1", "ls")
+    with monkeypatch.context() as m:
+        _break_replace(m)
+        assert budget.commit(res, "ls", "out", usage_tokens=40) == 40    # -473 not saved
+    assert budget.global_tokens == 40
+    assert budget.reserve("t", "203.0.113.1", "ls")[0] is None           # reload + unsaved
+    assert json.loads(state.read_text())["global_tokens"] == 40 + ONE_RESERVATION
+
+
+def test_rejected_reservation_charges_nothing_in_process(tmp_path):
+    state = tmp_path / "budget_state.json"
+    config = BudgetConfig(state_file=str(state), max_tokens_per_day=ONE_RESERVATION + 100)
+    a, b = Budget(config), Budget(config)
+    assert a.reserve("a", "203.0.113.1", "ls")[0] is None
+    before = state.read_text()
+    reason, res = b.reserve("b", "203.0.113.2", "ls")     # b loaded its view before a charged
+    assert (reason, res) == ("max_tokens_per_day", None)
+    assert b._sessions["b"].tokens == 0 and b._sessions["b"].commands == 0
+    assert state.read_text() == before                      # a refusal writes nothing
+    assert b.global_tokens == ONE_RESERVATION               # but it did see the other's spend
+
+
+def test_reservation_and_reconciliation_persist_across_restart(tmp_path):
+    state = tmp_path / "budget_state.json"
+    budget = Budget(BudgetConfig(state_file=str(state)))
+    reason, res = budget.reserve("s", "203.0.113.1", "ls")
+    assert reason is None and res.tokens == ONE_RESERVATION
+    assert json.loads(state.read_text())["global_tokens"] == ONE_RESERVATION
+    assert Budget(BudgetConfig(state_file=str(state))).global_tokens == ONE_RESERVATION
+    assert budget.commit(res, "ls", "file1\n", usage_tokens=40) == 40
+    restarted = Budget(BudgetConfig(state_file=str(state)))
+    assert restarted.global_tokens == 40 and restarted.ip_tokens("203.0.113.1") == 40
+    assert json.loads(state.read_text())["ip_tokens"] == {"203.0.113.1": 40}
+
+
+def test_new_day_resets_counters_before_the_cap_is_checked(tmp_path):
+    state = tmp_path / "budget_state.json"
+    state.write_text(json.dumps({"day": "2000-01-01", "global_tokens": 10**9,
+                                 "ip_tokens": {"203.0.113.1": 10**9}}))
+    budget = Budget(BudgetConfig(state_file=str(state)))
+    assert budget.reserve("s", "203.0.113.1", "ls")[0] is None
+    assert json.loads(state.read_text())["global_tokens"] == ONE_RESERVATION
+
+
+def test_unwritable_state_still_enforces_caps_in_memory(tmp_path):
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    os.chmod(ro, stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        budget = Budget(BudgetConfig(state_file=str(ro / "budget_state.json"),
+                                     max_tokens_per_day=ONE_RESERVATION + 100))
+        assert budget.reserve("a", "203.0.113.1", "ls")[0] is None
+        assert budget.global_tokens == ONE_RESERVATION        # charged once, not twice
+        assert budget.reserve("b", "203.0.113.2", "ls")[0] == "max_tokens_per_day"
+    finally:
+        os.chmod(ro, stat.S_IRWXU)

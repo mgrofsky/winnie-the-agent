@@ -111,7 +111,8 @@ def sensor_seed(config: Optional[ConfigParser], directory: os.PathLike | str,
 def event_log_state(path: Optional[os.PathLike | str]) -> tuple[str, Optional[str]]:
     """``("ok", None)``; ``("missing", None)`` when the configured log does not exist yet,
     the normal state of a sensor that has not logged an event; or ``("error", message)``
-    when no log is configured or the path cannot be read (permission denied, a directory)."""
+    when no log is configured or the path cannot be read (permission denied, a directory, a
+    FIFO or another file that is not a regular file)."""
     if not path:
         return "error", "no event log configured ([honeypot] log_file or --log)"
     try:
@@ -124,6 +125,8 @@ def event_log_state(path: Optional[os.PathLike | str]) -> tuple[str, Optional[st
         return "error", f"event log not readable ({exc.strerror or type(exc).__name__}): {path}"
     if stat.S_ISDIR(st.st_mode):
         return "error", f"event log path is a directory: {path}"
+    if not stat.S_ISREG(st.st_mode):      # a FIFO or device would block or never end a read
+        return "error", f"event log path is not a regular file: {path}"
     if not os.access(path, os.R_OK):
         return "error", f"event log not readable (permission denied): {path}"
     return "ok", None

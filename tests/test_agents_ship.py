@@ -244,6 +244,95 @@ def test_cursor_advances_only_after_a_successful_put(tmp_path):
     assert [x["detail"]["task_name"] for x in _lines(s3.puts[0])] == ["f4"]
 
 
+def test_a_log_replaced_during_a_run_is_not_claimed_by_the_cursor(tmp_path):
+    from agents.sessions import Cursor
+
+    log = write_log(tmp_path / "log.jsonl", _ftp(3))
+
+    class Swapping(FakeS3):
+        def put_object(self, **params):
+            result = super().put_object(**params)
+            log.rename(tmp_path / "old.jsonl")             # rotated while the run is shipping
+            write_log(log, _ftp(3, password="other1"))     # a new file of about the same size
+            return result
+
+    _run(tmp_path, _settings(), Swapping())
+    cursor = Cursor(tmp_path / "state" / ship.CURSOR_FILE)
+    assert cursor.inode is None and cursor.tail is None    # confirms no file and no content
+    s3 = FakeS3()
+    _run(tmp_path, _settings(), s3)                        # the next run starts the new file
+    assert [x["detail"]["task_name"] for p in s3.puts for x in _lines(p)] == ["f0", "f1", "f2"]
+
+
+def test_the_cursor_records_the_boundary_it_shipped_to(tmp_path):
+    from agents.sessions import Cursor, sample_log
+
+    log = write_log(tmp_path / "log.jsonl", _ftp(3))
+    _run(tmp_path, _settings(), FakeS3())
+    cursor = Cursor(tmp_path / "state" / ship.CURSOR_FILE)
+    sample = sample_log(log, [cursor.offset])
+    assert cursor.offset == sample.end == log.stat().st_size
+    assert cursor.tail == sample.tails[cursor.offset] is not None
+    assert cursor.start_offset(log) == cursor.offset
+
+
+def test_a_legacy_cursor_at_the_end_of_the_log_recovers_without_new_events(tmp_path):
+    """A cursor from before the fingerprint, exactly at EOF: the next successful run sends the
+    log once more (delivery is at least once), records the fingerprint, and is then stable."""
+    from agents.rotation import rotation_status
+    from agents.sessions import Cursor
+
+    log = write_log(tmp_path / "log.jsonl", _ftp(3))
+    _run(tmp_path, _settings(), FakeS3())
+    path = tmp_path / "state" / ship.CURSOR_FILE
+    legacy = json.loads(path.read_text())
+    for key in ("tail", "size", "mtime_ns"):
+        legacy.pop(key)
+    path.write_text(json.dumps(legacy))
+    assert Cursor(path).offset == log.stat().st_size                      # exactly at EOF
+    status = rotation_status({}, log, tmp_path / "state", ["ship"])
+    assert status["safe"] is False and status["readers"]["ship"]["state"] == "unverified"
+
+    s3 = FakeS3()
+    res, _ = _run(tmp_path, _settings(), s3)                              # no new events
+    assert res["start_offset"] == 0
+    assert [x["detail"]["task_name"] for p in s3.puts for x in _lines(p)] == ["f0", "f1", "f2"]
+    assert Cursor(path).tail is not None
+    assert rotation_status({}, log, tmp_path / "state", ["ship"])["safe"] is True
+    s3 = FakeS3()
+    _run(tmp_path, _settings(), s3)
+    assert s3.puts == []                                                  # stable afterwards
+
+
+def test_a_ship_run_whose_pre_read_sample_failed_certifies_nothing(tmp_path, monkeypatch):
+    from agents.sessions import Cursor
+
+    write_log(tmp_path / "log.jsonl", _ftp(3))
+    monkeypatch.setattr(Cursor, "sample", staticmethod(lambda *a, **k: None))
+    s3 = FakeS3()
+    _run(tmp_path, _settings(), s3)
+    assert len(s3.puts) == 1                                              # it still shipped
+    cursor = Cursor(tmp_path / "state" / ship.CURSOR_FILE)
+    assert cursor.inode is None and cursor.tail is None
+
+
+def test_a_log_rewritten_in_place_during_a_run_is_not_claimed_by_the_cursor(tmp_path):
+    from agents.sessions import Cursor
+
+    log = write_log(tmp_path / "log.jsonl", _ftp(3))
+
+    class Rewriting(FakeS3):
+        def put_object(self, **params):
+            result = super().put_object(**params)
+            data = log.read_bytes()
+            log.write_bytes(data.replace(b"hunter2", b"hunter3"))        # same size and inode
+            return result
+
+    _run(tmp_path, _settings(), Rewriting())
+    cursor = Cursor(tmp_path / "state" / ship.CURSOR_FILE)
+    assert cursor.inode is None and cursor.tail is None
+
+
 def test_a_failed_put_is_recorded_and_the_lines_are_sent_again(tmp_path, caplog):
     write_log(tmp_path / "log.jsonl", _ftp(5))
     s3 = FakeS3(fail_on=(2,), exc=ClientError("AccessDenied"))
