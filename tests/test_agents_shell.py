@@ -552,7 +552,7 @@ def test_local_replies_switch_is_read_from_config():
     assert hooks.local_replies_enabled(cp) is False
 
 
-# ---- review fixes: bounded cost on the event loop -------------------------------------------
+# ---- bounded cost on the event loop ---------------------------------------------------------
 
 def test_awk_program_parse_is_linear():
     # A regular expression here took tens of seconds on this line (time ~ length^4).
@@ -633,7 +633,7 @@ def test_long_words_tokenize_in_linear_time():
     assert time.perf_counter() - t < 0.1
 
 
-# ---- review fixes: fidelity -------------------------------------------------------------------
+# ---- fidelity ---------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("line,expected", [
     ("lspci -v", ""),                          # works on a real host; we print nothing
@@ -702,7 +702,7 @@ def test_meminfo_page_counts_are_whole_pages(memory_mb):
     assert int(free[3]) == int(rows["MemFree"].split()[0])
 
 
-# ---- review fixes: the model path -------------------------------------------------------------
+# ---- the model path ---------------------------------------------------------------------------
 
 class FailingAfter(RecordingHistory):
     """Answers with ``reply`` for the first ``ok`` calls, then raises."""
