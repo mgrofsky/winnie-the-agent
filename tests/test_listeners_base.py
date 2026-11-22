@@ -82,6 +82,44 @@ def test_listeners_and_ssh_share_one_budget_state(tmp_path):
     assert ctx.budget.config.state_file == ssh_cfg.state_file    # one daily state file
 
 
+# ---- event log file mode -----------------------------------------------------------
+
+def _event(writer, message="m"):
+    return writer.emit(task_name="t", src_ip="203.0.113.1", src_port=1, dst_port=21,
+                       message=message, sensor_protocol="ftp", event="connection")
+
+
+@pytest.mark.parametrize("mask", [0o000, 0o022, 0o077])
+def test_the_event_writer_creates_an_owner_only_log_and_appends(tmp_path, mask):
+    import json
+    import os
+
+    path = tmp_path / "ssh_log.log"
+    previous = os.umask(mask)
+    try:
+        writer = EventWriter(str(path), "unit")
+        assert _event(writer, "one") and _event(writer, "two")
+    finally:
+        os.umask(previous)
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert [json.loads(x)["message"] for x in path.read_text().splitlines()] == ["one", "two"]
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o640])
+def test_the_event_writer_keeps_the_mode_of_an_existing_log(tmp_path, mode):
+    import os
+
+    path = tmp_path / "ssh_log.log"
+    path.write_text("")
+    path.chmod(mode)                                  # pre-created by the operator
+    previous = os.umask(0)
+    try:
+        assert _event(EventWriter(str(path), "unit"))
+    finally:
+        os.umask(previous)
+    assert path.stat().st_mode & 0o777 == mode and path.read_text().count("\n") == 1
+
+
 # ---- model calls from SQL/HTTP fallbacks -----------------------------------------
 
 async def test_llm_json_reserves_and_applies_caps():

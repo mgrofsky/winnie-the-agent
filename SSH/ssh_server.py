@@ -33,6 +33,7 @@ if os.path.dirname(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
 from agents import hooks as agent_hooks  # noqa: E402
 from agents.budget import count_message_tokens as trim_token_counter  # noqa: E402
+from agents.eventlog import EVENT_LOG_MODE, open_event_log  # noqa: E402,F401
 
 # Sent instead of an empty first message; some providers reject empty content.
 SESSION_OPENER = "[new login session started]"
@@ -666,23 +667,19 @@ def apply_args_to_config(args) -> None:
                 config['user_accounts'][account.strip()] = ''
 
 
-EVENT_LOG_MODE = 0o640
-
-
 class EventLogHandler(logging.FileHandler):
-    """Append-mode event log that is created 0640 (a stricter umask still wins).
+    """Append-mode event log that is created owner-only (0600; a stricter umask still wins).
 
-    The log holds attempted credentials, so a new file must never exist with a wider mode
-    than the listeners' event log (listeners/events.py). The mode applies only at creation;
-    an existing file keeps its permissions, and the handler holds the file open as before.
+    The log holds attempted credentials. The listeners write the same file and either
+    process may create it, so both open it through ``agents.eventlog.open_event_log``. The
+    mode applies only at creation: an existing file keeps its permissions (a log an operator
+    pre-created 0640 for a reader group stays 0640), and the handler holds the file open as
+    before.
     """
 
     def _open(self):
-        def opener(path, flags):
-            return os.open(path, flags, EVENT_LOG_MODE)
-
         return open(self.baseFilename, self.mode, encoding=self.encoding,
-                    errors=self.errors, opener=opener)
+                    errors=self.errors, opener=open_event_log)
 
 
 def configure_logging() -> None:

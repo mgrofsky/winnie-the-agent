@@ -132,6 +132,51 @@ def test_image_copies_only_the_named_ssh_files_and_the_license():
     assert "COPY deploy/aws/render_config.py" in text and "COPY deploy/aws/host" in text
 
 
+def _aws_compose():
+    """The docker-compose.yml that deploy/aws/sensor.yaml writes on the host."""
+    import re
+    import textwrap
+
+    text = (ROOT / "deploy" / "aws" / "sensor.yaml").read_text()
+    body = re.search(r"cat > docker-compose.yml <<'EOF'\n(.*?)\n\s*EOF\n", text, re.S).group(1)
+    # CloudFormation substitutions: a trailing one splices in optional lines (dropped here),
+    # one inside a value becomes a placeholder, and the image reference is not needed.
+    lines = [line for line in textwrap.dedent(body).splitlines()
+             if not line.strip().startswith("image:")]
+    cleaned = [re.sub(r"\$\{[^}]*\}", "x", re.sub(r"\$\{[^}]*\}$", "", line)) for line in lines]
+    return yaml.safe_load("\n".join(cleaned))
+
+
+def test_every_event_log_reader_and_writer_runs_as_the_same_uid():
+    """The raw event log is created 0600 by whichever writer logs first, so the readers (agents,
+    exporter, console) can open it only because they share the writers' UID, in both the
+    bundled compose file and the AWS host's."""
+    for name, services in (("docker-compose.yml", _compose()["services"]),
+                           ("deploy/aws/sensor.yaml", _aws_compose()["services"])):
+        for service, spec in services.items():
+            assert spec.get("user") == "10001:10001", f"{name}: {service} runs as {spec.get('user')}"
+    aws = _aws_compose()["services"]
+    assert {"ssh", "listeners", "agents", "exporter"} <= set(aws)
+    assert "USER 10001" in (ROOT / "Dockerfile").read_text()
+
+
+def test_nothing_else_in_the_shipped_deployment_creates_the_event_log():
+    """Only the SSH handler and the listeners' writer create ssh_log.log; no image step, compose
+    file or bootstrap script pre-creates or touches it."""
+    import re
+
+    for path in (ROOT / "Dockerfile", ROOT / "docker-compose.yml", ROOT / "deploy" / "aws" / "sensor.yaml"):
+        for line in path.read_text().splitlines():
+            if "ssh_log" in line:
+                assert not re.search(r"\b(touch|install|chmod|chown|mkdir|cp|tee|>)\b[^\"']*ssh_log",
+                                     line.replace("--log", "").replace("--log-file", "")), \
+                    f"{path.name}: {line.strip()}"
+    creators = [p.relative_to(ROOT).as_posix() for pkg in ("agents", "listeners", "SSH")
+                for p in (ROOT / pkg).rglob("*.py")
+                if "open_event_log" in p.read_text() and p.name != "eventlog.py"]
+    assert sorted(creators) == ["SSH/ssh_server.py", "listeners/events.py"]
+
+
 class _OverrideLoader(yaml.SafeLoader):
     """Reads compose override files: ``!override`` keeps the value it tags."""
 
