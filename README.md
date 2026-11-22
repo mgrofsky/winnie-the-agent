@@ -293,6 +293,23 @@ the same everywhere and are readable by anyone with the source (see
 believable target should write their own scenario, or at least pin the identity in the
 scenario's `[bait]` table and change the parts that matter to them.
 
+## Export formats
+
+Everything Winnie produces for other systems is a file in a common format. Winnie writes
+the files and your systems pull them.
+
+| Format | What it holds | Details |
+| --- | --- | --- |
+| Sigma rules | Detection rule drafts for a SIEM, written for human review | [docs/portable-formats.md](docs/portable-formats.md) |
+| STIX 2.1 bundle | What the sensor saw, with indicators only for sources and files that passed promotion or operator approval. Optional, off by default | [docs/portable-formats.md](docs/portable-formats.md) |
+| `tracked.json` | Every live blocklist entry, tracked and enforced, with its status and expiry. The best source for a consumer | [docs/blocking.md](docs/blocking.md) |
+| Blocklist file, plain | Enforced addresses, one per line | [docs/blocking.md](docs/blocking.md) |
+| Blocklist file, CSV | The same enforced entries with their approval and expiry times | [docs/blocking.md](docs/blocking.md) |
+| Blocklist file, nftables | The same enforced entries as address sets that `nft -f` loads | [docs/blocking.md](docs/blocking.md) |
+
+The blocklist file is written in one of the three formats, chosen with
+`[respond] blocklist_format`.
+
 ## Logs
 
 Every component writes one JSON object per line to the same log (`[honeypot] log_file`,
