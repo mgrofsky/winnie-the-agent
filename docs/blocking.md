@@ -280,13 +280,17 @@ MAX_NEW = 50
 ALLOW = [ipaddress.ip_network(n) for n in ("192.0.2.0/24",)]   # your allow-list
 
 def load(path, previous):
-    """Return (watch, block) sets, or None to keep the previous copy and alert."""
+    """Return (watch, block, capped), or None to keep the previous copy and alert.
+
+    previous is watch | block from your last good copy. capped is True when the
+    new entries were held back; alert a person.
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
     try:
         doc = json.load(open(path))
         age = now - datetime.datetime.fromisoformat(doc["generated_at"])
-    except (OSError, ValueError, KeyError):
-        return None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None                     # unreadable, or a time with no timezone
     if doc.get("version") != 1 or age > MAX_AGE:
         return None
     watch, block = set(), set()
@@ -296,7 +300,7 @@ def load(path, previous):
             expires = datetime.datetime.fromisoformat(e["expires_at"])
         except (KeyError, TypeError, ValueError):
             continue
-        if expires <= now or not net.is_global:
+        if expires.tzinfo is None or expires <= now or not net.is_global:
             continue
         if net.prefixlen != (32 if net.version == 4 else 64):
             continue
@@ -306,13 +310,15 @@ def load(path, previous):
             block.add(str(net))
         elif e.get("status") == "tracked":
             watch.add(str(net))
-    if len((watch | block) - previous) > MAX_NEW:
-        return None
-    return watch, block
+    capped = len((watch | block) - previous) > MAX_NEW
+    if capped:                          # hold back the new entries, keep removals
+        watch, block = watch & previous, block & previous
+    return watch, block, capped
 ```
 
 When `load` returns `None`, keep your last good copy, remove from it the entries whose
-expiry has passed, and alert.
+expiry has passed, and alert. When `capped` is true, use the sets it returned, which hold
+no new addresses but do reflect removals, and alert.
 
 ## Recipes
 
