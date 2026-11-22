@@ -23,8 +23,11 @@ from .webhook import WebhookConnector
 NOTIFY_NAMES = ("webhook", "siem_http", "email")
 NAMES = ("webhook", "siem_http", "email", "enrich", "ticket", "block_webhook")
 # Sections read by other parts of the agents: the event export (agents/ship.py), the
-# tracked export (agents/tracked.py) and the sightings fetch (agents/sightings.py).
-OTHER_SECTIONS = ("s3_events", "tracked_export", "sightings")
+# tracked export (agents/tracked.py), the sightings fetch (agents/sightings.py), the
+# InternetDB lookups (agents/internetdb.py, agents/internetdb_lookup_exchange.py) and the
+# OTX submission (agents/otx.py).
+OTHER_SECTIONS = ("s3_events", "tracked_export", "sightings", "internetdb",
+                  "internetdb_exchange", "otx")
 
 __all__ = ["Connectors", "ConnectorResult", "Notification", "Transport", "NAMES"]
 

@@ -222,6 +222,7 @@ Everything runs without any model configured:
 | Per-source state | `overlay` | entries expire; at most 10,000 |
 | Approved blocklist | `agentdata`: `/agents/reports/blocklist/` | entries expire after `blocklist_ttl_days` (30) |
 | Detection drafts | `agentdata`: `/agents/detections/pending/` | no |
+| STIX bundle and its state (`[stix]`, off by default) | `agentdata`: `/agents/reports/stix/bundle.json`, `/agents/state/stix_state-*.json` | objects leave the bundle `keep_days` (30) after they expire or are revoked; back up the state with the bundle ([Portable formats](portable-formats.md#when-the-state-is-lost)) |
 | Blocklist candidates | `agentdata`: `/agents/detections/pending/blocklist-candidates.csv` | rewritten each detect run; rows past `expires` (`[agents] blocklist_expiry_days`, 14, or `blocklist_access_expiry_days`, 30) are left out |
 | Event export cursor and failure events | `agentdata`: `/agents/state/ship_cursor.json`, `ship_events.jsonl` | the failure file is kept under 1 MB |
 | Tracked list | `agentdata`: `/agents/reports/blocklist/tracked.json` | rewritten whole on every respond run while `track_before_enforce` is on; entries expire with the blocklist |
@@ -1001,7 +1002,8 @@ exporter's InternetDB lookups; on AWS the host firewall writes it.
 
 The sensor produces addresses and indicators: `detections/pending/blocklist-candidates.csv`,
 Sigma drafts, the approved blocklist file (`[respond] blocklist_file`), the tracked list
-(`tracked.json`) and, with export on, the raw events. Feeding any of them into a firewall,
+(`tracked.json`), the STIX bundle ([Portable formats](portable-formats.md)) and, with
+export on, the raw events. Feeding any of them into a firewall,
 a WAF, a session border controller, a SIEM or a paging system happens outside the sensor's fences, and a mistake there blocks or
 wakes up the wrong people. The guidance below applies to all of them, including the
 approved blocklist: a person approving an entry does not make the entry's source more

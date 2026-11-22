@@ -26,6 +26,9 @@ track_before_enforce``).
 ``--actions``, ``--by``, ``--external-host``). It reads the same directories, takes no run
 lock and never calls a model. The sign-in token comes from ``WINNIE_UI_TOKEN`` or is
 generated at start.
+
+``stix`` writes the STIX 2.1 bundle (``[stix]``, off by default) to a local file;
+``run-all`` does too when it is enabled. Nothing is sent anywhere (agents/stix.py).
 """
 
 from __future__ import annotations
@@ -187,7 +190,7 @@ def _run(argv=None) -> dict:
     parser = argparse.ArgumentParser(prog="python -m agents", description=__doc__)
     parser.add_argument("command", choices=["triage", "respond", "digest", "tune", "detect",
                                             "ship", "run-all", "queue", "approve", "reject", "unblock",
-                                            "enforce", "playbooks", "ui"])
+                                            "enforce", "playbooks", "ui", "stix"])
     parser.add_argument("target", nargs="?", help="approval id for approve / reject; address "
                                                   "or network for unblock; address for enforce")
     parser.add_argument("--log", help="honeypot JSON-lines log (default: [honeypot] log_file)")
@@ -506,6 +509,42 @@ def _run(argv=None) -> dict:
                                               dry_run=args.dry_run)
         return out
 
+    def _stix_stage(always: bool) -> None:
+        """STIX 2.1 bundle into a local file. Off unless ``[stix]`` is enabled; nothing is
+        sent. ``always``: report a disabled export instead of skipping it. A failure never
+        stops the other stages."""
+        from agents import otx, stix
+        from agents.triage import load_records
+
+        try:
+            settings = stix.StixSettings.from_config(cp)
+            if not settings.enabled:
+                if always:
+                    results["stix"] = {"status": "disabled"}
+                return
+            try:
+                respond_settings = _settings()
+                networks = respond_settings.networks() + otx.own_networks(cp)
+            except ValueError as exc:
+                # Without a valid never_act_on list no address is safe to write.
+                failed = {"error": f"[respond]: {str(exc)[:160]}; nothing written"}
+                results["stix"] = failed
+                log.error("stix: %s", failed["error"])
+                return
+            results["stix"] = stix.run_export(
+                settings, load_records(reports), reports, state, networks,
+                uploads_dir=otx.quarantine_dir(cp, base, args.data_dir),
+                upload_cap=otx.max_file_bytes(cp),
+                ttl_days=respond_settings.blocklist_ttl_days, dry_run=args.dry_run)
+        except stix.ConfigError as exc:
+            failed = {"error": f"[{stix.SECTION}]: {exc}"}
+            results["stix"] = failed
+            log.error("%s", failed["error"])
+        except Exception as exc:  # noqa: BLE001 - the export never stops the other stages
+            failed = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            results["stix"] = failed
+            log.error("stix export failed: %s", failed["error"])
+
     def locked(fn) -> dict:
         """One writing run at a time: a second one exits with an error instead of
         interleaving read-modify-write updates of records, cursors and state."""
@@ -529,6 +568,13 @@ def _run(argv=None) -> dict:
                 results["run_lock"] = {"error": msg}
                 return results
             return fn()
+
+    if args.command == "stix":
+        def _stix() -> dict:
+            _stix_stage(always=True)
+            return results
+
+        return _stix() if args.dry_run else locked(_stix)
 
     if args.command == "tune" and (args.history or args.rollback is not None):
         from agents.tuner import history, rollback
@@ -651,6 +697,8 @@ def _run(argv=None) -> dict:
                         "snapshot": res.snapshot, "commit": res.commit, "errors": res.errors}
 
             stage("tune", _tune)
+        if args.command == "run-all":
+            _stix_stage(always=False)
         if args.command in ("detect", "run-all"):
             from agents.detect import run_detect
 
