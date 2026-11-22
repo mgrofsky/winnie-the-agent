@@ -55,7 +55,8 @@ def test_missing_log_on_a_new_sensor_is_nothing_to_do(tmp_path, caplog):
         assert cli.main(["triage", *args]) == 0
         summary = cli.run(["run-all", *args])
     assert "error" not in summary["triage"] and summary["triage"]["status"] == "no_log"
-    assert summary["log_rotation"] == {"safe": True, "pending": []}
+    assert summary["log_rotation"]["safe"] is True and summary["log_rotation"]["pending"] == []
+    assert summary["log_rotation"]["log"] is None            # no file, nothing to rotate
     assert any("no event log yet" in r.getMessage() and r.levelname == "INFO"
                for r in caplog.records)
     assert not any(r.levelname in ("WARNING", "ERROR") for r in caplog.records)
@@ -184,7 +185,13 @@ def test_second_respond_or_run_all_exits_while_one_holds_the_run_lock(tmp_path, 
 def test_run_all_says_when_rotating_the_log_would_lose_work(tmp_path, monkeypatch, caplog):
     args = _setup(tmp_path, monkeypatch)
     summary = cli.run(["run-all", *args])
-    assert summary["log_rotation"] == {"safe": True, "pending": []}
+    assert summary["log_rotation"]["safe"] is True and summary["log_rotation"]["pending"] == []
+    assert summary["log_rotation"]["scope"] == "complete"
+    triage = summary["log_rotation"]["readers"]["triage"]
+    assert list(summary["log_rotation"]["readers"]) == ["triage"]
+    assert triage["state"] == "confirmed" and triage["behind_bytes"] == 0
+    assert triage["confirmed_offset"] == summary["log_rotation"]["log"]["complete_bytes"]
+    assert triage["generation"] == summary["log_rotation"]["log"]["generation"]
 
     # A session still open (no close, recent) is not triaged yet: its lines must survive.
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -201,10 +208,575 @@ def test_run_all_says_when_rotating_the_log_would_lose_work(tmp_path, monkeypatc
     assert any("not safe to rotate" in r.getMessage() for r in caplog.records)
 
 
-def test_ship_reports_unexported_events_as_pending(monkeypatch):
+def test_ship_reports_unexported_events_as_pending(tmp_path):
+    log = tmp_path / "log.jsonl"
+    log.write_text('{"a": 1}\n{"a": 2}\n')
     results = {"ship": {"objects": 3, "more_pending": True}}
-    status = cli.log_rotation_status(results)
+    status = cli.log_rotation_status(results, log_path=log, state=tmp_path / "state",
+                                     readers=["ship"])
     assert status["safe"] is False and any("ship" in p for p in status["pending"])
+
+
+# ---- log rotation: every configured reader must confirm the same stable boundary ----------
+
+class _FakeS3:
+    def __init__(self, fail=False):
+        self.puts = []
+        self.fail = fail
+
+    def put_object(self, **params):
+        if self.fail:
+            raise RuntimeError("boom")
+        self.puts.append(params)
+        return {}
+
+
+def _export_setup(tmp_path, monkeypatch, enabled="true", readers="", fail=False):
+    """The ``_setup`` sensor with the event export configured (fake client, loopback only)."""
+    from agents import ship
+
+    args = _setup(tmp_path, monkeypatch)
+    cfg = tmp_path / "config.ini"
+    cfg.write_text(cfg.read_text() + f"[connector.s3_events]\nenabled = {enabled}\n"
+                   "bucket = example-honeypot-events\npasswords = drop\n"
+                   + (f"[agents]\nlog_readers = {readers}\n" if readers else ""))
+    s3 = _FakeS3(fail=fail)
+    monkeypatch.setattr(ship, "default_client_factory", lambda _settings: s3)
+    return args, s3
+
+
+def _rotation(command, args):
+    return cli.run([command, *args])["log_rotation"]
+
+
+def _append_event(tmp_path):
+    with open(tmp_path / "log.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(trap_event("ftp", "auth_attempt", "192.0.2.77", "late", minutes=0,
+                                      username="admin", password="x", success=False)) + "\n")
+
+
+def test_triage_only_lab_is_safe_once_triage_has_drained_the_log(tmp_path, monkeypatch):
+    args = _setup(tmp_path, monkeypatch)                 # export not configured at all
+    status = _rotation("triage", args)
+    assert status["safe"] is True and status["pending"] == [] and status["scope"] == "complete"
+    assert list(status["readers"]) == ["triage"]
+    assert status["readers"]["triage"]["confirmed_offset"] == status["log"]["complete_bytes"] > 0
+
+
+def test_both_enabled_readers_at_the_same_stable_boundary_are_safe(tmp_path, monkeypatch):
+    args, s3 = _export_setup(tmp_path, monkeypatch)
+    status = _rotation("run-all", args)
+    assert s3.puts, "the export ran"
+    assert status["safe"] is True and status["scope"] == "complete"
+    boundary = status["log"]["complete_bytes"]
+    assert {n: r["confirmed_offset"] for n, r in status["readers"].items()} == {
+        "triage": boundary, "ship": boundary}
+    assert all(r["state"] == "confirmed" for r in status["readers"].values())
+
+
+def test_standalone_triage_is_not_safe_while_the_export_is_outstanding(tmp_path, monkeypatch):
+    args, s3 = _export_setup(tmp_path, monkeypatch)
+    status = _rotation("triage", args)
+    assert status["safe"] is False and s3.puts == []
+    assert status["readers"]["triage"]["state"] == "confirmed"
+    assert status["readers"]["ship"]["state"] == "unconfirmed"
+    assert any(p.startswith("ship:") for p in status["pending"])
+    assert status["scope"] == "partial"
+
+
+def test_standalone_shipping_is_not_safe_while_triage_is_outstanding(tmp_path, monkeypatch):
+    args, s3 = _export_setup(tmp_path, monkeypatch)
+    status = _rotation("ship", args)
+    assert s3.puts, "everything was exported"
+    assert status["readers"]["ship"]["state"] == "confirmed"
+    assert status["safe"] is False and status["scope"] == "partial"
+    assert status["readers"]["triage"]["state"] == "unconfirmed"
+    assert any(p.startswith("triage:") for p in status["pending"])
+    # Once triage has run on the same state, the same command can say both are done.
+    assert _rotation("triage", args)["safe"] is True
+
+
+def test_a_reader_listed_in_another_container_blocks_the_all_clear(tmp_path, monkeypatch):
+    """The AWS agents container: export disabled here, enabled in the exporter container."""
+    args, _ = _export_setup(tmp_path, monkeypatch, enabled="false", readers="triage, ship")
+    status = _rotation("run-all", args)
+    assert status["readers"]["triage"]["state"] == "confirmed"
+    assert status["readers"]["ship"]["state"] == "unconfirmed"
+    assert status["safe"] is False and status["scope"] == "partial"
+    assert any("another container" in p for p in status["pending"])
+    # The same run in a genuinely triage-only lab (nothing listed) is safe.
+    lab = tmp_path / "lab"
+    lab.mkdir()
+    args, _ = _export_setup(lab, monkeypatch, enabled="false")
+    assert _rotation("run-all", args)["safe"] is True
+
+
+def test_a_disabled_or_failing_export_never_confirms(tmp_path, monkeypatch):
+    args, _ = _export_setup(tmp_path, monkeypatch, enabled="false", readers="ship")
+    status = _rotation("ship", args)                      # the export is disabled here
+    assert status["safe"] is False
+    assert any("disabled in this configuration" in p for p in status["pending"])
+
+    failing = tmp_path / "failing"
+    failing.mkdir()
+    args, _ = _export_setup(failing, monkeypatch, fail=True)
+    status = _rotation("run-all", args)
+    assert status["readers"]["ship"]["state"] == "failed" and status["safe"] is False
+    assert status["readers"]["triage"]["state"] == "confirmed"
+
+
+def test_events_after_one_acknowledgment_make_the_log_unsafe_again(tmp_path, monkeypatch):
+    args, _ = _export_setup(tmp_path, monkeypatch)
+    assert _rotation("run-all", args)["safe"] is True
+    _append_event(tmp_path)                                # new write after both confirmed
+    status = _rotation("ship", args)                       # only the export acknowledges it
+    assert status["readers"]["ship"]["state"] == "confirmed"
+    assert status["readers"]["triage"]["state"] == "behind"
+    assert status["readers"]["triage"]["behind_bytes"] > 0 and status["safe"] is False
+    assert _rotation("run-all", args)["safe"] is True      # both caught up at the new boundary
+
+
+def test_an_unfinished_line_at_the_end_of_the_log_is_not_safe(tmp_path, monkeypatch):
+    args = _setup(tmp_path, monkeypatch)
+    assert _rotation("triage", args)["safe"] is True
+    with open(tmp_path / "log.jsonl", "a", encoding="utf-8") as f:
+        f.write('{"timestamp": "2026-')                   # a writer is mid-line
+    status = _rotation("triage", args)
+    assert status["safe"] is False and any("unfinished line" in p for p in status["pending"])
+
+
+def test_a_replaced_or_truncated_log_is_not_confirmed_by_the_old_cursor(tmp_path, monkeypatch):
+    args, _ = _export_setup(tmp_path, monkeypatch)
+    status = _rotation("run-all", args)
+    assert status["safe"] is True
+    log = tmp_path / "log.jsonl"
+    state = tmp_path / "reports" / "state"
+    readers = ["triage", "ship"]
+    lines = log.read_text().splitlines(keepends=True)
+
+    # Truncated in place (same inode): the cursors point past the end of the log.
+    log.write_text("".join(lines[:1]))
+    truncated = cli.log_rotation_status({}, log_path=log, state=state, readers=readers)
+    assert truncated["safe"] is False
+    assert {r["state"] for r in truncated["readers"].values()} == {"other_generation"}
+
+    # Replaced by a new file (new inode) holding other events of about the same size.
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_text("".join(l.replace("203.0.113", "203.0.114") for l in lines))
+    replacement.replace(log)
+    replaced = cli.log_rotation_status({}, log_path=log, state=state, readers=readers)
+    assert replaced["safe"] is False
+    assert {r["state"] for r in replaced["readers"].values()} == {"other_generation"}
+    assert any("different log generation" in p for p in replaced["pending"])
+
+    # An emptied log has nothing left to lose.
+    log.write_text("")
+    assert cli.log_rotation_status({}, log_path=log, state=state, readers=readers)["safe"] is True
+
+
+def test_an_unknown_reader_name_is_never_confirmed(tmp_path):
+    log = tmp_path / "log.jsonl"
+    log.write_text('{"a": 1}\n')
+    status = cli.log_rotation_status({}, log_path=log, state=tmp_path, readers=["triage", "siem"])
+    assert status["safe"] is False and any(p.startswith("siem:") for p in status["pending"])
+
+
+def test_log_replaced_while_a_run_was_reading_is_not_claimed_by_the_new_file(tmp_path):
+    """A reader confirms the file it read, not whatever file is there when it saves."""
+    from agents.sessions import Cursor
+
+    log = tmp_path / "log.jsonl"
+    log.write_text('{"a": 1}\n' * 3)
+    before = Cursor.sample(log)
+    log.rename(tmp_path / "old.jsonl")
+    log.write_text('{"b": 2}\n' * 3)                      # same size, a different file
+    cursor = Cursor(tmp_path / "cursor.json")
+    cursor.set_position(27, log, before)
+    cursor.save()
+    saved = Cursor(tmp_path / "cursor.json")
+    assert saved.inode is None and saved.tail is None     # claims no file and no content
+    assert saved.start_offset(log) == 0                   # the next run reads from the start
+
+
+def test_log_truncated_and_regrown_in_place_during_a_run_is_not_claimed(tmp_path):
+    from agents.sessions import Cursor
+
+    log = tmp_path / "log.jsonl"
+    log.write_text('{"a": 1}\n' * 3)
+    before = Cursor.sample(log)
+    log.write_text('{"b": 2}\n' * 3)                      # copytruncate and regrow: same inode
+    assert Cursor.sample(log).inode == before.inode
+    cursor = Cursor(tmp_path / "cursor.json")
+    cursor.set_position(27, log, before)
+    assert cursor.inode is None and cursor.tail is None
+
+
+def _bump_mtime(path, seconds=1):
+    """Move the modification time, so the test does not depend on timestamp granularity."""
+    import os
+
+    ns = path.stat().st_mtime_ns + seconds * 10**9
+    os.utime(path, ns=(ns, ns))
+
+
+def test_an_in_place_rewrite_after_the_pre_read_sample_is_not_blessed(tmp_path):
+    from agents.rotation import rotation_status
+    from agents.sessions import Cursor
+
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b"first\noldrow\n")
+    before = Cursor.sample(log)
+    log.write_bytes(b"first\nnewrow\n")                    # same inode, size and first line
+    _bump_mtime(log)
+    cursor = Cursor(tmp_path / "triage_cursor.json")
+    cursor.set_position(before.end, log, before)
+    cursor.save()
+    saved = Cursor(tmp_path / "triage_cursor.json")
+    assert saved.inode is None and saved.tail is None      # the new tail was not certified
+    status = rotation_status({}, log, tmp_path, ["triage"])
+    assert status["safe"] is False                         # the cursor claims no file
+    assert status["readers"]["triage"]["state"] == "other_generation"
+
+
+def test_even_with_a_coarse_clock_the_changed_boundary_window_is_caught(tmp_path):
+    from agents.sessions import Cursor
+
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b"first\noldrow\n")
+    before = Cursor.sample(log)
+    log.write_bytes(b"first\nnewrow\n")                    # mtime left as the write set it
+    cursor = Cursor(tmp_path / "cursor.json")
+    cursor.set_position(before.end, log, before)
+    assert cursor.tail is None
+
+
+def test_append_only_progress_keeps_the_stamp(tmp_path):
+    from agents.rotation import rotation_status
+    from agents.sessions import Cursor
+
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b"first\nsecond\n")
+    before = Cursor.sample(log)
+    with open(log, "ab") as f:
+        f.write(b"third\n")                                # a writer appends during the run
+    cursor = Cursor(tmp_path / "triage_cursor.json")
+    cursor.set_position(before.end, log, before)           # the reader handled up to `before`
+    cursor.save()
+    saved = Cursor(tmp_path / "triage_cursor.json")
+    assert saved.inode == before.inode and saved.tail == before.tails[before.end]
+    assert saved.start_offset(log) == before.end
+    triage = rotation_status({}, log, tmp_path, ["triage"])["readers"]["triage"]
+    assert triage["state"] == "behind" and triage["behind_bytes"] == 6
+    cursor.set_position(before.end + 6, log, Cursor.sample(log))
+    cursor.save()
+    assert rotation_status({}, log, tmp_path, ["triage"])["safe"] is True
+
+
+def test_copytruncate_and_regrow_past_the_old_size_is_not_blessed(tmp_path):
+    from agents.sessions import Cursor
+
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b"first\nsecond\n")
+    before = Cursor.sample(log)
+    log.write_bytes(b"first\nother-second\nand more rows after the truncate\n")   # larger now
+    cursor = Cursor(tmp_path / "cursor.json")
+    cursor.set_position(before.end, log, before)
+    assert cursor.inode is None and cursor.tail is None
+
+
+def test_a_failed_pre_read_sample_certifies_nothing(tmp_path):
+    from agents.sessions import Cursor
+
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b"first\nsecond\n")
+    cursor = Cursor(tmp_path / "cursor.json")
+    cursor.set_position(13, log, None)
+    assert cursor.inode is None and cursor.tail is None and cursor.size is None
+    assert cursor.start_offset(log) == 0
+
+
+def _big_log(tmp_path, n=120):
+    old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
+           ).replace(minute=5, second=0, microsecond=0)
+    recs = []
+    for i in range(n):
+        rec = trap_event("ftp", "auth_attempt", "192.0.2.4", f"f{i}", username="admin",
+                         password=f"pw{i:04d}", success=False)
+        rec["timestamp"] = (old + datetime.timedelta(seconds=i)).isoformat()
+        recs.append(rec)
+    return write_log(tmp_path / "log.jsonl", recs)
+
+
+def test_a_same_size_rewrite_away_from_the_first_line_and_the_tail_is_caught(
+        tmp_path, monkeypatch):
+    """The real readers confirmed this log. A line in the middle is then rewritten in place with
+    the same size: the inode, first line and last 4 KiB are all unchanged, only the modification
+    time moves."""
+    from agents.sessions import Cursor, sample_log
+
+    args, _ = _export_setup(tmp_path, monkeypatch)
+    log = _big_log(tmp_path)
+    assert _rotation("run-all", args)["safe"] is True
+    state = tmp_path / "reports" / "state"
+    data = log.read_bytes()
+    sample = sample_log(log)
+    spot = data.index(b"pw0040")
+    covered = [(o - min(o, 4096), o) for o in sample.tails]
+    assert not any(a <= spot < b for a, b in covered), "the edit must miss every sampled window"
+    stat = log.stat()
+    log.write_bytes(data.replace(b"pw0040", b"px0040"))
+    after = log.stat()
+    assert (after.st_ino, after.st_size) == (stat.st_ino, stat.st_size)
+    _bump_mtime(log)
+    assert Cursor(state / "triage_cursor.json").tail == sample_log(
+        log, [Cursor(state / "triage_cursor.json").offset]).tails[
+        Cursor(state / "triage_cursor.json").offset]                   # tail itself unchanged
+    status = cli.log_rotation_status({}, log_path=log, state=state, readers=["triage", "ship"])
+    assert status["safe"] is False
+    assert {r["state"] for r in status["readers"].values()} == {"other_generation"}
+    assert any("rewritten in place" in p for p in status["pending"])
+
+
+def test_a_rewrite_during_the_pre_and_post_samples_fails_closed_at_equal_size(
+        tmp_path, monkeypatch):
+    import agents.rotation as rotation
+
+    args = _setup(tmp_path, monkeypatch)
+    assert _rotation("triage", args)["safe"] is True
+    log = tmp_path / "log.jsonl"
+    real = rotation.sample_log
+    calls = []
+
+    def rewriting(path, offsets=()):
+        calls.append(1)
+        sample = real(path, offsets)
+        if len(calls) == 1:                                 # same size, same first line
+            data = log.read_bytes()
+            log.write_bytes(data[:-4] + b"ABC\n")
+            _bump_mtime(log)
+        return sample
+
+    monkeypatch.setattr(rotation, "sample_log", rewriting)
+    status = _rotation("triage", args)
+    assert status["safe"] is False and any("moved" in p for p in status["pending"])
+
+
+def test_a_legacy_triage_cursor_is_trusted_for_resume_and_causes_no_second_record(
+        tmp_path, monkeypatch):
+    """Rereading from the start would triage every old session again (a second record, and a
+    model call each), so triage keeps resuming from a legacy cursor and just adds the stamp."""
+    args = _setup(tmp_path, monkeypatch)
+    first = cli.run(["triage", *args])
+    assert first["triage"]["written"]
+    path = tmp_path / "reports" / "state" / "triage_cursor.json"
+    legacy = json.loads(path.read_text())
+    for key in ("tail", "size", "mtime_ns"):
+        legacy.pop(key)
+    path.write_text(json.dumps(legacy))
+    again = cli.run(["triage", *args])
+    assert again["triage"]["written"] == [] and again["triage"]["llm_calls"] == 0
+    assert json.loads(path.read_text())["tail"] is not None
+    assert again["log_rotation"]["safe"] is True
+
+
+def test_a_refused_stamp_keeps_the_ids_so_the_reread_makes_no_duplicates(tmp_path, monkeypatch):
+    """When the pre-read sample failed, the cursor will restart from 0; the handled ids must
+    survive that, or every session would be triaged a second time."""
+    from agents.sessions import Cursor
+
+    args = _setup(tmp_path, monkeypatch)
+    real = Cursor.sample
+    monkeypatch.setattr(Cursor, "sample", staticmethod(lambda *a, **k: None))
+    first = cli.run(["triage", *args])
+    assert first["triage"]["written"]
+    monkeypatch.setattr(Cursor, "sample", staticmethod(real))
+    again = cli.run(["triage", *args])                      # rereads from 0
+    assert again["triage"]["written"] == [] and again["triage"]["llm_calls"] == 0
+    assert again["log_rotation"]["safe"] is True
+
+
+def _confirmed_setup(tmp_path, monkeypatch, **kw):
+    args, s3 = _export_setup(tmp_path, monkeypatch, **kw)
+    assert _rotation("run-all", args)["safe"] is True
+    state = tmp_path / "reports" / "state"
+    return args, state, tmp_path / "log.jsonl"
+
+
+def test_a_same_size_rewrite_in_place_defeats_a_stale_matching_cursor(tmp_path, monkeypatch):
+    args, state, log = _confirmed_setup(tmp_path, monkeypatch)
+    before = log.stat()
+    text = log.read_text()
+    log.write_text(text.replace("203.0.113", "203.0.114").replace("192.0.2.4", "192.0.2.5"))
+    after = log.stat()
+    assert (after.st_ino, after.st_size) == (before.st_ino, before.st_size)
+    status = cli.log_rotation_status({}, log_path=log, state=state, readers=["triage", "ship"])
+    assert status["safe"] is False                          # same inode and size, other events
+    assert {r["state"] for r in status["readers"].values()} == {"other_generation"}
+
+
+def test_a_same_size_rewrite_of_only_the_tail_is_caught_when_the_first_line_is_kept(
+        tmp_path, monkeypatch):
+    args, state, log = _confirmed_setup(tmp_path, monkeypatch)
+    lines = log.read_text().splitlines(keepends=True)
+    last = lines[-1].replace("p3", "q3") if "p3" in lines[-1] else lines[-1][:-2] + "X\n"
+    assert len(last) == len(lines[-1]) and last != lines[-1]
+    log.write_text("".join(lines[:-1]) + last)
+    status = cli.log_rotation_status({}, log_path=log, state=state, readers=["triage", "ship"])
+    assert status["safe"] is False
+    assert {r["state"] for r in status["readers"].values()} == {"other_generation"}
+    assert any("rewritten in place" in p for p in status["pending"])   # first line unchanged
+
+
+def test_a_cursor_from_an_older_version_resumes_but_confirms_nothing(tmp_path, monkeypatch):
+    args, state, log = _confirmed_setup(tmp_path, monkeypatch)
+    for name in ("triage_cursor.json", "ship_cursor.json"):      # drop the new field
+        data = json.loads((state / name).read_text())
+        data.pop("tail")
+        (state / name).write_text(json.dumps(data))
+    from agents.sessions import Cursor
+
+    assert Cursor(state / "triage_cursor.json").start_offset(log) > 0   # still resumes
+    status = cli.log_rotation_status({}, log_path=log, state=state, readers=["triage", "ship"])
+    assert status["safe"] is False
+    assert {r["state"] for r in status["readers"].values()} == {"unverified"}
+    # One run of each reader writes the fingerprint and the log can be confirmed again.
+    assert _rotation("run-all", args)["safe"] is True
+
+
+def test_a_required_reader_disabled_here_is_not_confirmed_by_an_old_matching_cursor(
+        tmp_path, monkeypatch):
+    args, state, log = _confirmed_setup(tmp_path, monkeypatch)
+    cfg = tmp_path / "config.ini"                              # export now off in this config,
+    cfg.write_text(cfg.read_text().replace("enabled = true", "enabled = false")
+                   + "[agents]\nlog_readers = triage, ship\n")  # but still a required reader
+    status = _rotation("triage", args)
+    assert status["safe"] is False and status["scope"] == "partial"
+    assert status["readers"]["ship"]["state"] == "unconfirmed"      # its old cursor matches
+
+
+def test_a_log_that_cannot_be_read_never_gets_an_all_clear(tmp_path, monkeypatch):
+    args = _setup(tmp_path, monkeypatch)
+    log = tmp_path / "log.jsonl"
+    assert _rotation("triage", args)["safe"] is True
+    log.chmod(0)
+    try:
+        import os
+
+        if os.access(log, os.R_OK):
+            pytest.skip("permissions are not enforced for this user")
+        status = cli.log_rotation_status({}, log_path=log, state=tmp_path / "reports" / "state",
+                                         readers=["triage"])
+        assert status["safe"] is False and any("cannot be read" in p for p in status["pending"])
+    finally:
+        log.chmod(0o600)
+
+
+def test_a_log_that_is_not_a_regular_file_never_gets_an_all_clear(tmp_path):
+    (tmp_path / "logdir").mkdir()
+    status = cli.log_rotation_status({}, log_path=tmp_path / "logdir", state=tmp_path,
+                                     readers=["triage"])
+    assert status["safe"] is False and any("not a regular file" in p for p in status["pending"])
+    fifo = tmp_path / "fifo"
+    import os
+
+    os.mkfifo(fifo)
+    status = cli.log_rotation_status({}, log_path=fifo, state=tmp_path, readers=["triage"])
+    assert status["safe"] is False and any("not a regular file" in p for p in status["pending"])
+
+
+def test_a_failed_triage_on_an_unreadable_log_is_not_an_all_clear(tmp_path):
+    (tmp_path / "logdir").mkdir()
+    cfg = tmp_path / "config.ini"
+    cfg.write_text("[honeypot]\nlog_file = logdir\n")
+    summary = cli.run(["triage", "--config", str(cfg), "--no-llm", "--reports-dir",
+                       str(tmp_path / "r")])
+    assert "is a directory" in summary["triage"]["error"]
+    assert summary["log_rotation"]["safe"] is False
+    assert any(p.startswith("triage:") for p in summary["log_rotation"]["pending"])
+
+
+def test_a_failed_reader_blocks_even_a_missing_or_empty_log(tmp_path):
+    log = tmp_path / "missing.jsonl"
+    failed = {"ship": {"error": "[connector.s3_events]: bucket is missing"}}
+    status = cli.log_rotation_status(failed, log_path=log, state=tmp_path, readers=["triage", "ship"])
+    assert status["safe"] is False and status["log"] is None
+    ok = cli.log_rotation_status({}, log_path=log, state=tmp_path, readers=["triage"])
+    assert ok["safe"] is True                              # genuinely never created
+    log.write_text("")
+    assert cli.log_rotation_status(failed, log_path=log, state=tmp_path,
+                                   readers=["triage", "ship"])["safe"] is False
+    assert cli.log_rotation_status({}, log_path=log, state=tmp_path, readers=["triage"])["safe"]
+
+
+def test_a_configuration_error_withholds_the_all_clear(tmp_path):
+    log = tmp_path / "log.jsonl"
+    log.write_text("")
+    for name in ("missing.ini", "broken.ini"):
+        cfg = tmp_path / name
+        if name == "broken.ini":
+            cfg.write_text("[honeypot\nlog_file = nope\n")
+        summary = cli.run(["triage", "--config", str(cfg), "--log", str(log), "--no-llm",
+                           "--reports-dir", str(tmp_path / "r"),
+                           "--detections-dir", str(tmp_path / "det"),
+                           "--overlay", str(tmp_path / "overlay.json"),
+                           "--data-dir", str(tmp_path / "data")])
+        assert "config_error" in summary, name
+        assert summary["log_rotation"]["safe"] is False, name
+        assert any("configuration could not be read" in p
+                   for p in summary["log_rotation"]["pending"]), name
+    # With a log that has events the answer is also no, and the missing-log case too.
+    status = cli.log_rotation_status({}, log_path=tmp_path / "gone.jsonl", state=tmp_path,
+                                     readers=["triage"], config_error="bad")
+    assert status["safe"] is False
+
+
+def test_a_log_that_moves_between_the_two_samples_fails_closed(tmp_path, monkeypatch):
+    import agents.rotation as rotation
+
+    args = _setup(tmp_path, monkeypatch)
+    assert _rotation("triage", args)["safe"] is True
+    real = rotation.sample_log
+    calls = []
+
+    def moving(path, offsets=()):
+        calls.append(1)
+        sample = real(path, offsets)
+        if len(calls) == 1:                                # a writer appends after the first look
+            _append_event(tmp_path)
+        return sample
+
+    monkeypatch.setattr(rotation, "sample_log", moving)
+    status = _rotation("triage", args)
+    assert status["safe"] is False and any("moved" in p for p in status["pending"])
+    assert len(calls) == 2
+
+
+def test_the_boundary_counts_only_newline_complete_bytes(tmp_path):
+    from agents.sessions import sample_log
+
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b'{"a": 1}\n{"b": 2}\n{"c"')
+    sample = sample_log(log, [9])
+    assert (sample.size, sample.end) == (22, 18)
+    assert sample.tails[18] is not None and sample.tails[9] is not None
+    assert sample.tails.get(22) is None
+    log.write_bytes(b'no newline yet')
+    assert sample_log(log).end == 0
+    log.write_bytes(b"")
+    assert sample_log(log).end == 0
+
+
+def test_a_long_unfinished_line_fails_closed_without_scanning_the_file(tmp_path, monkeypatch):
+    import agents.sessions as sessions
+
+    monkeypatch.setattr(sessions, "MAX_PARTIAL_BYTES", 1024)
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b'{"a": 1}\n' + b"x" * 5000)
+    with pytest.raises(OSError):
+        sessions.sample_log(log)
+    status = cli.log_rotation_status({}, log_path=log, state=tmp_path, readers=["triage"])
+    assert status["safe"] is False and any("unreadable" in p or "cannot be read" in p
+                                           for p in status["pending"])
 
 
 def test_every_writing_command_waits_for_the_run_lock(tmp_path, monkeypatch):

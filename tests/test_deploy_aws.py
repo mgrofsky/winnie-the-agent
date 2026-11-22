@@ -941,6 +941,24 @@ def test_rendered_configs_turn_the_tracked_export_on_for_the_exporter_only(senso
     assert ship.get("connector.s3_events", "enabled") == "true"
 
 
+@pytest.mark.parametrize("ship", ["false", "true"])
+def test_both_rendered_configs_list_the_two_log_readers(sensor, tmp_path, ship):
+    """The agents and exporter containers keep separate state, so each must say the other
+    reader exists: neither may report an all-clear for the event log alone."""
+    cp = _render(sensor, tmp_path, f"config-{ship}.ini", ship, "false")
+    assert cp.get("agents", "log_readers") == "triage, ship"
+    assert cp.get("connector.s3_events", "enabled") == ship
+
+
+def test_the_aws_split_shares_no_state_mount_for_log_rotation():
+    """The rotation answer must not need a shared writable mount between the containers."""
+    text = (AWS / "sensor.yaml").read_text()
+    agents = text[text.index("                agents:\n"):text.index("                exporter:\n")]
+    exporter = text[text.index("                exporter:\n"):text.index("                ui:\n")]
+    assert "agentdata:/agents" in agents and "exportstate:/agents" in exporter
+    assert "exportstate" not in agents and "agentdata" not in exporter
+
+
 def _render_args(dst, ship, internetdb=()):
     return [sys.executable, str(AWS / "render_config.py"),
             str(ROOT / "SSH" / "config.ini.TEMPLATE"), str(dst), "winnie-sensor",

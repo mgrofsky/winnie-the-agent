@@ -267,6 +267,40 @@ def test_provider_outage_defers_and_saves_progress(tmp_path):
     assert sorted(result2["written"]) == ["session-2", "session-3"]
 
 
+def test_deferred_items_leave_the_cursor_short_of_the_end_of_the_log(tmp_path):
+    from agents.llm import LLMUnavailable
+    from agents.rotation import rotation_status
+    from agents.sessions import Cursor, sample_log
+
+    recs = ssh_session("session-1", "203.0.113.1", ["id"])
+    recs += ssh_session("session-2", "203.0.113.2", ["id"], start=1)
+    result, reports = _run(tmp_path, recs, FakeJsonLLM(GOOD_TRIAGE, LLMUnavailable("x")))
+    assert result["deferred"] == ["session-2"]
+    state = reports / "state"
+    cursor = Cursor(state / "triage_cursor.json")
+    sample = sample_log(tmp_path / "log.jsonl")
+    assert 0 < cursor.offset < sample.end and result["pending_bytes"] == sample.end - cursor.offset
+    status = rotation_status({"triage": result}, tmp_path / "log.jsonl", state, ["triage"])
+    assert status["safe"] is False
+    assert status["readers"]["triage"]["state"] == "behind"
+    assert status["readers"]["triage"]["behind_bytes"] == result["pending_bytes"]
+    assert any("1 deferred" in p for p in status["pending"])
+    # When the model is back the next run drains it and the same check passes.
+    result2, _ = _run(tmp_path, recs, FakeJsonLLM(GOOD_TRIAGE))
+    assert rotation_status({"triage": result2}, tmp_path / "log.jsonl", state, ["triage"])["safe"]
+
+
+def test_triage_stamps_the_boundary_it_read(tmp_path):
+    from agents.sessions import Cursor, sample_log
+
+    result, reports = _run(tmp_path, ssh_session("session-1", "203.0.113.1", ["id"]),
+                           FakeJsonLLM(GOOD_TRIAGE))
+    cursor = Cursor(reports / "state" / "triage_cursor.json")
+    sample = sample_log(tmp_path / "log.jsonl", [cursor.offset])
+    assert cursor.offset == sample.end and cursor.tail == sample.tails[cursor.offset]
+    assert cursor.inode == sample.inode and cursor.head == sample.head
+
+
 def test_provider_rejecting_one_item_does_not_stop_the_run(tmp_path):
     from agents.llm import LLMRequestError
 

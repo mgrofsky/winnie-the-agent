@@ -185,8 +185,9 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     return {"status": "stopped"}
 
 
-def _run(argv=None) -> dict:
-    """Parse args and run the requested agents. Returns a summary dict (also used by tests)."""
+def _run(argv=None, rotation: Optional[dict] = None) -> dict:
+    """Parse args and run the requested agents. Returns a summary dict (also used by tests).
+    ``rotation``, when given, is filled with what ``log_rotation_status`` needs."""
     parser = argparse.ArgumentParser(prog="python -m agents", description=__doc__)
     parser.add_argument("command", choices=["triage", "respond", "digest", "tune", "detect",
                                             "ship", "run-all", "queue", "approve", "reject", "unblock",
@@ -253,6 +254,16 @@ def _run(argv=None) -> dict:
         int(agents_cfg.get("max_tuner_changes_per_run", 3))
 
     respond_cfg = cp["respond"] if "respond" in cp else {}
+    if rotation is not None:
+        from agents.rotation import local_readers, parse_reader_list, required_readers
+
+        try:       # an unreadable setting counts as enabled: the export then has to confirm
+            export_on = cp.getboolean("connector.s3_events", "enabled", fallback=False)
+        except ValueError:
+            export_on = True
+        rotation.update(log_path=log_path, state=state, readers=required_readers(
+            parse_reader_list(agents_cfg.get("log_readers", "")), export_on),
+            local=local_readers(export_on), config_error=cfg_error)
 
     def _settings():
         return runtime.respond_settings(cp)
@@ -728,33 +739,28 @@ def run(argv=None) -> dict:
     """Run one command; triage, ship and run-all also say whether the event log may be
     rotated now (``log_rotation``) and log a warning line when it may not."""
     args_list = list(sys.argv[1:] if argv is None else argv)
-    results = _run(args_list)
+    context: dict = {}
+    results = _run(args_list, context)
     # triage, ship and run-all are the commands whose results carry these keys.
     if ("triage" in results or "ship" in results) and "--dry-run" not in args_list \
-            and "run_lock" not in results:
-        status = log_rotation_status(results)
+            and "run_lock" not in results and context:
+        status = log_rotation_status(results, **context)
         results["log_rotation"] = status
         if not status["safe"]:
             log.warning("event log not safe to rotate yet: %s", "; ".join(status["pending"]))
     return results
 
 
-def log_rotation_status(results: dict) -> dict:
-    """Whether rotating the event log now loses nothing: triage has no unfinished or
-    deferred items left in it and the export has shipped everything."""
-    pending = []
-    triage = results.get("triage")
-    if isinstance(triage, dict) and "error" not in triage:
-        if triage.get("pending_bytes", 0) > 0 or triage.get("deferred"):
-            pending.append(f"triage: {triage.get('pending_bytes', 0)} bytes of the log hold "
-                           f"unfinished or deferred items ({len(triage.get('deferred') or [])} "
-                           "deferred)")
-    elif isinstance(triage, dict):
-        pending.append("triage: failed, nothing was processed")
-    ship = results.get("ship")
-    if isinstance(ship, dict) and (ship.get("more_pending") or "error" in ship):
-        pending.append("ship: events not exported yet")
-    return {"safe": not pending, "pending": pending}
+def log_rotation_status(results: dict, *, log_path, state, readers, local=None,
+                        config_error=None) -> dict:
+    """Whether rotating the event log now loses nothing: every required reader (triage, the
+    export when enabled, and any reader listed in ``[agents] log_readers``) has confirmed
+    the log's current generation up to its current end. The keys ``safe`` and ``pending``
+    are the contract; ``scope``, ``log`` and ``readers`` carry the evidence (see
+    ``agents.rotation``). A configuration error never yields ``safe``."""
+    from agents.rotation import rotation_status
+
+    return rotation_status(results, log_path, state, readers, local, config_error)
 
 
 def main(argv=None) -> int:

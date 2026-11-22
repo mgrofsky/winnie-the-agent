@@ -88,13 +88,14 @@ def _append(path, records, partial: str = ""):
         f.write(partial)
 
 
-def _done_everything(parsed, cursor, log):
+def _done_everything(parsed, cursor, log, before=None):
+    before = before or Cursor.sample(log)       # a reader samples the log before it reads
     sessions, campaigns = pending(parsed, cursor, now=LATER)
     for s in sessions:
         cursor.mark(s.session_id, s.last_offset)
     for c in campaigns:
         cursor.mark(c.campaign_id, c.last_offset)
-    cursor.advance(parsed, log)
+    cursor.advance(parsed, log, before)
     return sessions, campaigns
 
 
@@ -129,7 +130,7 @@ def test_unfinished_items_hold_the_mark_and_partial_lines_wait(tmp_path):
     sessions, _ = pending(parsed, cursor, now=T0 + datetime.timedelta(minutes=30))
     assert [s.session_id for s in sessions] == ["session-done"]
     cursor.mark("session-done", parsed.sessions["session-done"].last_offset)
-    cursor.advance(parsed, log)
+    cursor.advance(parsed, log, Cursor.sample(log))
     assert cursor.offset == parsed.sessions["session-open"].first_offset
     assert "session-done" not in cursor.done or cursor.done["session-done"] >= cursor.offset
 
@@ -191,3 +192,34 @@ def test_udp_only_campaign_without_nonce_round_trip_is_unverified(tmp_path):
     assert by_ip["192.0.2.80"].unverified_source
     assert not by_ip["192.0.2.81"].unverified_source
     assert not by_ip["192.0.2.82"].unverified_source
+
+
+def test_cursor_saves_a_content_fingerprint_and_resumes_only_while_it_matches(tmp_path):
+    log = tmp_path / "log.jsonl"
+    _append(log, ssh_session("session-a", "203.0.113.7", ["id"]))
+    cursor = Cursor(tmp_path / "cursor.json")
+    _done_everything(parse_log(log), cursor, log, before=Cursor.sample(log))
+    cursor.save()
+    saved = Cursor(tmp_path / "cursor.json")
+    assert saved.tail and saved.start_offset(log) == saved.offset > 0
+    data = log.read_bytes()
+    log.write_bytes(data[:-3] + b"XY\n")                  # same size, same inode, same first line
+    assert log.stat().st_size == len(data) and os.stat(log).st_ino == saved.inode
+    assert saved.start_offset(log) == 0                   # the content before the offset changed
+
+
+def test_a_cursor_file_from_an_older_version_still_resumes(tmp_path):
+    import json
+
+    log = tmp_path / "log.jsonl"
+    _append(log, ssh_session("session-a", "203.0.113.7", ["id"]))
+    cursor = Cursor(tmp_path / "cursor.json")
+    _done_everything(parse_log(log), cursor, log)
+    cursor.save()
+    legacy = json.loads((tmp_path / "cursor.json").read_text())
+    legacy.pop("tail")                                    # as written before the fingerprint
+    (tmp_path / "cursor.json").write_text(json.dumps(legacy))
+    old = Cursor(tmp_path / "cursor.json")
+    assert old.tail is None and old.start_offset(log) == old.offset > 0
+    (tmp_path / "cursor.json").write_text(json.dumps({**legacy, "tail": 5}))
+    assert Cursor(tmp_path / "cursor.json").tail is None  # a malformed field is ignored

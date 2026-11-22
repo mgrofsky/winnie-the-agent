@@ -62,6 +62,9 @@ if want is None:
         "listeners": {"ftp_pasv_ports": "30000-30019", "ftp_pasv_address": public_ip,
                       "llm": "false"},
         "respond": {"queue_enforce": "true", "track_before_enforce": tracked},
+        # Triage (agents container) and the export (exporter container) keep separate
+        # state, so each container's log_rotation answer is partial; both are listed.
+        "agents": {"log_readers": "triage, ship"},
         "connector.s3_events": {"enabled": ship, "bucket": bucket, "prefix": prefix + "/",
                                 "region": region, "bucket_owner": owner,
                                 "layout": "wrapped", "passwords": "hash"},

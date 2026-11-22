@@ -1431,6 +1431,7 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
     reports_dir = Path(reports_dir)
     state = Path(state_dir) if state_dir else reports_dir / "state"
     cursor = Cursor(state / "triage_cursor.json")
+    before = Cursor.sample(log_path)              # the file this run is about to read
     parsed = parse_log(log_path, window_minutes=window_minutes,
                        start_offset=cursor.start_offset(log_path))
     sessions, campaigns = pending(parsed, cursor, now=now)
@@ -1519,7 +1520,7 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
     pending_bytes = 0
     if not dry_run:
         record_sensor_limits(reports_dir, parsed.sensor_limits)
-        cursor.advance(parsed, log_path)
+        cursor.advance(parsed, log_path, before)
         cursor.save()
         # Lines from the cursor on still hold unfinished or deferred items; rotating the log
         # now would lose them.
