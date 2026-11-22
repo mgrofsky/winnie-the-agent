@@ -19,45 +19,70 @@ On top of that SSH honeypot this project adds:
 - **Scenarios**: one TOML file describes the whole fake target (organisation, host, users,
   services, banners, accounts, fake data, HTTP pages and APIs, honeytokens), so every
   protocol on a sensor tells the same story. Six scenarios ship with the project.
-- **Budgets**: hard limits on model spend and concurrency, enforced in code before any
-  model call.
+- **Budgets**: every model call first reserves its estimated tokens against per-session,
+  per-source and daily token budgets, with concurrency limits, all enforced in code. They
+  are estimates, not provider billing, and calls in flight can pass a limit by the
+  estimate error.
 - **Triage**: one validated record per SSH session or per trap campaign, plus a daily digest.
+- **Where addresses are** (optional): country, city and network owner of each source,
+  read from GeoLite2 or DB-IP Lite database files on disk (no network call), stored on
+  the triage record and shown in the console and the digest.
+- **What Shodan already knows** (optional, off by default): open ports, host names, tags
+  and known CVEs that Shodan's public InternetDB holds for interesting sources, looked up
+  by the agents (never a honeypot container), or delivered through the object store by a
+  lookup outside the sensor, checked as untrusted data and shown in the console. Free for
+  non-commercial use.
+- **Indicators to OTX** (optional, off by default, dry run until you turn sending on): the
+  addresses of proven sources that did more than probe, and the SHA-256 of files they
+  uploaded, added to one AlienVault OTX pulse per day. Never attacker-written text. A
+  public pulse shows that you run a honeypot; the pulse is private by default.
 - **Tuning**: a fenced tuner that adds the fake accounts, SIP extensions and lure files
   attackers actually go for, writing only to a versioned overlay file.
-- **Detections**: Sigma rule drafts and blocklist candidates for human review.
+- **Detections**: Sigma rule drafts and blocklist candidates for human review, with a
+  processing pipeline onto the sensor's own events.
+- **STIX 2.1 export** (optional, off by default): a local bundle of what the sensor saw,
+  with indicators only for sources and files that passed promotion or operator approval.
+  What has and has not been tested with other tools is in
+  [docs/portable-formats.md](docs/portable-formats.md).
 - **Response playbooks**: deterministic rules that react to triage records with local
   changes (tarpit, deeper or shallower interaction, per-source honeytokens), notifications
   through opt-in connectors, and enforcement actions that run only after a person approves
-  them.
+  them. Optionally in two steps: a blocklist entry is tracked first, for your cloud to
+  watch and report sightings of, and blocked only on a second decision.
 
 > Winnie is used in a live production environment. Review the [deployment guidance](#deployment)
 > before setting up your own instance.
 
 ## How it fits together
 
-![Data flow: attackers, front-ends, event log, agents pipeline, outputs and operator approval](docs/dataflow.svg)
+![Data flow and trust boundaries: attackers, front-ends, captured data, agents pipeline, agent outputs, operator approval, model providers and third-party services](docs/diagrams/winnie-dataflow.png)
 
 The front-ends write events; the agents read them. Each agents run triages new sessions and
 campaigns, runs the response playbooks, writes the digest, tunes the overlay, drafts
 detections and, when `[connector.s3_events]` is enabled, finally exports new log lines to
-S3 for a SIEM (`python -m agents ship`, not shown in the diagram). Agents never talk
+S3 for a SIEM (`python -m agents ship`). Agents never talk
 to attackers, and front-ends never write anything the agents produce. Details are in
 [docs/architecture.md](docs/architecture.md).
 
 ## Quick start (local lab)
 
-Requirements: Docker with Compose v2, `ssh-keygen`, and about 1 GB of disk for the image
-(see [Known issues](#known-issues)).
+The lab is a demo on your own machine. Every port is bound to 127.0.0.1, it needs no
+provider keys or cloud accounts, and the walkthrough below takes you from a clone to one
+SSH session you can see in the operator console. It is not a deployment: for a sensor on the
+internet, read the [isolated-host guidance](docs/operations.md#before-you-deploy) and the
+[AWS deployment guide](deploy/aws/README.md).
+
+Requirements: Docker with Compose 2.24.4 or newer (the lab override uses `!override`; check
+with `docker compose version`), `ssh-keygen`, and about 1 GB of disk for the image (see
+[Known issues](#known-issues)).
 
 ```bash
-git clone <this repository>
-cd <repository directory>
+git clone https://github.com/mgrofsky/winnie-the-agent.git
+cd winnie-the-agent
 
 # Configuration and SSH host key (both are gitignored)
 cp SSH/config.ini.TEMPLATE SSH/config.ini
 ssh-keygen -t rsa -b 4096 -N "" -f SSH/ssh_host_key
-# The containers run as uid 10001 and read SSH/ through a read-only bind mount.
-sudo chown 10001 SSH/config.ini SSH/ssh_host_key   # Linux; Docker Desktop maps ownership itself
 ```
 
 Edit `SSH/config.ini`:
@@ -66,17 +91,85 @@ Edit `SSH/config.ini`:
 - In `[scenario]`, pick `active` (default `sip_provider`; see [Scenarios](#scenarios)).
 - Optionally change the persona model in `[llm]` (the template selects OpenAI `gpt-4o`).
   Without that provider's API key in the environment, everything still runs: the SSH and
-  Telnet shells answer with canned replies (a prompt and `command not found`), and triage
-  writes deterministic records.
+  Telnet shells answer the usual host-sizing commands (`uname`, `uptime`, `free`, `lspci`,
+  `nvidia-smi`, `/proc/cpuinfo` and more) from the scenario's host profile, a known tool's
+  own error (or nothing) when it is used in a way the shell does not reproduce, and
+  `command not found` only for unknown commands, and triage writes deterministic records.
 
-Then start the stack with the lab override, which binds every port to 127.0.0.1 on a high
-port:
+**Linux only, after you have finished editing.** The containers run as uid 10001 and read
+`SSH/` through a read-only bind mount, so that user must own the files. Once you hand them
+over you need `sudo` to edit them again, which is why this comes last. On macOS and Windows
+(Docker Desktop) skip it: Docker Desktop maps ownership itself.
 
 ```bash
-# Optional: export the [llm] provider's key, e.g. OPENAI_API_KEY=...  (passed by name)
-docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml up -d
-ssh -p 12222 guest@127.0.0.1
+sudo chown 10001 SSH/config.ini SSH/ssh_host_key
 ```
+
+Define one shell function and use it for every command below. It works in bash and zsh and
+keeps the stack, the console, the logs and the teardown on the same project (`winnie-lab`)
+and the same volumes. Run it in each new shell, since a function does not outlive the
+shell:
+
+```bash
+lab() { docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml "$@"; }
+```
+
+For the no-key demo, make sure no provider key is set in this shell. Compose passes these
+four through by name, and with one set the lab would call that provider (and bill you):
+
+```bash
+unset ANTHROPIC_API_KEY OPENAI_API_KEY GOOGLE_API_KEY AZURE_OPENAI_API_KEY
+```
+
+(Compose also reads a `.env` file in the repository directory; make sure it sets none of
+them.) Then start the stack and the operator console. The lab override binds every port to
+127.0.0.1 on a high port:
+
+```bash
+lab --profile ui up -d --build
+```
+
+*Optional, separate from this walkthrough:* to use a real model, export the key of the
+provider you chose in `[llm]` (and `[agents]`) in the shell that runs `lab ... up`, for
+example `export OPENAI_API_KEY=...`. It is passed by name and never written to a file. That
+path makes paid model calls, and the "zero model calls" result below no longer applies.
+
+Open one SSH session. The `guest` account has an empty password: press Enter when asked.
+The first connection also asks you to accept the host key.
+
+```bash
+ssh -p 12222 guest@127.0.0.1 'uname -s'      # prints: Linux
+```
+
+Then run one analysis pass. The agents container does this every hour; run it now so the
+session is processed. Without a provider key it makes no model calls:
+
+```bash
+lab exec agents python -m agents run-all --config /config/config.ini --log /data/ssh_log.log --data-dir /data --reports-dir /agents/reports --state-dir /agents/state --detections-dir /agents/detections
+```
+
+The summary it prints has `"llm_calls": 0` under `triage`, and the session's id in
+`triage.written`: that id is the session record. Note it. To see the record, print the
+console's sign-in link and open it in your browser (the console is
+`http://127.0.0.1:8480`):
+
+```bash
+lab logs ui
+```
+
+On the console's Records page, open the record whose id is the one from `triage.written`.
+Do not look for a source address: Docker may record its gateway address instead of
+`127.0.0.1` for your connection. The Activity page lists the same session's events,
+including the `uname -s` input and the answer; search it for the session id. The link
+carries a token that signs anyone in, so keep it out of screenshots, issues and chat.
+
+If a lab port is already taken on your machine (HTTP 18080 is a common one; `up` then fails
+to bind it), change only the host side (the number before
+the container port) of that mapping in `docker-compose.lab.yml`, for example
+`"127.0.0.1:12222:8022"` to `"127.0.0.1:12223:8022"`, and use the new number everywhere
+below (`ssh -p 12223`, or the console's port in the browser). Running `ssh` against a new
+host key later, after `down -v` and a new `ssh-keygen`, warns that the key changed; clear
+the old one with `ssh-keygen -R "[127.0.0.1]:12222"`.
 
 | Service | Lab port | Service | Lab port |
 |---|---|---|---|
@@ -88,9 +181,17 @@ ssh -p 12222 guest@127.0.0.1
 | MSSQL | 11433 | S3 | 19000 |
 
 Only the services enabled by the active scenario answer; nothing listens behind the other ports.
-The agents container runs `python -m agents run-all` every hour. Tear down with
-`docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml down -v`
-(`-v` deletes the volumes, including captured data).
+
+Stop the demo with:
+
+```bash
+lab --profile ui down
+```
+
+That removes the containers and keeps the volumes, so the captured log, the triage records
+and the sensor seed are still there the next time you run `lab --profile ui up -d`. Adding
+`-v` (`lab --profile ui down -v`) also deletes the volumes, and with them everything the lab
+captured.
 
 ### Without Docker
 
@@ -130,6 +231,7 @@ section after `[user_accounts]` is optional and has safe defaults.
 | `[agents]` | Analyst model and call caps per run and per day, tuner changes per run, triage records per run and record retention. |
 | `[respond]` | Response engine: enforcement queue, approval expiry, blocklist file and format, `never_act_on` ranges, proxy guard, notification caps, retention. |
 | `[connector.*]` | Outbound connectors (webhook, siem_http, email, enrich, ticket, block_webhook). All off by default. |
+| `[connector.otx]` | Indicators to an AlienVault OTX pulse: proven, active source addresses and upload hashes only. Off by default, and a dry run (written to a file, nothing sent) until `dry_run = false`. See [docs/operations.md](docs/operations.md#indicators-to-otx). |
 | `[connector.s3_events]` | Event export: ships the event log to an S3 bucket as JSON lines for a SIEM S3 reader (`python -m agents ship`, also the last step of `run-all`). Off by default; passwords are hashed unless configured otherwise. See [docs/operations.md](docs/operations.md#event-export-to-s3). |
 
 Secrets are never written to the config. API keys and connector credentials are read from
@@ -204,6 +306,27 @@ type (`connection`, `auth_attempt`, `command`, `register`, `invite`, ...).
 **The log contains every username and password attackers submit, in plain text.** See
 [docs/architecture.md](docs/architecture.md#logging-contract) for the full format.
 
+## Operator console
+
+A local web console for the operator: pipeline health, the approval queue, triage records
+with SSH transcript replay, digests, tuner state, playbooks and detections. It is
+read-only by default, listens on 127.0.0.1:8480 only, and never calls a model.
+
+![The console's overview screen, shown with test data](docs/console.png)
+
+```bash
+python -m agents ui                       # without Docker
+lab --profile ui up -d ui                 # the lab, with the `lab` function from the quick start
+lab logs ui                               # prints the sign-in link (a secret: keep it out of screenshots)
+```
+
+For a stack started without the lab override, use `docker compose --profile ui up -d ui` and
+`docker compose logs ui` from the same directory and project.
+
+On a remote host, reach it with `ssh -L 8480:127.0.0.1:8480 <host>`. Sign-in, actions
+(approve, reject, unblock) and the AWS setup are in
+[docs/operations.md](docs/operations.md#operator-console).
+
 ## Safety design
 
 - **No real system.** The SSH and Telnet shells are model output or canned text. The
@@ -215,8 +338,13 @@ type (`connection`, `auth_attempt`, `command`, `register`, `invite`, ...).
   history trimming are counted locally, so no tokenizer is ever downloaded.
 - **Uploads are quarantined.** FTP uploads are stored once per SHA-256 with mode 0600,
   under per-file, per-source and total caps, and are never read back or executed.
-- **Budgets in code.** Every model call reserves its estimated cost first; when a limit is
-  reached the model is not called and the attacker gets a canned error.
+- **Budgets in code.** Every model call reserves its estimated token cost first, against
+  per-session, per-source and host-wide daily limits (estimates, not provider billing); when a limit is
+  reached the model is not called and the attacker gets a canned error. Known commands are
+  answered by a deterministic shell without the model, a session gets at most 50 model
+  answers (then the shell answers the rest), and a bot replaying a script another session
+  already ran, with an identical history, gets the cached replies instead of new model
+  calls.
 - **The model cannot steer the system.** Models get no tools, files or network. Analyst
   output must validate against strict schemas; the tuner only picks from candidates the
   code generated; playbooks are matched and executed by code. Attacker text reaches
@@ -239,7 +367,10 @@ The full threat model is in [docs/security-model.md](docs/security-model.md).
 Read [docs/operations.md](docs/operations.md) before deploying. For AWS,
 [deploy/aws/README.md](deploy/aws/README.md) is a worked example: CloudFormation templates
 for one sensor host with no outbound route and a write-only events bucket in another
-account, with a containment checklist. In short:
+account, with a containment checklist (and an optional tailnet for the operator console). Its
+optional model access on Amazon Bedrock for the persona and the analyst (a second stack,
+`deploy/aws/models.yaml`) has been run once on a real account; the guide says what was
+seen and what is still unproven. In short:
 
 - **Run it isolated.** Put the sensor on a dedicated host or VM in its own network segment
   with no route to anything you care about. Block outbound traffic from the front-ends at
@@ -281,7 +412,13 @@ account, with a containment checklist. In short:
 - **Image size.** The Docker image is about 650 MB on disk, mostly the Python base image
   and the model provider client libraries. See
   [docs/operations.md](docs/operations.md#image-size-and-token-counting).
-- The model sometimes invents the attacker's next command and answers it too.
+- **Invented commands are handled.** A chat model playing a shell can carry on past the
+  prompt, type a command the client never sent and answer it. This is a known behaviour and
+  Winnie handles it: every model reply is cut back to the output of the one input and one
+  prompt before it is sent, stored or cached, and each cut is logged as a `Reply cut`
+  event, so you can see how often it happens. A reply to an input that can print a
+  prompt-shaped line itself (it contains `@`, `$`, a backtick, a backslash or `%`) is left
+  whole rather than risk cutting real output.
 - The daily budget is shared between processes on one host through a file lock; several
   hosts do not share one cap.
 - Changing the SSH banner or the active scenario needs a restart.

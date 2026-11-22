@@ -20,6 +20,11 @@ domains and addresses; the SIEM output keeps raw values.
   (playbook, source, action) for a configurable period.
 - ``unblock``: remove an address or network from the approved blocklist. Blocklist entries
   also expire on their own (default 30 days).
+- With ``[respond] track_before_enforce`` on, approving ``export_blocklist`` (or
+  ``block_webhook``) only puts the source on the tracked list (``tracked.json``, written
+  next to the blocklist file for the operator's cloud to watch) and calls nothing; ``enforce`` is the second, separate decision that moves one
+  tracked entry into the enforcement blocklist file and calls the block connector if it is
+  enabled. Off (the default), approving writes the entry straight to the blocklist file.
 - Every run is recorded as JSON in ``reports/response/``. ``dry_run`` writes nothing and
   calls nothing; it returns what would happen.
 
@@ -58,11 +63,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 
-import yaml
-
 from agents.addresses import is_public
 from agents.budget import ip_key
 from agents.connectors.base import Notification
+from agents.localfile import read_regular
 from agents.playbooks import (
     Playbook,
     derive_facts,
@@ -89,12 +93,18 @@ SAFE_CHARS = re.compile(r"[^A-Za-z0-9 .,:;()_/@#+=%?&'-]")
 MARKUP_CHARS = re.compile(r"[@#*_~`|<>\[\]{}!\\]")
 APPROVAL_ID_RE = r"a-[0-9a-f]{12}"
 DETECTION_FILE_RE = r"[0-9a-f]{8}-[a-z0-9-]{1,60}\.yml"
+# Written by agents/detect.py (PROVENANCE_FILE there) next to the drafts it describes.
+DETECTION_PROVENANCE_FILE = "provenance.json"
+MAX_PROVENANCE_BYTES = 4 * 1024 * 1024
 RESPONSE_FILE_RE = re.compile(r"^(\d{8}T\d{6}Z)-")
 DEFAULT_APPROVAL_TTL_HOURS = 72
 DEFAULT_LOOKBACK_HOURS = 48
 MAX_PROCESSED = 100_000
 CGNAT = ipaddress.ip_network("100.64.0.0/10")
 NOTICE_PLAYBOOK = "notify_suppressed"
+TRACKED_FILE = "tracked.json"
+TRACKED = "tracked"
+ENFORCED = "enforced"
 
 
 def sanitize(value: object, cap: int) -> str:
@@ -128,7 +138,7 @@ def _read_json(path: Path, default):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, type(default)) else default
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return default
 
 
@@ -156,6 +166,7 @@ class RespondSettings:
     blocklist_file: Optional[str] = None
     blocklist_format: str = "plain"
     blocklist_ttl_days: float = 30.0
+    track_before_enforce: bool = False
     reject_suppress_hours: float = 168.0
     expired_suppress_hours: float = 24.0
     snapshot_keep: int = 200
@@ -200,6 +211,8 @@ class RespondSettings:
                 raise ValueError(f"[respond] {f.name} has an invalid value") from None
         settings = cls(**kw)
         settings.networks()
+        if settings.blocklist_file and Path(settings.blocklist_file).name == TRACKED_FILE:
+            raise ValueError(f"[respond] blocklist_file may not be named {TRACKED_FILE}")
         if not 0 <= settings.notify_reserved_share < 1:
             raise ValueError("[respond] notify_reserved_share must be >= 0 and < 1")
         if not 0 < settings.proxy_threshold <= 1:
@@ -377,19 +390,28 @@ def suppressed_notice(connector: str, count: int, since: Optional[str]) -> Notif
 
 
 def matching_detections(record: TriageRecord, detections_dir: Path) -> list[str]:
-    """Draft files in pending/ whose recorded provenance (``related_records``) includes this
-    record. Overlap with attacker-supplied values alone never selects a draft."""
+    """Draft files in pending/ whose recorded provenance includes this record: the record
+    ids ``agents/detect.py`` wrote for each draft to ``pending/provenance.json``. Overlap
+    with attacker-supplied values alone never selects a draft."""
+    pending = detections_dir / "pending"
+    try:
+        body = read_regular(pending / DETECTION_PROVENANCE_FILE, MAX_PROVENANCE_BYTES)
+        if len(body) > MAX_PROVENANCE_BYTES:
+            return []
+        doc = json.loads(body.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return []
+    drafts = doc.get("drafts") if isinstance(doc, dict) and doc.get("version") == 1 else None
+    if not isinstance(drafts, dict):
+        return []
     out = []
-    for path in sorted((detections_dir / "pending").glob("*.yml")):
-        if not re.fullmatch(DETECTION_FILE_RE, path.name):
+    for name in sorted(drafts):
+        related = drafts[name]
+        if not isinstance(name, str) or not re.fullmatch(DETECTION_FILE_RE, name):
             continue
-        try:
-            rule = yaml.safe_load(path.read_text(encoding="utf-8"))
-            related = rule.get("related_records")
-        except (OSError, yaml.YAMLError, AttributeError):
-            continue
-        if isinstance(related, list) and record.id in {str(r) for r in related}:
-            out.append(path.name)
+        if isinstance(related, list) and record.id in {str(r) for r in related} \
+                and (pending / name).is_file():
+            out.append(name)
     return out[:20]
 
 
@@ -554,6 +576,34 @@ def list_queue(state_dir: os.PathLike | str, now: Optional[datetime.datetime] = 
     return out
 
 
+def peek_queue(state_dir: os.PathLike | str, now: Optional[datetime.datetime] = None,
+               include_closed: bool = False) -> list[dict]:
+    """What ``list_queue`` returns, as a pure read for a read-only state directory: no lock,
+    no directory, index or approval file is created or changed. An overdue pending item is
+    returned as an ``expired`` copy (a closed item). Unreadable or malformed files are
+    skipped."""
+    adir = _approvals_dir(Path(state_dir))
+    now = now or _now()
+    out = []
+    try:
+        paths = sorted(adir.glob("a-*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        if not re.fullmatch(APPROVAL_ID_RE + r"\.json", path.name):
+            continue
+        a = _read_json(path, {})
+        try:
+            expires = _parse(str(a["expires_at"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if a.get("status") == "pending" and expires <= now:
+            a = {**a, "status": "expired"}
+        if include_closed or a.get("status") == "pending":
+            out.append(a)
+    return out
+
+
 class ApprovalError(ValueError):
     pass
 
@@ -625,6 +675,22 @@ def _blocklist_target(reports_dir: Path, blocklist_file) -> Path:
     return Path(blocklist_file) if blocklist_file else reports_dir / "blocklist" / "approved.txt"
 
 
+def tracked_target(reports_dir: os.PathLike | str, blocklist_file=None) -> Path:
+    """Where the tracked export goes: ``tracked.json`` next to the blocklist file."""
+    return _blocklist_target(Path(reports_dir), blocklist_file).parent / TRACKED_FILE
+
+
+# Fields an entry may carry besides its times. Entries written with the switch off carry
+# none of them, so the store stays exactly as before; an entry without ``status`` is
+# enforced.
+_ENTRY_EXTRA = {"status": 16, "approval_id": 16, "playbook": 64, "enforced_at": 40,
+                "enforced_by": 64}
+
+
+def entry_status(value) -> str:
+    return TRACKED if isinstance(value, dict) and value.get("status") == TRACKED else ENFORCED
+
+
 def _load_blocklist(state_dir: Path, now: datetime.datetime,
                     ttl_days: float) -> tuple[dict, bool]:
     """Live entries (expired ones dropped) and whether anything was dropped or upgraded."""
@@ -642,30 +708,86 @@ def _load_blocklist(state_dir: Path, now: datetime.datetime,
         except ValueError:
             changed = True
             continue
-        live[key] = {"approved_at": approved, "expires_at": expires}
+        entry = {"approved_at": approved, "expires_at": expires}
+        if isinstance(value, dict):
+            for name, cap in _ENTRY_EXTRA.items():
+                if isinstance(value.get(name), str):
+                    entry[name] = value[name][:cap]
+            if value.get("source_verified") is True:
+                entry["source_verified"] = True
+            if "status" in entry and entry["status"] not in (TRACKED, ENFORCED):
+                del entry["status"]
+        live[key] = entry
     return live, changed
 
 
+def peek_blocklist(state_dir: os.PathLike | str, now: Optional[datetime.datetime] = None,
+                   ttl_days: float = 30.0) -> dict:
+    """Live approved blocklist entries, {key: {approved_at, expires_at, ...}}, as a pure read
+    for a read-only state directory: no lock, and expired or legacy entries are left on disk
+    (the next writer prunes them). Tracked entries carry ``status: tracked``."""
+    entries, _ = _load_blocklist(Path(state_dir), now or _now(), ttl_days)
+    return entries
+
+
+def tracked_document(entries: dict, now: datetime.datetime, sensor: str = "") -> dict:
+    """The tracked export: every live entry with its stage and times, sorted by address.
+    Nothing else (no approval ids, playbooks, operator names or secrets)."""
+    rows = [{"address": key, "status": entry_status(value),
+             "approved_at": _entry_times(value)[0], "expires_at": _entry_times(value)[1]}
+            for key, value in sorted(entries.items())]
+    return {"version": 1, "generated_at": _iso(now), "sensor": sanitize(sensor, 64),
+            "entries": rows}
+
+
+def write_tracked(path: Path, entries: dict, now: datetime.datetime, sensor: str = "") -> None:
+    """Write the tracked export whole and atomically, so removals and expiry propagate."""
+    text = json.dumps(tracked_document(entries, now, sensor), indent=2, sort_keys=True) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    # Owner only: the exporter and the console read it as the same user.
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
 def _write_blocklist_files(state_dir: Path, reports_dir: Path, entries: dict, blocklist_file,
-                           fmt: str) -> Path:
+                           fmt: str, track: bool = False, now: Optional[datetime.datetime] = None,
+                           sensor: str = "") -> Path:
+    """Store every entry; the blocklist file gets only enforced ones. With ``track`` the
+    tracked export is rewritten too."""
     _atomic_json(_blocklist_store(state_dir), entries)
     target = _blocklist_target(reports_dir, blocklist_file)
-    write_blocklist(target, entries, fmt)
+    write_blocklist(target, {k: v for k, v in entries.items() if entry_status(v) == ENFORCED},
+                    fmt)
+    if track:
+        write_tracked(target.parent / TRACKED_FILE, entries, now or _now(), sensor)
     return target
+
+
+def _target_network(target: str):
+    value = str(target).strip()
+    if "/" in value:
+        return ipaddress.ip_network(value, strict=False)
+    return ipaddress.ip_network(ip_key(str(ipaddress.ip_address(value))), strict=False)
 
 
 def unblock(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike | str,
             blocklist_file: Optional[os.PathLike | str] = None, blocklist_format: str = "plain",
-            now: Optional[datetime.datetime] = None, ttl_days: float = 30) -> dict:
+            now: Optional[datetime.datetime] = None, ttl_days: float = 30,
+            by: Optional[str] = None, track_before_enforce: bool = False,
+            sensor: str = "") -> dict:
     """Remove an address (its IPv4 address or IPv6 /64 key) or every entry inside a
-    network from the approved blocklist, then rewrite the blocklist file."""
+    network from the approved blocklist, tracked or enforced, then rewrite the blocklist
+    file (and, with ``track_before_enforce``, the tracked export). An audit record goes to
+    ``<reports_dir>/response`` first: the STIX export revokes from it, so when it cannot be
+    written the unblock fails and the blocklist is left as it was."""
     state_dir, reports_dir = Path(state_dir), Path(reports_dir)
     now = now or _now()
     value = str(target).strip()
-    if "/" in value:
-        net = ipaddress.ip_network(value, strict=False)
-    else:
-        net = ipaddress.ip_network(ip_key(str(ipaddress.ip_address(value))), strict=False)
+    net = _target_network(value)
+    who = sanitize(by or getpass.getuser(), 64)
     with _locked(state_dir):
         entries, _ = _load_blocklist(state_dir, now, ttl_days)
         removed = []
@@ -674,9 +796,100 @@ def unblock(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike 
             if k.version == net.version and (k == net or k.subnet_of(net)):
                 removed.append(key)
                 del entries[key]
+        # "unblock" never matches APPROVAL_ID_RE, so this cannot overwrite an approval
+        # record; the leading stamp keeps it under apply_retention.
+        _atomic_json(reports_dir / "response" /
+                     f"{now.strftime('%Y%m%dT%H%M%SZ')}-unblock-{secrets.token_hex(3)}.json",
+                     {"timestamp": _iso(now),
+                      "unblock": {"target": sanitize(value, 64), "removed": sorted(removed),
+                                  "by": who}})
         path = _write_blocklist_files(state_dir, reports_dir, entries, blocklist_file,
-                                      blocklist_format)
+                                      blocklist_format, track_before_enforce, now, sensor)
     return {"removed": sorted(removed), "entries": len(entries), "file": path.name}
+
+
+class EnforceError(ValueError):
+    """``enforce`` refused; the message says why and nothing changed."""
+
+
+class EnforceChanged(EnforceError):
+    """``enforce`` refused because the entry no longer matches what the caller saw."""
+
+
+
+def _verified_entry(state_dir: Path, key: str, entry: dict) -> bool:
+    """Whether the tracked entry still comes from a verified source: it was recorded as one
+    when approved and, while its approval file exists, that file agrees."""
+    if entry.get("source_verified") is not True or not valid_source_key(key):
+        return False
+    aid = str(entry.get("approval_id", ""))
+    if not re.fullmatch(APPROVAL_ID_RE, aid):
+        return False
+    path = _approvals_dir(state_dir) / f"{aid}.json"
+    if not path.exists():
+        return True   # aged out by retention; the entry's own record stands
+    a = _read_json(path, {})
+    return (a.get("status") == "done" and a.get("action") in ("export_blocklist", "block_webhook")
+            and a.get("subject") == key and not a.get("unverified_source"))
+
+
+def enforce(target: str, state_dir: os.PathLike | str, reports_dir: os.PathLike | str,
+            connectors=None, by: Optional[str] = None,
+            blocklist_file: Optional[os.PathLike | str] = None, blocklist_format: str = "plain",
+            now: Optional[datetime.datetime] = None, ttl_days: float = 30.0,
+            never_act_on: tuple[str, ...] = (), track_before_enforce: bool = True,
+            sensor: str = "", expected: Optional[dict] = None) -> dict:
+    """Move one tracked entry to ``enforced``: the second, separate decision that blocks.
+
+    ``target`` is an address (or its IPv6 /64 key) exactly as listed. The checks approval
+    runs are run again (verified source, public address, ``never_act_on``, not expired);
+    an entry that is not tracked, or already enforced, is refused with ``EnforceError``.
+    Then the blocklist file (and the tracked export) is rewritten, an audit record is
+    written and, if the block connector is enabled, it is called as ``block_webhook`` is.
+    A failed connector call is reported; the entry stays enforced in the file.
+
+    ``expected`` is what the caller saw of the entry (for example its ``approved_at``,
+    ``expires_at`` and ``approval_id``); when given, it is compared under the lock and any
+    difference (the entry was removed and approved again since) raises ``EnforceChanged``."""
+    state_dir, reports_dir = Path(state_dir), Path(reports_dir)
+    now = now or _now()
+    networks = RespondSettings(never_act_on=tuple(never_act_on)).networks()
+    try:
+        net = _target_network(target)
+    except ValueError:
+        raise EnforceError("not an address or blocklist entry") from None
+    who = sanitize(by or getpass.getuser(), 64)
+    with _locked(state_dir):
+        entries, _ = _load_blocklist(state_dir, now, ttl_days)
+        key = next((k for k in entries if ipaddress.ip_network(k, strict=False) == net), None)
+        if key is None:
+            raise EnforceError(f"{sanitize(target, 64)} is not on the tracked list "
+                               "(never approved, removed or expired)")
+        entry = entries[key]
+        if expected is not None and any(entry.get(k) != v for k, v in expected.items()):
+            raise EnforceChanged(f"{key} changed since it was shown")
+        if entry_status(entry) == ENFORCED:
+            raise EnforceError(f"{key} is already enforced")
+        if not _verified_entry(state_dir, key, entry):
+            raise EnforceError(f"refused: {key} is not a verified source")
+        reason = source_refusal(key, networks)
+        if reason:
+            raise EnforceError(f"refused: {reason}")
+        entry.update(status=ENFORCED, enforced_at=_iso(now), enforced_by=who)
+        path = _write_blocklist_files(state_dir, reports_dir, entries, blocklist_file,
+                                      blocklist_format, track_before_enforce, now, sensor)
+    result: dict = {"target": key, "status": ENFORCED, "file": path.name,
+                    "enforced_at": entry["enforced_at"],
+                    "entries": sum(1 for v in entries.values() if entry_status(v) == ENFORCED)}
+    if connectors is not None and connectors.enabled("block_webhook"):
+        r = connectors.block(key, str(entry.get("playbook", "")) or "enforce")
+        result["connector"] = {"ok": bool(r.ok), "status": r.status}
+    else:
+        result["connector"] = {"ok": None, "status": "not called: block connector disabled"}
+    _atomic_json(reports_dir / "response" /
+                 f"{now.strftime('%Y%m%dT%H%M%SZ')}-enforce-{secrets.token_hex(3)}.json",
+                 {"timestamp": _iso(now), "enforce": {**result, "by": who}})
+    return result
 
 
 # ---- approve / reject --------------------------------------------------------------------
@@ -685,8 +898,13 @@ def approve(aid: str, state_dir: os.PathLike | str, reports_dir: os.PathLike | s
             detections_dir: os.PathLike | str, connectors=None, by: Optional[str] = None,
             blocklist_file: Optional[os.PathLike | str] = None, blocklist_format: str = "plain",
             now: Optional[datetime.datetime] = None, blocklist_ttl_days: float = 30.0,
-            expired_suppress_hours: float = 24.0, never_act_on: tuple[str, ...] = ()) -> dict:
+            expired_suppress_hours: float = 24.0, never_act_on: tuple[str, ...] = (),
+            track_before_enforce: bool = False, sensor: str = "") -> dict:
     """Execute one queued enforce action after re-checking it. Returns the approval.
+
+    With ``track_before_enforce``, ``export_blocklist`` and ``block_webhook`` add the source
+    to the tracked list only and call nothing; an entry that is already enforced stays
+    enforced and gets a fresh expiry. ``enforce`` is what calls the block connector.
 
     The pending -> executing transition happens under the queue lock, so only one of
     several concurrent approvals of the same id executes."""
@@ -718,14 +936,35 @@ def approve(aid: str, state_dir: os.PathLike | str, reports_dir: os.PathLike | s
         result = {"ok": False, "status": f"refused: {reason}"}
     else:
         action = a.get("action")
-        if action == "export_blocklist":
+        # With the switch on, approving block_webhook is the same first decision as
+        # export_blocklist: the source is tracked and nothing is called. Only enforce
+        # calls the block connector.
+        if action == "export_blocklist" or (action == "block_webhook" and track_before_enforce):
+            times = {"approved_at": _iso(now), "expires_at": _iso(
+                now + datetime.timedelta(days=blocklist_ttl_days))}
             with _locked(state_dir):
                 entries, _ = _load_blocklist(state_dir, now, blocklist_ttl_days)
-                entries[subject] = {"approved_at": _iso(now), "expires_at": _iso(
-                    now + datetime.timedelta(days=blocklist_ttl_days))}
+                old = entries.get(subject)
+                if not track_before_enforce:
+                    entries[subject] = times
+                elif old is not None and entry_status(old) == ENFORCED:
+                    entries[subject] = {**old, **times}
+                else:
+                    entries[subject] = {**times, "status": TRACKED, "approval_id": aid,
+                                        "playbook": str(a.get("playbook", ""))[:64],
+                                        "source_verified": True}
                 target = _write_blocklist_files(state_dir, reports_dir, entries, blocklist_file,
-                                                blocklist_format)
-            result = {"ok": True, "status": f"written to {target.name}", "entries": len(entries)}
+                                                blocklist_format, track_before_enforce, now,
+                                                sensor)
+            if not track_before_enforce:
+                result = {"ok": True, "status": f"written to {target.name}",
+                          "entries": len(entries)}
+            elif entry_status(entries[subject]) == ENFORCED:
+                result = {"ok": True, "status": f"already enforced in {target.name}; expiry "
+                          "extended", "entries": len(entries)}
+            else:
+                result = {"ok": True, "status": f"tracked in {TRACKED_FILE}; nothing blocked",
+                          "entries": len(entries)}
         elif action == "publish_detection":
             moved = []
             for name in a.get("params", {}).get("files", []):
@@ -755,9 +994,11 @@ def approve(aid: str, state_dir: os.PathLike | str, reports_dir: os.PathLike | s
 
 
 def reject(aid: str, state_dir: os.PathLike | str, by: Optional[str] = None,
-           now: Optional[datetime.datetime] = None, suppress_hours: float = 168) -> dict:
+           now: Optional[datetime.datetime] = None, suppress_hours: float = 168,
+           reports_dir: Optional[os.PathLike | str] = None) -> dict:
     """Reject one queued action. The same (playbook, source, action) is not queued again
-    for ``suppress_hours``."""
+    for ``suppress_hours``. With ``reports_dir``, an audit record goes to its ``response``
+    directory, as for an approval."""
     state_dir = Path(state_dir)
     now = now or _now()
     with _locked(state_dir):
@@ -770,6 +1011,10 @@ def reject(aid: str, state_dir: os.PathLike | str, by: Optional[str] = None,
         idx = _load_index(state_dir)
         _close_in_index(idx, a, now, "rejected", suppress_hours)
         _save_index(state_dir, idx, now)
+    if reports_dir is not None:
+        _atomic_json(Path(reports_dir) / "response" /
+                     f"{now.strftime('%Y%m%dT%H%M%SZ')}-{aid}.json",
+                     {"timestamp": _iso(now), "approval": a})
     return a
 
 
@@ -943,6 +1188,7 @@ class _Run:
     now: datetime.datetime
     st: EngineState
     proxy: Optional[dict] = None
+    sensor: str = ""
     runs: list = dataclasses.field(default_factory=list)
     local_ops: list = dataclasses.field(default_factory=list)  # (step, record, playbook)
 
@@ -952,9 +1198,11 @@ def run_respond(reports_dir: os.PathLike | str, state_dir: os.PathLike | str,
                 connectors=None, playbooks: Optional[list[Playbook]] = None,
                 scenario_name: Optional[str] = None, seed: Optional[str] = None,
                 dry_run: bool = False, now: Optional[datetime.datetime] = None,
-                settings: Optional[RespondSettings] = None, **options) -> dict:
+                settings: Optional[RespondSettings] = None, sensor: str = "",
+                **options) -> dict:
     """Run enabled playbooks on new records. ``options`` override fields of ``settings``
-    (for example ``queue_enforce=True``)."""
+    (for example ``queue_enforce=True``). ``sensor`` names the sensor in the tracked
+    export."""
     settings = dataclasses.replace(settings or RespondSettings(), **options)
     networks = settings.networks()
     if playbooks is None:
@@ -965,7 +1213,7 @@ def run_respond(reports_dir: os.PathLike | str, state_dir: os.PathLike | str,
     run = _Run(settings=settings, reports_dir=Path(reports_dir), state_dir=Path(state_dir),
                detections_dir=Path(detections_dir), connectors=connectors,
                scenario_name=scenario_name, seed=seed, dry_run=dry_run, now=now or _now(),
-               st=EngineState(Path(state_dir)))
+               st=EngineState(Path(state_dir)), sensor=sensor)
     run.st.roll(run.now)
 
     window = _records_in_window(run.reports_dir, run.now, settings.lookback_hours)
@@ -1162,9 +1410,16 @@ def _finish(run: _Run) -> tuple[dict, Optional[dict]]:
     run.st.save(now)
     with _locked(run.state_dir):
         entries, changed = _load_blocklist(run.state_dir, now, settings.blocklist_ttl_days)
-        if changed:
+        # Tracked mode rewrites every run, so the export's generated_at shows it is current.
+        # A missing blocklist file is rewritten too: a new volume mounted over its
+        # directory (an upgrade) must not leave the firewall without its list.
+        # Nothing is written before the first approval, as before.
+        missing = _blocklist_store(run.state_dir).exists() and \
+            not _blocklist_target(run.reports_dir, settings.blocklist_file).exists()
+        if changed or missing or settings.track_before_enforce:
             _write_blocklist_files(run.state_dir, run.reports_dir, entries,
-                                   settings.blocklist_file, settings.blocklist_format)
+                                   settings.blocklist_file, settings.blocklist_format,
+                                   settings.track_before_enforce, now, run.sensor)
     retention = apply_retention(run.state_dir, run.reports_dir, now, settings)
     alarm = size_alarm(run.state_dir, run.reports_dir, settings)
     return retention, alarm

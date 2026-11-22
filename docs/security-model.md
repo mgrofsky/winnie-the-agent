@@ -49,6 +49,19 @@ connections are accepted only from the control connection's source. The S3 trap 
 traffic a front-end originates is a model API call, when a model is configured. Enforce
 this with a host firewall as well (see [operations.md](operations.md#egress-control-in-production)).
 
+### Address locations come from files, not the network
+
+The optional `[geoip]` lookup (country, city and network owner of a source address) reads
+`.mmdb` files on disk and makes no network call: no web lookup and no DNS, so it adds no
+egress and tells no third party which addresses touched the sensor. Reverse DNS is not
+done. The files are third-party content and are treated as data: names are stripped of
+control and format characters and clipped, the country code must be two capital letters
+and the AS number a 32-bit integer or they are dropped, the console shows them only as
+text nodes, and the digest puts them in code spans. A missing, corrupt or replaced file
+turns the lookup off or changes what is shown; it cannot raise into the agents or the
+console, and a looked-up place never enters an approval's `view_hash`, so a database
+update cannot block or change a decision.
+
 ### Not a reflector
 
 Over UDP, SIP sends at most one response per request, never larger than the request by
@@ -66,8 +79,10 @@ line and appears in the daily digest.
 
 ### Bounded resources
 
-- Model spend: per session, per source per day (IPv6 per /64) and global daily token caps,
-  command caps and concurrency limits, reserved before every call
+- Model spend: per session, per source per day (IPv6 per /64) and global daily estimated
+  token caps, command caps and concurrency limits, reserved before every call (the host-wide
+  and per-source checks and the charge happen in one locked step, so processes sharing the
+  state file cannot both take the last of a cap)
   ([architecture.md](architecture.md#budgets)).
 - Listeners: connection slots globally, per source, per service and per source per service;
   rate limits; read timeouts; minimum-progress checks; byte and command caps per connection;
@@ -97,7 +112,7 @@ object (analysts).
 |---|---|---|
 | Persona (SSH, Telnet) | the text the attacker sees in that session | anything else: its output is sent to the attacker and logged, nothing more |
 | SQL / HTTP fallback | column names and capped cell values, or a JSON body, validated against a strict schema | protocol state, other connections, files |
-| Triage analyst | intent, stage, skill, judgement, techniques, a narrative and extra IOCs, all schema-validated | severity below the deterministic floor; IOCs that do not appear verbatim in the transcript; which playbooks run beyond what those enum fields select |
+| Triage analyst | intent, stage, skill, judgement, techniques, a narrative (headline, actions, assessment, not seen, paragraph) and extra IOCs, all schema-validated; who, volume and target are computed by code | severity below the deterministic floor; IOCs that do not appear verbatim in the transcript; which playbooks run beyond what those enum fields select |
 | Tuner ranking | the order of candidates the code generated, by index | any value written to the overlay |
 | Detect | a length-capped, character-restricted title and description | the rule body and selectors |
 
@@ -109,7 +124,8 @@ control is schema validation plus the fact that no free-form model text flows in
 persona prompt, the config, the overlay or a playbook decision.
 
 Playbooks match only on enum and numeric fields of a validated record plus facts computed by
-code. The model-written narrative leaves the honeypot only if
+code; the narrative parts are read by nothing but the digest and the console, which show
+them as escaped text. The model-written narrative leaves the honeypot only if
 `[respond] include_narrative = true`, labelled untrusted, stripped of markup, and cut to
 fit the 300-character summary.
 
@@ -137,11 +153,22 @@ authentication only and are never rendered into a prompt.
 - **Tiers fixed in code.** Local actions change only this honeypot. Notify actions go only
   to connectors the operator enabled. Enforce actions (blocklist, detection publishing,
   tickets, block webhook) never run without `python -m agents approve <id>`, and only if
-  `[respond] queue_enforce = true`. Approvals expire.
+  `[respond] queue_enforce = true`. Approvals expire. With `[respond]
+  track_before_enforce = true`, approving a blocklist entry only tracks it, and blocking
+  takes a second decision by a person (`python -m agents enforce <address>` or the
+  console's Enforce), which runs the approval checks again. Nothing triggers enforcement
+  on its own, sightings included.
 - **Source gates.** UDP sources that never completed a nonce round trip, non-global
   addresses and `never_act_on` ranges get no per-source action of any tier. This prevents
   an attacker from spoofing a victim's address into a blocklist or a tarpit. Gates are
   checked again at approval time.
+- **Output used elsewhere.** Addresses reach enforcement only through an approved enforce
+  action. Everything the sensor writes (blocklist candidates, the approved blocklist, Sigma
+  drafts, exported events) is evidence from a host that talks to attackers, and a system
+  that consumes it should act
+  only on proven sources, expire entries, check an allow-list first and treat the sensor as
+  possibly compromised. See
+  [Using the intelligence outside the sensor](operations.md#using-the-intelligence-outside-the-sensor).
 - **Proxy guard.** If one non-global address accounts for most records, per-source actions
   are refused for the run, since every client would otherwise share one identity.
 - **Connectors.** `https` only (SMTP requires STARTTLS before credentials); no private or
@@ -177,6 +204,134 @@ authentication only and are never rendered into a prompt.
   for the sensor. AWS endpoints are not pinned the way connector destinations are; the
   TLS certificate check against the AWS host name is the protection. Delivery is at least
   once.
+- **Tracked list and sightings.** Two more flows, both off by default and run by the
+  agents process only (see [operations.md](operations.md#tracked-list-and-sightings)):
+  - *One object out.* `[connector.tracked_export]` sends `tracked.json`: each listed
+    address, its status (`tracked` or `enforced`), its approval and expiry times, and the
+    sensor name. No approval ids, playbooks, operator names or secrets.
+  - *One object in.* `[connector.sightings]` fetches `sightings.json`, written by the
+    operator's environment. It is untrusted: whoever can write that object, or the
+    local file, controls its content. It is parsed strictly and refused whole on the first
+    problem (size and entry caps, exact types, valid addresses and timestamps), strings are
+    cut to 64 characters with control and invisible characters removed, unknown keys and
+    unlisted addresses are ignored, and a refused copy never replaces a good one. The
+    console renders it as text like everything else. It is display only: no code path
+    acts on a sighting.
+  - With `kind = s3`, each flow builds its own client with a guard that refuses, before a
+    request is sent, every operation but its one (`PutObject` out, `GetObject` in) and
+    every bucket and key but the configured one. Credentials come from the default chain.
+    An `endpoint_url` for another S3-compatible store must be `https` and is checked at
+    load (a private address or `localhost` needs `allow_private`), but the S3 client
+    resolves the name itself on each call, so unlike the HTTP connectors the address is
+    not pinned; the TLS certificate check is the protection. With `kind = https`, the
+    connector rules above apply, and the token may come from `secret_file`, read at each
+    call and never logged.
+  - What a sensor taken over learns from them: which addresses the operator tracks and
+    enforces, and when, from `tracked.json`; and where, on which service, how often and
+    when each was seen elsewhere, at whatever granularity the producer chose to write. The
+    producer should write the minimum: listed addresses only, coarse labels, no internal
+    host names, addresses or account ids.
+- **Shodan InternetDB lookup.** One more outbound destination for the agents process,
+  off by default (`[connector.internetdb]`, see
+  [operations.md](operations.md#what-shodan-already-knows-about-a-source)). It runs at the
+  end of `run-all` / `ship`, never in a honeypot container, and adds no connection between
+  containers: results go to a local file that triage and the console read.
+  - *What it carries.* One HTTPS GET per address to `internetdb.shodan.io`, the address in
+    the path and nothing else: no key, no cookie, a generic user agent, nothing about what
+    the source did. The host is a constant in the code with no configuration key; the
+    connection goes to a resolved, checked and pinned public address, the certificate is
+    verified, redirects are refused, each call has a 5 second deadline and a 64 KB cap.
+    Only single global unicast sources of SUSPICIOUS, MALICIOUS or honeytoken records are
+    sent, never an unverified UDP source or anything in `[respond] never_act_on`. Shodan
+    learns which addresses this sensor found interesting, at most 100 per run and 2000 a
+    day; the sources themselves see nothing, since InternetDB answers from data it already
+    holds.
+  - *The answer is data.* Host names are attacker-influenced. Every value is checked
+    against a strict pattern and bound (ports 1 to 65535, hostname character set and
+    length, a CVE id pattern) and anything else is dropped; an answer for another address
+    or not a JSON object is not kept; the file is checked again when read. It is display
+    only: no code path acts on it, it never enters a model prompt, a record summary or an
+    approval's `view_hash`, and the console shows it as text nodes.
+  - *Failure is quiet.* Rate limits, server errors and unreachability stop that run and
+    back off; triage, response and the console carry on as with the feature off.
+  - *Delivered mode* (`mode = delivered`, see
+    [operations.md](operations.md#delivered-answers)). The sensor has no path to
+    InternetDB at all: the lookup happens outside it, and the sensor gains no new outbound
+    destination, only one more object written and one read in the store it already uses.
+    Both files are data. The wanted list leaving the sensor holds addresses only (the
+    same selection as a direct lookup, `never_act_on` applied when it is written and again
+    before it leaves, rebuilt from the checked addresses so nothing else in the file can
+    go). The answers object coming in is untrusted: refused whole over its size or entry
+    caps or when it is not a version 1 object, and each answer is dropped unless it is for
+    an address the sensor asked for or already holds, has a sane `checked_at`, and passes
+    the same field checks as a direct answer. A producer that is taken over can therefore
+    show wrong ports or tags for addresses the sensor itself chose, and nothing more: the
+    answers stay display only. A sensor that is taken over learns nothing new from it and
+    can write only the wanted list (on AWS the answers key is outside the prefix it may
+    write, so it cannot write its own answers).
+  - *The exporter's own lookups* (`[connector.internetdb_exchange] kind = lookup`, see
+    [operations.md](operations.md#the-exporter-asks-internetdb); on AWS `InternetDbLookup`).
+    The exporter gains one outbound destination, `internetdb.shodan.io`, carrying exactly
+    what a direct lookup carries (one GET per address, the address in the path and nothing
+    else) under the same caps, pacing, cache and back-off. The agents container still has
+    no egress and gets none: it reads attacker-influenced text and runs the model, so it
+    only writes the wanted list and reads the answers file, as in delivered mode. The
+    wanted list is untrusted input to the exporter: it is read with a size cap, must be a
+    version 1 list of at most 500 distinct canonical global addresses or it is refused
+    whole, `never_act_on` is applied again, and only a checked address reaches the request,
+    as the path of a fixed URL; nothing in the file chooses the host, a header or any other
+    content. What a taken-over agents container can do through it is choose which public
+    addresses the exporter asks about, within `max_per_run` and `max_per_day`. The
+    exporter's cache, counters and back-off are in its own state volume, which the agents
+    container cannot write; answers reach the shared answers file only through the same
+    checks as answers from the store. On AWS the host firewall lets uid 10001 reach tcp 443
+    only on the IPv4 addresses `internetdb.shodan.io` resolved to (at most 8, refreshed
+    every 15 minutes by root, global unicast only), and the exporter connects only to those
+    addresses, verifying the certificate for the fixed name. InternetDB sits behind a
+    shared CDN, so those addresses also serve other sites: the rule is wider than one host,
+    and what keeps it to InternetDB is that the exporter, the only process allowed, has the
+    host fixed in code and checks the certificate. Code execution inside the exporter could
+    use those addresses to reach other sites on that CDN; it could already reach S3.
+- **Indicators to OTX.** One more outbound destination, off by default and dry by default
+  even when enabled (`[connector.otx]`, see
+  [operations.md](operations.md#indicators-to-otx); on AWS `OtxSubmit`). It is the only
+  flow that hands sensor findings to a public service.
+  - *What leaves.* IPv4 source addresses and, if `hashes` is on, SHA-256 hashes of
+    quarantined uploads, added to one pulse per UTC day on `otx.alienvault.com`. Each
+    indicator's title and description are fixed text plus a protocol name and class names
+    from fixed lists. Also the pulse name, description and tags from config, and the API
+    key in one header. Nothing an attacker wrote: no URL, domain, command, credential,
+    user name, user agent or file name.
+  - *Why attacker text cannot steer it.* An attacker could otherwise name an innocent host
+    in a command and get it listed. The address sent is the source's own, and only when the
+    source is proven (TCP, or a SIP nonce round trip) and global unicast, outside
+    `never_act_on` and not the sensor's own address. The hash sent is the one the front-end
+    computed over bytes the source itself uploaded, taken from the quarantine's metadata
+    (written only by the front-ends), never a hash quoted in text; a file cut at the
+    quarantine cap is left out. Whether a source qualifies comes from counted facts
+    (accepted logins, planted credentials used, high-signal events the code assigns); the
+    model's judgement can only veto. The worst a source can do on purpose is get its own
+    address, or the hash of a file it uploaded, published, which is the point.
+  - *The hand-off.* `run-all` writes the candidates file (addresses, hashes, fixed names,
+    timestamps); the sender reads it as untrusted input: a regular file only, at most
+    256 KB, every field checked against its pattern or list, the whole file refused on any
+    problem, `never_act_on` applied again. What a taken-over agents container can do
+    through it is choose which global IPv4 addresses and well-formed hashes are submitted,
+    within `max_per_run` and `max_per_day`, under the operator's OTX account. That is a
+    reputation risk (an innocent address could be listed), bounded by the caps and visible
+    in the pulse and the events. The dry run, on by default, lets the operator read every
+    request before any is sent.
+  - *The call.* Host fixed in code, pinned public address, certificate and name checked,
+    no redirects, no proxy, 15 second deadline, 1 MB cap, back-off on any failure. Only the
+    new pulse's id is read from an answer, and only in the shape OTX uses. Sent indicators
+    are remembered so none is sent twice.
+  - *The key.* From an environment variable or a key file, read only when a request is
+    about to be sent; never logged and never written to state, events, the dry-run file or
+    an error message (errors carry the exception type only). On AWS it is a SecureString
+    read at boot by root into a file only the exporter mounts.
+  - *What a pulse reveals.* A public pulse tells anyone that the account's owner runs a
+    honeypot and roughly when each listed source hit it. Private (`public = false`) is the
+    default.
 - **Notification content.** Built from structured fields; attacker-derived URLs, domains,
   addresses and `@` are defanged in chat, email and ticket outputs; the enrichment
   response is treated as untrusted and flattened to a few short scalar fields.
@@ -191,6 +346,143 @@ write only their own data volume; they read the overlay and per-source state but
 change them. The agents read the front-end volume read-only and do not mount the
 repository. A compromised listener therefore cannot alter what the agents produce, and a
 compromised agents process cannot change the front-ends' code or configuration.
+
+## Operator console
+
+`python -m agents ui` (see [operations.md](operations.md#operator-console)) is a web
+console for the operator. It is a security component even though only the operator uses
+it: almost everything it displays was typed by attackers.
+
+**What it can read and write.**
+
+| Mode | Reads | Writes |
+|---|---|---|
+| Read-only (default) | event log, agent data (records, digests, queue, tuner and decoy state, detections, sightings file), overlay, playbooks | nothing (in Docker every mount is read-only) |
+| Actions on (`--actions` or `[ui] actions = true`, plus agent data mounted read-write) | the same | approval queue, blocklist store and file, `tracked.json`, `response/` audit records, approved detections: what `approve`, `reject`, `unblock` and `enforce` write |
+
+With actions on it calls the same `approve`, `reject`, `unblock` and `enforce` functions as
+the CLI, so the same gates apply: the source is re-checked at approval and at
+enforcement, the queue lock stops a double execution, expired items cannot be approved.
+Decisions are recorded as `ui:<operator>`. The overlay and the event log stay read-only
+in both modes. With actions on, the console is in the same trust zone as the agents
+container.
+
+**Loopback only, behind a tunnel.** The server binds a loopback address and refuses
+anything else unless told otherwise; the Docker service binds 0.0.0.0 inside its container
+and the host publishes it on 127.0.0.1 only. There is no public URL and no inbound port:
+the operator reaches it through `ssh -L` or SSM port forwarding. The console is on a
+network of its own, so the honeypot containers cannot connect to it. That network cannot
+be internal (Docker does not publish ports from internal networks), so what limits the
+container's egress is what it holds: no model key, no AWS settings, no connector secrets,
+read-only data.
+
+**Optional external name, behind a same-host proxy.** With `[ui] external_host` (or
+`--external-host`) set, the console also answers to that one HTTPS name, served by a
+TLS-terminating reverse proxy on the same host that forwards to the loopback port (see
+[operations.md](operations.md#reaching-it-over-a-private-network)). It still binds
+loopback, and the bind guard is unchanged. What changes:
+
+- Who can reach the console is then decided by the VPN's access rules, not by host
+  access. Allow only the operator's devices, to that one port, and nothing initiated from
+  the sensor towards them.
+- Join the sensor with a tagged key and check the tag after joining: an untagged key
+  joins it as the key's creator, with that person's access to the whole private network.
+  See [operations.md](operations.md#joining-the-sensor-to-the-vpn).
+- The token and session checks are unchanged. Under the external name a POST needs an
+  `https://` `Origin` equal to that name, the cookie is `Secure`, and responses carry
+  HSTS. A session is bound to the kind of name it was issued under (loopback or external),
+  so a cookie from one is refused on the other.
+- The console never reads `X-Forwarded-*`, `Forwarded` or identity headers. It cannot tell
+  a proxied request from a direct one, so nothing the proxy adds can sign anyone in or
+  change a check.
+- A sign-in page that hands out the token (the AWS template's optional `/go`,
+  `UiTailnetSignIn`) removes the token as a second check: whoever the access rules let
+  reach the node is signed in, and with actions on can approve blocks. The console itself
+  still trusts no header; the page simply gives every admitted visitor the token.
+- Opening tcp 443 for the VPN client (or for the exporter's InternetDB lookups,
+  `InternetDbLookup`, or its OTX submissions, `OtxSubmit`) opens it for every process on
+  the host network. On
+  the AWS template that would include the exporter, the one container with the instance
+  role, which reads attacker-written data; the template therefore limits its user (uid
+  10001) with host `OUTPUT` rules to what it reached before the option (its endpoints, the
+  S3 prefix list's CIDRs, the metadata service, DNS) and nothing over the tunnel, and
+  rejects the rest; with `InternetDbLookup` also InternetDB's pinned addresses, and with
+  `OtxSubmit` OTX's (one /32 each, after the other rules). Those rules fail closed: a missing or stale prefix list stops the
+  export, it never widens the reach. They are applied before Docker starts at every boot,
+  because Docker restarts the containers itself, and Docker does not start without at
+  least the exporter's `REJECT`. They depend on the exporter running as uid 10001 and
+  on nothing else unprivileged running on the host network.
+- If the node's state is kept outside the host (the AWS template keeps it in a Parameter
+  Store SecureString so a rebuilt host is the same node), that parameter is a credential
+  for the node: anyone who can read it can join a copy of the sensor to the network, with
+  the sensor's tag and access. The instance role is the only principal the template lets
+  write it.
+- A name a public CA issues a certificate for appears in certificate transparency logs.
+  Give the node a neutral name that does not say it is a sensor or a honeypot.
+- This is for a private network. A public reverse proxy or tunnel would put the sign-in
+  page on the internet with only the token in front of it; do not use one.
+
+**Sign-in and request checks** (`agents/ui/server.py`):
+
+- At start the server logs one sign-in link with a random token (or uses
+  `WINNIE_UI_TOKEN`, at least 24 characters). `GET /?token=...` sets an HttpOnly,
+  SameSite=Strict session cookie. The cookie holds its issue time and an HMAC-SHA256 of
+  it under a random key made fresh at every start, never derived from the token: a
+  session ends when the server restarts (even with a fixed `WINNIE_UI_TOKEN`) and after 12
+  hours, both enforced by the server, with nothing stored server-side. An altered,
+  expired or future-dated cookie gets the same 401 as no cookie. The CSRF value is an
+  HMAC of the cookie value, so one session's value is refused with another's cookie. The
+  token itself is never stored in a cookie, returned by an endpoint or logged again.
+- The sign-in token is not used up: after a restart or expiry the operator opens the same
+  logged link again (with a fixed `WINNIE_UI_TOKEN`, the same link across restarts). The
+  token is compared first, so the correct one always signs in; failed attempts are
+  counted and answered 429 once over 10 a minute, which slows guessing but cannot lock the
+  operator out.
+- Every request's `Host` must name localhost, 127.0.0.1 or [::1], which defeats DNS
+  rebinding. Every POST also needs an `Origin` exactly equal to `http://` plus that
+  `Host` (so a page on another local port or under another loopback name cannot post),
+  the session cookie, the `X-Winnie-CSRF` header, actions turned on, and a JSON object
+  body of at most 16 KiB.
+- A POST refused by any of those checks is answered before its body is read and the
+  connection closed, so an unauthenticated client cannot hold a worker with a slow body.
+  An accepted body must arrive within 10 seconds in total. At most 32 connections are
+  served at once; the rest get a fixed 503. HTTP/0.9 requests are closed unanswered.
+- Static files come from a fixed table; no file is looked up from the request path.
+  Errors become a bare 500.
+- The console's unblock removes exactly one listed entry: the target must parse to a key
+  already on the blocklist. A network covering several entries (or everything, such as
+  `0.0.0.0/0`) is refused; ranges are unblocked with `python -m agents unblock`.
+- Enforce takes one tracked entry exactly as listed, with a hash of the entry as the page
+  showed it (address, status, times). An entry that changed, expired or was enforced since
+  the page loaded gets a 409 and nothing changes.
+
+**Displayed text is attacker-controlled.** Commands, usernames, passwords, HTTP requests
+and transcripts are all hostile input. The console renders them as text only, never as
+HTML: no inline script, a strict Content-Security-Policy (`default-src 'none'`, scripts
+and styles from the console itself only, `frame-ancestors 'none'`), `nosniff`, no
+referrer, no caching, and JSON with `<`, `>`, `&`, U+2028 and U+2029 escaped.
+
+**The Activity screen adds no new trust.** It reads the same event log the transcript
+replay reads, read-only, through the same GET-only checks (signed-in session, Host and
+Origin rules), and has no POST route. Its index lives in memory and writes nothing. Every
+answer goes through the same sanitising boundary as the rest of the API (control and
+invisible characters removed, strings, lists and dicts capped, long fields flagged as
+cut), honeytoken values the sensor planted are masked (in the whole text before any cut,
+and in sources and session ids too, as in the transcript), and the page renders
+everything as text. Every request reads at most 16 MiB of the log back, and its in-memory
+index and facet counters are bounded, so a flood of long lines or made-up values cannot
+make one request or the index grow without limit. A source or session from the log becomes a link only when it matches a strict
+pattern (an address, a session id), and only inside the console.
+
+**What it deliberately cannot do.** It never calls a model, so nothing it shows can steer
+one. It never displays configuration or secrets. It cannot roll back the tuner (use
+`python -m agents tune --rollback N`) or change playbooks, scenarios or the overlay.
+
+**Host access is the control.** Anyone who can reach the loopback port and read the
+container log (or knows `WINNIE_UI_TOKEN`) can use the console, and with actions on can
+approve a block. Restrict shell, Docker and SSM access on the host accordingly. With an
+external name set, add the VPN's access rules to that list: anyone they let reach the
+proxy needs only the token.
 
 ## Fingerprinting
 
@@ -268,3 +560,10 @@ bundled one. The bundled scenarios are examples.
   not by cryptography.
 - The captured data contains real-looking and sometimes real credentials. Protecting it is
   the operator's job.
+- Code execution on the sensor is out of scope as an attack, but if it happens the
+  attacker can read the tracked list and the sightings file, and with the exchange
+  credentials overwrite the export object and read the sightings object. Keep the
+  sightings file to the minimum the operator needs to decide.
+- The operator console trusts anyone who can reach its loopback port and read its log.
+  Host access is the only control in front of it. With `external_host` set, the VPN's
+  access rules and the token are.

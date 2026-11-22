@@ -158,6 +158,47 @@ description = """..."""          # max 2000 characters
 | `os_pretty_name`, `kernel`, `timezone` | Shown by the persona (`uname`, `/etc/os-release`). |
 | `lures` | Up to 25 absolute paths of bait files the persona should show. |
 | `[[identity.users]]` | Up to 16 users: `name`, `uid`, `gecos`, `home`, `shell`. |
+| `[identity.hardware]` | Optional. What the shell reports about CPU, memory, disk and GPU; see below. |
+
+### `[identity.hardware]`
+
+The deterministic shell (`agents/shell.py`) answers the commands bots use to size a host
+from this table plus the rest of `[identity]`, so `nproc`, `free`, `df`, `/proc/cpuinfo`,
+`/proc/meminfo`, `lscpu`, `lspci` and `nvidia-smi` agree with each other. Leave it out for
+a small cloud VM with no GPU (`lspci` shows a plain VGA device and `nvidia-smi` is not
+installed), which is what most real targets look like. Which VM is chosen by the sensor
+seed from six shapes (2 to 8 vCPUs, 4 to 32 GB, Xeon 8259CL or 8275CL, or EPYC 7R13;
+`HARDWARE_PRESETS` in `scenarios/schema.py`), so two sensors running the same scenario do
+not report the same machine. The persona block shows the model the same shape. Set the
+table to pin it; a key left out of a table you do set takes the default below.
+
+| Key | Default | Notes |
+|---|---|---|
+| `cpu_model` | `Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz` | Up to 64 characters. A model containing `AMD` reports an AMD vendor and flags. |
+| `cpus` | `2` | 1 to 64. |
+| `memory_mb` | `4096` | 512 to 1048576. The kernel reports about 97% of it, as on a VM. |
+| `disk_gb` | `40` | 8 to 65536, the root file system. |
+| `gpu` | none | One of `rtx3060`, `rtx3090`, `rtx4090`, `t4`, `a10g`, `a100`, `l4`, `h100`. Consumer cards show as `VGA compatible controller` in `lspci`, data-center cards as `3D controller`. |
+| `gpu_count` | `1` | 1 to 8, used when `gpu` is set. |
+
+```toml
+[identity.hardware]
+cpus = 16
+memory_mb = 65536
+disk_gb = 500
+gpu = "rtx4090"
+gpu_count = 2
+```
+
+Uptime, load and memory use are derived from the sensor seed and the clock: stable for one
+sensor (the boot time does not move between commands), different between sensors. So are
+how busy the host is (its load level), which optional services show in `ps` (multipathd,
+snapd, irqbalance, qemu-ga and the like for the distribution) and whether one of the
+scenario's login users has an idle SSH session open from the internal network (`w`, `who`,
+`uptime` and `ps` all show it). The persona block names that login and those services, so
+the model's own `ps`, `w` and `last` agree with the local answers. The kernel string is the
+scenario's `kernel`, as written; with no scenario it is one Ubuntu 22.04 build
+(`5.15.0-105-generic`).
 
 ### `[ssh]`
 

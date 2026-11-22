@@ -89,6 +89,30 @@ model_name = gpt-4o
 # to test this with your model.
 trimmer_max_tokens = 64000
 
+# Answer known commands from the scenario's host profile instead of the model. Facts no
+# command can change (uname -r, uptime, nproc, free, /proc/cpuinfo, lscpu, lspci,
+# nvidia-smi, the IoT openers, busybox probes) are answered locally for the whole session;
+# facts a session can change (hostname, id, whoami, which, ls, pwd, ps, df, /etc files,
+# paths that do not exist yet) only until a model reply has answered a command. cd, export
+# and downloads always go to the model. A local answer ends with the prompt the model
+# showed last; if that prompt does not show the working directory, local answers stop for
+# the session. No tokens, and the same answers a sensor without a model gives. The answers
+# are added to the session history so the model stays consistent. Set to false to send
+# every command to the model.
+local_shell_replies = true
+
+# Wait this many milliseconds (a random half to all of it, at most 2000) before a reply
+# made without a model call (local, cached or past the model cap), so it is not instant
+# next to model replies. 0 answers at once.
+local_reply_delay_ms = 0
+
+# Mark the persona prompt for the provider's prompt cache. Default: on for anthropic; off
+# for aws, because not every Claude or Nova model on Bedrock accepts cache points. Set to
+# true to use it on aws (Claude and Nova model ids only). If the first request with a
+# cache point is refused as invalid, it is retried without one and caching stays off until
+# restart ("Prompt caching disabled" in the log). Ignored for other providers.
+#prompt_caching = true
+
 # Description of the emulated system for the telnet persona, relative to this file. The
 # SSH server takes it from --prompt-file instead (default: prompt.txt).
 #prompt_file = prompt.txt
@@ -104,7 +128,9 @@ system_prompt = Interpret all inputs as though they were SSH commands and provid
 
     If {interactive} is True, make sure to include a realistic MOTD on the
     first call, and to end all responses with a realistic shell prompt to display to 
-    the user, including a space at the end. 
+    the user, including a space at the end. Answer only the one input you were
+    given: its output, then one prompt, then stop. Never type a further command
+    after that prompt, never answer one, and do not repeat the input line itself.
 
     If {interactive} is False, do not include a shell prompt or MOTD.
 
@@ -149,11 +175,23 @@ root = *
 # session default allows on the order of 50 commands.
 max_line_bytes = 2048
 max_commands_per_session = 200
+# Commands per session the model may be asked, failed calls included. Local answers and
+# cached replies do not count, and cached replies are still served past it. Past it the session stays open and the deterministic shell answers (unknown
+# commands get "command not found"); a "Model cap reached" event is logged once.
+max_model_commands_per_session = 50
 max_tokens_per_session = 400000
 max_tokens_per_ip_per_day = 1000000
 max_tokens_per_day = 3000000
 max_concurrent_sessions = 20
 max_concurrent_sessions_per_ip = 3
+# Model replies kept in memory and served again, without a model call, to a session whose
+# history so far is identical, inputs and replies (bots replaying one script). A session
+# stops using the cache once its history holds anything another session could not share:
+# a local answer showing the clock or its own address (w, who, uptime, ps), a model error
+# or fallback, or a reply that was not stored. Not kept across restarts, never for a
+# source with a planted token or a deep/shallow mode. 0 turns the cache off.
+reply_cache_entries = 2000
+reply_cache_max_age = 21600
 # Daily counters (global and per source; IPv6 sources count per /64) persist here, shared
 # by the SSH server and the listeners on the same host through a file lock, so a restart
 # does not reset the day. Relative paths resolve inside the data directory.
@@ -265,6 +303,17 @@ max_tuner_changes_per_run = 3
 # removes session and campaign records older than record_retention_days (0 keeps them).
 max_records_per_run = 1000
 record_retention_days = 90
+# Detect: each row of detections/pending/blocklist-candidates.csv expires this many days
+# after the source was last seen, and the next run leaves it out. Sources that got past a
+# login or used a planted credential keep the longer period.
+blocklist_expiry_days = 14
+blocklist_access_expiry_days = 30
+# Readers that must have handled the event log before it is rotated (the log_rotation result
+# of triage, ship and run-all). triage always counts, and so does the export when
+# [connector.s3_events] is enabled in this same config. List a reader that runs in another
+# container, with its own state directory, so this container never reports an all-clear for
+# a log that reader has not finished: log_readers = triage, ship
+#log_readers =
 
 # Response playbooks (playbooks/*.toml; python -m agents respond / queue / approve / reject).
 # Local steps (tarpit, deepen, shallow, plant_token, tag_source, capture_more) change only
@@ -285,6 +334,14 @@ blocklist_format = plain
 # Approved entries expire after this many days; `python -m agents unblock <ip-or-network>`
 # removes one sooner.
 blocklist_ttl_days = 30
+# Two stages for export_blocklist. false: approving writes the address straight to the
+# blocklist file (above). true: approving only puts it on the tracked list (tracked.json,
+# written next to the blocklist file, for your cloud to watch; see [connector.tracked_export])
+# and nothing is blocked; `python -m agents enforce <address>` (or Enforce in the console) is
+# a second, separate decision that moves it to the blocklist file and calls
+# [connector.block_webhook] if enabled. Entries approved before this was turned on stay
+# enforced.
+track_before_enforce = false
 # A rejected request is not queued again for the same (playbook, source, action) for this
 # long; an approval that expired undecided is held back for expired_suppress_hours.
 reject_suppress_hours = 168
@@ -321,12 +378,33 @@ snapshot_keep_days = 7
 retention_days = 30
 size_alarm_mb = 500
 
+# Operator console (python -m agents ui): a small web UI on loopback, reached through an SSH
+# or SSM tunnel. The sign-in token comes from WINNIE_UI_TOKEN or is generated at start and
+# logged once as a sign-in link; it is never read from this file.
+[ui]
+# Port to listen on.
+port = 8480
+# Address to bind; anything but loopback is refused unless --allow-non-loopback is given.
+bind = 127.0.0.1
+# Allow approve, reject and unblock from the console (--actions turns it on for one run).
+actions = false
+# Name recorded with decisions made in the console (--by overrides it).
+#operator = oncall
+# HTTPS name of a reverse proxy on this host that forwards to the port above (--external-host
+# overrides it). Empty: loopback names only. See docs/operations.md, "Reaching it".
+#external_host = sensor.example-tailnet.ts.net
+# Event-log lines the Activity screen keeps in memory (one small entry each, oldest
+# dropped first; 1000 to 500000). Worst case about 115 MiB at the default and 275 MiB at
+# 500000; see docs/operations.md, "The indexed window".
+#activity_entries = 200000
+
 # Outbound connectors. All disabled by default. Destinations must be https and public
 # (allow_private = true to permit internal ones). Secrets are environment variable NAMES.
 # Every connector below also accepts these keys (defaults shown):
 #   max_per_day = 200       sends per day before the connector stops
 #   timeout = 10            seconds per send (at most 30)
 #   allow_private = false
+#   secret_file =           absolute path of a file holding the token, instead of secret_env
 # The HTTP connectors (all but email) send secret_env's value in the header named by
 # header (default Authorization).
 #[connector.webhook]
@@ -387,3 +465,192 @@ size_alarm_mb = 500
 #max_objects_per_run = 50
 #max_bytes_per_object = 5242880
 #timeout = 10
+
+# Tracked export (python -m agents ship; also the last step of run-all). Sends tracked.json,
+# the tracked list written by [respond] track_before_enforce, whole, only when it changed.
+# kind = s3: PutObject of exactly one key (the client refuses every other operation, bucket
+# and key). Credentials come from the default chain, never from this file.
+# kind = https: one PUT or POST of the document, with the HTTP connector rules above.
+#[connector.tracked_export]
+#enabled = false
+#kind = s3
+# Where to read tracked.json when this process does not see the agents' reports directory
+# (default: next to the blocklist file).
+#file = /blocklist/tracked.json
+#bucket = example-honeypot-events
+#key = events/tracked/tracked.json
+#region = us-east-1
+#bucket_owner = 123456789012
+# Another store that speaks the S3 API (https only; allow_private for an internal one).
+#endpoint_url = https://s3.example.com
+#url = https://intel.example.com/api/winnie/tracked
+#method = PUT
+#secret_env = WINNIE_TRACKED_TOKEN
+#header = Authorization
+
+# Sightings: where else your environment saw a listed address, shown on the console's
+# blocklist screen. Display only; nothing acts on them. The file is untrusted and checked
+# strictly; a refused file keeps the last good one. See docs/operations.md, "Sightings".
+[sightings]
+# Default: sightings.json in the agents' state directory.
+#path = /agents/state/sightings.json
+max_bytes = 1048576
+max_entries = 5000
+# The console marks the file stale when its generated_at is older than this.
+stale_hours = 48
+
+# Where source addresses are: country, region, city and network owner (AS number), shown in
+# the console and the digest and stored on each triage record. Read from MaxMind-format
+# .mmdb files on disk (MaxMind GeoLite2 City / ASN or DB-IP Lite City / ASN) with the
+# optional maxminddb package; no network call of any kind. Off unless a path is set; a
+# missing file or package leaves it off. Replace a file by renaming a new copy into place;
+# it is picked up within a minute. See docs/operations.md, "Where addresses are".
+#[geoip]
+#city_db = /geoip/dbip-city-lite.mmdb
+#asn_db = /geoip/dbip-asn-lite.mmdb
+# Credit line the console shows in its footer as plain text. The free databases require
+# one; DB-IP Lite (CC BY 4.0) asks for "IP Geolocation by DB-IP" with a link to db-ip.com.
+#attribution = IP Geolocation by DB-IP (db-ip.com)
+
+# Optional sightings fetch (python -m agents ship; also run-all), at most once per
+# interval_minutes. kind = s3: GetObject of exactly one key; kind = https: GET. The local
+# file is replaced only by a copy that passes the checks.
+#[connector.sightings]
+#enabled = false
+#kind = s3
+#interval_minutes = 15
+#bucket = example-honeypot-events
+#key = sightings/sightings.json
+#region = us-east-1
+#bucket_owner = 123456789012
+#endpoint_url = https://s3.example.com
+#url = https://intel.example.com/api/winnie/sightings
+#secret_env = WINNIE_SIGHTINGS_TOKEN
+#header = Authorization
+
+# Optional: what Shodan InternetDB (https://internetdb.shodan.io, no key) already knows about
+# interesting source addresses: open ports, host names, tags, CPEs and known CVE ids, shown
+# in the console and stored on triage records. Looked up by run-all / ship in the agents
+# container (never a honeypot container), one HTTPS GET per address with only the address
+# in it. Free for non-commercial use; a company may use it internally but not in a product
+# it charges for. The destination is fixed in code. See docs/operations.md, "What Shodan
+# already knows about a source".
+#[connector.internetdb]
+#enabled = false
+# Lookups per run and per UTC day; one request at a time, at least min_interval_seconds apart.
+#max_per_run = 100
+#max_per_day = 2000
+#min_interval_seconds = 1
+# An answer (also "no information") is kept this long; InternetDB is refreshed weekly.
+#cache_days = 7
+# Records seen in this window are considered (SUSPICIOUS, MALICIOUS or a honeytoken used).
+#lookback_days = 7
+# Addresses kept in the local file; the oldest answers are dropped first.
+#max_entries = 5000
+# direct: this process asks InternetDB (above). delivered: it never does. run-all writes the
+# addresses it wants looked up (addresses only, at most max_wanted) to wanted_file, something
+# outside the sensor answers through the object store, and every answer is checked here
+# exactly like a direct one before it reaches answers_file, which triage and the console
+# read. See docs/operations.md, "Delivered answers".
+#mode = direct
+#max_wanted = 500
+# Default: internetdb_wanted.json next to the blocklist file (as tracked.json).
+#wanted_file = /blocklist/internetdb_wanted.json
+# Default: internetdb.json in the agents' state directory.
+#answers_file = /internetdb/internetdb.json
+# A delivered answer older than this is not accepted.
+#max_age_days = 30
+
+# Delivered mode only, run by ship / run-all in the process with the credentials or egress. s3:
+# PutObject of the wanted list to one key, GetObject of the answers from another; the
+# answers object is refused whole above max_bytes or max_entries; each answer is checked on
+# its own. kind = lookup: no object store and nothing outside the sensor; this process reads
+# the wanted list and asks InternetDB itself, with the caps, pacing and cache set above, and
+# keeps its own state in its state directory; it writes the checked answers to
+# answers_file. Put it in the exporter's config only (on AWS, InternetDbLookup does), never
+# in the config of a process that must not reach the internet. See docs/operations.md,
+# "The exporter asks InternetDB".
+#[connector.internetdb_exchange]
+#enabled = false
+#kind = s3
+# kind = lookup only: connect only to these IPv4 addresses (one per line, at most 8), the
+# ones the host firewall lets this process reach (deploy/aws/host/sensor-egress.sh).
+#addresses_file = /egress/internetdb-addresses
+#bucket = example-honeypot-events
+#wanted_key = events/internetdb/wanted.json
+#answers_key = internetdb/answers.json
+#region = us-east-1
+#bucket_owner = 123456789012
+#endpoint_url = https://s3.example.com
+#interval_minutes = 15
+#max_bytes = 4194304
+#max_entries = 1000
+
+# Confirmed indicators to an AlienVault OTX pulse (off by default). run-all writes the
+# candidates (source addresses and upload hashes only, from sources whose address is proven
+# and that did more than probe) to candidates_file; the process with submit = true adds what
+# it has not sent before to one pulse per UTC day. The destination is fixed in code
+# (otx.alienvault.com). A public pulse shows anyone that this operator runs a honeypot and
+# roughly when each source hit it. See docs/operations.md, "Indicators to OTX".
+#[connector.otx]
+#enabled = false
+# true: write what would be sent to otx_dry_run.json in the state directory and send
+# nothing. Sending needs enabled = true and dry_run = false.
+#dry_run = true
+# false: only write the candidates (the agents container on AWS, which has no egress).
+#submit = true
+# Also submit the SHA-256 of whole files the quarantine kept from those sources.
+#hashes = true
+# The API key: an environment variable name or a file (one line), not both.
+#secret_env = WINNIE_OTX_KEY
+#secret_file = /run/otx-key
+# The pulse is named "<pulse_name> <YYYY-MM-DD>".
+#pulse_name = Honeypot sources
+#description = Source addresses and uploaded file hashes seen by a honeypot sensor.
+#tags = honeypot
+# white | green | amber | red; a public pulse cannot be amber or red.
+#tlp = green
+#public = false
+# Days until each indicator expires on OTX.
+#expiration_days = 30
+# Indicators per run (one request) and per UTC day.
+#max_per_run = 200
+#max_per_day = 1000
+# Records seen in this window are considered.
+#lookback_days = 7
+# Indicators remembered as sent, so none is sent twice; the oldest are dropped first.
+#max_entries = 20000
+# Default: otx_candidates.json next to the blocklist file (as tracked.json).
+#candidates_file = /blocklist/otx_candidates.json
+# Connect only to these IPv4 addresses (one per line, at most 8), the ones the host
+# firewall lets this process reach (deploy/aws/host/sensor-egress.sh).
+#addresses_file = /egress/otx-addresses
+
+# STIX 2.1 bundle in a local file (off by default): python -m agents stix, and run-all when
+# enabled. Nothing is sent anywhere and no credential is used. Observed-data for proven
+# source addresses and stored files; indicators only for sources and file hashes that pass
+# the OTX connector's promotion rules (proven source that did more than probe; the model can
+# only hold one back) or that an operator approved onto the blocklist. See
+# docs/portable-formats.md.
+#[stix]
+#enabled = false
+# Default: stix/bundle.json in the reports directory.
+#output_file = /reports/stix/bundle.json
+# The producing identity (identity_class system). A new name starts every object afresh.
+#identity_name = Honeypot sensor
+# white | green | amber | red: the standard STIX TLP marking on every object.
+#tlp = amber
+# Also the SHA-256 of whole files the quarantine kept.
+#hashes = true
+# Records and stored files seen in this window are considered.
+#lookback_days = 7
+# A rule-promoted indicator is valid until its last sighting plus this many days. An
+# operator-approved entry uses its own expires_at. A file hash does not move to another
+# owner the way an address does, so it is kept longer.
+#address_lifetime_days = 30
+#hash_lifetime_days = 365
+# Expired and revoked objects stay in the bundle this long, then are dropped.
+#keep_days = 30
+# Caps on the bundle: objects and bytes. Indicators are kept first when it is full.
+#max_objects = 5000
+#max_bytes = 8388608

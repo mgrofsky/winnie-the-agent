@@ -111,6 +111,8 @@ def build_context(config: ConfigParser, base: Path, scenario_name: Optional[str]
     # persona path in agents.hooks (planted tokens, tarpit) read the same state as the
     # listeners themselves.
     hooks.set_source_state(ctx.source_state, seed)
+    hooks.set_local_replies(hooks.local_replies_enabled(config))
+    hooks.set_local_delay(hooks.local_delay_ms(config))
     ctx.overlay_path = overlay  # type: ignore[attr-defined]
     ctx.ftp_pasv_ports = parse_port_range(section.get("ftp_pasv_ports", ""))
     ctx.ftp_pasv_address = (section.get("ftp_pasv_address", "") or "").strip() or None

@@ -349,21 +349,31 @@ def refuse_other_operations(model=None, **_kwargs) -> None:
         raise OperationRefused(f"S3 operation {str(name)[:40]} is not allowed")
 
 
-def default_client_factory(settings: ShipSettings, session=None):
-    """An S3 client from the default credential chain, with timeouts, limited retries and
-    the PutObject-only hook registered. Imports boto3 only when called."""
+def s3_client(region: Optional[str], timeout: float, hooks: tuple, endpoint_url=None,
+              session=None):
+    """An S3 client from the default credential chain with timeouts, limited retries and
+    ``hooks`` ((event, handler) pairs) registered. ``endpoint_url`` points it at an
+    S3-compatible store instead of AWS. Imports boto3 only when called."""
     from botocore.config import Config
 
     if session is None:
         import boto3
 
         session = boto3.session.Session()
-    cfg = Config(connect_timeout=settings.timeout, read_timeout=settings.timeout,
+    cfg = Config(connect_timeout=timeout, read_timeout=timeout,
                  retries={"total_max_attempts": MAX_ATTEMPTS, "mode": "standard"},
                  tcp_keepalive=False)
-    client = session.client("s3", region_name=settings.region, config=cfg, use_ssl=True)
-    client.meta.events.register("before-call.s3", refuse_other_operations)
+    kw = {"endpoint_url": endpoint_url} if endpoint_url else {}
+    client = session.client("s3", region_name=region, config=cfg, use_ssl=True, **kw)
+    for event, handler in hooks:
+        client.meta.events.register(event, handler)
     return client
+
+
+def default_client_factory(settings: ShipSettings, session=None):
+    """The event export's client: PutObject only."""
+    return s3_client(settings.region, settings.timeout,
+                     (("before-call.s3", refuse_other_operations),), session=session)
 
 
 def _error_code(exc: Exception) -> str:
@@ -444,7 +454,13 @@ def run_ship(settings: ShipSettings, log_path, state_dir, *, seed: Optional[str]
     now = now or datetime.datetime.now(datetime.timezone.utc)
     factory = client_factory or default_client_factory
     cursor = Cursor(state_dir / CURSOR_FILE)
+    before = Cursor.sample(log_path)              # the file this run is about to read
     start = cursor.start_offset(log_path)
+    if start > 0 and cursor.tail is None:
+        # Saved by an older version: nothing proves the bytes before the offset are the ones
+        # that were shipped. Send the log again once, from the start (delivery is at least
+        # once), and the cursor then records the fingerprint it lacks.
+        start = 0
     summary: dict = {"objects": 0, "events": 0, "bytes": 0, "skipped_malformed": 0,
                      "skipped_oversized": 0, "more_pending": False, "keys": [],
                      "start_offset": start}
@@ -474,7 +490,7 @@ def run_ship(settings: ShipSettings, log_path, state_dir, *, seed: Optional[str]
                     "event": "s3_put_failed", "key": obj_key, "error": code,
                     "lines": len(batch.lines)})
                 return False
-            cursor.set_position(batch.end, log_path)
+            cursor.set_position(batch.end, log_path, before)
             cursor.save()
         summary["objects"] += 1
         summary["events"] += len(batch.lines)
@@ -516,7 +532,7 @@ def run_ship(settings: ShipSettings, log_path, state_dir, *, seed: Optional[str]
                 return summary
         elif batch.end > start and not dry_run:
             # Only skipped lines since the last object: move past them.
-            cursor.set_position(batch.end, log_path)
+            cursor.set_position(batch.end, log_path, before)
             cursor.save()
     summary["dry_run"] = dry_run
     return summary

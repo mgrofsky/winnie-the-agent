@@ -39,6 +39,8 @@ from . import bait as bait_mod
 from . import tokens as tokens_mod
 from .bait import Bait, BaitError, Pins
 from .schema import (
+    GPU_SPECS,
+    HARDWARE_PRESETS,
     BaitSpec,
     HoneytokenSpec,
     LoginPolicy,
@@ -165,6 +167,13 @@ class _Gen:
         return None
 
 
+def _hardware_line(hw) -> str:
+    gpu = (f"{hw.gpu_count} x {GPU_SPECS[hw.gpu].product} (nvidia-smi installed)" if hw.gpu
+           else "none (no NVIDIA driver, nvidia-smi is not installed)")
+    return (f"{hw.cpus} vCPU {hw.cpu_model}, {hw.memory_mb} MB RAM, {hw.disk_gb} GB root "
+            f"disk, GPU: {gpu}")
+
+
 @dataclass
 class LoadedScenario:
     scenario: Scenario
@@ -260,6 +269,15 @@ class LoadedScenario:
                 seen.append(p)
         return seen[:25]
 
+    @property
+    def hardware(self):
+        """The scenario's ``[identity.hardware]``, or when it has none, one of the
+        ``HARDWARE_PRESETS`` chosen by the sensor seed (stable per sensor)."""
+        ident = self.scenario.identity
+        if "hardware" in ident.model_fields_set:
+            return ident.hardware
+        return _rng(self.seed, self.scenario.name, "hardware").choice(HARDWARE_PRESETS)
+
     def persona_fragment(self) -> str:
         """Render the SSH/Telnet persona block. Only schema-validated values are emitted."""
         ident = self.scenario.identity
@@ -271,6 +289,7 @@ class LoadedScenario:
             f"- OS: {ident.os_pretty_name}",
             f"- uname -a: {ident.kernel}",
             f"- Timezone: {ident.timezone}",
+            f"- Hardware: {_hardware_line(self.hardware)}",
         ]
         if ident.users:
             lines.append("- Local users (name:uid:home:shell):")

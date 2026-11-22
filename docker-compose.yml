@@ -3,6 +3,7 @@
 #   export ANTHROPIC_API_KEY=...        # passed by name only; never written to any file
 #   docker compose up --build           # SSH + listeners (scenario from SSH/config.ini) + agents
 #   docker compose --profile bank up    # add the example 'bank' sensor (one scenario per container)
+#   docker compose --profile ui up -d ui  # operator console on 127.0.0.1:8480 (read-only)
 #
 # Trust boundaries (volumes):
 #   frontend  written only by ssh + listeners: event log, quarantine, budget state, sensor
@@ -119,6 +120,45 @@ services:
       - frontend:/data:ro
       - agentdata:/agents
       - overlay:/overlay
+      # [geoip] database files (optional, read only), e.g. city_db = /geoip/dbip-city-lite.mmdb:
+      # - ./geoip:/geoip:ro
+
+  # Operator console (python -m agents ui), off unless asked for:
+  #   docker compose --profile ui up -d ui
+  #   docker compose logs ui              # the sign-in link
+  # Same image and directories as agents, every mount read-only, no model key, no AWS
+  # settings and no connector secrets. docker-compose.ui-actions.yml turns on approve,
+  # reject and unblock. The container binds 0.0.0.0 because the host publishes the port on
+  # 127.0.0.1 only; from another machine use ssh -L 8480:127.0.0.1:8480 <host>.
+  # It has a network of its own: not frontend (the honeypot containers must not reach it)
+  # and not the default network the agents use. A published port rules out an internal
+  # network, so egress from this container is limited by what it holds (no secrets,
+  # read-only data), not by the network.
+  ui:
+    <<: *hardening
+    image: winnie-agents:local
+    profiles: ["ui"]
+    environment:
+      WINNIE_DATA_DIR: /data
+      WINNIE_OVERLAY: /overlay/overlay.json
+      WINNIE_SOURCE_STATE: /overlay/source_state.json
+      # Optional fixed sign-in token (24+ characters); empty means a new one each start.
+      WINNIE_UI_TOKEN: ${WINNIE_UI_TOKEN:-}
+    command: ["python", "-m", "agents", "ui", "--config", "/config/config.ini",
+              "--log", "/data/ssh_log.log", "--data-dir", "/data",
+              "--reports-dir", "/agents/reports", "--state-dir", "/agents/state",
+              "--detections-dir", "/agents/detections",
+              "--bind", "0.0.0.0", "--allow-non-loopback", "--port", "8480"]
+    networks: [ui]
+    ports:
+      - "127.0.0.1:8480:8480"
+    volumes:
+      - ./SSH/config.ini:/config/config.ini:ro
+      - frontend:/data:ro
+      - agentdata:/agents:ro
+      - overlay:/overlay:ro
+      # [geoip] database files (optional, read only); the same directory as agents.
+      # - ./geoip:/geoip:ro
 
   # One example sensor per scenario. Only the default stack above runs unless a profile
   # is chosen. Each needs its own host ports (or address) in a real deployment, and would
@@ -182,6 +222,7 @@ services:
 # (e.g. a host firewall rule on this subnet) without affecting the agents service.
 networks:
   frontend: {}
+  ui: {}
 
 volumes:
   frontend:

@@ -20,10 +20,24 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
+[project.optional-dependencies]
+# Country, city and network owner of source addresses, read from .mmdb files on disk
+# ([geoip] in config.ini). Without it the lookup is off and nothing else changes.
+geoip = ["maxminddb>=2.6"]
+
 [dependency-groups]
 dev = [
     "pytest",
     "pytest-asyncio",
+    # Checks of the portable outputs (docs/portable-formats.md): Sigma rules are parsed and
+    # converted with the Sigma project's own library and two published backends, STIX
+    # bundles are checked with the OASIS validator. Not needed at run time.
+    # The Elasticsearch and OpenSearch backends require pySigma below 2.0.
+    "pysigma==1.5.1",
+    "pysigma-backend-elasticsearch==2.1.1",
+    "pysigma-backend-opensearch==2.0.3",
+    "stix2==3.0.2",
+    "stix2-validator==3.3.2",
 ]
 
 [tool.pytest.ini_options]

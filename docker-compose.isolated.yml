@@ -10,6 +10,9 @@
 # Docker does not publish ports for containers that are only on an internal network, so
 # this layout serves no external traffic. For production egress control see
 # docs/operations.md (host firewall rule on the front-end subnet).
+#
+# The operator console (--profile ui) is not changed: it is on its own network, not
+# frontend, so it keeps its 127.0.0.1:8480 publish and the front-ends still cannot reach it.
 
 services:
   ssh:

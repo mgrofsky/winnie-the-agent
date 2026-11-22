@@ -2,7 +2,11 @@
 
 After login every line goes through ``agents.hooks.persona_invoke`` when
 ``ctx.persona_history`` is set (budgets enforced there); otherwise a deterministic minimal
-shell answers. Nothing is ever executed.
+shell answers (``agents.shell``, shared with the SSH fallback). Nothing is ever executed.
+
+Replies can carry binary bytes (a loader reading ``/bin/echo``): they go out exactly as the
+shell made them (``shell.wire``), with a 0xFF byte doubled as Telnet requires, and the event
+log keeps a printable copy (``shell.printable``).
 """
 
 from __future__ import annotations
@@ -82,39 +86,27 @@ def _identity(ctx: ListenerContext) -> tuple[str, str, str]:
     if ctx.scenario is not None:
         ident = ctx.scenario.scenario.identity
         return ctx.scenario.hostname, ident.os_pretty_name, ident.kernel
-    return ("srv01", "Ubuntu 22.04.4 LTS",
-            "Linux srv01 5.15.0-105-generic #115-Ubuntu SMP x86_64 GNU/Linux")
+    from agents.shell import Host
+
+    host = Host()
+    return host.hostname, host.os_pretty_name, host.kernel
 
 
-def canned_shell(ctx: ListenerContext, user: str, line: str, cwd: str) -> tuple[str, bool]:
-    """Deterministic minimal shell. Returns (output, close)."""
-    host, os_name, kernel = _identity(ctx)
+def canned_shell(ctx: ListenerContext, user: str, line: str, cwd: str,
+                 src_ip: Optional[str] = None, session=None) -> tuple[str, bool]:
+    """Deterministic shell (``agents.shell``, the same answers as the SSH fallback).
+    ``session`` (``shell.Session``) carries the working directory and the files the session
+    wrote between lines. Returns (output, close)."""
+    from agents import shell
+
     parts = line.split()
     if not parts:
         return "", False
-    cmd, args = parts[0], parts[1:]
-    uid = 0 if user == "root" else 1000
-    if cmd in ("exit", "logout", "quit"):
+    if parts[0] in ("exit", "logout", "quit"):
         return "logout\r\n", True
-    if cmd == "whoami":
-        return f"{user}\r\n", False
-    if cmd == "id":
-        return f"uid={uid}({user}) gid={uid}({user}) groups={uid}({user})\r\n", False
-    if cmd == "uname":
-        return (f"{kernel}\r\n" if "-a" in args else "Linux\r\n"), False
-    if cmd == "hostname":
-        return f"{host}\r\n", False
-    if cmd == "pwd":
-        return f"{cwd}\r\n", False
-    if cmd == "echo":
-        return " ".join(args)[:512] + "\r\n", False
-    if cmd in ("cd", "true", ":", "export", "unset", "history"):
-        return "", False
-    if cmd == "ls":
-        return "\r\n", False
-    if cmd == "cat" and args and args[0] in ("/etc/os-release", "/etc/issue"):
-        return f'PRETTY_NAME="{os_name}"\r\n', False
-    return f"-bash: {cmd[:64]}: command not found\r\n", False
+    out = shell.reply(shell.host_for(ctx.scenario, ctx.seed), line, user=user,
+                      interactive=True, cwd=cwd, src_ip=src_ip, session=session)
+    return _crlf(out), False
 
 
 async def _login(conn: Conn, reader: TelnetReader, host: str) -> Optional[str]:
@@ -138,6 +130,28 @@ def _crlf(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\n", "\r\n")
 
 
+def _wire(text: str) -> bytes:
+    """A reply as Telnet data: its exact bytes, with IAC (0xFF) doubled."""
+    from agents.shell import wire
+
+    return wire(text).replace(b"\xff", b"\xff\xff")
+
+
+def _logged(text: str) -> str:
+    from agents.shell import printable
+
+    return printable(text[:RESPONSE_LOG_CAP])[:RESPONSE_LOG_CAP]
+
+
+def _note_cut(conn: Conn, user: str, resp) -> None:
+    """One ``notice`` event when the persona reply was cut back to one round
+    (``agents.onereply``): counts and a short sample of what the model invented, which is
+    never an input of the client's."""
+    cut = getattr(resp, "reply_cut", None)
+    if isinstance(cut, dict):
+        conn.emit("notice", "Reply cut", username=user, data=cut)
+
+
 async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:
     from agents import hooks
 
@@ -153,9 +167,10 @@ async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:
             return await hooks.persona_invoke(
                 ctx.persona_history, session_id=conn.task_name, src_ip=conn.src_ip,
                 username=user, text=text, interactive=True, llm_config=llm_config,
-                counts_as_command=counts)
+                counts_as_command=counts, scenario=ctx.scenario)
 
         first = await ask("", counts=False)
+        _note_cut(conn, user, first)
         content = str(getattr(first, "content", ""))
         await conn.write(_crlf(content))
         if getattr(first, "budget_exceeded", False):
@@ -169,12 +184,13 @@ async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:
             content = str(getattr(resp, "content", ""))
             exceeded = bool(getattr(resp, "budget_exceeded", False))
             conn.emit("command", "Telnet input", username=user,
-                      data={"input": line, "response": content[:RESPONSE_LOG_CAP],
+                      data={"input": line, "response": _logged(content),
                             "persona": True, "budget_exceeded": exceeded})
             conn.capture("telnet_input", line)
+            _note_cut(conn, user, resp)
             if content == END_OF_SESSION:
                 return
-            await conn.write(_crlf(content))
+            await conn.write(_wire(_crlf(content)))
             if exceeded:
                 return
     finally:
@@ -182,20 +198,23 @@ async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:
 
 
 async def _canned_session(conn: Conn, reader: TelnetReader, user: str) -> None:
+    from agents.shell import Session, prompt_path
+
     host, os_name, _ = _identity(conn.ctx)
-    cwd = "/root" if user == "root" else f"/home/{user}"
+    home = "/root" if user == "root" else f"/home/{user}"
     sigil = "#" if user == "root" else "$"
+    session = Session(cwd=home)
     await conn.write(f"Welcome to {os_name}\r\n\r\n")
     while True:
-        await conn.write(f"{user}@{host}:~{sigil} ")
+        await conn.write(f"{user}@{host}:{prompt_path(session.cwd, home)}{sigil} ")
         line = await reader.readline()
         if not conn.command():
             return
-        out, close = canned_shell(conn.ctx, user, line.strip(), cwd)
+        out, close = canned_shell(conn.ctx, user, line.strip(), home, conn.src_ip, session)
         conn.emit("command", "Telnet input", username=user,
-                  data={"input": line, "response": out[:RESPONSE_LOG_CAP], "persona": False})
+                  data={"input": line, "response": _logged(out), "persona": False})
         conn.capture("telnet_input", line)
-        await conn.write(out)
+        await conn.write(_wire(out))
         if close:
             return
 

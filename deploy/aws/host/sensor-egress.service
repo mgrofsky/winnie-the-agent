@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh the S3 prefix list the exporter may reach (sensor-egress.sh)
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sensor-egress.sh refresh

@@ -98,7 +98,7 @@ def test_schema_rejects_unknown_actions_conditions_and_tier_overrides(bad):
 
 def test_tiers_are_fixed_in_code_and_shipped_playbooks_validate():
     pbs, errors = load_playbooks()
-    assert errors == [] and len(pbs) == 6
+    assert errors == [] and len(pbs) == 7
     for p in pbs:
         for step in p.steps:
             assert tier_of(step) == ACTION_TIERS[step.action]
@@ -275,6 +275,26 @@ def test_sensitive_data_playbook_only_in_bank_or_healthcare(tmp_path):
         "tag_source", "plant_token", "deepen", "notify"]
 
 
+def test_miner_recon_watches_and_never_enforces_or_deepens(tmp_path):
+    from agents.detect import record_reasons
+
+    pb = _shipped()["miner_recon"]
+    assert all(tier_of(s) != "enforce" for s in pb.steps)
+    gpu = rec(rid="gpu", kind="session", protocol="ssh", signals={"hardware_recon": 2},
+              judgement="MALICIOUS", ip="198.51.100.50")
+    telnet = rec(rid="tn", protocol="telnet", signals={"hardware_recon": 1},
+                 ip="198.51.100.51")
+    plain = rec(rid="plain", kind="session", protocol="ssh", signals={}, ip="198.51.100.52")
+    write(tmp_path / "reports", gpu, telnet, plain)
+    out = run(tmp_path, [pb])
+    assert sorted(r["trigger"]["record_id"] for r in out["runs"]) == ["gpu", "tn"]
+    assert [s["action"] for s in out["runs"][0]["steps"]] == [
+        "tag_source", "capture_more", "notify"]
+    entry = ss.load(tmp_path / "source_state.json").entries["198.51.100.50"]
+    assert "miner_recon" in entry.tags and entry.budget_mode == "normal"
+    assert "command" in record_reasons(gpu)
+
+
 # ---- per-source state ----------------------------------------------------------------------
 
 def test_source_state_bounded_expires_and_rejects_free_text(tmp_path, monkeypatch):
@@ -361,15 +381,15 @@ async def test_ssh_persona_tarpit_token_and_shallow(tmp_path):
     h = History()
     start = time.perf_counter()
     await hooks.persona_invoke(h, session_id="s1", src_ip="198.51.100.50", username="root",
-                               text="ls", interactive=True, llm_config={})
+                               text="ls -la", interactive=True, llm_config={})
     assert time.perf_counter() - start >= 0.28                 # tarpit applied
     access, _ = ss.source_token(SEED, "198.51.100.50")
     assert access in h.payloads[0]["decoy_profile"]            # unique token served
     r = await hooks.persona_invoke(h, session_id="s2", src_ip="198.51.100.51", username="root",
-                                   text="ls", interactive=True, llm_config={})
+                                   text="ls -la", interactive=True, llm_config={})
     assert r.budget_exceeded and len(h.payloads) == 1          # shallow: canned, no model call
     await hooks.persona_invoke(h, session_id="s3", src_ip="198.51.100.52", username="root",
-                               text="ls", interactive=True, llm_config={})
+                               text="ls -la", interactive=True, llm_config={})
     assert access not in h.payloads[-1]["decoy_profile"]      # others never see it
 
 
@@ -533,7 +553,7 @@ async def test_listener_entry_point_hands_source_state_to_the_telnet_persona(tmp
 
     start = time.perf_counter()
     await hooks.persona_invoke(History(), session_id="telnet-1", src_ip="198.51.100.90",
-                               username="admin", text="ls", interactive=True, llm_config={})
+                               username="admin", text="ls -la", interactive=True, llm_config={})
     assert time.perf_counter() - start >= 0.18
     assert ss.source_token(SEED, "198.51.100.90")[0] in History.payload["decoy_profile"]
 

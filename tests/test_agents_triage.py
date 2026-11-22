@@ -267,6 +267,40 @@ def test_provider_outage_defers_and_saves_progress(tmp_path):
     assert sorted(result2["written"]) == ["session-2", "session-3"]
 
 
+def test_deferred_items_leave_the_cursor_short_of_the_end_of_the_log(tmp_path):
+    from agents.llm import LLMUnavailable
+    from agents.rotation import rotation_status
+    from agents.sessions import Cursor, sample_log
+
+    recs = ssh_session("session-1", "203.0.113.1", ["id"])
+    recs += ssh_session("session-2", "203.0.113.2", ["id"], start=1)
+    result, reports = _run(tmp_path, recs, FakeJsonLLM(GOOD_TRIAGE, LLMUnavailable("x")))
+    assert result["deferred"] == ["session-2"]
+    state = reports / "state"
+    cursor = Cursor(state / "triage_cursor.json")
+    sample = sample_log(tmp_path / "log.jsonl")
+    assert 0 < cursor.offset < sample.end and result["pending_bytes"] == sample.end - cursor.offset
+    status = rotation_status({"triage": result}, tmp_path / "log.jsonl", state, ["triage"])
+    assert status["safe"] is False
+    assert status["readers"]["triage"]["state"] == "behind"
+    assert status["readers"]["triage"]["behind_bytes"] == result["pending_bytes"]
+    assert any("1 deferred" in p for p in status["pending"])
+    # When the model is back the next run drains it and the same check passes.
+    result2, _ = _run(tmp_path, recs, FakeJsonLLM(GOOD_TRIAGE))
+    assert rotation_status({"triage": result2}, tmp_path / "log.jsonl", state, ["triage"])["safe"]
+
+
+def test_triage_stamps_the_boundary_it_read(tmp_path):
+    from agents.sessions import Cursor, sample_log
+
+    result, reports = _run(tmp_path, ssh_session("session-1", "203.0.113.1", ["id"]),
+                           FakeJsonLLM(GOOD_TRIAGE))
+    cursor = Cursor(reports / "state" / "triage_cursor.json")
+    sample = sample_log(tmp_path / "log.jsonl", [cursor.offset])
+    assert cursor.offset == sample.end and cursor.tail == sample.tails[cursor.offset]
+    assert cursor.inode == sample.inode and cursor.head == sample.head
+
+
 def test_provider_rejecting_one_item_does_not_stop_the_run(tmp_path):
     from agents.llm import LLMRequestError
 
@@ -482,3 +516,73 @@ def test_s3_campaign_signals_are_deterministic(tmp_path):
     assert scanner.judgement.value == "BENIGN" and not scanner.techniques
     planted = by_ip["192.0.2.52"]
     assert planted.judgement.value == "MALICIOUS" and planted.honeytokens == ["backup_key"]
+
+
+# ---- hardware_recon ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("commands,count", [
+    (["nvidia-smi"], 1),
+    (["/usr/bin/nvidia-smi -L"], 1),
+    (["which nvidia-smi"], 1),
+    (["nvidia-smi -q | grep \"Product Name\" | head -n 1 | awk '{print $4, $5, $6}'"], 1),
+    (["lspci | grep VGA | cut -f5- -d ' '"], 1),
+    (["lspci | grep VGA -c"], 1),
+    (["lspci | grep \"3D controller\" | cut -f5- -d ' '"], 1),
+    (["lspci | grep -i nvidia"], 1),
+    (["cat /proc/cpuinfo | grep name | wc -l"], 1),
+    (["grep -c ^processor /proc/cpuinfo"], 1),
+    (["cat /proc/cpuinfo | grep processor -c"], 1),
+    (["cat /proc/cpuinfo", "nproc"], 1),                       # read here, counted there
+    # The real miner check-in: three lspci/GPU queries out of six commands.
+    (["/bin/./uname -s -v -n -r -m", "uptime -p", "lspci | grep VGA | cut -f5- -d ' '",
+      "lspci | grep VGA -c", "nvidia-smi -q | grep \"Product Name\" | head -n 1",
+      "lspci | grep \"3D controller\" | cut -f5- -d ' '"], 4),
+    # Not sizing on their own.
+    (["uname -a"], 0), (["nproc"], 0), (["lscpu"], 0), (["lspci"], 0),
+    (["cat /proc/cpuinfo"], 0), (["free -m", "df -h", "uptime"], 0),
+    (["echo vga; lspci"], 0), (["lspci; echo 3d"], 0),
+    (["cat /proc/meminfo | wc -l"], 0),
+    # Command words, not substrings.
+    (["command -v nvidia-smi"], 1), (["sudo /usr/bin/nvidia-smi -L"], 1),
+    (["uname -a; nvidia-smi 2>/dev/null"], 1), (["x=$(nvidia-smi -L)"], 1),
+    (["lspci -d ::0300"], 1), (["lspci -d 10de:"], 1), (["lspci -nn | grep -i nvidia"], 1),
+    (["echo nvidia-smi"], 0), (["ls /usr/share/nvidia-smi.txt"], 0),
+    (["lspci -s 00:3d.0 -v"], 0), (["grep nvidia-smi /var/log/syslog"], 0),
+    (["grep -i vga notes.txt | lspci"], 0), (["lspci -d 8086:"], 0),
+    (["echo /proc/cpuinfo nproc"], 0),
+])
+def test_hardware_recon_is_defined_tightly(commands, count):
+    from agents.triage import hardware_recon, session_signals
+
+    assert hardware_recon(commands) == count
+    assert session_signals(commands).get("hardware_recon", 0) == count
+
+
+def test_hardware_recon_session_is_malicious_discovery_without_a_model(tmp_path):
+    recs = ssh_session("session-gpu", "203.0.113.20", ["lspci | grep VGA -c"])
+    recs += ssh_session("session-plain", "203.0.113.21", ["uname -a"], start=1)
+    _, reports = _run(tmp_path, recs, None)
+    by_id = {r.id: r for r in load_records(reports)}
+    gpu = by_id["session-gpu"]
+    assert gpu.high_signal == {"hardware_recon": 1}
+    assert gpu.judgement.value == "MALICIOUS" and gpu.stage.value in ("DISCOVERY",)
+    assert by_id["session-plain"].high_signal == {}
+
+
+def test_telnet_campaign_carries_hardware_recon(tmp_path):
+    recs = [trap_event("telnet", "auth_attempt", "203.0.113.30", "telnet-1", username="root",
+                       password="vizxv", success=True),
+            trap_event("telnet", "command", "203.0.113.30", "telnet-1", minutes=0.1,
+                       data={"input": "/bin/busybox ECCHI", "response": "", "persona": False}),
+            trap_event("telnet", "command", "203.0.113.30", "telnet-1", minutes=0.2,
+                       data={"input": "cat /proc/cpuinfo | grep name | wc -l", "response": "2",
+                             "persona": False}),
+            trap_event("telnet", "auth_attempt", "203.0.113.31", "telnet-2", username="root",
+                       password="x", success=True),
+            trap_event("telnet", "command", "203.0.113.31", "telnet-2", minutes=0.3,
+                       data={"input": "uname -a", "response": "", "persona": False})]
+    _, reports = _run(tmp_path, recs, None)
+    camps = {r.src_ip: r for r in load_records(reports) if r.kind == "campaign"}
+    assert camps["203.0.113.30"].high_signal == {"hardware_recon": 1}
+    assert any(t.id == "T1082" for t in camps["203.0.113.30"].techniques)
+    assert camps["203.0.113.31"].high_signal == {}

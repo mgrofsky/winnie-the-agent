@@ -1,0 +1,22 @@
+# Operator console with actions on: approve, reject and unblock from the console. It calls
+# the same functions as "python -m agents approve|reject|unblock", so every gate those
+# commands have still applies, and decisions are recorded as ui:<operator>.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ui-actions.yml --profile ui up -d ui
+#
+# The only changes: the agent-data volume is mounted read-write and --actions is added.
+# Those three commands write only under the agent-data volume (approval queue, blocklist
+# store and blocklist file, audit records, approved detections), so the overlay and the
+# event log stay read-only. With this file the console can change what the agents act on:
+# treat it as part of the same trust zone as the agents container, and anyone who can
+# reach its loopback port and read its log as someone who can approve a block.
+
+services:
+  ui:
+    command: ["python", "-m", "agents", "ui", "--config", "/config/config.ini",
+              "--log", "/data/ssh_log.log", "--data-dir", "/data",
+              "--reports-dir", "/agents/reports", "--state-dir", "/agents/state",
+              "--detections-dir", "/agents/detections",
+              "--bind", "0.0.0.0", "--allow-non-loopback", "--port", "8480", "--actions"]
+    volumes:
+      - agentdata:/agents

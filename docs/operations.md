@@ -40,9 +40,10 @@ sensor may run and what it may reach.
 | File | Purpose |
 |---|---|
 | `Dockerfile` | One image (`python:3.13-slim`, dependencies from `uv.lock`) for all services. Runs as UID 10001. |
-| `docker-compose.yml` | `ssh`, `listeners` and `agents` services, plus one example sensor per scenario behind a profile. Host ports default to the real service ports. |
+| `docker-compose.yml` | `ssh`, `listeners` and `agents` services, plus one example sensor per scenario and the operator console (`ui`), each behind a profile. Host ports default to the real service ports. |
 | `docker-compose.lab.yml` | Override: every port bound to 127.0.0.1 on a high port, for a workstation lab. |
 | `docker-compose.isolated.yml` | Override: front-ends on an internal network with no route out and no DNS, for verifying that nothing connects outward. |
+| `docker-compose.ui-actions.yml` | Override: lets the operator console approve, reject and unblock (agent data read-write, `--actions`). See [Operator console](#operator-console). |
 
 All services run as a non-root user with a read-only root filesystem, a small `/tmp`
 tmpfs, all capabilities dropped and `no-new-privileges`.
@@ -51,9 +52,9 @@ Volumes:
 
 | Volume | Written by | Mounted read-only by | Contents |
 |---|---|---|---|
-| `frontend` | `ssh`, `listeners` | `agents` | event log, quarantine, budget state, sensor seed |
-| `overlay` | `agents` | `ssh`, `listeners` | tuner overlay, per-source state |
-| `agentdata` | `agents` | (none) | triage records, digests, response runs, approvals, tuner snapshots, honeytoken registry, detection drafts, blocklist |
+| `frontend` | `ssh`, `listeners` | `agents`, `ui` | event log, quarantine, budget state, sensor seed |
+| `overlay` | `agents` | `ssh`, `listeners`, `ui` | tuner overlay, per-source state |
+| `agentdata` | `agents` (and `ui` with actions on) | `ui` | triage records, digests, response runs, approvals, tuner snapshots, honeytoken registry, detection drafts, blocklist |
 
 `./SSH` (config, host key, prompt) is bind-mounted read-only into the front-ends, and
 `./SSH/config.ini` alone into `agents`. The agents container does not mount the
@@ -116,13 +117,30 @@ net, not a substitute.
 
 ## Lab deployment
 
+The lab is a loopback demo for a workstation: every port is bound to 127.0.0.1, and it works
+without provider keys. The [README quick start](../README.md#quick-start-local-lab) walks
+through it from a clone to one SSH session in the console, including the ownership of the
+config and host key on Linux. For a sensor on the internet use
+[Before you deploy](#before-you-deploy), [Egress control in production](#egress-control-in-production)
+and the [AWS guide](../deploy/aws/README.md) instead. The lab override needs Docker Compose
+2.24.4 or newer (it uses `!override`).
+
+Use the same shell function as the quick start for every lab command, so the stack, the
+console, the logs and the teardown share one project and its volumes:
+
 ```bash
 cp SSH/config.ini.TEMPLATE SSH/config.ini
 ssh-keygen -t rsa -b 4096 -N "" -f SSH/ssh_host_key
 # in SSH/config.ini: [listeners] ftp_pasv_address = 127.0.0.1
-docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml up -d
-docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml logs -f
+lab() { docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml "$@"; }
+lab --profile ui up -d --build
+lab logs -f
 ```
+
+If a lab port is in use, change only the host side of that mapping in
+`docker-compose.lab.yml` (`"127.0.0.1:12222:8022"` to `"127.0.0.1:12223:8022"`) and use the
+new number in every client command. Stop the lab with `lab --profile ui down`. That keeps the
+volumes; `lab --profile ui down -v` also deletes them and the data the lab captured.
 
 Test with real clients against 127.0.0.1 and the lab ports. With the default
 `sip_provider` scenario, for example: `ssh -p 12222 root@127.0.0.1`,
@@ -133,7 +151,8 @@ few attempts from the same source, or at once for an account listed in the scena
 (`scenarios/<name>/scenario.toml` lists them).
 
 To check that the front-ends make no outbound connections, use the isolated override and
-run clients as containers on the same internal network:
+run clients as containers on the same internal network. It uses the same project name as the
+lab, so take the lab down first (`lab --profile ui down`):
 
 ```bash
 docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.isolated.yml up -d
@@ -192,13 +211,20 @@ count; leave some headroom below the model's context window.
 
 Everything runs without any model configured:
 
-- The SSH and Telnet shells answer with plausible canned replies (`command not found` and a
-  prompt; `exit` and `logout` end the session). If the persona's provider needs an API key
-  and it is not set, no network attempt is made.
+- The SSH and Telnet shells answer from the deterministic shell: `uname`, `uptime`, `id`,
+  `nproc`, `free`, `df`, `ps`, `/proc` and `/etc` files, `lscpu`, `lspci`, `nvidia-smi`,
+  `which`, `ls` of standard directories, the IoT botnet openers and `busybox` probes, with
+  `wget` and `curl` failing, all consistent with the scenario's host profile. A known
+  command used with an option or file the shell does not handle gets that tool's own error
+  (`invalid option`, `No such file or directory`) or no output; only an unknown command
+  gets `command not found`. Then a prompt (see
+  [architecture.md](architecture.md#deterministic-shell)). `exit` and `logout` end the
+  session. If the persona's provider needs an API key and it is not set, no network attempt
+  is made.
 - Unknown SQL and API requests get protocol errors instead of model answers.
 - Triage writes deterministic records for every SSH session and campaign. Download-and-
-  execute, persistence, credential-file reads and honeytoken use still mark a session
-  `MALICIOUS`.
+  execute, persistence, credential-file reads, hardware sizing for mining and honeytoken
+  use still mark a session `MALICIOUS`.
 - The tuner ranks candidates by frequency; detect uses its default titles.
 
 ## Data and retention
@@ -214,20 +240,178 @@ Everything runs without any model configured:
 | Per-source state | `overlay` | entries expire; at most 10,000 |
 | Approved blocklist | `agentdata`: `/agents/reports/blocklist/` | entries expire after `blocklist_ttl_days` (30) |
 | Detection drafts | `agentdata`: `/agents/detections/pending/` | no |
+| STIX bundle and its state (`[stix]`, off by default) | `agentdata`: `/agents/reports/stix/bundle.json`, `/agents/state/stix_state-*.json` | objects leave the bundle `keep_days` (30) after they expire or are revoked; back up the state with the bundle ([Portable formats](portable-formats.md#when-the-state-is-lost)) |
+| Blocklist candidates | `agentdata`: `/agents/detections/pending/blocklist-candidates.csv` | rewritten each detect run; rows past `expires` (`[agents] blocklist_expiry_days`, 14, or `blocklist_access_expiry_days`, 30) are left out |
 | Event export cursor and failure events | `agentdata`: `/agents/state/ship_cursor.json`, `ship_events.jsonl` | the failure file is kept under 1 MB |
+| Tracked list | `agentdata`: `/agents/reports/blocklist/tracked.json` | rewritten whole on every respond run while `track_before_enforce` is on; entries expire with the blocklist |
+| Sightings and transfer state | `agentdata`: `/agents/state/sightings.json`, `tracked_export_state.json`, `sightings_fetch_state.json` | no; the sightings file is replaced by each good fetch |
+
+Triage removes its own session and campaign records after `record_retention_days`; delete
+digests on whatever schedule your data policy sets.
+
+### Rotating the event log
 
 Rotate the event log yourself, and only when nothing is pending. The summary of every
-`triage`, `ship` and `run-all` run carries `log_rotation`: `{"safe": true}` when triage has
-no unfinished or deferred items left in the log and the export has shipped everything;
-otherwise `safe` is false, `pending` says what is waiting (bytes of the log still needed by
-triage, events not yet exported), and the run logs `event log not safe to rotate yet`.
-Rotating then would lose those sessions, campaigns or events. On a busy sensor some
-campaign is usually still open (its window plus 10 minutes), so rotate after a run that
-reports `safe`, for example in a quiet period or with the front-ends briefly stopped. The
-triage cursor notices a new file (different inode) or a truncated one and starts from the
-beginning. Prefer copy-and-truncate, because the SSH server keeps its log file open. Triage removes its own
-session and campaign records after `record_retention_days`; delete digests on whatever
-schedule your data policy sets.
+`triage`, `ship` and `run-all` run carries `log_rotation`:
+
+```json
+{"safe": true, "pending": [], "scope": "complete",
+ "log": {"generation": "5b0e1c9a77d2f410", "complete_bytes": 48211, "partial_bytes": 0,
+         "tail": "c41f0aa9e3b27d65"},
+ "readers": {"triage": {"state": "confirmed", "confirmed_offset": 48211, "behind_bytes": 0,
+                        "generation": "5b0e1c9a77d2f410", "tail": "c41f0aa9e3b27d65"}}}
+```
+
+The attestation is read from one open file descriptor: `generation` is an opaque id of the
+log file (it changes when the file is replaced, and when the first line changes after a
+truncate), `complete_bytes` counts only bytes up to the last newline (`partial_bytes` is an
+unfinished line), and `tail` fingerprints the last 4 KiB before that point. A reader's
+`generation`, `confirmed_offset` and `tail` come from its cursor, which saves them at the
+boundary it actually processed.
+
+`safe` is true only when every reader that must confirm shows the log's current
+`generation`, a `confirmed_offset` equal to `complete_bytes`, and a `tail` that matches the
+log's content there. Otherwise `safe` is false, `pending` says why, and the run logs `event
+log not safe to rotate yet`. Rotating then would lose those sessions, campaigns or events.
+A reader that is missing, behind, failed, disabled in this config, unknown, or positioned
+in a different generation (the file was replaced, rotated or truncated since it last ran,
+or rewritten in place, including a rewrite that keeps the size, the first line and the
+bytes at the boundary but moves the modification time) does not confirm. A reader also
+saves nothing for a file that changed under it while it ran: it must still be the sampled
+file plus appended lines. Neither does a cursor with no fingerprint (written by an older
+version): triage keeps resuming from it, because starting over would triage every session
+a second time, and its next run adds the fingerprint; the export sends the log once more
+from the start on its next run (delivery is at least once), even with no new events, and
+then records it. The check also says no when the log ends in an unfinished line (a writer is
+active), is not a regular file or cannot be read, when the configuration could not be read
+(the set of readers is then unknown), and when the log moved between the two samples it
+takes. An empty log, or one that was never created, holds nothing to lose, unless a reader
+failed or the configuration is in error.
+
+The readers that must confirm are triage, always; the export, when
+`[connector.s3_events] enabled` is true in the same config; and any reader named in
+`[agents] log_readers` (`triage`, `ship`). Each one's position is read from its cursor in
+the state directory (`triage_cursor.json`, `ship_cursor.json`), so a command reports on a
+reader it did not run: `triage` alone says the export is outstanding, and `ship` alone says
+triage is.
+
+- **Triage only (the default lab).** Nothing exports the log, so `triage` or `run-all`
+  reports `safe` once triage has finished everything in it. On a busy sensor some campaign
+  is usually still open (its window plus 10 minutes), so rotate after a run that reports
+  `safe`, in a quiet period or with the front-ends briefly stopped.
+- **Triage and export on one state directory.** `run-all` runs both and answers for both:
+  `safe` needs `readers.triage` and `readers.ship` confirmed at the same `generation` and
+  `confirmed_offset`, equal to `log.complete_bytes`.
+- **Separate state, as on the AWS sensor.** The agents container has the export off and the
+  exporter container has it on, each with its own state volume, so neither can read the
+  other's cursor. Both configs list `log_readers = triage, ship`, and each command reports
+  `scope: "partial"`, `safe: false` and the other reader as unconfirmed. That is expected:
+  a command that can see only its own reader reports that reader and never an all-clear.
+  Compare the two reports yourself:
+
+  1. Stop the writers, the `ssh` container and every `listeners` container, so the log
+     stops growing. Keep them stopped until the log is rotated.
+  2. Run `python -m agents triage` (or `run-all`) in the agents container and
+     `python -m agents ship` in the exporter container, with the flags from their compose
+     commands, once each.
+  3. In the two reports, `log.generation`, `log.complete_bytes` and `log.tail` must be
+     identical, `log.partial_bytes` must be 0, and each container's own reader must show
+     `"state": "confirmed"` with that `generation` and `tail` and a `confirmed_offset` equal
+     to `complete_bytes`. If any value differs, a reader is behind or the log changed
+     between the two runs: run both again. Triage can stay behind until the sessions that
+     were open when you stopped the writers count as finished (120 minutes idle, or a
+     logged close) and their campaigns' windows have passed; wait for that, or accept that
+     those sessions are not triaged.
+  4. Rotate while the writers are still stopped, then start them.
+
+  This needs no volume shared between the two containers: each one reads only its own
+  cursor, and you compare the two printed attestations.
+
+Events written between the check and the rotation are confirmed by no reader. With the
+writers stopped there are none, so keep them stopped until the rotation is done. If the
+writers must keep running, any rotation can lose the events written after the check (a
+truncation loses them outright, and a rename leaves them in the old file for the SSH
+server, which holds its log open, until it restarts). Check again immediately before
+rotating, and rotate only if `log.generation`, `log.complete_bytes` and `log.tail` are
+unchanged. A truncated or replaced log is a new generation: each reader starts it from the
+beginning on its next run, and the ids it already handled prevent repeats, so until each
+reader has run once on the new file `pending` reports a different generation. Prefer
+copy-and-truncate with the writers stopped, because the SSH server opens its log in append
+mode.
+
+### Event log permissions
+
+The log holds attempted usernames and passwords, so keep it readable only by the people and
+services that need it. Two processes write `ssh_log.log`, the SSH server and the listeners,
+and either may be the one that creates it. Both create it owner-only, mode 0600, in the same
+`open` call (no later `chmod`, so there is no moment when it is wider; a stricter umask can
+only remove more), and both append. Nothing else in the shipped deployment creates it: the
+image, the compose files and the AWS bootstrap neither pre-create nor `touch` it, and the
+agents, exporter and console only read it.
+
+A file that already exists keeps its mode. Earlier versions created it 0644 (the SSH server,
+with the process umask) or 0640 (the listeners), so on an upgraded sensor check it and
+tighten it yourself:
+
+```sh
+ls -ldn /data /data/ssh_log.log     # in Docker: docker compose exec ssh ls -ldn /data /data/ssh_log.log
+```
+
+1. **Find the service user.** In the bundled Docker files and on the AWS host every service
+   (`ssh`, `listeners`, `agents`, `exporter`, `ui`) runs as UID 10001:10001, so the writers
+   and the readers are the same user and 0600 is enough; the console and exporter need no
+   group. Without Docker, it is the account that runs `SSH/ssh_server.py`
+   (`ps -o user= -p "$(pgrep -f ssh_server.py)"`), and the listeners must run as that same
+   account, or the second writer cannot append to a file the first created 0600.
+2. **List the authorized readers.** The accounts that run `python -m agents` (triage, ship,
+   console) and any backup or log-forwarding job you added. Anyone else should have no
+   access.
+3. **Tighten the log.** `chmod 0600` it, as the service user or root. It takes effect
+   immediately for the open file; no restart is needed. Run `python -m agents triage
+   --dry-run` as each reader account to confirm it still reads the log. Rotated copies and
+   backups hold the same content; give them the same mode.
+4. **Check the parent directory.** It must not be writable by others (anyone who can
+   write there can replace the log) and should not be listable by them: `chmod 0750`, or
+   0700 when only the service user reads. The image creates `/data` as 0750.
+
+#### A separate reader account (optional)
+
+If a reader that is not the service user must read the log (a forwarder, a backup job, an
+analyst's account), give it access through a dedicated group, never by widening the mode for
+everyone. The mode stays 0640 only because you create the file that way: a writer that finds
+no file creates it 0600 and the group loses access. So the file has to exist, with the right
+owner, group and mode, before any writer runs.
+
+1. Create the group and add the authorized readers to it, and nobody else (for example
+   `groupadd winnie-log-readers; usermod -aG winnie-log-readers REVIEWER`).
+2. Keep the log in a directory of its own, owned by the service user, group
+   `winnie-log-readers`, mode 0750. Do not grant the group the data directory itself: it
+   also holds the quarantine, the sensor seed and the budget state. Moving the log means
+   every process must use the new path: `[honeypot] log_file` or `--log-file` for both
+   writers, `--log` for the agents, the exporter and the console, and a volume mount of the
+   new directory in each container (read-only for the readers). The stock compose files and
+   `sensor.yaml` pass these paths explicitly, so edit each command and mount there.
+3. Stop both writers, then give the file the right owner, group and mode. Do one of these,
+   never both:
+   - **No log exists yet (a new path, or a replacement after rotating).** Create it so that
+     an existing file is never overwritten; with `noclobber` the redirect fails instead of
+     truncating (it opens with `O_EXCL`), as root in bash or zsh:
+     `( umask 077; set -o noclobber; : > /path/ssh_log.log ) && chown SERVICE_USER:winnie-log-readers /path/ssh_log.log && chmod 0640 /path/ssh_log.log`.
+     It is never wider than 0600 until the final `chmod`.
+   - **A log already exists (an upgrade, or your data).** Do not re-create it. Check
+     `ls -ln`, then `chown SERVICE_USER:winnie-log-readers FILE` and `chmod 0640 FILE` in
+     place, or just `chmod 0600 FILE` if no group is needed.
+4. Start the writers. Both append to the file and leave its owner, group and mode alone.
+   Check with `ls -ln`, and read it as a group member.
+
+**Rotating.** Run the drain checks in [Rotating the event log](#rotating-the-event-log)
+before anything that removes or truncates the log: with the writers stopped, both readers
+must confirm the same boundary. Then either truncate in place (copy it, then `: > FILE` as
+the service user), which keeps the owner, group and mode, or rename it and create the
+replacement with the `noclobber` command above *before* the writers resume. Otherwise the
+first writer to log creates it 0600 and the readers lose access without any error. Give the
+archived copy the same group and mode, or a stricter one, and delete it on your retention
+schedule.
 
 Keep `sensor_seed` (on the `frontend` volume) across rebuilds: it determines all fake data
 and honeytoken values. A new seed changes every honeytoken, so earlier tokens are no longer
@@ -284,7 +468,8 @@ writes at most `max_objects_per_run` objects; the rest waits for the next run.
 
 Delivery is at least once. The export keeps its own cursor in the state directory
 (`ship_cursor.json`), with the same rotation checks as the triage cursor (inode, a hash of
-the first line, and the newline just before the offset). The cursor moves only after a
+the first line, the newline just before the offset, and a fingerprint of the bytes before
+it). The cursor moves only after a
 successful `PutObject`, so lines in an object that failed or was interrupted are sent again
 in the next run, and a reader may see an event twice. Only complete lines are shipped; a
 line still being written waits. Malformed lines, and a single line larger than
@@ -367,23 +552,1054 @@ hash keeps the correlation value without copying those secrets into another syst
 holding the sensor seed can still test guesses against the hashes, so the seed stays on the
 front-end volume.
 
+## Tracked list and sightings
+
+With `[respond] track_before_enforce = true`, approving a blocklist entry only tracks it,
+and blocking it is a second decision. The stages, the `enforce` command and what happens
+to existing entries are in [playbooks.md](playbooks.md#track-before-enforce). This section
+covers the two files that connect the tracked list to the rest of your environment:
+
+- **Out:** `tracked.json`, written by respond next to the blocklist file. Your cloud can
+  watch it. `[connector.tracked_export]` sends it.
+- **In:** `sightings.json`, written by your environment: where else it saw a listed
+  address. The console shows it next to each entry. `[connector.sightings]` can fetch it.
+
+Both transfers are off by default. They run in the agents process only, in
+`python -m agents ship` and at the end of `run-all`.
+
+### Turning it on
+
+1. Set `[respond] track_before_enforce = true` (and `queue_enforce = true`, without which
+   nothing is queued) and restart the services. Entries already on the blocklist stay
+   enforced.
+2. Approve an `export_blocklist` item. It appears in `tracked.json`
+   (`reports/blocklist/tracked.json` by default) and as Tracked on the console's blocklist
+   screen. Nothing is blocked.
+3. Optional: enable `[connector.tracked_export]` so your cloud can read the list. Check it
+   with `python -m agents ship --dry-run`.
+4. Optional: have your environment produce the sightings document, and either write it to
+   `[sightings] path` or enable `[connector.sightings]` to fetch it.
+5. When you decide to block an entry: `python -m agents enforce 198.51.100.7`, or Enforce
+   on the console with [actions on](#turning-actions-on).
+
+### Tracked export
+
+```ini
+[connector.tracked_export]
+enabled = true
+kind = s3                          ; s3 or https
+#file = /blocklist/tracked.json    ; default: tracked.json next to the blocklist file
+# kind = s3: PutObject of one key
+bucket = example-honeypot-events
+key = tracked/tracked.json
+region = us-east-1
+#bucket_owner = 123456789012
+#endpoint_url = https://s3.example.com
+# kind = https: one PUT or POST
+#url = https://intel.example.com/api/tracked
+#method = PUT
+#secret_file = /run/secrets/tracked-token
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | false | |
+| `kind` | none | `s3` or `https`; required |
+| `file` | `tracked.json` next to `[respond] blocklist_file` | absolute path to read the document from, for a process that does not see the agents' reports directory |
+| `bucket`, `key` | none | `s3`: the one object written; required |
+| `region` | none | `s3`: the bucket's region; with `endpoint_url`, the store's own region name |
+| `bucket_owner` | none | `s3`: 12-digit account id, sent as `ExpectedBucketOwner` |
+| `endpoint_url` | none | `s3`: another store that speaks the S3 API; `https` only |
+| `url` | none | `https`: the destination; required |
+| `method` | `PUT` | `https`: `PUT` or `POST` |
+| `secret_env`, `secret_file` | none | `https`: bearer token from an environment variable, or from a file (absolute path, read at each call); one or the other |
+| `header` | `Authorization` | `https`: the header that carries the token |
+| `max_per_day` | 200 | `https`: sends per day |
+| `timeout` | 10 | seconds, at most 30 |
+| `allow_private` | false | allow a private or loopback `endpoint_url` or `url` |
+
+- The document is sent whole when its content (everything but `generated_at`) differs from
+  the last copy stored (a hash in `<state-dir>/tracked_export_state.json`), so a removal or
+  an expiry reaches the remote copy on the next run, and at least once every 24 hours
+  otherwise, so the remote `generated_at` shows the sensor is still exporting.
+- Before sending, the file is checked to be a tracked export of at most 8 MiB.
+- `kind = s3` writes exactly one object with `PutObject`. As with the event export, a hook
+  on the client refuses every other operation, bucket and key before a request is sent, so
+  the sensor needs `s3:PutObject` on that one key and nothing else. Credentials come from
+  the default AWS credential chain, never from `config.ini`. `endpoint_url` must be
+  `https`, and a private address or `localhost` in it is refused at load unless
+  `allow_private` is set. The S3 client resolves the name itself on each call, so unlike
+  the HTTP connectors the address is not pinned.
+- `kind = https` follows the [connector rules](playbooks.md#connectors): `https` only,
+  public destinations unless `allow_private`, the address resolved and pinned per call, no
+  redirects, timeouts, a response cap and the daily cap.
+- A failure is logged, recorded in `ship_events.jsonl` (shown in the Event export row of
+  the console's overview) and tried again on the next run. It never stops the event
+  export or the rest of the run.
+
+On AWS, see [deploy/aws/README.md](../deploy/aws/README.md) for running the tracked export
+from the exporter container.
+
+### Sightings
+
+Your environment writes one JSON document, by any means it likes:
+
+```json
+{
+  "version": 1,
+  "generated_at": "2026-11-18T09:00:00Z",
+  "sightings": [
+    {
+      "address": "198.51.100.7",
+      "where": "prod",
+      "service": "tcp/443",
+      "first_seen": "2026-11-17T22:10:00Z",
+      "last_seen": "2026-11-18T08:55:00Z",
+      "count": 14,
+      "source": "flow logs"
+    },
+    {
+      "address": "2001:db8:4:5::1f",
+      "where": "staging",
+      "service": "tcp/22",
+      "first_seen": "2026-11-16T03:00:00Z",
+      "last_seen": "2026-11-16T03:40:00Z",
+      "count": 3,
+      "source": "threat-list finding"
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | 1 |
+| `generated_at` | when the producer wrote it; ISO 8601, UTC if no zone is given |
+| `sightings[].address` | an IPv4 address, or an IPv6 address or /64; IPv6 is matched by its /64 |
+| `where` | where it was seen, a short label of your choosing |
+| `service` | what it reached, for example `tcp/443` |
+| `first_seen`, `last_seen` | ISO 8601; `first_seen` not after `last_seen` |
+| `count` | a non-negative integer |
+| `source` | what reported it, for example `flow logs` |
+
+The file is untrusted and checked strictly. The whole file is refused on the first
+problem: over the size or entry cap, a wrong type, an invalid address or timestamp, a
+negative or non-integer count, a string over 256 characters. Strings are cut to 64
+characters with control and other
+invisible characters removed. Unknown keys are ignored. Sightings of addresses that are
+not on the list are ignored.
+
+```ini
+[sightings]
+#path = /agents/state/sightings.json   ; default: sightings.json in the state directory
+max_bytes = 1048576
+max_entries = 5000
+stale_hours = 48
+
+[connector.sightings]
+enabled = true
+kind = s3                              ; s3 or https
+interval_minutes = 15
+bucket = example-honeypot-events
+key = sightings/sightings.json
+region = us-east-1
+#url = https://intel.example.com/api/sightings
+#secret_env = WINNIE_SIGHTINGS_TOKEN
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `[sightings] path` | `<state-dir>/sightings.json` | absolute path of the local file the console reads |
+| `max_bytes` | 1048576 (1 MiB) | larger files are refused; at most 16 MiB |
+| `max_entries` | 5000 | more sightings than this and the file is refused; at most 100,000 |
+| `stale_hours` | 48 | the console marks the file stale when `generated_at` is older than this |
+| `[connector.sightings] enabled` | false | |
+| `kind` | none | `s3` (`GetObject` of one key) or `https` (`GET`); required |
+| `interval_minutes` | 15 | fetch at most this often, 1 to 1440 |
+
+The other `[connector.sightings]` keys are those of the tracked export: `bucket`, `key`,
+`region`, `bucket_owner`, `endpoint_url` for `s3`; `url`, `secret_env` or `secret_file`,
+`header`, `max_per_day` for `https`; `timeout` and `allow_private` for both. The `s3`
+client is its own, guarded to `GetObject` of that one key. An `https` response may be as
+large as `max_bytes`.
+
+How it is used:
+
+- **Display only.** Nothing acts on a sighting. It never triggers enforcement.
+- **Fetch.** The local file is replaced atomically, and only by a copy that passed the
+  checks. A failed or refused fetch keeps the local file, is logged (the same refused copy
+  only once), is recorded in `ship_events.jsonl` and is tried again when next due.
+- **A refused local file.** The console keeps showing the last good copy it read, marks the
+  file refused and logs the problem once. The good copy is held in memory, so after a
+  console restart a refused file shows no sightings until a good one arrives.
+- **Stale.** A file older than `stale_hours` is still shown, marked stale.
+
+On the console's blocklist screen, when the switch is on or any entry is tracked, each
+entry shows its status (Tracked or Enforced), since when, its expiry and its sightings:
+total count, number of places, last seen, and a small table of where, service, count, last
+seen and source ("No sightings yet" when there are none). A line above the list gives the
+sightings file's age and the stale and refused markers. With actions on, a tracked entry
+has Enforce next to Unblock. Its confirmation says which files change and whether the
+block connector will be called, and the request carries a hash of the entry as shown, so an
+entry that changed or expired since the page loaded is refused. With the switch off and no
+tracked entries the screen is as before.
+
+### Using this with your cloud
+
+The contract is the two JSON documents above: the tracked export going out and the
+sightings document coming in. Anything that can read one object and write another can take
+part. This repository has no adapter for any cloud, so every row below is a likely shape,
+not something that has been tested.
+
+| Platform | Out: the tracked export feeds | In: sightings come from | Status |
+|---|---|---|---|
+| AWS | `kind = s3` to a bucket; a scheduled job you own turns it into a managed threat list, for example a GuardDuty threat list, or a watch rule in your SIEM | GuardDuty findings, VPC flow logs or load balancer logs, summarised by a scheduled job into `sightings.json` in a bucket; `[connector.sightings] kind = s3` | not tested |
+| Azure | `kind = https` to an endpoint you run, which loads it into a Microsoft Sentinel watchlist or threat-intelligence import | Sentinel or Defender alerts, or network flow logs, summarised by a scheduled job and served over `https` | not tested |
+| Google Cloud | `kind = https` to an endpoint you run, or `kind = s3` with `endpoint_url` if your bucket offers an S3-compatible endpoint; loaded into a Security Command Center or Chronicle reference list | Security Command Center findings or VPC flow logs, summarised by a scheduled job | not tested |
+| Self-hosted or S3-compatible store | `kind = s3` with `endpoint_url` (and `allow_private` for an internal one) | any job that writes `sightings.json` to the same store | not tested |
+
+Things to hold on both sides:
+
+- **The producer decides what the sensor learns.** The sensor is a machine attackers are
+  invited to probe. Assume whoever takes it over reads the sightings file. Write the
+  minimum: only addresses that are on the tracked list, a coarse `where` (an environment
+  label such as `prod`, never a host name, an internal address or an account id), the
+  service as protocol and port, counts and times. Leave out anything you would not hand to
+  the attacker.
+- **The consumer owns the conversion.** A list built from the tracked export is evidence
+  from an exposed host. Apply the rules in [Using the intelligence outside the
+  sensor](#using-the-intelligence-outside-the-sensor): validate every entry, check an
+  allow-list, cap the size and honour `expires_at`. A watch list or threat list that alerts
+  fits the tracked stage; blocking belongs to enforced entries only, if at all.
+- **One object each way.** Give the sensor write access to the one export object and read
+  access to the one sightings object, nothing else, and no credentials for the systems the
+  lists feed.
+
+## Where addresses are
+
+The console and the digest can show where a source address is: country, region, city and
+the network that owns it (AS number and name), for example
+`198.51.100.7 · Frankfurt, Germany · AS64500 Example Cloud`. The answer comes from database
+files you put on disk. Nothing is looked up over the network: the containers have no
+internet access, and this feature does not change that. Reverse DNS names are not shown;
+they need a live query.
+
+It is off until you set a path. With the files or the `maxminddb` package missing, it
+stays off and everything else works as before; the agents and the console each log one
+line at start saying whether it is on, with each file's build date, or why it is off.
+
+### Getting a database
+
+Two free sources work, in MaxMind's `.mmdb` format. Use either, or one of each:
+
+- **DB-IP Lite** (no account): "IP to City Lite" and "IP to ASN Lite" in MMDB format from
+  db-ip.com, updated monthly. Licensed CC BY 4.0: wherever the results are shown you must
+  credit DB-IP with "IP Geolocation by DB-IP" and a link to db-ip.com. Set `attribution`
+  (below) and the console shows it in its footer.
+- **MaxMind GeoLite2** (free account and licence key): "GeoLite2 City" and "GeoLite2 ASN".
+  The GeoLite2 licence applies, including its attribution requirement and keeping the files
+  up to date; read it before you use them.
+
+Download on a machine with internet access, never from inside the sensor's containers,
+then copy the files to the sensor host.
+
+### Turning it on
+
+Put the files in a `geoip` directory next to `docker-compose.yml`, uncomment the
+`./geoip:/geoip:ro` lines under the `agents` and `ui` services, and add to `SSH/config.ini`:
+
+```ini
+[geoip]
+city_db = /geoip/dbip-city-lite.mmdb
+asn_db = /geoip/dbip-asn-lite.mmdb
+attribution = IP Geolocation by DB-IP (db-ip.com)
+```
+
+Paths are as the containers see them and must be absolute. Either key alone works. The image
+installs `maxminddb` (the `geoip` extra in `pyproject.toml`); without Docker,
+`uv sync --extra geoip`. `*.mmdb` and `geoip/` are in `.gitignore`: never commit them.
+
+### What it changes
+
+- Each new triage record stores what the lookup said when it was written (`src_geo`:
+  country code and name, region, city, AS number and owner, and the build date of each
+  file), so the record keeps what was true at the time. Older records get a lookup when
+  shown, and the record page says which ("when recorded" or "looked up now").
+- The console shows it after the address on the overview's top sources and honeytoken
+  hits, the records list (with a country filter), the record page (the Who line and the
+  campaign's source addresses), approval cards, the blocklist and tracked list, the decoy
+  screen's per-source state and the activity screen.
+- The digest's Who line carries the same short form.
+- Exports and notifications do not change.
+
+Private, loopback, link-local, shared (CGNAT), documentation, multicast and reserved
+addresses are labelled ("private address") without a lookup. A network wider than /24
+(IPv4) or /48 (IPv6) is not looked up.
+
+### Refreshing
+
+Download the new release, copy it next to the old file and rename it into place
+(`mv dbip-city-lite.mmdb.new dbip-city-lite.mmdb`). Both processes check the files about
+once a minute and switch to the new copy without a restart. Overwriting the file in place
+works too but can give odd answers for up to a minute, so prefer the rename. On AWS the
+host has no path to fetch these files; see the deployment README.
+
+## What Shodan already knows about a source
+
+The console can show what Shodan's public InternetDB already holds about an interesting
+source address: open ports, host names, tags (for example `vpn`, `scanner`, `cloud`), CPEs
+and known vulnerability ids. On the record page and the overview's top sources (and the
+decoy screen's per-source list) it is one line under the address, for example
+`Shodan: ports 22, 80, 8080 · tags vpn · 3 known CVEs · host a.example.net`, which opens to
+the full lists, the lookup date and a "Data from Shodan InternetDB" credit. Shodan collects
+this on its own schedule (refreshed weekly), so the source never sees the lookup.
+
+It is off by default. Off, unreachable or rate limited, everything else works as before.
+
+### Terms of use
+
+InternetDB needs no account or key. Shodan's terms: free for non-commercial use; a company
+may use it internally, but not to build a product it charges for (that needs a Shodan
+enterprise licence). Check that your use fits before you turn it on.
+
+### What is sent, and from where
+
+- One HTTPS GET per address to `https://internetdb.shodan.io/<address>`, with the address
+  in the path and nothing else: no cookies, no key, a generic user agent
+  (`internetdb-client/1`), nothing about what the source did. The host is fixed in the code;
+  the configuration cannot point it anywhere else. The certificate is verified, redirects
+  are not followed, each call has a 5 second deadline and the answer is capped at 64 KB.
+- It runs in the `agents` container as part of `run-all` (and `python -m agents ship`),
+  next to the sightings fetch. The honeypot containers never make it and gain no network
+  access. The results go to `<state-dir>/internetdb.json`, which triage and the console
+  read; no new connection between containers.
+- Which addresses: the single source address of triage records seen in the last 7 days
+  that were judged SUSPICIOUS or MALICIOUS or used a honeytoken, most important first.
+  Never an unverified UDP source, a private or other non-global address, a campaign's
+  network, or an address inside `[respond] never_act_on` (list your own and allow-listed
+  addresses there). With a `never_act_on` that does not parse, nothing is looked up.
+- Pacing: one request at a time, at least a second apart, at most 100 per run and 2000 per
+  UTC day. An answer, including "no information", is kept 7 days. A 429, a server error, a
+  redirect or a network failure stops the run and backs off for 15 minutes, doubling up to
+  a day. The file keeps at most 5000 addresses, oldest dropped first.
+
+### The answer is data
+
+Host names come from reverse DNS and certificates, so an attacker can choose them. Each
+value is checked before it is kept: ports are integers from 1 to 65535 (at most 50),
+host names use only letters, digits, hyphens and dots, at most 253 characters (at most
+10), tags and CPEs a short, conservative character set (at most 20 each), and
+vulnerability ids must look like `CVE-2024-12345` (at most 50). Anything else is dropped,
+and an answer that is not a JSON object for the address asked about is not kept. The
+file is checked the same way again when read. It is display only: nothing acts on it, it
+is never put into a model prompt, and the console shows it as plain text.
+
+### Turning it on
+
+```ini
+[connector.internetdb]
+enabled = true
+```
+
+The other keys (`max_per_run`, `max_per_day`, `min_interval_seconds`, `cache_days`,
+`lookback_days`, `max_entries`) are in `SSH/config.ini.TEMPLATE` with their defaults. In
+`docker-compose.yml` the `agents` service already has outbound access; if you filter its
+egress, allow tcp 443 to `internetdb.shodan.io` (it is served from Cloudflare, so its
+addresses are shared and can change). `python -m agents ship --dry-run` says how many
+addresses would be looked up without sending anything.
+
+### What it changes
+
+- Each new triage record stores what the file held for its source when it was written
+  (`src_shodan`, with the lookup date). The lookup runs at the end of a run, after triage,
+  so a source's first record usually has none stored; the console then shows the file's
+  current answer, marked "latest lookup" rather than "when recorded".
+- Records written with the feature off are byte-for-byte as before. The digest, exports,
+  notifications, approval cards and their `view_hash` do not change.
+- On the AWS deployment the agents container never asks InternetDB; use delivered answers
+  or the exporter's own lookups (below); see its README.
+
+### Delivered answers
+
+Some sensors must not reach InternetDB at all: on AWS the agents container has no egress,
+and InternetDB sits behind a shared CDN, so no firewall rule can let the sensor reach it
+without also reaching every other site there. Delivered mode moves the lookup off the
+sensor. The sensor never makes a request to InternetDB; only two small files move, through
+the object store the sensor already writes to.
+
+```ini
+[connector.internetdb]
+enabled = true
+mode = delivered            ; direct (the default) | delivered
+
+[connector.internetdb_exchange]   ; in the process that has the store credentials
+enabled = true
+kind = s3
+bucket = example-honeypot-events
+wanted_key = events/internetdb/wanted.json
+answers_key = internetdb/answers.json
+#region, bucket_owner, endpoint_url, interval_minutes = 15, max_bytes, max_entries
+```
+
+1. `run-all` writes the wanted list: the addresses a direct lookup would choose (same
+   selection, same `never_act_on` rule), most important first, at most `max_wanted`
+   (default and limit 500), to `internetdb_wanted.json` next to the blocklist file (or
+   `wanted_file`). Written atomically, owner only, on every run.
+2. The exchange (`ship`, or the end of `run-all`) puts that list to `wanted_key` when its
+   addresses changed and at least once a day. It is checked first and rebuilt from the
+   checked addresses, so nothing else in the local file can leave, and `never_act_on` is
+   applied again.
+3. Something outside the sensor reads the list, asks InternetDB and writes the answers to
+   `answers_key`. [`deploy/aws/internetdb_lookup.py`](../deploy/aws/internetdb_lookup.py) is
+   a reference: one file, standard library plus boto3, runnable as a Lambda function or by
+   hand.
+4. The exchange gets the answers object (one GetObject of one key, at most once per
+   `interval_minutes`, at most `max_bytes`), checks it (below) and merges what passes into
+   `answers_file` (default `<state-dir>/internetdb.json`), the file triage and the console
+   already read. Everything after that works as in direct mode.
+
+On one host, one config does all of it. On AWS the agents container writes the list and the
+exporter moves both files; the deployment README has the wiring.
+
+**The wanted list** (sensor to store):
+
+```json
+{"version": 1, "generated_at": "2026-11-20T12:00:00+00:00",
+ "addresses": ["198.51.100.7", "2001:db8::5"]}
+```
+
+Addresses only, in canonical form, no duplicates, at most 500. Nothing about what a source
+did.
+
+**The answers object** (store to sensor):
+
+```json
+{"version": 1, "generated_at": "2026-11-20T12:05:00Z",
+ "answers": [
+   {"ip": "198.51.100.7", "checked_at": "2026-11-20T12:04:10Z", "status": "found",
+    "ports": [22, 80], "hostnames": ["a.example.net"], "tags": ["vpn"],
+    "cpes": ["cpe:/a:openbsd:openssh:7.4"], "vulns": ["CVE-2017-15906"]},
+   {"ip": "2001:db8::5", "checked_at": "2026-11-20T12:04:11Z", "status": "not_found"}]}
+```
+
+A found answer is InternetDB's own answer body plus `checked_at` and `status`; `not_found`
+is what a 404 means. Rules, in the order the sensor applies them:
+
+- The whole object is refused (the local answers stay as they were, logged once per bad
+  copy) when it is larger than `max_bytes` (default 4 MB), not UTF-8 JSON, not an object
+  with `"version": 1`, has no `answers` list, or has more than `max_entries` answers
+  (default 1000).
+- Each answer is then checked on its own and dropped on any problem:
+  - `ip` is a string in canonical form (`2001:db8::5`, not `2001:DB8::5`), a single global
+    address, outside `[respond] never_act_on`, and either on the current local wanted list
+    or already held in `answers_file`. Answers for addresses the sensor never asked about
+    are dropped.
+  - `checked_at` is an ISO 8601 time (no zone means UTC), at most five minutes in the
+    future, no older than `max_age_days` (default 30), and newer than the answer already
+    held for that address (an older or equal one is skipped, not counted as bad).
+  - `status` is `found` or `not_found`.
+  - For `found`, `ip`, `ports`, `hostnames`, `tags`, `cpes` and `vulns` go through exactly
+    the check a direct answer gets (see "The answer is data" above), with the lookup date
+    taken from `checked_at`.
+- Unknown keys are ignored (the reference producer keeps its own state under `producer`).
+- The local file keeps at most `max_entries` addresses of `[connector.internetdb]`, oldest
+  dropped first.
+
+With `kind = s3` the direct-mode keys (`max_per_run`, `max_per_day`, `min_interval_seconds`,
+`cache_days`) do nothing; pacing is the producer's job. The reference producer uses the
+same defaults: at most 100 lookups a run and 2000 a day, a second apart, answers fresh for
+7 days, back-off on 429, 5xx or network failure. With `kind = lookup` (next) they apply to
+the exporter's own lookups.
+
+### The exporter asks InternetDB
+
+The third way needs nothing outside the sensor and no object store. The agents side does
+not change at all: it stays `mode = delivered`, writes the wanted list and reads
+`answers_file`. The exchange step (`ship`, in the process that has egress) reads the wanted
+list, asks InternetDB itself and writes the checked answers to `answers_file`.
+
+```ini
+[connector.internetdb]
+enabled = true
+mode = delivered
+
+[connector.internetdb_exchange]   ; in the exporter's config only
+enabled = true
+kind = lookup
+#addresses_file = /egress/internetdb-addresses   ; connect only to these (AWS sets it)
+```
+
+- The wanted list is treated as untrusted input: the same check as the `s3` kind (read up
+  to 64 KB, version 1, at most 500 distinct canonical global addresses or the whole file is
+  refused, other keys ignored, `never_act_on` applied again). Only an address from it goes
+  into a request, in the path of the fixed URL; nothing in the file can change the host,
+  the headers or anything else sent.
+- The lookups are the same code as direct mode: the fixed host, certificate checked, no
+  redirects, 5 s deadline, 64 KB cap, one at a time at least `min_interval_seconds` apart,
+  `max_per_run` and `max_per_day`, answers (including "not found") fresh for `cache_days`,
+  back-off on 429, 5xx or a network failure, and the same check of every answer.
+- The exporter keeps its cache, day count and back-off in its own state directory
+  (`<state-dir>/internetdb_lookup.json`). On AWS the agents container cannot write it.
+- Answers reach `answers_file` through the same check as an answers object from the store,
+  so the file has exactly the shape the `s3` kind writes.
+- Unreachable, refused by a firewall or rate limited: the event export, the tracked export
+  and sightings carry on; the reason is in the run result (`internetdb.exchange`).
+- `addresses_file` (optional): a file of IPv4 addresses, one per line, at most 8. When set,
+  a lookup connects only to one of them (the first the name resolves to, else the first
+  listed), still checking the certificate for `internetdb.shodan.io`. On AWS the host
+  firewall writes it (see the deployment README). With the file set but empty or missing,
+  nothing is looked up.
+- `python -m agents ship --dry-run` reports how many addresses would be looked up.
+
+**Which of the three.** Direct when the process that triages may reach the internet (a
+single host you run yourself). The exporter's lookups when that process must stay without
+egress but the exporter may reach InternetDB (the AWS deployment with `InternetDbLookup`).
+Delivered through the object store when nothing on the sensor may reach InternetDB, or you
+want the lookups to come from another network (`InternetDbDelivered` and a producer such as
+the reference Lambda function).
+
+## Indicators to OTX
+
+The sensor can give confirmed indicators back to the community as an AlienVault OTX pulse:
+the addresses of sources that did real harm, and the SHA-256 of files they uploaded. It is
+off by default, and even when turned on it only writes what it would send to a file until
+you turn sending on.
+
+**A public pulse is public.** Anyone can read it, so it shows that whoever owns the OTX
+account runs a honeypot, and roughly when each listed source hit it (the pulse is one per
+UTC day). Sources that check OTX can learn that the sensor's own traffic is being
+reported. The pulse is private (`public = false`) unless you change that.
+
+### What is sent, and what is not
+
+Only indicators from a source whose address is proven **and** that did something past
+probing. Proven: not `unverified_source`, so the address completed a TCP exchange or a SIP
+nonce round trip. Past probing, from facts the code counted (never from model output):
+
+| Class | Meaning |
+|---|---|
+| `logged_in` | an accepted login, or an accepted SIP REGISTER |
+| `honeytoken` | used a planted credential |
+| `download_execute`, `persistence`, `credential_file_read`, `hardware_recon` | ran commands that do these |
+| `redis_takeover`, `sql_exec_attempt`, `sql_cred_dump` | took over a service or ran commands through it |
+| `smtp_relay_attempt`, `sip_dialed_number` | tried to relay mail or place outside calls |
+| `s3_bulk_download`, `s3_upload`, `s3_planted_key`, `ftp_upload`, `quarantine_quota` | took or uploaded files, or used a planted storage key |
+
+Failed logins alone, `ftp_active_mode` and `http_proxy_attempt` (probes scanners send) do
+not count. A record the model judged BENIGN is not sent: the model can hold a source back
+but never put one forward.
+
+Two indicator types, nothing else:
+
+- `IPv4`: the source address, global unicast only.
+- `FileHash-SHA256`: the hash of a file such a source uploaded, as the front-end computed it
+  while storing the file in the quarantine (read from the quarantine's own metadata, never
+  from attacker text). A file that reached the quarantine's per-file cap may have been cut,
+  so its hash is left out. `hashes = false` turns these off.
+
+No URLs, domains, commands, passwords, user names, user agents or anything else the
+attacker wrote: an attacker could name an innocent host to get it listed. Each indicator's
+title and description are fixed text plus the protocol and class names, for example
+"Source address seen on a honeypot over SSH. Logged in or registered; Tried to fetch a file
+and run it."
+
+Never sent: an address inside `[respond] never_act_on` (list your own and allow-listed
+addresses there), a private or other non-global address, the sensor's own address
+(`[listeners] ftp_pasv_address`, which the AWS deployment sets to the Elastic IP), an
+unverified UDP source, and IPv6 addresses (not in this version). The check runs when the
+candidates are written and again when they are read. With a `never_act_on` that does not
+parse, nothing is sent.
+
+### How it runs
+
+1. `run-all` (it has the triage records) writes the candidates to `otx_candidates.json` next
+   to the blocklist file: addresses, hashes, protocol and class names, timestamps. Records
+   seen in the last 7 days, at most 1000 indicators and 256 KB (when they do not
+   fit, hashes go before addresses, the oldest first).
+2. `ship` (or `run-all` when `submit = true`) reads that file with the same care as the
+   InternetDB wanted list: a regular file only (no FIFO, no symlink), at most 256 KB, every
+   field checked, the whole file refused on any problem. It adds what it has not sent
+   before to the day's pulse: `POST /api/v1/pulses/create` the first time in a UTC day,
+   `PATCH /api/v1/pulses/<id>` with the new indicators after that.
+
+The request goes to `https://otx.alienvault.com` only (fixed in the code), with the
+certificate and name checked, no redirects, no proxy, a 15 second deadline and a 1 MB
+answer cap. At most 200 indicators per run (one request) and 1000 per UTC day. A 429, a
+server error, a redirect, a refused key, any other unexpected status or a network failure
+stops the run and backs off for 15 minutes, doubling up to a day. If the day's pulse was
+deleted on OTX, the next run creates a new one. Only the new pulse's id is read from an
+answer, and only when it is 24 letters or digits.
+
+Every indicator sent is remembered in `<state-dir>/otx_state.json` (at most 20000, and never
+more than the 8 MB the state reader accepts; oldest dropped first), so nothing is sent
+twice. Each run adds one `otx_submit` event with the counts (sent, failed, skipped as
+already sent, excluded, hashes off or over the cap) to `<state-dir>/ship_events.jsonl`. A failure never stops the event export or the other
+stages.
+
+### Turning it on
+
+Make an OTX account, copy its API key from the settings page, and keep it out of
+`config.ini`:
+
+```ini
+[connector.otx]
+enabled = true
+secret_env = WINNIE_OTX_KEY       ; or secret_file = /run/otx-key (one line)
+#tags = honeypot
+#tlp = green                      ; white | green | amber | red
+#public = false
+#expiration_days = 30
+```
+
+With only that, it runs **dry**: each run writes the request it would make, with the
+indicators, to `<state-dir>/otx_dry_run.json`, and sends nothing (no key is read). Read
+that file. When it is what you want to share, set `dry_run = false`. The indicators held
+back during the dry run are sent then, within the caps. `python -m agents ship --dry-run`
+reports how many would be sent and writes nothing.
+
+The key is read only when a request is about to be sent. It is never logged and never
+written to the state, the dry-run file, the events or an error message.
+
+A process that must not send (the agents container on AWS) gets `submit = false`: it
+writes the candidates and does nothing else. The process that sends needs tcp 443 to
+`otx.alienvault.com`. `addresses_file` limits it to the addresses listed there, as for the
+exporter's InternetDB lookups; on AWS the host firewall writes it.
+
+## Using the intelligence outside the sensor
+
+The sensor produces addresses and indicators: `detections/pending/blocklist-candidates.csv`,
+Sigma drafts, the approved blocklist file (`[respond] blocklist_file`), the tracked list
+(`tracked.json`), the STIX bundle ([Portable formats](portable-formats.md)) and, with
+export on, the raw events. Feeding any of them into a firewall,
+a WAF, a session border controller, a SIEM or a paging system happens outside the sensor's fences, and a mistake there blocks or
+wakes up the wrong people. The guidance below applies to all of them, including the
+approved blocklist: a person approving an entry does not make the entry's source more
+trustworthy.
+
+- **Act only on proven sources.** Use candidate rows with `source_proven` set to `yes`, and
+  events that pass the [source proof](architecture.md#source-proof) filter (`transport`
+  is `tcp`, or `data.source_verified` or `data.nonce_verified` is `true`). A UDP source
+  address is whatever the sender wrote, so an unproven address may belong to a bystander
+  the attacker picked. Acting on it lets anyone choose whom you block.
+- **Expire entries.** Honour `expires` in the candidate file, and give anything you derive
+  from raw events an expiry of its own. Attack traffic comes mostly from rented servers,
+  residential proxies and compromised devices whose addresses change hands. A permanent
+  entry ends up blocking whoever holds the address next, and nobody remembers why it is
+  there.
+- **Keep an allow-list and check it before listing.** List your carriers and SIP trunks,
+  offices and VPN egress, monitoring and uptime checks, the scanners you pay for, and your
+  customers' known addresses. Check it before an address goes onto any list, not after a
+  complaint. The sensor is on the internet and sees some of your own traffic, and an
+  attacker can provoke it into listing an address you depend on. A block on a carrier or a
+  monitor is an outage you caused.
+- **Check whether the address was already a successful caller.** Before acting, look the
+  address up in the logs of your real services: authenticated logins, completed calls,
+  normal API use, from before it first appeared on the sensor. If it was, never page or
+  block on it automatically; send it to a person. It may be a customer behind shared NAT,
+  a customer's compromised device, or a forged source aimed at you. Each of those needs a
+  different response, and none of them is an automatic block.
+- **Cap list size.** Give every list a maximum number of entries, and when it is full,
+  stop adding and alert instead of evicting older entries. An attacker with many proven
+  addresses (a botnet is enough) can generate entries faster than you review them. If new
+  entries push out old ones, a flood evicts the real entries you meant to keep; if nothing
+  is capped, the list can exhaust a firewall's rule table or slow every lookup.
+- **Start any block in count or review mode.** A new rule or list should first log or count
+  what it would have dropped, for long enough to see real traffic against it, before it
+  drops anything. A wrong entry in count mode costs a log line; in block mode it costs a
+  customer, often silently.
+- **Prefer detection to blocking for services you do not expose.** If the sensor emulates a
+  service you do not run on the internet (Redis, S3, a database port), blocking listed
+  addresses on that service protects nothing. Alert instead when a listed address appears
+  in your real logs on any service. That match is rare and worth a look, and it costs
+  nothing when the entry is wrong.
+- **Treat the sensor as possibly compromised.** The sensor exchanges data with attackers
+  all day, so plan for the day its output is wrong or written by someone else. A list
+  derived from its events is evidence for a person or a correlating system to weigh, not
+  an authority your enforcement trusts directly. In practice: have the receiving side pull
+  from the sensor rather than letting the sensor push into enforcement; give the sensor no
+  credentials for your firewalls, WAF or SIEM rules; validate every entry on the receiving
+  side (address syntax, not on the allow-list, within the size cap, has an expiry); and
+  keep a way to remove everything that came from the sensor in one step.
+
 ## Running agent commands in Docker
 
 The agents CLI defaults to paths inside the repository, which do not exist in the
 container. Pass the same directories the scheduled loop uses:
 
 ```bash
-dc="docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml"
-args="--config /config/config.ini --data-dir /data --reports-dir /agents/reports \
-  --state-dir /agents/state --detections-dir /agents/detections"
+lab() { docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml "$@"; }
+args=(--config /config/config.ini --data-dir /data --reports-dir /agents/reports
+      --state-dir /agents/state --detections-dir /agents/detections)
 
-$dc exec agents python -m agents queue $args
-$dc exec agents python -m agents approve a-0123456789ab --by alice $args
-$dc exec agents python -m agents tune --history $args
-$dc exec agents python -m agents tune --rollback 3 $args
-$dc exec agents python -m agents run-all --dry-run --log /data/ssh_log.log $args
-$dc exec agents python -m agents ship --dry-run --log /data/ssh_log.log $args
+lab exec agents python -m agents queue "${args[@]}"
+lab exec agents python -m agents approve a-0123456789ab --by alice "${args[@]}"
+lab exec agents python -m agents tune --history "${args[@]}"
+lab exec agents python -m agents tune --rollback 3 "${args[@]}"
+lab exec agents python -m agents run-all --dry-run --log /data/ssh_log.log "${args[@]}"
+lab exec agents python -m agents ship --dry-run --log /data/ssh_log.log "${args[@]}"
 ```
+
+`lab` is the function from [Lab deployment](#lab-deployment) and `args` is an array, so the
+snippets run unchanged in bash and zsh. On another stack, replace `lab` with your own
+`docker compose` command line.
+
+## Operator console
+
+`python -m agents ui` is a local web console over the same files the CLI reads. It shows:
+
+- an overview and pipeline health;
+- the response approval queue;
+- triage records, with SSH transcript replay and the decoy's reply under each command; a
+  record's narrative is laid out in parts (headline, who, volume, target, what they did,
+  what it means, not seen) on the record page, the overview and the queue, and the records
+  table shows the headline; records written before the parts existed show their paragraph;
+- raw activity: every event in the log, any service, with filters and search;
+- daily digests;
+- how the decoy is being adjusted (Decoy);
+- playbooks and detections.
+
+It is read-only by default. It never calls a model and never shows configuration or
+secrets. The CLI commands keep working alongside it: the console only reads the files the
+pipeline writes, and its decisions (with actions on) go through the same functions as the
+CLI's, so you can use either at any time.
+
+The console shows what the agents have produced; it does not triage anything itself. On a
+fresh host, or after the agent volumes are lost, Overview, Queue, Records and Digests stay
+empty until the first `run-all` pass finishes. The `agents` service runs one when it
+starts and then every `RUN_ALL_INTERVAL_SECONDS` (an hour by default). To run one now, use
+`run-all` without `--dry-run` as in [Running agent commands in
+Docker](#running-agent-commands-in-docker):
+
+```bash
+lab exec agents python -m agents run-all --log /data/ssh_log.log "${args[@]}"
+```
+
+### Starting it
+
+Without Docker, from the repository root (same default paths as the other commands; pass
+`--config`, `--log`, `--data-dir`, `--reports-dir`, `--state-dir` and `--detections-dir` to
+point it elsewhere):
+
+```bash
+python -m agents ui
+```
+
+With Docker, from the same directory as the rest of the stack:
+
+```bash
+docker compose --profile ui up -d ui
+```
+
+In the local lab, use the `lab` function from [Lab deployment](#lab-deployment) instead
+(`lab --profile ui up -d ui`), so the console joins the same project and volumes as the
+lab's front-ends. A console started in a different project would see empty volumes. Every
+`docker compose` command in this section works the same way through `lab`.
+
+The `ui` service is off unless the profile is named. It uses the agents' image and
+directories, mounts every volume read-only, gets no model key, AWS setting or connector
+secret, and is on a network of its own, so the honeypot containers cannot reach it.
+
+Options: `--bind` (default 127.0.0.1), `--port` (default 8480), `--actions`, `--by NAME`,
+`--external-host NAME` (see [below](#reaching-it-over-a-private-network)). The same settings
+can go in `config.ini`:
+
+```ini
+[ui]
+port = 8480
+bind = 127.0.0.1
+actions = false
+operator = alice
+```
+
+The console refuses to bind anything but a loopback address unless given
+`--allow-non-loopback`. The Docker service uses it because the container binds 0.0.0.0
+while the host publishes the port on 127.0.0.1 only.
+
+### Signing in
+
+At start the console logs a sign-in link with a random token, new on every start:
+
+```bash
+docker compose logs ui          # in the lab: lab logs ui; or the terminal that runs python -m agents ui
+```
+
+The link is a secret: keep it, and the token in it, out of screenshots, tickets and chat.
+
+Open that link; it sets a session cookie. The session ends after 12 hours and whenever
+the console restarts; the page then shows "not signed in". The link itself stays valid
+for as long as that console process runs, so open it again to get a new session. To keep
+the same token (and link) across restarts, set `WINNIE_UI_TOKEN` (24 characters or more)
+in the shell that starts it; sessions still end at each restart. Anyone with the link and
+access to the port can use the console, so treat the log and the token like a password.
+
+Wrong tokens are slowed down (429 after ten a minute) but never block the right one.
+
+### Reaching it
+
+The console listens on loopback only. There is no public URL and no inbound port to open.
+To reach it from another machine without a tunnel, see the next section.
+
+- **On the same machine:** `http://127.0.0.1:8480`.
+- **On a remote host:** forward the port over SSH, then open `http://127.0.0.1:8480` on
+  your workstation:
+
+  ```bash
+  ssh -L 8480:127.0.0.1:8480 <host>
+  ```
+
+- **On the AWS sensor:** SSM port forwarding, see
+  [deploy/aws/README.md](../deploy/aws/README.md#operator-console-optional).
+
+Use `127.0.0.1` or `localhost` in the address bar: the console rejects requests that name
+any other host. Actions must come from the page under the same name and port they are
+sent to, so stay on one address (do not sign in on `localhost` and act from a tab opened
+on `127.0.0.1`).
+
+### Reaching it over a private network
+
+To open the console from another machine without logging in to the host, put an HTTPS
+reverse proxy on the same host, in front of the loopback port, and reach it over a private
+mesh VPN. The console keeps listening on 127.0.0.1; it only accepts one more name. On AWS,
+the example template sets all of this up with `TailscaleEnabled=true`, following the rules
+in [Joining the sensor to the VPN](#joining-the-sensor-to-the-vpn); see
+[Console over a tailnet](../deploy/aws/README.md#console-over-a-tailnet-optional). By
+hand, with Tailscale for example:
+
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:8480
+```
+
+That serves the node's own HTTPS name, for example `sensor.example-tailnet.ts.net`, to
+devices on the tailnet only. Then tell the console that name:
+
+```ini
+[ui]
+external_host = sensor.example-tailnet.ts.net
+```
+
+or start it with `--external-host sensor.example-tailnet.ts.net` (the flag wins; with
+Docker, use `config.ini`, and set `WINNIE_UI_TOKEN` in the shell that runs compose). Use the
+exact name the browser will show, with `:port` only if the proxy is not on 443. It must be
+a plain DNS name: no `https://`, no path, no IP address. The console refuses to start on
+anything else.
+
+Under that name the console is HTTPS only: the session cookie is `Secure`, responses
+carry `Strict-Transport-Security`, and actions must come from an `https://` page on that
+name. A session started on `127.0.0.1` does not work under the external name, and the
+reverse; sign in on the one you use. The console ignores `X-Forwarded-*` and identity
+headers the proxy adds; it trusts only the token.
+
+- Set a fixed `WINNIE_UI_TOKEN` (24 characters or more, kept in your password manager), so
+  signing in does not need the container log. At start the console logs both links and a
+  warning that it is reachable through a proxy. Those links carry the token, so keep the
+  console's log on the host (a `local` or `json-file` log driver; the AWS template sets
+  `driver: local`), never a driver that ships it elsewhere, and treat the log as a secret.
+- Start read-only. Add the actions override only when you mean to act from the console,
+  and take it off again after.
+- Limit the VPN's access rules to your own devices and this one port. See
+  [security-model.md](security-model.md#operator-console).
+
+#### Joining the sensor to the VPN
+
+The sensor is a host attackers are invited to probe. Join it so that, if it is ever taken
+over, it reaches nothing on the private network. With Tailscale (the AWS template's
+`TailscaleEnabled` option does each of these for you, except the tag check and the access
+rules, which live in the tailnet's admin console):
+
+- **Join with a tagged auth key, and check the tag after joining.** An auth key without a
+  tag joins the host as the person who made the key, with that person's access to
+  everything else on the tailnet. This is the line that matters most: confirm in the admin
+  console that the node shows the tag and no user before going further.
+- **Access rules: people in, nothing out.** Allow named people or a group to the tag on
+  tcp 443 only, and write no rule with the tag as a source. Check from the host:
+  `tailscale status` should list no peers beyond the devices you let in, and a connection
+  from the host to any of them should fail.
+- **Turn off Tailscale's firewall management on a Docker host:**
+  `tailscale up --netfilter-mode=off`. In the default mode it inserts its own chain at the
+  top of `FORWARD`, ahead of Docker's `DOCKER-USER` jump, and that chain accepts forwarded
+  traffic into and out of `tailscale0`. A bridged container could then reach the tailnet,
+  and the tailnet the containers, past the [egress rules](#egress-control-in-production)
+  this project relies on. With `off` it writes no rules; the next line is the only one
+  you need.
+- **Drop forwarded traffic from the tunnel:**
+  `iptables -I DOCKER-USER -i tailscale0 -j DROP` (and persist it with the other
+  `DOCKER-USER` rules). Without it, a device on the tailnet can reach the honeypot's
+  published ports and show up as an attacker in the event log. The proxy on 443 is a host
+  process, so this does not affect the console.
+- **Nothing else on the sensor:** no Tailscale SSH, no accepted routes, no Tailscale-managed
+  DNS, no exit node (`--ssh=false --accept-routes=false --accept-dns=false`, and no
+  `--exit-node`).
+- **Kernel (TUN) mode, not userspace networking.** In userspace mode tailscaled terminates
+  connections itself and there is no `tailscale0` interface, so the rule above has nothing
+  to match.
+- **Outbound tcp 443, for tailscaled only.** The node needs it to reach the coordination
+  server and relays. A cloud firewall rule for tcp 443 to anywhere opens it to every
+  process on the host network, not only tailscaled: on the AWS template that includes the
+  exporter, which holds the instance role and parses data attackers wrote, and could then
+  send the role's credentials anywhere. So limit the unprivileged host-network processes on
+  the host itself, by owner: the AWS template sends every packet of the exporter's user
+  (uid 10001) through an `OUTPUT` chain that accepts only what it needed before (its
+  endpoints, the S3 prefix list's CIDRs, the metadata service, DNS) and nothing out
+  `tailscale0`, and rejects the rest, and applies those rules before Docker starts at every
+  boot, since host firewall rules do not survive a reboot and Docker restarts the
+  containers on its own; see
+  [Console over a tailnet](../deploy/aws/README.md#console-over-a-tailnet-optional).
+  Bridged containers are not affected by the 443 rule: the `DOCKER-USER` rules stop every
+  new connection from them. No inbound rule is needed: the node reaches out, and relays
+  carry the traffic back.
+- **Delete the join key once the node has joined.** Wherever the key is kept for the
+  host to read, anything that takes over the host can read it too, and a valid tagged
+  key joins a new machine as the sensor. Revoke it in the admin console as well.
+- **A rebuilt host is a new node, unless its state is kept elsewhere.** The node's identity
+  lives in tailscaled's state. Kept on the instance, a replaced instance needs a new tagged
+  key (and the old node removed). The AWS template keeps it in one Parameter Store
+  SecureString instead (tailscaled's `--state=arn:...` store), so a rebuilt host comes back
+  as the same node. That parameter is then a credential: whoever can read it can run a
+  copy of the node. Its TLS certificate is not in the state and is issued again after
+  each rebuild, within Let's Encrypt's limit of five for the same name a week.
+- **A sign-in page makes the access rules the only gate.** The AWS template's optional
+  `/go` page (`UiTailnetSignIn`) signs in whoever the tailnet lets reach the node, so the
+  token stops being a second check. Use it only when the access rules name exactly the
+  people who should sign in.
+
+### Activity
+
+The Activity screen (key `7`) lists every line of the event log, newest first: time,
+source, service, event, username, outcome and a one-line summary. Open a row to see what
+was sent and what the honeypot answered, in plain monospace text, with long values
+collapsed behind "Show more". Click a source to filter to it; click a session to see all
+of its events in order, for any service, with a link to its triage record when there is
+one. A record's page links back to its raw activity: a session to its own events, a
+campaign to its source and service over its time span.
+
+Filters live in the address, so a view can be bookmarked and the back button works:
+
+| Filter | Matches |
+|---|---|
+| Time | the last hour, 24 hours (default) or 7 days, everything indexed, or a custom range in UTC |
+| Service | the protocol (`ssh`, `telnet`, `http`, `s3`, `ftp`, `smtp`, `sip`, `redis`, `postgres`, `mysql`, `mssql`, `mllp`); the list shows the 50 busiest services in the window with counts |
+| Event | connection, login attempt, input, reply, request, transfer, register, call attempt, error, close, other |
+| Outcome | success or failure (login attempts and SIP registrations carry one) |
+| Source | one exact address, or a network such as `198.51.100.0/24` |
+| User | one exact username |
+| Search | text in what was sent or answered, the log message, username, password, source or session (case-insensitive) |
+
+What "answered" means depends on what each service logs:
+
+| Service | Sent | Answered or result |
+|---|---|---|
+| SSH | the typed input (decoded from the log's base64) | the decoy's reply, a separate "reply" event |
+| Telnet | the input line | the reply text |
+| HTTP | method, path, query and body | the status code only |
+| S3 | method, path and query | the operation and status code |
+| PostgreSQL, MySQL, SQL Server | the statement | the result the log records (rows returned, rows affected or an error code) |
+| FTP, SMTP, Redis, MLLP | the command or message | none for commands (the log does not record the reply); a transfer's file and size, an accepted message's size and recipients |
+| SIP | the request and dialed number | the stage (challenge, rejected, registered) |
+
+Where the log has only a status or result, that is shown and nothing more; an input with
+no recorded reply says so.
+
+**The indexed window.** The console keeps one small entry per log line in memory (offset,
+time, source, service, event, session, username, outcome); nothing is written to disk. It
+starts at the last 64 MiB of the log and grows from there, up to `[ui] activity_entries`
+lines (default 200,000, at most 500,000), dropping the oldest. The strings in an entry are
+cut (source at 46 characters, session id and username at 64) and shared between entries.
+Measured worst case, with every line carrying its own source, session id and username at
+those lengths: about 0.55 KiB an entry, so about 115 MiB of console memory at the default
+and 275 MiB at the maximum. Real logs repeat sources and sessions and use much less. When
+older lines exist outside the window, the screen says so and how far back it reaches; read
+those on the host. Each refresh reads at most 64 MiB of new log, and log rotation or
+truncation starts the index again.
+
+**Reads per request.** Every request reads lines back from disk under one budget of
+16 MiB: a page of events, a search, a session view and a record's replies. A page or a
+search that runs out returns what it read and says so, and "Load older" (or "Search
+further back") continues from there; a session view or replies list says it stopped at
+the read limit. Only lines with very long content (large HTTP bodies, long pasted
+scripts) get near it.
+
+**When the log changes underneath the page.** "Load older" and the new-events check carry
+the identity of the log they were loaded from. After the log is rotated or truncated, or
+the console restarts, the server refuses the old position, and the screen reloads the list
+from the newest events with a notice, instead of mixing rows from two files.
+
+The screen checks for new events every 30 seconds and offers them ("3 new events, Show")
+instead of inserting rows under what you are reading. Honeytoken values the sensor planted
+are masked everywhere in the console (event text, usernames, passwords, sources, session
+ids, the transcript and replies) as on the honeytokens screen, whose "reveal" is the only
+place a value is shown. Text is masked whole before it is cut, so a value across a cut is
+not shown in part. Other passwords attackers typed are shown. A search still finds lines
+by a planted value; it is masked in what is shown.
+
+A session view lists every event of one session in order. For SSH, the logins and
+commands are replayed from the transcript (as on the record page) and the connection,
+close and error lines come from the indexed window, merged by time; a line without a
+usable time keeps its place in the file. When the window no longer holds those lines, the
+heading says "Logins and commands" instead of "Everything".
+
+On a record's page, an SSH session's commands are listed with the decoy's reply under
+each, collapsed to its first lines. Replies are paired with commands by their place in the
+session (the third command gets the reply that followed the third input), never by text,
+so repeated identical commands keep their own replies. As a check, the paired input must
+start with the record's command; when it does not, the command says "reply could not be
+matched" rather than showing a reply that may belong to another command. A command with
+no reply logged says "no reply recorded". Campaign records keep their command sample as
+before: it gathers commands from many connections and has no single sequence to pair
+(Telnet sessions are campaigns, so their replies are read on the session view instead).
+
+### Decoy
+
+The Decoy screen shows how the fake system is being adjusted to stay convincing. Nothing on
+it needs a decision. It has three parts:
+
+- **Current adjustments to the fake system**: what the tuner has layered over the
+  configured scenario (`decoy/overlay.json`), in words: fake logins per service, bait
+  files, the host name, SIP extensions and how many tries a login takes. The raw file is
+  behind "Show the raw adjustments file". Empty means the fake system is the scenario as
+  configured.
+- **What the tuner changed and when**: one row per tuner run with its time, how many
+  changes it made and how many its fence refused. Open a row for each change in words
+  with its reason, each refusal with its reason, and the raw run record. "Undo points"
+  lists the snapshots `python -m agents tune --rollback N` restores. Empty means the tuner
+  has found no reason to change anything yet; it runs with every `run-all` pass and works
+  without a model (a model only reorders its suggestions).
+- **What returning attackers are shown**: each source a playbook's local step singled
+  out, when a stored record last saw it, and what is kept for it on every visit (its own
+  planted secret, slowed replies, longer or canned replies, fuller logging, labels), with
+  the playbooks that set it and when it expires.
+
+Times are relative, with the exact UTC time on hover, as on the other screens.
+
+### Turning actions on
+
+With actions on, the console can approve, reject and unblock, and enforce a tracked entry.
+It calls the same functions as `python -m agents approve`, `reject`, `unblock` and
+`enforce`, so every gate those commands have
+still applies (source re-checks at approval time, the queue lock, expiry). Decisions are
+recorded as `ui:<operator>`, from `--by` or `[ui] operator`.
+
+```bash
+# Without Docker
+python -m agents ui --actions --by alice ...      # or [ui] actions = true
+
+# With Docker: agent data read-write and --actions, nothing else changes
+docker compose -f docker-compose.yml -f docker-compose.ui-actions.yml --profile ui up -d ui
+```
+
+Actions need write access to the agent data (the approval queue, the blocklist and the
+`response/` audit records under `reports/`). The overlay and the event log stay
+read-only. In Docker the console holds no connector secrets, so approve `open_ticket` and
+`block_webhook` items with the CLI in the `agents` container, which has them. With track
+before enforce on, approving `block_webhook` only tracks the source and calls nothing, so
+the console can approve it. Likewise, with the block connector enabled, run `enforce` there
+if the connector should be called.
+
+The console's unblock takes one blocklist entry exactly as listed. To remove a range
+(every entry inside a network), use `python -m agents unblock <network>`.
+
+With actions on, the console can change what the sensor blocks. Anyone who can reach its
+port and read its log can approve a block, so keep host access as tight as for the agents
+container itself.
 
 ## Upgrading and rolling back
 
@@ -455,12 +1671,15 @@ label whatever its style, and `{{sha1:LABEL}}` hashes the pinned value.
 | Symptom | Likely cause |
 |---|---|
 | Every source in the log is a 172.x or similar gateway address; a "proxy may be hiding client addresses" warning | Docker userland proxy is on. See [Client addresses](#client-addresses). |
-| SSH shell answers only `command not found` | No persona model: the provider's API key is not set in the container's environment, or the model call failed (look for `Model error` events and the startup warning). |
+| SSH shell answers host facts (`uname`, `free`, `lspci`) but `command not found` to everything else | No persona model: the provider's API key is not set in the container's environment, or the model call failed (look for `Model error` events and the startup warning). |
 | SSH sessions close with `fork: Resource temporarily unavailable` | A budget limit was reached; the `Budget exceeded` event names which one. |
+| A long session starts answering `command not found` for things the model used to answer | It reached `[budget] max_model_commands_per_session`; look for its `Model cap reached` event. The session stays open on the deterministic shell. |
+| `Prompt caching disabled` in the SSH log | The provider refused the first request that carried a cache point (the model does not take them). Requests are retried without one and caching stays off until restart. Remove `[llm] prompt_caching = true` for that model. |
 | FTP `LIST` or `RETR` hangs or connects to a private address | `ftp_pasv_address` not set to the address clients reach, or the passive port range is not published. |
 | A MySQL, PostgreSQL or MSSQL client fails right after connecting | The client requires TLS, which the traps do not offer (for `sqlcmd` with ODBC 18, encryption is required by default). The attempt is logged. |
 | `sipsak` REGISTER gets no reply over UDP | Its request is smaller than the 401 challenge. Set `[listeners] sip_udp_slack_bytes` (for example 128) if you need to answer it. |
 | Agents log "no sensor seed yet" | The front-ends have not started yet or the `frontend` volume is not mounted; the seed is created on first start. |
 | Playbooks run but nothing is sent or queued | Notify steps need an enabled connector; enforce steps need `[respond] queue_enforce = true`. Run `python -m agents respond --dry-run` to see each step's status. |
+| The blocklist screen marks sightings `refused` | The newest sightings file failed the checks; the console log names the first problem. Fix the producer. The last good copy stays on show. |
 | Steps show `refused: non-global source` or `refused: never_act_on` | The source is private, loopback or similar (expected in a lab), or inside a `[respond] never_act_on` range. |
 | `run-all` exits with status 2 | One stage failed; the JSON summary on stderr names it. The other stages still ran. A `run_lock` error means another `respond` or `run-all` run was still in progress, so nothing ran. |

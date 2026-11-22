@@ -1,0 +1,1899 @@
+"""Data API for the operator console (the ``Routes`` object ``server`` calls).
+
+Everything returned here was typed by attackers or derived from it. The rules:
+
+- GET never writes. Only loaders that are pure reads are called (``peek_blocklist``,
+  ``DailyCallCounter.peek``, ``EngineState``'s constructor, ...); files without such a
+  loader (approvals, tuner runs) are read directly. No lock file, directory, cursor or
+  counter is created.
+- Ids before paths. A request path component reaches the filesystem only after matching a
+  strict pattern, and the final path must resolve inside its base directory. Record ids
+  are looked up in the parsed record set and never become a path. Anything else is a 404.
+- One sanitising boundary. ``Api.get`` passes its whole answer through ``scrub``, which
+  removes control, format and other invisible characters from every string, drops any key
+  that cleaning would change, and caps string, list and dict sizes, so a field added later
+  cannot skip it.
+- What is shown is what is acted on. An approval is served as a projection of named fields
+  read by exact key, and is decidable here only when every value the engine acts on is
+  already in its exact, clean form (``undecidable_reason``).
+- Missing or corrupt data is normal: a fresh deployment answers with empty lists.
+- Bounded work: the record set and the queue are cached and re-read only when a cheap
+  directory signature changes; the event log is indexed incrementally (``logindex``).
+- Errors are ``{"error": <fixed text>}``; request input and exception text are never
+  echoed.
+- POST (approve, reject, unblock, enforce) runs only for a signed-in operator with ``[ui]
+  actions`` on (the shell checks that). It calls ``respond.approve`` / ``reject`` /
+  ``unblock`` / ``enforce`` with the arguments the CLI passes, so every gate stays in one
+  place. A decision names the ``view_hash`` the operator saw (the raw approval, what the
+  card showed and, for ``publish_detection``, the files it names; for ``enforce``, the
+  blocklist entry as listed); any difference now is a 409 and nothing changes.
+- Activity (``agents.ui.activity``) reads the event log only: an in-memory index of every
+  line, and back-reads of the lines shown (or searched, under a byte budget). Honeytoken
+  values the sensor planted are masked in it.
+- Where an address is (``agents.enrich``: country, city, network owner) is display only,
+  from database files on disk. A record keeps the place stored when it was written; one
+  written without it is looked up now. A live lookup never enters a ``view_hash``: queue
+  cards carry it beside the hashed record summary, which shows only the stored place.
+- What Shodan InternetDB knows about an address (``agents.internetdb``: open ports, host
+  names, tags, CPEs, CVE ids) is display only, read from the local file the exporter
+  writes; every value is checked again on read. A record keeps what was stored when it
+  was written; one written without it shows the file's current answer. It never enters a
+  ``view_hash`` or a record summary.
+- Sightings (``agents.sightings``) are display only. The file is parsed strictly, the last
+  good copy stays on show when a new one is refused, and only sightings of listed
+  addresses are served.
+"""
+
+from __future__ import annotations
+
+import datetime
+import getpass
+import hashlib
+import hmac
+import ipaddress
+import json
+import logging
+import math
+import os
+import re
+import stat
+import sys
+import threading
+import time
+import unicodedata
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+from pydantic import ValidationError
+
+from agents import triage
+from agents.budget import ip_key
+from agents.llm import DailyCallCounter
+from agents.playbooks import PLAYBOOKS_DIR, load_playbooks, tier_of
+from agents.respond import (
+    APPROVAL_ID_RE,
+    DETECTION_FILE_RE,
+    ENFORCED,
+    TRACKED,
+    TRACKED_FILE,
+    ApprovalError,
+    EnforceChanged,
+    EnforceError,
+    EngineState,
+    RespondSettings,
+    approve,
+    enforce,
+    entry_status,
+    peek_blocklist,
+    reject,
+    size_alarm,
+    unblock,
+)
+from agents.sightings import SightingsReader, SightingsSettings, by_address
+from agents.runtime import event_log_state
+from agents.source_state import load as load_source_state
+from agents.source_state import valid_source_key
+from agents.triage import (
+    JUDGEMENT_RANK,
+    Judgement,
+    TriageRecord,
+    geo_view,
+    rank,
+    shodan_view,
+    record_layout,
+    with_geo,
+)
+from agents.tuner import history as tuner_history
+from agents.ui import activity, logindex
+from agents.ui.activity import EventIndex
+from agents.ui.logindex import DEFAULT_MAX_SESSIONS, RangeTooLarge, SessionIndex
+from scenarios.loader import load_overlay
+
+log = logging.getLogger(__name__)
+UTC = datetime.timezone.utc
+
+TEXT_CAP = 4_000
+LONG_TEXT_CAP = 200_000
+KEY_CAP = 200
+MAX_DEPTH = 32
+DEFAULT_PER = 50
+MAX_PER = 200
+MAX_PAGE = 1_000_000
+CACHE_SECONDS = 3.0
+SLOW_CACHE_SECONDS = 60.0
+SHIP_TAIL_BYTES = 64 * 1024
+SHIP_TAIL_EVENTS = 10
+TOP_SOURCES = 10
+HONEYTOKEN_HITS = 20
+TUNER_RECORDS = 20
+MAX_TUNER_FILE = 1024 * 1024
+MAX_JSON_FILE = 16 * 1024 * 1024
+WINDOWS = {"24h": datetime.timedelta(hours=24), "7d": datetime.timedelta(days=7)}
+# Size caps of the response boundary: a hostile file cannot make any route's body unbounded.
+LIST_CAP = 2_000
+DICT_CAP = 500
+
+
+def _strip_pattern() -> re.Pattern:
+    """Characters that make text render other than it reads, or not at all: every C0
+    control except \\t and \\n, DEL, C1 controls, every format character (category Cf:
+    bidi marks and overrides, zero-width characters, soft hyphen, tag characters, ...),
+    the line and paragraph separators, variation selectors, the whole tag block and the
+    Hangul fillers that render as blank space. Built from ``unicodedata`` once at import
+    (about 1.1M lookups, a few tens of milliseconds)."""
+    points = set(range(0x00, 0x09)) | set(range(0x0B, 0x20)) | set(range(0x7F, 0xA0))
+    points |= {c for c in range(sys.maxunicode + 1) if unicodedata.category(chr(c)) == "Cf"}
+    points |= {0x2028, 0x2029, 0x115F, 0x1160, 0x3164, 0xFFA0}
+    points |= set(range(0x180B, 0x1810))      # Mongolian free variation selectors
+    points |= set(range(0xFE00, 0xFE10))      # variation selectors 1-16
+    points |= set(range(0xE0100, 0xE01F0))    # variation selectors 17-256
+    points |= set(range(0xE0000, 0xE0080))    # tag block, unassigned code points included
+    ranges, start, prev = [], None, None
+    for c in sorted(points):
+        if start is None:
+            start = prev = c
+        elif c == prev + 1:
+            prev = c
+        else:
+            ranges.append((start, prev))
+            start = prev = c
+    ranges.append((start, prev))
+    body = "".join(f"\\U{a:08x}" if a == b else f"\\U{a:08x}-\\U{b:08x}" for a, b in ranges)
+    return re.compile(f"[{body}]")
+
+
+_STRIP_RE = _strip_pattern()
+# The record id shape triage.write_record produces (its _safe_filename alphabet).
+RECORD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
+DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+DETECTION_RE = re.compile(DETECTION_FILE_RE)
+TOKEN_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+PROTOCOL_RE = re.compile(r"[a-z0-9]{1,16}")
+COUNTRY_RE = re.compile(r"[A-Z]{2}")
+TUNER_FILE_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}\.json")
+APPROVAL_RE = re.compile(APPROVAL_ID_RE)
+APPROVAL_FILE_RE = re.compile(APPROVAL_ID_RE + r"\.json")
+RECORD_FILE_RE = re.compile(r"[^.].*\.json")   # what triage.load_records globs (*.json)
+VIEW_HASH_RE = re.compile(r"[0-9a-f]{64}")
+DECIDE_RE = re.compile(r"queue/([^/]+)/(approve|reject)")
+SIGHTING_ROWS = 20
+MAX_TARGET = 64
+ERROR_CAP = 200
+# Approved actions that send through a connector, and the connector each one needs.
+CONNECTOR_FOR = {"open_ticket": "ticket", "block_webhook": "block_webhook"}
+# Actions respond.approve executes, and the params keys each one reads.
+PARAMS_USED: dict[str, tuple[str, ...]] = {"export_blocklist": (), "publish_detection": ("files",),
+                                           "open_ticket": ("priority",), "block_webhook": ()}
+TICKET_PRIORITIES = ("low", "medium", "high")
+MAX_DETECTION_FILES = 50
+# Approval fields served, each read by exact key from the file as parsed.
+APPROVAL_FIELDS = ("id", "status", "action", "tier", "playbook", "record_id", "subject",
+                   "unverified_source", "created_at", "expires_at", "summary", "approved_by",
+                   "approved_at", "rejected_by", "rejected_at", "expired_at")
+RESULT_FIELDS = ("ok", "status", "files", "entries")
+# Stand-in digest of a detection file named by an approval that is not in pending/.
+MISSING_FILE = "missing"
+
+NOT_FOUND = (404, {"error": "not found"})
+BAD_QUERY = (400, {"error": "bad query"})
+CHANGED = (409, {"error": "changed"})
+BAD_VIEW_HASH = (400, {"error": "view_hash must be the 64-character hex value from the queue"})
+BAD_TARGET = (400, {"error": "target must be an IP address or network"})
+NO_CONNECTOR = (400, {"error": "connector not available here; approve with the CLI in the "
+                               "agents container"})
+BAD_SETTINGS = (500, {"error": "[respond] settings are invalid; nothing was changed (see the "
+                               "server log)"})
+UNDECIDABLE = (400, {"error": "this item cannot be decided in the console; nothing was "
+                              "changed. Decide it with the CLI (python -m agents approve or "
+                              "reject <id>) after checking the file"})
+# Why an approval is not decidable here (fixed texts; never built from the file).
+WHY_ID = "its id does not match its file name"
+WHY_ACTION = "its action is not one the engine runs"
+WHY_SUBJECT = "its target is not an address or /64 in the exact form the engine acts on"
+WHY_PLAYBOOK = "its playbook name is missing or contains hidden characters"
+WHY_PARAMS = "its parameters are not in the exact form the engine acts on"
+WHY_EXPIRY = "its expiry time is missing or malformed"
+WHY_FILES = "a detection file it names is not a regular file inside detections/pending"
+WHY_UNREADABLE = "the file cannot be read in full"
+
+
+# ---- sanitising boundary -------------------------------------------------------------------
+
+class LongText(str):
+    """A string allowed the long cap (a digest or detection file)."""
+
+
+def clean_text(value: str, cap: int = TEXT_CAP) -> str:
+    """Invisible and control characters removed (``\\n`` and ``\\t`` kept), then capped.
+    The input is cut first so a huge string costs no more than a capped one."""
+    return _STRIP_RE.sub("", value[:cap * 2])[:cap]
+
+
+class _Scrubber:
+    """One pass of ``scrub``; ``cut`` records whether anything was dropped or capped."""
+
+    def __init__(self) -> None:
+        self.cut = False
+
+    def __call__(self, value: object, depth: int = 0) -> object:
+        if depth > MAX_DEPTH:
+            self.cut = True
+            return None
+        if value is None or isinstance(value, bool) or isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, str):
+            return clean_text(value, LONG_TEXT_CAP if isinstance(value, LongText) else TEXT_CAP)
+        if isinstance(value, dict):
+            return self._dict(value, depth)
+        if isinstance(value, (list, tuple)):
+            if len(value) > LIST_CAP:
+                self.cut = True
+            return [self(v, depth + 1) for v in value[:LIST_CAP]]
+        return clean_text(str(value))
+
+    def _dict(self, value: dict, depth: int) -> dict:
+        # A key that cleaning would change is dropped, never renamed: renaming could make
+        # "subject‎" replace "subject", so the page would show one value while the
+        # engine reads the other. Dropping also means no two keys can become one.
+        out: dict = {}
+        for k, v in value.items():
+            if len(out) >= DICT_CAP:
+                self.cut = True
+                break
+            key = k if isinstance(k, str) else str(k)
+            if key in out or clean_text(key, KEY_CAP) != key:
+                self.cut = True
+                continue
+            out[key] = self(v, depth + 1)
+        return out
+
+
+def scrub_flagged(value: object) -> tuple[object, bool]:
+    """``scrub`` and whether it dropped a key or cut a list, dict or nesting level."""
+    s = _Scrubber()
+    out = s(value)
+    return out, s.cut
+
+
+def scrub(value: object) -> object:
+    """The response boundary: every string cleaned and capped, numbers made JSON-safe, any
+    other type turned into cleaned text, keys that cleaning would change dropped, lists
+    and dicts capped (``LIST_CAP``, ``DICT_CAP``). Applied to the whole answer, so no field
+    can skip it."""
+    return _Scrubber()(value)
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                      default=str)
+
+
+def view_hash(raw: dict, approval: dict, record: Optional[dict],
+              files: Optional[dict[str, str]] = None) -> str:
+    """SHA-256 over what a decision depends on: the approval as parsed from disk, the
+    approval and record summary as served (after ``scrub``) and, for ``publish_detection``,
+    the SHA-256 of each named pending file. The approve and reject calls send it back, so a
+    decision is only made on what the operator saw. Raises ValueError or RecursionError
+    when ``raw`` cannot be serialised (such an item is not decidable here)."""
+    text = _canonical({"raw": raw, "approval": approval, "record": record,
+                       "files": files or {}})
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+# The entry fields a blocklist view hash covers, and ``enforce`` re-checks under its lock.
+# ``approval_id`` is not shown; it tells apart an entry removed and approved again within
+# the same second.
+VIEW_FIELDS = ("approved_at", "expires_at", "approval_id")
+
+
+def blocklist_view_hash(key: str, entry: dict) -> str:
+    """What the blocklist row showed and ``enforce`` acts on: the key, its stage and times
+    (and the approval that put it there)."""
+    shown = {"target": key, "status": entry_status(entry),
+             **{k: entry.get(k) for k in VIEW_FIELDS}}
+    return hashlib.sha256(_canonical(shown).encode()).hexdigest()
+
+
+def sightings_summary(rows: list) -> dict:
+    """Total count, last seen and the most recent rows (where, service, count, times)."""
+    rows = sorted(rows, key=lambda s: s.last_seen, reverse=True)
+    return {"total": sum(s.count for s in rows),
+            "last_seen": rows[0].last_seen.isoformat(timespec="seconds") if rows else None,
+            "places": len(rows),
+            "rows": [{"where": s.where, "service": s.service, "count": s.count,
+                      "first_seen": s.first_seen.isoformat(timespec="seconds"),
+                      "last_seen": s.last_seen.isoformat(timespec="seconds"),
+                      "source": s.source} for s in rows[:SIGHTING_ROWS]]}
+
+
+def project_approval(raw: dict) -> dict:
+    """The served approval: named fields read by exact key, never the whole object, so a
+    look-alike key cannot stand in for one the engine reads. Only the params the action
+    uses are served (all of them are what it acts on)."""
+    out = {k: raw[k] for k in APPROVAL_FIELDS if k in raw}
+    params = raw.get("params")
+    if isinstance(params, dict):
+        used = PARAMS_USED.get(raw.get("action"), ()) if isinstance(raw.get("action"), str) \
+            else ()
+        out["params"] = {k: params[k] for k in used if k in params}
+    result = raw.get("result")
+    if isinstance(result, dict):
+        out["result"] = {k: result[k] for k in RESULT_FIELDS if k in result}
+    return out
+
+
+def _clean_same(value: object, cap: int = TEXT_CAP) -> bool:
+    """A string that the response boundary would serve unchanged."""
+    return isinstance(value, str) and clean_text(value, cap) == value
+
+
+def _exact_source_key(value: object) -> bool:
+    """``value`` is a source key (IPv4 address or IPv6 /64) in the exact canonical text
+    ``ip_key`` writes, so the target shown is byte for byte the target acted on."""
+    if not isinstance(value, str) or not _clean_same(value, MAX_TARGET) \
+            or not valid_source_key(value):
+        return False
+    try:
+        canon = str(ipaddress.ip_network(value, strict=True)) if "/" in value \
+            else str(ipaddress.ip_address(value))
+    except ValueError:
+        return False
+    return canon == value
+
+
+def undecidable_reason(stem: str, raw: dict) -> Optional[str]:
+    """None when every value ``respond.approve`` / ``reject`` act on is in its exact clean
+    form, so the card shows what would be acted on; else a fixed reason. ``stem`` is the
+    file name without ``.json``: the id a decision is sent to."""
+    aid = raw.get("id")
+    if not isinstance(aid, str) or aid != stem or not APPROVAL_RE.fullmatch(aid):
+        return WHY_ID
+    action = raw.get("action")
+    if not isinstance(action, str) or action not in PARAMS_USED:
+        return WHY_ACTION
+    if not _exact_source_key(raw.get("subject")):
+        return WHY_SUBJECT
+    playbook = raw.get("playbook")
+    if not _clean_same(playbook, KEY_CAP) or not playbook:
+        return WHY_PLAYBOOK
+    if _parse_ts(raw.get("expires_at")) is None:
+        return WHY_EXPIRY
+    params = raw.get("params", {})
+    if not isinstance(params, dict):
+        return WHY_PARAMS
+    if action == "publish_detection":
+        files = params.get("files")
+        if not isinstance(files, list) or not 0 < len(files) <= MAX_DETECTION_FILES \
+                or not all(isinstance(n, str) and DETECTION_RE.fullmatch(n) for n in files):
+            return WHY_PARAMS
+    if action == "open_ticket" and params.get("priority", "medium") not in TICKET_PRIORITIES:
+        return WHY_PARAMS
+    return None
+
+
+def _file_digest(base: Path, name: str) -> Optional[str]:
+    """SHA-256 of ``base/name`` read in chunks, ``MISSING_FILE`` when it does not exist,
+    or None when it is not a regular file directly inside ``base`` (a symlink out, a
+    directory): the engine would move such an entry without the console seeing it."""
+    path = _inside(base, name)
+    if path is None:
+        return None
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return MISSING_FILE
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+# ---- small helpers -------------------------------------------------------------------------
+
+class _BadQuery(Exception):
+    pass
+
+
+def _int(query: dict[str, str], name: str, default: int, low: int, high: int) -> int:
+    raw = query.get(name)
+    if raw is None or raw == "":
+        return default
+    if not re.fullmatch(r"\d{1,9}", raw):
+        raise _BadQuery
+    return max(low, min(high, int(raw)))
+
+
+def paginate(items: list, query: dict[str, str]) -> dict:
+    page = _int(query, "page", 1, 1, MAX_PAGE)
+    per = _int(query, "per", DEFAULT_PER, 1, MAX_PER)
+    start = (page - 1) * per
+    return {"total": len(items), "page": page, "per": per, "items": items[start:start + per]}
+
+
+def _parse_ts(value: object) -> Optional[datetime.datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def _inside(base: Path, name: str) -> Optional[Path]:
+    """``base / name`` when it resolves to a direct child of ``base``; else None."""
+    path = base / name
+    try:
+        if path.resolve().parent != base.resolve():
+            return None
+    except (OSError, RuntimeError):
+        return None
+    return path
+
+
+def _read_text(path: Path, cap: int) -> Optional[tuple[str, bool]]:
+    """(text, truncated) of at most ``cap`` characters, or None when unreadable."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(cap * 4 + 1)
+            more = f.read(1) != b""
+    except OSError:
+        return None
+    text = raw.decode("utf-8", errors="replace")
+    return text[:cap], more or len(text) > cap
+
+
+def _read_json(path: Path, default):
+    """Parsed JSON of the expected type, or ``default`` (missing, oversized, corrupt)."""
+    try:
+        if path.stat().st_size > MAX_JSON_FILE:
+            return default
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return default
+    return data if isinstance(data, type(default)) else default
+
+
+def _list_names(directory: Path, pattern: re.Pattern) -> list[str]:
+    try:
+        with os.scandir(directory) as it:
+            return sorted(e.name for e in it if pattern.fullmatch(e.name) and e.is_file())
+    except OSError:
+        return []
+
+
+def _signature(dirs: tuple[Path, ...]) -> tuple:
+    """Entry count and newest mtime per directory, from one scandir pass each."""
+    sig = []
+    for d in dirs:
+        try:
+            dir_mtime = d.stat().st_mtime_ns
+            count, newest = 0, 0
+            with os.scandir(d) as it:
+                for entry in it:
+                    count += 1
+                    try:
+                        newest = max(newest, entry.stat(follow_symlinks=False).st_mtime_ns)
+                    except OSError:
+                        continue
+        except OSError:
+            sig.append(None)
+            continue
+        sig.append((dir_mtime, count, newest))
+    return tuple(sig)
+
+
+class _DirCache:
+    """A value loaded from some directories, re-loaded only when their signature changes,
+    checked at most every ``min_interval`` seconds."""
+
+    def __init__(self, dirs: tuple[Path, ...], load: Callable[[], object], min_interval: float,
+                 clock: Callable[[], float]) -> None:
+        self.dirs, self.load, self.min_interval, self.clock = dirs, load, min_interval, clock
+        self._lock = threading.Lock()
+        self._value: object = None
+        self._sig: object = None
+        self._checked = float("-inf")
+        self.loads = 0
+
+    def get(self):
+        with self._lock:
+            now = self.clock()
+            if self._value is None or now - self._checked >= self.min_interval:
+                self._checked = now
+                sig = _signature(self.dirs)
+                if self._value is None or sig != self._sig:
+                    self._value = self.load()
+                    self._sig = sig
+                    self.loads += 1
+            return self._value
+
+    def invalidate(self) -> None:
+        """Check the signature on the next ``get`` (after this process wrote)."""
+        with self._lock:
+            self._checked = float("-inf")
+
+
+@dataclass
+class _Records:
+    newest: list[TriageRecord]               # newest first
+    ranked: list[TriageRecord]               # triage.rank order
+    by_id: dict[str, TriageRecord]
+    stamps: dict[str, Optional[datetime.datetime]]
+
+
+@dataclass(frozen=True)
+class _Approval:
+    """One approval file: its name without ``.json`` (the id a decision is sent to, already
+    matching ``APPROVAL_ID_RE``) and its content as parsed."""
+
+    stem: str
+    raw: dict
+
+    def status_at(self, now: datetime.datetime) -> object:
+        """The status, with an overdue pending item judged expired (as ``peek_queue``)."""
+        status = self.raw.get("status")
+        if status == "pending":
+            expires = _parse_ts(self.raw.get("expires_at"))
+            if expires is not None and expires <= now:
+                return "expired"
+        return status
+
+
+@dataclass(frozen=True)
+class _View:
+    shown: dict                      # the served approval projection (status as on disk)
+    record: Optional[dict]           # the served record summary, or None
+    reason: Optional[str]            # why it is not decidable here, or None
+    files: dict[str, str]            # publish_detection: name -> SHA-256 or MISSING_FILE
+    digest: Optional[str]            # the view_hash, when decidable
+
+
+def _bounded(value: object) -> object:
+    """``scrub``, with ``"truncated": true`` added to a dict answer when a list, dict or
+    nesting level was cut or a key dropped (as routes flag a cut string)."""
+    out, cut = scrub_flagged(value)
+    if cut and isinstance(out, dict):
+        out["truncated"] = True
+    return out
+
+
+def _stamp(r: TriageRecord) -> Optional[datetime.datetime]:
+    return _parse_ts(r.last_seen) or _parse_ts(r.first_seen)
+
+
+def _summary(r: TriageRecord) -> dict:
+    return {"id": r.id, "kind": r.kind, "protocol": r.protocol, "src_ip": r.src_ip,
+            "first_seen": r.first_seen, "last_seen": r.last_seen,
+            "judgement": r.judgement.value, "stage": r.stage.value, "intent": r.intent.value,
+            "skill": r.skill.value, "username": r.username, "commands": r.commands,
+            "auth_attempts": r.auth_attempts, "auth_successes": r.auth_successes,
+            "connections": r.connections, "honeytokens": list(r.honeytokens),
+            "high_signal": sum(r.high_signal.values()), "llm_used": r.llm_used,
+            "unverified_source": r.unverified_source, "narrative": r.narrative[:300],
+            "layout": record_layout(r),
+            **({"geo": geo_view(r.src_geo)} if r.src_geo is not None else {})}
+
+
+def _placed(item: dict, geo: Optional[dict]) -> dict:
+    """``item`` with ``"geo"`` added when there is a place (absent otherwise, so answers
+    are as before with the lookup off)."""
+    if geo is not None:
+        item["geo"] = geo
+    return item
+
+
+def _known_as(item: dict, known: Optional[dict]) -> dict:
+    """``item`` with ``"shodan"`` added when the InternetDB file has an answer (absent
+    otherwise, so answers are as before with the feature off)."""
+    if known is not None:
+        item["shodan"] = known
+    return item
+
+
+def _haystack(r: TriageRecord) -> str:
+    parts = [r.id, r.src_ip, r.username or "", r.narrative, r.headline, *r.actions,
+             *r.assessment, *r.clients, *r.command_sample,
+             *(i.value for i in r.iocs), *r.honeytokens, *r.src_addresses]
+    parts += [u for u, _ in r.credentials.top_usernames]
+    return "\n".join(parts).lower()
+
+
+MASK = "......"
+MASK_PREFIX_MIN = 8   # shorter values show nothing: two characters would be most of them
+
+
+def _mask(value: str) -> str:
+    """A honeytoken value hidden: its first two characters only when it is long enough
+    that they give little away, otherwise nothing at all."""
+    return value[:2] + MASK if len(value) >= MASK_PREFIX_MIN else MASK
+
+
+def pair_inputs(turns: list[dict]) -> list[tuple[str, Optional[str]]]:
+    """One (input text, reply) pair per input turn, in order: the reply is the decoy's
+    response turns that follow the input (before the next input) joined by newlines, or
+    None when none was logged. Responses before the first input belong to no command."""
+    out: list[list] = []
+    for t in turns:
+        text = t.get("text") if isinstance(t.get("text"), str) else ""
+        if t.get("role") == "input":
+            out.append([text, None])
+        elif t.get("role") == "response" and out:
+            out[-1][1] = text if out[-1][1] is None else out[-1][1] + "\n" + text
+    return [(i, r) for i, r in out]
+
+
+def pair_replies(turns: list[dict]) -> list[Optional[str]]:
+    """The replies of ``pair_inputs`` alone."""
+    return [r for _, r in pair_inputs(turns)]
+
+
+def _merge(first: list[dict], second: list[dict], second_first) -> list[dict]:
+    """Two lists, each kept in its own order, merged: the next of ``second`` goes before
+    the next of ``first`` when ``second_first(next_second, next_first)`` says so."""
+    out: list[dict] = []
+    i = j = 0
+    while i < len(first) and j < len(second):
+        if second_first(second[j], first[i]):
+            out.append(second[j])
+            j += 1
+        else:
+            out.append(first[i])
+            i += 1
+    return out + first[i:] + second[j:]
+
+
+def _iso_ts(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(value, UTC).isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+# ---- the API -------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ApiPaths:
+    """Where the API reads. None of these is ever written."""
+
+    reports: Path
+    state: Path
+    data: Path
+    detections: Path
+    overlay: Path
+    source_state: Path
+    playbooks: Path = PLAYBOOKS_DIR
+    log: Optional[Path] = None
+    budget_state: Optional[Path] = None   # default <data>/budget_state.json
+
+
+@dataclass
+class ApiLimits:
+    """Numbers shown next to today's counts (caps, not secrets)."""
+
+    analyst_calls_per_day: int = 500
+    frontend_tokens_per_day: Optional[int] = None
+    index_sessions: int = DEFAULT_MAX_SESSIONS
+    activity_entries: int = activity.DEFAULT_MAX_ENTRIES
+
+
+@dataclass
+class Api:
+    """The console's routes. Thread-safe; build once and share.
+
+    ``respond_settings`` and ``connectors`` are what the CLI's approve / reject / unblock
+    use (``runtime.respond_settings`` and ``runtime.respond_connectors``). The settings are
+    re-read on every decision so a bad ``[respond]`` refuses it instead of falling back to
+    defaults; without the callable, ``settings`` is used. ``operator`` is the ``[ui]``
+    label; decisions are recorded as ``ui:<operator>`` (the OS user when it is empty)."""
+
+    paths: ApiPaths
+    settings: RespondSettings = field(default_factory=RespondSettings)
+    limits: ApiLimits = field(default_factory=ApiLimits)
+    cache_seconds: float = CACHE_SECONDS
+    clock: Callable[[], float] = time.monotonic
+    now: Callable[[], datetime.datetime] = lambda: datetime.datetime.now(UTC)
+    operator: str = ""
+    respond_settings: Optional[Callable[[], RespondSettings]] = None
+    connectors: Optional[Callable[[], object]] = None
+    sensor: str = ""
+    sightings: SightingsSettings = field(default_factory=SightingsSettings)
+    # ``agents.enrich.GeoLookup`` (address -> GeoInfo or None, never raises), or None.
+    geo: Optional[Callable] = None
+    # ``agents.internetdb.InternetDbReader`` (address -> ShodanInfo or None, never raises),
+    # or None when ``[connector.internetdb]`` is off.
+    shodan: Optional[Callable] = None
+
+    def __post_init__(self) -> None:
+        self._sightings = SightingsReader(self.sightings.file(self.paths.state), self.sightings)
+        self._connectors_lock = threading.Lock()
+        self._connectors_built = False
+        self._connectors_value: object = None
+        p = self.paths
+        self._records = _DirCache((p.reports / "sessions", p.reports / "campaigns"),
+                                  self._load_records, self.cache_seconds, self.clock)
+        self._queue = _DirCache((p.state / "approvals",), self._load_queue,
+                                self.cache_seconds, self.clock)
+        self.index = SessionIndex(p.log, max_sessions=self.limits.index_sessions,
+                                  min_interval=self.cache_seconds, clock=self.clock)
+        self.events = EventIndex(p.log, max_entries=self.limits.activity_entries,
+                                 min_interval=self.cache_seconds, clock=self.clock)
+        self._facets_lock = threading.Lock()
+        self._facets: tuple[object, dict] = (None, {})
+        self._alarm_lock = threading.Lock()
+        self._alarm: tuple[float, object] = (float("-inf"), None)
+        self._routes: list[tuple[re.Pattern, Callable]] = [
+            (re.compile(r"overview"), self.overview),
+            (re.compile(r"records"), self.records),
+            (re.compile(r"records/([^/]+)"), self.record),
+            (re.compile(r"records/([^/]+)/transcript"), self.transcript),
+            (re.compile(r"records/([^/]+)/replies"), self.replies),
+            (re.compile(r"activity"), self.activity),
+            (re.compile(r"activity/session/([^/]+)"), self.activity_session),
+            (re.compile(r"queue"), self.queue),
+            (re.compile(r"blocklist"), self.blocklist),
+            (re.compile(r"digests"), self.digests),
+            (re.compile(r"digests/([^/]+)"), self.digest),
+            (re.compile(r"decoy"), self.decoy),
+            (re.compile(r"playbooks"), self.playbooks),
+            (re.compile(r"detections"), self.detections),
+            (re.compile(r"detections/([^/]+)/([^/]+)"), self.detection),
+            (re.compile(r"honeytokens"), self.honeytokens),
+        ]
+
+    # -- Routes protocol --
+
+    def get(self, path: str, query: dict[str, str]) -> tuple[int, object]:
+        status, value = self._dispatch(path, query)
+        return status, _bounded(value)
+
+    def post(self, path: str, body: dict) -> tuple[int, object]:
+        status, value = self._dispatch_post(path, body)
+        return status, _bounded(value)
+
+    def _dispatch_post(self, path: str, body: dict) -> tuple[int, object]:
+        if not path.startswith("/api/"):
+            return NOT_FOUND
+        rest = path[len("/api/"):]
+        m = DECIDE_RE.fullmatch(rest)
+        if m is None and rest not in ("blocklist/unblock", "blocklist/enforce"):
+            return NOT_FOUND
+        try:
+            if m is not None:
+                return self._decide(m.group(1), m.group(2), body)
+            if rest == "blocklist/enforce":
+                return self._enforce(body)
+            return self._unblock(body)
+        except Exception:  # noqa: BLE001 - details go to the log, never to the client
+            log.exception("api action failed")
+            return 500, {"error": "internal error"}
+
+    def _dispatch(self, path: str, query: dict[str, str]) -> tuple[int, object]:
+        if not path.startswith("/api/"):
+            return NOT_FOUND
+        rest = path[len("/api/"):]
+        for pattern, handler in self._routes:
+            m = pattern.fullmatch(rest)
+            if m is None:
+                continue
+            try:
+                return handler(query, *m.groups())
+            except _BadQuery:
+                return BAD_QUERY
+            except Exception:  # noqa: BLE001 - a bad file must not take the console down
+                log.exception("api route failed")
+                return 500, {"error": "internal error"}
+        return NOT_FOUND
+
+    # -- loaders --
+
+    def _load_records(self) -> _Records:
+        records = []
+        # triage.load_records' files, each kept inside its directory as the digest and
+        # detection routes are (a symlink out of reports/sessions is not followed).
+        for sub in ("sessions", "campaigns"):
+            base = self.paths.reports / sub
+            for name in _list_names(base, RECORD_FILE_RE):
+                path = _inside(base, name)
+                try:
+                    if path is None or path.stat().st_size > MAX_JSON_FILE:
+                        continue
+                    records.append(TriageRecord.model_validate_json(
+                        path.read_text(encoding="utf-8")))
+                except (OSError, ValidationError, ValueError, RecursionError):
+                    log.warning("skipping invalid record %s", name[:80])
+        stamps = {r.id: _stamp(r) for r in records}
+        floor = datetime.datetime.min.replace(tzinfo=UTC)
+        newest = sorted(records, key=lambda r: stamps[r.id] or floor, reverse=True)
+        return _Records(newest=newest, ranked=rank(records), by_id={r.id: r for r in records},
+                        stamps=stamps)
+
+    def _load_queue(self) -> list[_Approval]:
+        """Every approval file, as ``peek_queue`` lists them (a pure read; a file without a
+        parseable ``expires_at`` is skipped), keeping each file's name for decisions."""
+        adir = self.paths.state / "approvals"
+        items = []
+        for name in _list_names(adir, APPROVAL_FILE_RE):
+            raw = _read_json(adir / name, {})
+            if _parse_ts(raw.get("expires_at")) is not None:
+                items.append(_Approval(name[:-len(".json")], raw))
+        return sorted(items, key=lambda a: str(a.raw.get("created_at", "")), reverse=True)
+
+    def _queue_now(self) -> list[_Approval]:
+        """The cached queue; callers judge expiry at request time (``status_at``): the cache
+        only reloads when the directory changes, and an item can pass its expiry without
+        any file changing."""
+        return self._queue.get()
+
+    def _view(self, item: _Approval, by_id: dict[str, TriageRecord]) -> _View:
+        """What the queue serves for ``item`` and its ``view_hash``, from the file as it is
+        on disk. The queue route and a decision both call this, so they hash alike."""
+        raw = item.raw
+        shown = scrub(project_approval(raw))
+        rid = raw.get("record_id")
+        r = by_id.get(rid) if isinstance(rid, str) else None
+        record = scrub(_summary(r)) if r is not None else None
+        reason = undecidable_reason(item.stem, raw)
+        files = self._detection_files(raw) if reason is None else {}
+        if files is None:
+            reason, files = WHY_FILES, {}
+        digest = None
+        if reason is None:
+            try:
+                digest = view_hash(raw, shown, record, files)
+            except (ValueError, TypeError, RecursionError):
+                reason = WHY_UNREADABLE
+        return _View(shown, record, reason, files, digest)
+
+    def _card(self, item: _Approval, now: datetime.datetime,
+              by_id: dict[str, TriageRecord]) -> dict:
+        """One queue entry: the served approval, the record summary shown beside it, the
+        detection files it names, and a ``view_hash`` when it can be decided here now."""
+        v = self._view(item, by_id)
+        status = item.status_at(now)
+        # Only an untouched pending item can be decided; one past its expiry is shown as
+        # expired (it is still pending on disk, and respond would refuse it).
+        decidable = v.reason is None and status == "pending"
+        out = {"id": item.stem, "approval": {**v.shown, "status": scrub(status)},
+               "view_hash": v.digest if decidable else None,
+               "can_decide_here": decidable,
+               "can_approve_here": decidable and self._connector_ready(item.raw),
+               "undecidable_reason": v.reason,
+               "record": v.record}
+        # Beside the hashed parts: a looked-up place can change with the database.
+        _placed(out, self._where(item.raw.get("subject")))
+        if item.raw.get("action") == "publish_detection" and v.reason is None:
+            out["detection_files"] = [{"name": n, "present": d != MISSING_FILE}
+                                      for n, d in v.files.items()]
+        return out
+
+    def _detection_files(self, raw: dict) -> Optional[dict[str, str]]:
+        """{name: SHA-256 or MISSING_FILE} for the pending files a ``publish_detection``
+        approval names ({} for other actions), or None when one is not a regular file
+        inside detections/pending. Names were checked by ``undecidable_reason``."""
+        if raw.get("action") != "publish_detection":
+            return {}
+        out = {}
+        for name in raw["params"]["files"]:
+            digest = _file_digest(self.paths.detections / "pending", name)
+            if digest is None:
+                return None
+            out[name] = digest
+        return out
+
+    def _where(self, value: object) -> Optional[dict]:
+        """Where an address or network is, as served (``triage.geo_view``), or None."""
+        if self.geo is None or not isinstance(value, str):
+            return None
+        return geo_view(self.geo(value))
+
+    def _known(self, value: object) -> Optional[dict]:
+        """What the InternetDB file holds for an address, as served, or None."""
+        if self.shodan is None or not isinstance(value, str):
+            return None
+        try:
+            return shodan_view(self.shodan(value))
+        except Exception:  # noqa: BLE001 - display only
+            return None
+
+    def _src_where(self, raw: object, mask) -> Optional[dict]:
+        """``_where`` for an event-log source, only when masking leaves it as it is."""
+        return self._where(raw) if isinstance(raw, str) and mask(raw) == raw else None
+
+    def _shown(self, r: TriageRecord) -> TriageRecord:
+        """``r`` as displayed: its stored place, or one looked up now when it has none."""
+        return with_geo(r, self.geo)
+
+    def _record_id(self, raw: str) -> Optional[TriageRecord]:
+        if not RECORD_ID_RE.fullmatch(raw):
+            return None
+        return self._records.get().by_id.get(raw)
+
+    def _engine(self) -> Optional[EngineState]:
+        try:
+            return EngineState(self.paths.state)   # the constructor only reads
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _size_alarm(self):
+        """``respond.size_alarm`` walks three directories; refreshed once a minute."""
+        with self._alarm_lock:
+            at, value = self._alarm
+            now = self.clock()
+            if now - at >= SLOW_CACHE_SECONDS:
+                value = size_alarm(self.paths.state, self.paths.reports, self.settings)
+                self._alarm = (now, value)
+            return value
+
+    # -- routes --
+
+    def overview(self, query: dict[str, str]) -> tuple[int, object]:
+        window = query.get("window") or "24h"
+        if window not in WINDOWS:
+            raise _BadQuery
+        now = self.now()
+        since = now - WINDOWS[window]
+        recs = self._records.get()
+        inside = [r for r in recs.newest
+                  if recs.stamps[r.id] is not None and recs.stamps[r.id] >= since]
+        by_protocol = Counter(r.protocol for r in inside)
+        by_judgement = Counter(r.judgement.value for r in inside)
+        sources: Counter = Counter(r.src_ip for r in inside)
+        worst: dict[str, Judgement] = {}
+        for r in inside:
+            seen = worst.get(r.src_ip)
+            if seen is None or JUDGEMENT_RANK[r.judgement] > JUDGEMENT_RANK[seen]:
+                worst[r.src_ip] = r.judgement
+        hits = [_summary(self._shown(r)) for r in inside if r.honeytokens][:HONEYTOKEN_HITS]
+        pending = [a.raw for a in self._queue_now() if a.status_at(now) == "pending"]
+        expiries = sorted(str(a.get("expires_at", "")) for a in pending if a.get("expires_at"))
+        return 200, {
+            "window": window, "since": since.isoformat(timespec="seconds"),
+            "totals": {"records": len(inside),
+                       "sessions": sum(1 for r in inside if r.kind == "session"),
+                       "campaigns": sum(1 for r in inside if r.kind == "campaign"),
+                       "by_protocol": dict(sorted(by_protocol.items())),
+                       "by_judgement": {j.value: by_judgement.get(j.value, 0)
+                                        for j in Judgement}},
+            "top_sources": [_known_as(_placed({"src_ip": ip, "records": n,
+                                               "worst": worst[ip].value}, self._where(ip)),
+                                      self._known(ip))
+                            for ip, n in sources.most_common(TOP_SOURCES)],
+            "honeytoken_hits": hits,
+            "approvals": {"pending": len(pending),
+                          "soonest_expiry": expiries[0] if expiries else None},
+            "health": self._health(recs, now),
+        }
+
+    def _health(self, recs: _Records, now: datetime.datetime) -> dict:
+        p = self.paths
+        log_state, _ = event_log_state(p.log)   # the message names the path: not returned
+        log_info: dict = {"state": log_state}
+        if log_state == "ok":
+            try:
+                log_info["bytes"] = os.stat(p.log).st_size
+            except OSError:
+                pass
+            self.index.refresh()
+            log_info["index"] = self.index.stats()
+        stamps = [s for s in recs.stamps.values() if s is not None]
+        counter = DailyCallCounter(p.state / "analyst_calls.json",
+                                   self.limits.analyst_calls_per_day).peek()
+        today = now.date().isoformat()
+        budget = _read_json(p.budget_state or p.data / "budget_state.json", {})
+        tokens = budget.get("global_tokens") if budget.get("day") == today else 0
+        limits = triage.sensor_limit_totals(p.reports, today)
+        return {
+            "event_log": log_info,
+            "newest_record": max(stamps).isoformat(timespec="seconds") if stamps else None,
+            "records_total": len(recs.newest),
+            "analyst_calls": counter,
+            "frontend_tokens": {"day": today,
+                                "tokens": tokens if isinstance(tokens, int) and tokens >= 0 else 0,
+                                "limit": self.limits.frontend_tokens_per_day},
+            "sensor_limits": [{"protocol": proto, "reason": reason, "pool": pool, "count": n}
+                              for (proto, reason, pool), n in limits.most_common()],
+            "size_alarm": self._size_alarm(),
+            "ship_failures": self._ship_failures(),
+        }
+
+    def _ship_failures(self) -> list[dict]:
+        path = self.paths.state / "ship_events.jsonl"
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - SHIP_TAIL_BYTES))
+                raw = f.read(SHIP_TAIL_BYTES)
+        except OSError:
+            return []
+        lines = raw.split(b"\n")
+        if size > SHIP_TAIL_BYTES:
+            lines = lines[1:]   # the first one is probably cut
+        out = []
+        for line in reversed(lines):
+            try:
+                ev = json.loads(line.decode("utf-8", errors="replace"))
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(ev, dict):
+                # Whitelisted fields: the object key carries the configured bucket prefix.
+                out.append({k: ev.get(k) for k in ("timestamp", "event", "error", "lines")})
+            if len(out) >= SHIP_TAIL_EVENTS:
+                break
+        return out
+
+    def records(self, query: dict[str, str]) -> tuple[int, object]:
+        recs = self._records.get()
+        sort = query.get("sort") or "newest"
+        if sort not in ("newest", "rank"):
+            raise _BadQuery
+        items = recs.ranked if sort == "rank" else recs.newest
+        kind = query.get("kind") or ""
+        if kind:
+            if kind not in ("session", "campaign"):
+                raise _BadQuery
+            items = [r for r in items if r.kind == kind]
+        protocol = (query.get("protocol") or "").lower()
+        if protocol:
+            if not PROTOCOL_RE.fullmatch(protocol):
+                raise _BadQuery
+            items = [r for r in items if r.protocol == protocol]
+        judgement = (query.get("judgement") or "").upper()
+        if judgement:
+            if judgement not in {j.value for j in Judgement}:
+                raise _BadQuery
+            items = [r for r in items if r.judgement.value == judgement]
+        honeytoken = query.get("honeytoken") or ""
+        if honeytoken:
+            if honeytoken not in ("0", "1"):
+                raise _BadQuery
+            items = [r for r in items if bool(r.honeytokens) == (honeytoken == "1")]
+        src = query.get("src") or ""
+        if src:
+            if len(src) > 64:
+                raise _BadQuery
+            items = [r for r in items if r.src_ip == src or src in r.src_addresses]
+        country = (query.get("country") or "").strip().upper()
+        if country:
+            if not COUNTRY_RE.fullmatch(country):
+                raise _BadQuery
+            items = [r for r in items
+                     if (g := self._shown(r).src_geo) is not None and g.country_code == country]
+        q = (query.get("q") or "").strip().lower()
+        if q:
+            if len(q) > 200:
+                raise _BadQuery
+            items = [r for r in items if q in _haystack(r)]
+        page = paginate(items, query)
+        page["items"] = [_summary(self._shown(r)) for r in page["items"]]
+        page["sort"] = sort
+        if self.geo is not None:
+            page["geo"] = bool(getattr(self.geo, "enabled", True))
+        return 200, page
+
+    def record(self, query: dict[str, str], rid: str) -> tuple[int, object]:
+        r = self._record_id(rid)
+        if r is None:
+            return NOT_FOUND
+        approvals = [a.stem for a in self._queue_now() if a.raw.get("record_id") == r.id]
+        stored = r.src_geo is not None
+        r = self._shown(r)
+        # Without a stored answer the record is served exactly as before.
+        dumped = r.model_dump(mode="json", exclude={"src_shodan"} if r.src_shodan is None
+                              else None)
+        out = {"record": dumped, "layout": record_layout(r),
+               "approvals": approvals,
+               "transcript_available": False, "transcript_withheld": None}
+        if r.src_geo is not None:
+            out.update(geo=geo_view(r.src_geo), geo_stored=stored)
+        if r.src_shodan is not None:
+            out.update(shodan=shodan_view(r.src_shodan), shodan_stored=True)
+        elif (known := self._known(r.src_ip)) is not None:
+            out.update(shodan=known, shodan_stored=False)
+        places = {a: g for a in r.src_addresses[:20] if (g := self._where(a)) is not None}
+        if places:
+            out["address_geo"] = places
+        span = self.index.range_of(r.id) if r.kind == "session" and r.protocol == "ssh" \
+            else None
+        if span is not None and span[1] - span[0] > logindex.MAX_RANGE_BYTES:
+            # Said up front, rather than offering a transcript that then answers 422. The id
+            # matched RECORD_ID_RE, so it is safe to quote in the command.
+            out["transcript_withheld"] = (
+                f"This session's lines span more than "
+                f"{logindex.MAX_RANGE_BYTES // (1024 * 1024)} MiB of the event log, so the "
+                f"console does not replay it. Read it on the host with: "
+                f"grep -F '\"{r.id}\"' <event log>")
+        else:
+            out["transcript_available"] = span is not None
+        return 200, out
+
+    def transcript(self, query: dict[str, str], rid: str) -> tuple[int, object]:
+        r = self._record_id(rid)
+        if r is None or r.kind != "session" or r.protocol != "ssh":
+            return NOT_FOUND
+        try:
+            t = self.index.transcript(r.id)
+        except RangeTooLarge:
+            return 422, {"error": "transcript too large"}
+        if t is None:
+            return 404, {"error": "transcript not available"}
+        # Masked whole, then cut by ``scrub``: honeytoken values are masked everywhere in
+        # the console except the explicit reveal on the honeytokens screen.
+        mask = self._masker()
+        turns = []
+        for turn in t["turns"]:
+            text = mask(turn["text"])
+            turns.append({**turn, "text": text, "truncated": len(text) > TEXT_CAP})
+        t["turns"] = paginate(turns, query)
+        t["auth_attempts"] = [{**a, "username": mask(a["username"]),
+                               "password": mask(a["password"])} for a in t["auth_attempts"]]
+        t["username"], t["src_ip"] = mask(t["username"]), mask(t["src_ip"])
+        return 200, t
+
+    def replies(self, query: dict[str, str], rid: str) -> tuple[int, object]:
+        """What the decoy answered to each command of an SSH session record, paired with
+        the record's command list by place in the session (the n-th input turn is the n-th
+        command), never by text. As a check on the pairing, the paired input must start
+        with the record's command; when it does not, the pair is marked ``unmatched`` and
+        no reply is shown. ``status`` per command: ``reply``, ``none`` (no reply logged),
+        ``unmatched``, or ``not_read`` (past ``activity.READ_BUDGET`` of the session)."""
+        r = self._record_id(rid)
+        if r is None or r.kind != "session" or r.protocol != "ssh":
+            return NOT_FOUND
+        try:
+            t = self.index.transcript(r.id, max_bytes=activity.READ_BUDGET)
+        except RangeTooLarge:
+            return 422, {"error": "transcript too large"}
+        if t is None:
+            return 404, {"error": "transcript not available"}
+        mask = self._masker()
+        pairs = pair_inputs(t["turns"])
+        cut = t.get("cut") is True
+        items = []
+        for i, command in enumerate(r.command_sample):
+            item = {"index": i, "command": mask(command), "status": "none",
+                    "recorded": False, "reply": None, "truncated": False}
+            if i >= len(pairs):
+                if cut:
+                    item["status"] = "not_read"
+            elif not pairs[i][0].startswith(command):
+                item["status"] = "unmatched"
+            elif pairs[i][1] is not None:
+                reply = mask(pairs[i][1])
+                # The last pair read may be missing reply lines past the read limit.
+                partial = cut and i == len(pairs) - 1
+                item.update(status="reply", recorded=True, reply=reply[:TEXT_CAP],
+                            truncated=len(reply) > TEXT_CAP or partial)
+            items.append(item)
+        return 200, {"id": r.id, "items": items, "commands_in_session": len(pairs),
+                     "read_cut": cut}
+
+    # -- activity --
+
+    def _masker(self) -> Callable[[Optional[str]], Optional[str]]:
+        """Replaces the sensor's own honeytoken values in attacker text, as the honeytoken
+        screen shows them (``_mask``). Typed passwords are otherwise shown as logged."""
+        registry = _read_json(self.paths.reports / "honeytokens.json", {})
+        raw = registry.get("tokens") if isinstance(registry.get("tokens"), list) else []
+        values = sorted({t["value"] for t in raw if isinstance(t, dict)
+                         and isinstance(t.get("value"), str) and len(t["value"]) >= 4},
+                        key=len, reverse=True)[:500]
+
+        def mask(text: Optional[str]) -> Optional[str]:
+            # Hidden characters are removed first (``scrub`` would remove them anyway), so
+            # a value split by one is still found. Callers mask whole text and cut after.
+            if not isinstance(text, str):
+                return text
+            text = _STRIP_RE.sub("", text)
+            for v in values:
+                if v in text:
+                    text = text.replace(v, _mask(v))
+            return text
+        return mask
+
+    def _activity_filters(self, query: dict[str, str]) -> activity.Filters:
+        def ts(name: str) -> Optional[float]:
+            raw = query.get(name) or ""
+            if not raw:
+                return None
+            dt = _parse_ts(raw) if len(raw) <= 40 else None
+            if dt is None:
+                raise _BadQuery
+            return dt.timestamp()
+
+        def text(name: str, cap: int, pattern: Optional[re.Pattern] = None) -> Optional[str]:
+            raw = (query.get(name) or "").strip()
+            if not raw:
+                return None
+            if len(raw) > cap or clean_text(raw, cap) != raw \
+                    or (pattern is not None and not pattern.fullmatch(raw)):
+                raise _BadQuery
+            return raw
+
+        src = text("src", 64)
+        if src is not None and "/" in src:
+            try:
+                ipaddress.ip_network(src, strict=False)
+            except ValueError:
+                raise _BadQuery from None
+        kind = text("kind", 16)
+        if kind is not None and kind not in activity.KINDS:
+            raise _BadQuery
+        outcome = text("outcome", 8)
+        if outcome is not None and outcome not in ("success", "failure"):
+            raise _BadQuery
+        service = text("service", 16)
+        if service is not None:
+            service = service.lower()
+            if not activity.SERVICE_RE.fullmatch(service):
+                raise _BadQuery
+        return activity.Filters(since=ts("from"), until=ts("to"), src=src, service=service,
+                                kind=kind, outcome=outcome, username=text("user", 64),
+                                session=text("session", 128, activity.SESSION_ID_RE))
+
+    def _activity_facets(self, entries: list, info: dict, mask) -> dict:
+        with self._facets_lock:
+            key, value = self._facets
+            if key != info["generation"]:
+                value = activity.facets(entries)
+                self._facets = (info["generation"], value)
+        # Counted on the raw values, masked as served (the registry can change).
+        return {"services": {mask(k): n for k, n in value["services"].items()},
+                "kinds": value["kinds"], "approximate": value["approximate"],
+                "top_sources": [{"src": mask(s["src"]), "events": s["events"]}
+                                for s in value["top_sources"]]}
+
+    def _activity_item(self, e: tuple, rec: Optional[dict], mask) -> dict:
+        outcome = None if e[activity.OK] is None else \
+            "success" if e[activity.OK] else "failure"
+        # Every text is masked whole and cut after (``describe`` does the same), so a
+        # honeytoken across a cut point is never shown in part.
+        user = mask(e[activity.USER])
+        item = {"offset": e[activity.OFF], "src": mask(e[activity.SRC]),
+                "service": mask(e[activity.SERVICE]), "kind": e[activity.KIND],
+                "session": mask(e[activity.SESSION]), "username": user,
+                "outcome": outcome}
+        _placed(item, self._src_where(e[activity.SRC], mask))
+        if rec is None:
+            item.update(time=None, summary="this line is no longer in the event log",
+                        unreadable=True)
+            return item
+        when = rec.get("timestamp")
+        d = activity.describe(rec, e[activity.SERVICE], e[activity.KIND], TEXT_CAP, mask)
+        item["time"] = when[:40] if isinstance(when, str) else None
+        item["summary"] = activity.summary(e[activity.KIND], user, e[activity.OK], d)
+        item["message"] = d["message"]
+        for name in ("sent", "answered", "result"):
+            value = d[name]
+            item[name] = value[:TEXT_CAP] if isinstance(value, str) else None
+            item[name + "_truncated"] = isinstance(value, str) and len(value) > TEXT_CAP
+        if "password" in d:
+            item["password"] = d["password"]
+        return item
+
+    def activity(self, query: dict[str, str]) -> tuple[int, object]:
+        """Raw events, newest first. Structured filters run on the in-memory index; the
+        lines shown (and, for ``q``, the candidate lines) are read back under
+        ``activity.READ_BUDGET`` bytes per request, and when it runs out the answer says so
+        (``read_cut``) and hands back a cursor (``next_before``) to continue from. ``after``
+        returns only how many matching events are newer than that offset (for the "new
+        events" notice). Every answer carries ``log_id``; a cursor (``before``, ``after``)
+        must come with the ``log_id`` it was handed out with, and one from another log (the
+        log was rotated or truncated, or the console restarted) is refused with 409."""
+        filters = self._activity_filters(query)
+        q = (query.get("q") or "").strip()
+        if len(q) > 200 or clean_text(q, 200) != q:
+            raise _BadQuery
+        q = q.lower()
+        before = self._offset_param(query, "before")
+        after = self._offset_param(query, "after")
+        per = _int(query, "per", activity.PAGE_SIZE, 1, activity.MAX_PAGE_SIZE)
+        entries, info = self.events.snapshot()
+        log_id = info["log_id"]
+        if (before is not None or after is not None) and query.get("log_id") != log_id:
+            return 409, {"error": "the event log changed since this list was loaded",
+                         "log_id": log_id}
+        newest = entries[-1][activity.OFF] if entries else None
+        if after is not None:
+            start = activity.before_index(entries, after + 1)
+            n = sum(1 for e in entries[start:] if filters.match(e))
+            return 200, {"new": n, "newest": newest, "approximate": bool(q), "log_id": log_id}
+        mask = self._masker()
+        items: list[dict] = []
+        budget = activity.READ_BUDGET
+        i = activity.before_index(entries, before) - 1
+        last_examined: Optional[tuple] = None
+        exhausted = False
+        f = activity.open_log(self.paths.log)
+        try:
+            while i >= 0 and len(items) < per:
+                e = entries[i]
+                if filters.match(e):
+                    if budget <= 0:
+                        exhausted = True
+                        break
+                    budget -= activity.read_cost(e)
+                    rec = activity.read_line(f, e) if f is not None else None
+                    if not q or (rec is not None and q in self._haystack(e, rec)):
+                        items.append(self._activity_item(e, rec, mask))
+                last_examined = e
+                i -= 1
+        finally:
+            if f is not None:
+                f.close()
+        # Stopped with older entries left (a full page or the read budget): continue below
+        # the last one examined.
+        next_before = last_examined[activity.OFF] \
+            if i >= 0 and last_examined is not None else None
+        out: dict = {"items": items, "per": per, "next_before": next_before, "newest": newest,
+                     "log_id": log_id, "read_cut": exhausted,
+                     "budget_bytes": activity.READ_BUDGET,
+                     "window": self._activity_window(entries, info),
+                     "facets": self._activity_facets(entries, info, mask)}
+        if q:
+            reached = last_examined[activity.TS] if last_examined else None
+            out["search"] = {"complete": not exhausted, "budget_bytes": activity.READ_BUDGET,
+                             "searched_back_to": _iso_ts(reached)}
+        return 200, out
+
+    @staticmethod
+    def _offset_param(query: dict[str, str], name: str) -> Optional[int]:
+        raw = query.get(name)
+        if raw is None or raw == "":
+            return None
+        if not re.fullmatch(r"\d{1,15}", raw):
+            raise _BadQuery
+        return int(raw)
+
+    @staticmethod
+    def _activity_window(entries: list, info: dict) -> dict:
+        times = [e[activity.TS] for e in (entries[0], entries[-1])] if entries else [None, None]
+        return {"entries": info["entries"], "max_entries": info["max_entries"],
+                "older_outside": info["older_outside"], "caught_up": info["caught_up"],
+                "oldest": _iso_ts(times[0]), "newest": _iso_ts(times[1])}
+
+    @staticmethod
+    def _haystack(e: tuple, rec: dict) -> str:
+        d = activity.describe(rec, e[activity.SERVICE], e[activity.KIND], TEXT_CAP)
+        parts = [d.get(k) for k in ("sent", "answered", "result", "message", "password")]
+        parts += [e[activity.USER], e[activity.SRC], e[activity.SESSION]]
+        return "\n".join(p for p in parts if isinstance(p, str)).lower()
+
+    def activity_session(self, query: dict[str, str], sid: str) -> tuple[int, object]:
+        """Every event of one session in order, any service, read under
+        ``activity.READ_BUDGET`` bytes (``events_cut`` and ``read_cut`` say when the view
+        stops short). An SSH session's logins and turns are replayed from the transcript
+        code (``SessionIndex.transcript``), as on its record page, with its connection,
+        close and error lines from the indexed window merged in."""
+        if not activity.SESSION_ID_RE.fullmatch(sid):
+            return NOT_FOUND
+        mask = self._masker()
+        key = sid[:activity.SESSION_CAP]       # the index keeps session ids this long
+        entries, info = self.events.snapshot()
+        mine = [e for e in entries if e[activity.SESSION] == key]
+        if sid.startswith("session-"):
+            try:
+                t = self.index.transcript(sid, max_bytes=activity.READ_BUDGET)
+            except RangeTooLarge:
+                return 422, {"error": "transcript too large"}
+            if t is not None:
+                return 200, self._ssh_session(sid, t, mine, mask)
+        if not mine:
+            return 404, {"error": "session not in the indexed window"}
+        events, read_cut = self._read_events(mine[:activity.SESSION_EVENTS],
+                                             activity.READ_BUDGET, mask)
+        cut = len(mine) > activity.SESSION_EVENTS or read_cut
+        first = next((e for e in mine if e[activity.SRC]), mine[0])
+        times = [ev["time"] for ev in events if ev.get("time")]
+        out = {"id": sid, "service": mask(mine[0][activity.SERVICE]),
+               "src": mask(first[activity.SRC]),
+               "start": times[0] if times else None, "end": times[-1] if times else None,
+               "from": "index", "events": events, "events_cut": cut,
+               "read_cut": read_cut, "log_id": info["log_id"],
+               "record_id": self._record_for(sid, mine[0][activity.SERVICE],
+                                             first[activity.SRC], mine[0][activity.TS])}
+        return 200, _placed(out, self._src_where(first[activity.SRC], mask))
+
+    def _read_events(self, mine: list, budget: int, mask) -> tuple[list[dict], bool]:
+        """Items for ``mine`` in order, read back until ``budget`` bytes run out, and
+        whether they ran out first."""
+        events: list[dict] = []
+        f = activity.open_log(self.paths.log)
+        try:
+            for e in mine:
+                if budget <= 0:
+                    return events, True
+                budget -= activity.read_cost(e)
+                events.append(self._activity_item(e, activity.read_line(f, e) if f else None,
+                                                  mask))
+        finally:
+            if f is not None:
+                f.close()
+        return events, False
+
+    # Kinds an SSH session view takes from the transcript; every other kind of the
+    # session's lines (connection, close, error, other) comes from the index.
+    SSH_TRANSCRIPT_KINDS = ("login", "input", "reply")
+
+    def _ssh_session(self, sid: str, t: dict, mine: list, mask) -> dict:
+        """Logins and turns from the transcript, turns in transcript order and logins
+        merged by parsed time (a login whose time, or the next turn's, is missing comes
+        first, as auth lines come before the shell's); then the connection, close and error
+        lines the index holds, merged by parsed time (without one, a connection line comes
+        first and the others last, each in file order)."""
+        logins = []
+        for a in t["auth_attempts"]:
+            user = mask(a["username"])
+            logins.append({"time": a["ts"], "_t": activity._ts(a["ts"]), "kind": "login",
+                           "username": user, "password": mask(a["password"]),
+                           "outcome": "success" if a["success"] else "failure",
+                           "summary": activity.summary("login", user, a["success"], {})})
+        turns = []
+        for turn in t["turns"]:
+            name = "sent" if turn["role"] == "input" else "answered"
+            text = mask(turn["text"])
+            turns.append({"time": turn["ts"], "_t": activity._ts(turn["ts"]),
+                          "kind": "input" if turn["role"] == "input" else "reply",
+                          name: text[:TEXT_CAP], name + "_truncated": len(text) > TEXT_CAP,
+                          "summary": text.strip().split("\n", 1)[0][:activity.SUMMARY_CAP]})
+        events = _merge(turns, logins, lambda login, turn: login["_t"] is None
+                        or turn["_t"] is None or login["_t"] <= turn["_t"])
+        others = [e for e in mine if e[activity.KIND] not in self.SSH_TRANSCRIPT_KINDS]
+        budget = activity.READ_BUDGET - int(t.get("read_bytes") or 0)
+        extra, read_cut = self._read_events(others[:activity.SESSION_EVENTS], budget, mask)
+        for item, e in zip(extra, others):
+            item["_t"] = e[activity.TS]
+
+        def extra_first(x: dict, y: dict) -> bool:
+            if x["_t"] is not None and y["_t"] is not None:
+                return x["_t"] < y["_t"]
+            return x["kind"] == "connection"
+        events = _merge(events, extra, extra_first)
+        for ev in events:
+            del ev["_t"]
+        read_cut = read_cut or t.get("cut") is True
+        cut = len(events) > activity.SESSION_EVENTS or read_cut \
+            or len(others) > activity.SESSION_EVENTS
+        return _placed({"id": sid, "service": "ssh", "src": mask(t["src_ip"]), "start": t["start"],
+                "end": t["end"], "from": "transcript", "events": events[:activity.SESSION_EVENTS],
+                "events_cut": cut, "read_cut": read_cut, "connection_lines": bool(others),
+                "record_id": sid if sid in self._records.get().by_id else None},
+                       self._src_where(t["src_ip"], mask))
+
+    def _record_for(self, sid: str, service: str, src: Optional[str],
+                    ts: Optional[float]) -> Optional[str]:
+        """The triage record a listener session went into: the campaign for its service
+        and source whose time span holds it."""
+        recs = self._records.get()
+        if sid in recs.by_id:
+            return sid
+        if src is None or ts is None:
+            return None
+        for r in recs.newest:
+            if r.kind != "campaign" or r.protocol != service:
+                continue
+            if r.src_ip != src and src not in r.src_addresses:
+                continue
+            first, last = _parse_ts(r.first_seen), _parse_ts(r.last_seen)
+            if first is not None and last is not None \
+                    and first.timestamp() - 1 <= ts <= last.timestamp() + 1:
+                return r.id
+        return None
+
+    def queue(self, query: dict[str, str]) -> tuple[int, object]:
+        everything = query.get("all") or "0"
+        if everything not in ("0", "1"):
+            raise _BadQuery
+        now = self.now()
+        items = self._queue_now()
+        if everything == "0":
+            items = [a for a in items if a.status_at(now) == "pending"]
+        page = paginate(items, query)
+        by_id = self._records.get().by_id
+        page["items"] = [self._card(a, now, by_id) for a in page["items"]]
+        page["mode"] = {"track_before_enforce": bool(self.settings.track_before_enforce)}
+        return 200, page
+
+    def _block_connector(self) -> bool:
+        conns = self._connectors()
+        return conns is not None and bool(conns.enabled("block_webhook"))
+
+    def blocklist(self, query: dict[str, str]) -> tuple[int, object]:
+        now = self.now()
+        entries = peek_blocklist(self.paths.state, now, self.settings.blocklist_ttl_days)
+        track = bool(self.settings.track_before_enforce)
+        staged = track or any(entry_status(v) == TRACKED for v in entries.values())
+        items = sorted(({"target": k, "approved_at": v["approved_at"],
+                         "expires_at": v["expires_at"]} for k, v in entries.items()),
+                       key=lambda e: e["approved_at"], reverse=True)
+        page = paginate(items, query)
+        for e in page["items"]:
+            _placed(e, self._where(e["target"]))
+        if not staged:
+            return 200, page
+        seen = self._sightings.read(now)
+        groups = by_address(seen["doc"], (e["target"] for e in page["items"]))
+        for e in page["items"]:
+            value = entries[e["target"]]
+            e["status"] = entry_status(value)
+            if e["status"] == ENFORCED and isinstance(value.get("enforced_at"), str):
+                e["enforced_at"] = value["enforced_at"]
+            if e["status"] == TRACKED:
+                e["view_hash"] = blocklist_view_hash(e["target"], value)
+            e["sightings"] = sightings_summary(groups.get(e["target"], []))
+        page["mode"] = {"track_before_enforce": track, "block_connector": self._block_connector(),
+                        "blocklist_file": self._blocklist_file_name(),
+                        "tracked_file": TRACKED_FILE}
+        page["sightings"] = {k: seen[k] for k in ("state", "error", "generated_at",
+                                                    "age_hours", "stale", "stale_hours")}
+        return 200, page
+
+    def _blocklist_file_name(self) -> str:
+        name = Path(self.settings.blocklist_file).name if self.settings.blocklist_file \
+            else "approved.txt"
+        return name[:64]
+
+    def digests(self, query: dict[str, str]) -> tuple[int, object]:
+        names = _list_names(self.paths.reports / "daily", re.compile(r"\d{4}-\d{2}-\d{2}\.md"))
+        return 200, paginate([n[:-3] for n in reversed(names)], query)
+
+    def digest(self, query: dict[str, str], day: str) -> tuple[int, object]:
+        if not DAY_RE.fullmatch(day):
+            return NOT_FOUND
+        path = _inside(self.paths.reports / "daily", f"{day}.md")
+        got = _read_text(path, LONG_TEXT_CAP) if path is not None else None
+        if got is None:
+            return NOT_FOUND
+        text, truncated = got
+        return 200, {"day": day, "text": LongText(text), "truncated": truncated}
+
+    def detections(self, query: dict[str, str]) -> tuple[int, object]:
+        base = self.paths.detections
+        return 200, {kind: _list_names(base / kind, DETECTION_RE)
+                     for kind in ("pending", "approved")}
+
+    def detection(self, query: dict[str, str], kind: str, name: str) -> tuple[int, object]:
+        if kind not in ("pending", "approved") or not DETECTION_RE.fullmatch(name):
+            return NOT_FOUND
+        path = _inside(self.paths.detections / kind, name)
+        got = _read_text(path, LONG_TEXT_CAP) if path is not None else None
+        if got is None:
+            return NOT_FOUND
+        text, truncated = got
+        return 200, {"kind": kind, "name": name, "text": LongText(text), "truncated": truncated}
+
+    def decoy(self, query: dict[str, str]) -> tuple[int, object]:
+        p = self.paths
+        try:
+            overlay: Optional[dict] = load_overlay(p.overlay).model_dump(mode="json")
+            overlay_error = None
+        except (OSError, ValueError):
+            overlay, overlay_error = None, "overlay file is not valid"
+        tuner_runs = []
+        for name in reversed(_list_names(p.reports / "tuner", TUNER_FILE_RE)[-TUNER_RECORDS:]):
+            path = _inside(p.reports / "tuner", name)   # no symlink out of the directory
+            try:
+                if path is None or path.stat().st_size > MAX_TUNER_FILE:
+                    continue
+            except OSError:
+                continue
+            data = _read_json(path, {})
+            if data:
+                tuner_runs.append({"file": name, "timestamp": data.get("timestamp"),
+                                   "snapshot": data.get("snapshot"),
+                                   "changes": data.get("changes") or [],
+                                   "rejected": data.get("rejected") or [],
+                                   "commit": data.get("commit")})
+        state = load_source_state(p.source_state)
+        entries = sorted((e.model_dump(mode="json") for e in state.entries.values()),
+                         key=lambda e: e["updated_at"], reverse=True)
+        page = paginate(entries, query)
+        seen = self._last_seen_by_source()
+        for e in page["items"]:
+            stamp = seen.get(e["key"])
+            e["last_seen"] = stamp.isoformat(timespec="seconds") if stamp else None
+            _known_as(_placed(e, self._where(e.get("key"))), self._known(e.get("key")))
+        return 200, {"overlay": overlay, "overlay_error": overlay_error,
+                     "history": list(reversed(tuner_history(p.state / "tuner")))[:50],
+                     "tuner_runs": tuner_runs, "source_state": page}
+
+    def _last_seen_by_source(self) -> dict[str, datetime.datetime]:
+        """Source key (IPv4 address or IPv6 /64, as source state keys them) -> the newest
+        time a stored triage record saw it."""
+        recs = self._records.get()
+        out: dict[str, datetime.datetime] = {}
+        for r in recs.newest:
+            stamp = recs.stamps.get(r.id)
+            if stamp is None:
+                continue
+            for addr in {r.src_ip, *r.src_addresses}:
+                key = ip_key(addr)
+                if key not in out or stamp > out[key]:
+                    out[key] = stamp
+        return out
+
+    def playbooks(self, query: dict[str, str]) -> tuple[int, object]:
+        pbs, errors = load_playbooks(self.paths.playbooks)
+        engine = self._engine()
+        today = self.now().date().isoformat()
+        counts = engine.counts if engine is not None and engine.day == today else {}
+        items = [{"name": pb.name, "enabled": pb.enabled, "priority": pb.priority,
+                  "description": pb.description, "cooldown_minutes": pb.cooldown_minutes,
+                  "max_runs_per_day": pb.max_runs_per_day,
+                  "runs_today": counts.get(pb.name, 0),
+                  "when": pb.when.model_dump(mode="json", exclude_defaults=True),
+                  "steps": [{"action": st.action, "tier": tier_of(st)} for st in pb.steps]}
+                 for pb in pbs]
+        cooldowns = sorted(({"key": k, "at": v} for k, v in
+                            (engine.cooldowns.items() if engine is not None else [])),
+                           key=lambda c: c["at"], reverse=True)
+        return 200, {"playbooks": items, "errors": errors,
+                     "engine": {"day": engine.day if engine is not None else None,
+                                "counts": counts,
+                                "notify_sent": engine.sent if engine is not None
+                                and engine.day == today else {},
+                                "cooldowns": paginate(cooldowns, query)}}
+
+    def honeytokens(self, query: dict[str, str]) -> tuple[int, object]:
+        reveal = query.get("reveal") or ""
+        if reveal and not TOKEN_NAME_RE.fullmatch(reveal):
+            raise _BadQuery
+        registry = _read_json(self.paths.reports / "honeytokens.json", {})
+        raw = registry.get("tokens") if isinstance(registry.get("tokens"), list) else []
+        hits: Counter = Counter()
+        for r in self._records.get().newest:
+            hits.update(set(r.honeytokens))
+        tokens = []
+        for t in raw:
+            if not isinstance(t, dict) or not isinstance(t.get("name"), str) \
+                    or not isinstance(t.get("value"), str):
+                continue
+            planted = t.get("planted_in") if isinstance(t.get("planted_in"), list) else []
+            tokens.append({"name": t["name"], "kind": str(t.get("kind", "")),
+                           "planted_in": [str(x) for x in planted][:50],
+                           "planted_for": t.get("planted_for"),
+                           "legacy": t.get("legacy") is True,
+                           "hits": hits.get(t["name"], 0), "value": t["value"]})
+        if reveal:
+            match = next((t for t in tokens if t["name"] == reveal), None)
+            if match is None:
+                return NOT_FOUND
+            return 200, {"name": match["name"], "value": match["value"]}
+        for t in tokens:
+            t["value"] = _mask(t["value"])
+        return 200, {"scenario": registry.get("scenario"), "tokens": paginate(tokens, query)}
+
+    # -- decisions --
+
+    def _connectors(self):
+        """The ``Connectors`` object, built once (building sends nothing), or None."""
+        with self._connectors_lock:
+            if not self._connectors_built:
+                self._connectors_built = True
+                if self.connectors is not None:
+                    try:
+                        self._connectors_value = self.connectors()
+                    except Exception:  # noqa: BLE001 - no connectors is a working state
+                        log.exception("building connectors failed; connector actions are off")
+            return self._connectors_value
+
+    @staticmethod
+    def _needed_connector(action: str, track: bool) -> Optional[str]:
+        """The connector approving ``action`` calls, or None. With track before enforce on,
+        approving ``block_webhook`` only tracks the source (enforce calls the connector)."""
+        if track and action == "block_webhook":
+            return None
+        return CONNECTOR_FOR.get(action)
+
+    def _connector_ready(self, approval: dict) -> bool:
+        """Whether approving would run the action here rather than consume the approval: a
+        connector action needs that connector enabled in this process."""
+        name = self._needed_connector(str(approval.get("action", "")),
+                                      bool(self.settings.track_before_enforce))
+        if name is None:
+            return True
+        conns = self._connectors()
+        return conns is not None and bool(conns.enabled(name))
+
+    def _decision_settings(self) -> Optional[RespondSettings]:
+        if self.respond_settings is None:
+            return self.settings
+        try:
+            return self.respond_settings()
+        except ValueError as exc:
+            log.error("refusing a console decision: %s", str(exc)[:200])
+            return None
+
+    def _by(self) -> str:
+        """``ui:<operator>``; never from the request. ``respond`` sanitises it as for the CLI."""
+        name = self.operator.strip()
+        if not name:
+            try:
+                name = getpass.getuser()
+            except (OSError, KeyError):   # a container user without a passwd entry
+                name = "unknown"
+        return "ui:" + name
+
+    def _decide(self, aid: str, verb: str, body: dict) -> tuple[int, object]:
+        if not APPROVAL_RE.fullmatch(aid):
+            return NOT_FOUND
+        path = self.paths.state / "approvals" / f"{aid}.json"
+        if not path.is_file():
+            return NOT_FOUND
+        given = body.get("view_hash")
+        if not isinstance(given, str) or not VIEW_HASH_RE.fullmatch(given):
+            return BAD_VIEW_HASH
+        settings = self._decision_settings()
+        if settings is None:
+            return BAD_SETTINGS
+        current = self.view_of(aid)
+        if current.reason is not None:
+            # Approve and reject alike: reject also acts on the raw subject, playbook and
+            # action (its suppression key), so it could be misdirected the same way.
+            return UNDECIDABLE
+        if current.digest is None or \
+                not hmac.compare_digest(current.digest.encode(), given.encode()):
+            return CHANGED
+        state, reports = self.paths.state, self.paths.reports
+        try:
+            if verb == "reject":
+                result = reject(aid, state, by=self._by(),
+                                suppress_hours=settings.reject_suppress_hours,
+                                reports_dir=reports)
+            else:
+                conns = self._connectors()
+                needed = self._needed_connector(str(current.shown.get("action", "")),
+                                                bool(settings.track_before_enforce))
+                if needed is not None and (conns is None or not conns.enabled(needed)):
+                    # approve would mark it executing and then failed: refuse, keep it pending.
+                    return NO_CONNECTOR
+                result = approve(aid, state, reports, self.paths.detections, connectors=conns,
+                                 by=self._by(), blocklist_file=settings.blocklist_file,
+                                 blocklist_format=settings.blocklist_format,
+                                 blocklist_ttl_days=settings.blocklist_ttl_days,
+                                 expired_suppress_hours=settings.expired_suppress_hours,
+                                 never_act_on=settings.never_act_on,
+                                 track_before_enforce=settings.track_before_enforce,
+                                 sensor=self.sensor)
+        except ApprovalError as exc:
+            # Fixed text from respond: the validated id and status / expiry read from disk.
+            return 400, {"error": clean_text(str(exc), ERROR_CAP)}
+        finally:
+            self._queue.invalidate()
+        return 200, {"approval": project_approval(result) if isinstance(result, dict) else None}
+
+    def view_of(self, aid: str) -> _View:
+        """The view of approval ``aid`` as the queue would serve it now, read fresh from disk
+        (the record set's signature is re-checked first, so a record re-triaged since the
+        page loaded changes the hash). ``aid`` must already match ``APPROVAL_ID_RE``. The
+        status and expiry are re-checked by respond under its lock; this makes sure the
+        operator decided on what is on disk now."""
+        raw = _read_json(self.paths.state / "approvals" / f"{aid}.json", {})
+        self._records.invalidate()
+        return self._view(_Approval(aid, raw), self._records.get().by_id)
+
+    # One fixed answer for every refused unblock: the console removes single listed entries,
+    # and a range (which can empty the whole list in one click) is a CLI decision.
+    UNBLOCK_REFUSED = (400, {"error": "target must be one blocklist entry exactly as listed; "
+                                      "unblock a range with the CLI (python -m agents unblock)"})
+
+    def _unblock(self, body: dict) -> tuple[int, object]:
+        """Remove exactly one listed entry. ``target`` must parse (``ipaddress``) to a value
+        equal to an existing key; covering networks such as 0.0.0.0/0 are refused here."""
+        raw = body.get("target")
+        if not isinstance(raw, str) or len(raw) > MAX_TARGET:
+            return self.UNBLOCK_REFUSED
+        wanted = self._unblock_network(raw.strip())
+        if wanted is None:
+            return self.UNBLOCK_REFUSED
+        settings = self._decision_settings()
+        if settings is None:
+            return BAD_SETTINGS
+        entries = peek_blocklist(self.paths.state, self.now(), settings.blocklist_ttl_days)
+        key = next((k for k in entries if self._unblock_network(k) == wanted), None)
+        if key is None:
+            return self.UNBLOCK_REFUSED
+        try:
+            # respond.unblock also removes entries inside the given network; keys are single
+            # addresses or IPv6 /64s, so for an exact key that is only the key itself.
+            result = unblock(key, self.paths.state, self.paths.reports,
+                             blocklist_file=settings.blocklist_file,
+                             blocklist_format=settings.blocklist_format,
+                             ttl_days=settings.blocklist_ttl_days, by=self._by(),
+                             track_before_enforce=settings.track_before_enforce,
+                             sensor=self.sensor)
+        except ValueError:
+            return self.UNBLOCK_REFUSED
+        return 200, result
+
+    ENFORCE_REFUSED = (400, {"error": "target must be one tracked blocklist entry exactly as "
+                                      "listed"})
+
+    def _enforce(self, body: dict) -> tuple[int, object]:
+        """Move exactly one listed tracked entry to enforced. ``view_hash`` must match the
+        entry as it is on disk now (status and times), so an entry that changed, expired or
+        was enforced since the page loaded is a 409 and nothing changes."""
+        raw = body.get("target")
+        if not isinstance(raw, str) or len(raw) > MAX_TARGET:
+            return self.ENFORCE_REFUSED
+        wanted = self._unblock_network(raw.strip())
+        if wanted is None:
+            return self.ENFORCE_REFUSED
+        given = body.get("view_hash")
+        if not isinstance(given, str) or not VIEW_HASH_RE.fullmatch(given):
+            return BAD_VIEW_HASH
+        settings = self._decision_settings()
+        if settings is None:
+            return BAD_SETTINGS
+        entries = peek_blocklist(self.paths.state, self.now(), settings.blocklist_ttl_days)
+        key = next((k for k in entries if self._unblock_network(k) == wanted), None)
+        if key is None:
+            return CHANGED
+        if not hmac.compare_digest(blocklist_view_hash(key, entries[key]).encode(),
+                                   given.encode()):
+            return CHANGED
+        # The read above takes no lock; enforce compares what was checked here again under
+        # its lock, so a change in between (unblock and approve again) is still refused.
+        seen = {k: entries[key].get(k) for k in VIEW_FIELDS}
+        seen["status"] = entries[key].get("status")
+        try:
+            result = enforce(key, self.paths.state, self.paths.reports,
+                             connectors=self._connectors(), by=self._by(),
+                             blocklist_file=settings.blocklist_file,
+                             blocklist_format=settings.blocklist_format,
+                             ttl_days=settings.blocklist_ttl_days,
+                             never_act_on=settings.never_act_on,
+                             track_before_enforce=settings.track_before_enforce,
+                             sensor=self.sensor, expected=seen)
+        except EnforceChanged:
+            return CHANGED
+        except EnforceError as exc:
+            # Fixed text from respond: the listed key and the check that refused it.
+            return 400, {"error": clean_text(str(exc), ERROR_CAP)}
+        return 200, result
+
+    @staticmethod
+    def _unblock_network(value: str):
+        """``value`` as an ``ip_network`` (an address is its /32 or /128), or None. Host bits
+        set under a prefix are refused rather than masked, so 198.51.100.7/24 is no key."""
+        if "%" in value:   # scoped IPv6 addresses are never blocklist keys
+            return None
+        try:
+            return ipaddress.ip_network(value, strict=True)
+        except ValueError:
+            return None

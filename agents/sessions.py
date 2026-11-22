@@ -20,10 +20,12 @@ from __future__ import annotations
 import base64
 import binascii
 import datetime
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
@@ -310,7 +312,7 @@ def iter_records(path: os.PathLike | str, start_offset: int = 0
                 continue
             try:
                 obj = json.loads(raw.decode("utf-8", errors="replace"))
-            except ValueError:
+            except (ValueError, RecursionError):
                 yield start, pos, None
                 continue
             yield start, pos, obj if isinstance(obj, dict) else None
@@ -355,7 +357,9 @@ def _sensor_limit(parsed: "ParsedLog", task: str, ts: datetime.datetime, protoco
 
 
 def parse_log(path: os.PathLike | str, window_minutes: int = 60,
-              start_offset: int = 0) -> ParsedLog:
+              start_offset: int = 0, end_offset: Optional[int] = None) -> ParsedLog:
+    """Parse complete lines from ``start_offset``; with ``end_offset``, only lines that
+    start before it (the console replays one session's byte range this way)."""
     sessions: dict[str, Session] = {}
     campaigns: dict[str, Campaign] = {}
     ssh_auth: dict[str, list[tuple[datetime.datetime, AuthAttempt]]] = {}
@@ -366,6 +370,8 @@ def parse_log(path: os.PathLike | str, window_minutes: int = 60,
                        end_offset=start_offset, window_minutes=window_minutes)
 
     for start, end, rec in iter_records(path, start_offset):
+        if end_offset is not None and start >= end_offset:
+            break
         parsed.end_offset = end
         if rec == {}:
             continue  # blank line
@@ -500,6 +506,94 @@ def parse_log(path: os.PathLike | str, window_minutes: int = 60,
 
 # ---- cursor ------------------------------------------------------------------------------
 
+TAIL_BYTES = 4096            # content fingerprint window ending at a boundary
+MAX_PARTIAL_BYTES = 1 << 20  # longest unfinished last line a sample will look back over
+
+
+class NotRegularFile(OSError):
+    """The log path names something other than a regular file (directory, pipe, device)."""
+
+
+@dataclass(frozen=True)
+class LogSample:
+    """What one open and one ``fstat`` of the log showed, all from the same descriptor.
+
+    ``end`` is the offset just past the last newline: only bytes before it are complete
+    lines. ``tails`` maps each requested offset, ``end`` and a few checkpoints spread over
+    the file to a hash of the (at most 4096) bytes before it, or None when the offset is past
+    ``end``: bytes that already exist never change in an append-only log, so the same offsets
+    hash the same later. ``mtime_ns`` is the modification time to the nanosecond: a rewrite
+    that leaves the size unchanged moves it. ``generation`` is an opaque id of this log file
+    (its inode and first-line hash)."""
+    inode: int
+    size: int
+    head: Optional[str]
+    end: int
+    tails: dict
+    mtime_ns: int = 0
+
+    @property
+    def generation(self) -> str:
+        return log_generation(self.inode, self.head)
+
+
+def log_generation(inode: Optional[int], head: Optional[str]) -> str:
+    return hashlib.sha256(f"{inode}:{head or ''}".encode()).hexdigest()[:16]
+
+
+def sample_log(path: os.PathLike | str, offsets: Iterable[int] = ()) -> LogSample:
+    """Sample the log through a single descriptor. Raises ``FileNotFoundError`` when it is
+    missing, ``NotRegularFile`` for a directory or pipe, and ``OSError`` for anything else
+    (permission, or no line end in the last MAX_PARTIAL_BYTES)."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise NotRegularFile(errno.EINVAL, "not a regular file", str(path))
+        size = st.st_size
+        first = os.pread(fd, Cursor.HEAD_BYTES, 0)
+        line = first[: first.find(b"\n") + 1] if b"\n" in first else first
+        head = hashlib.sha256(line).hexdigest() if line else None
+        end = _end_of_lines(fd, size, str(path))
+        tails = {}
+        for offset in {*offsets, end, end // 4, end // 2, 3 * end // 4}:
+            n = min(offset, TAIL_BYTES)
+            data = os.pread(fd, n, offset - n) if 0 <= offset <= end else b""
+            tails[offset] = hashlib.sha256(data).hexdigest() if len(data) == n and \
+                0 <= offset <= end else None
+        return LogSample(st.st_ino, size, head, end, tails, st.st_mtime_ns)
+    finally:
+        os.close(fd)
+
+
+def rewritten(before: LogSample, after: LogSample) -> bool:
+    """Whether ``after`` can not be ``before`` plus appended lines: another file, a shorter
+    one, a changed first line, a same-size file with a new modification time, or any
+    sampled window whose bytes differ (a copytruncate that was regrown, an in-place edit)."""
+    if after.inode != before.inode or after.size < before.size:
+        return True
+    if before.head is not None and after.head != before.head:
+        return True
+    if after.size == before.size and after.mtime_ns != before.mtime_ns:
+        return True
+    return any(after.tails.get(offset) != digest
+               for offset, digest in before.tails.items() if digest is not None)
+
+
+def _end_of_lines(fd: int, size: int, path: str) -> int:
+    floor = max(0, size - MAX_PARTIAL_BYTES)
+    pos = size
+    while pos > floor:
+        start = max(floor, pos - 65536)
+        i = os.pread(fd, pos - start, start).rfind(b"\n")
+        if i >= 0:
+            return start + i + 1
+        pos = start
+    if floor == 0:
+        return 0                       # no newline anywhere: nothing complete yet
+    raise OSError(errno.EFBIG, "no line end in the last 1 MiB", path)
+
+
 class Cursor:
     """High-water mark over the log.
 
@@ -508,7 +602,11 @@ class Cursor:
     log size). The log's inode, a hash of its first line and the newline just before
     ``offset`` are checked on resume; on rotation or truncation reading restarts from 0
     (``done`` still prevents repeats). The first-line hash catches a rotated log whose new
-    file reuses the old inode number.
+    file reuses the old inode number. ``tail`` hashes the (at most 4096) bytes before
+    ``offset`` as they were when the cursor was saved, so a log rewritten in place with the
+    same size no longer matches; a cursor saved by an older version has no ``tail`` and is
+    resumed as before, but never counts as a confirmation for rotation until its reader
+    runs again.
     """
 
     HEAD_BYTES = 4096
@@ -522,6 +620,14 @@ class Cursor:
             return None
         return hashlib.sha256(first).hexdigest() if first else None
 
+    @staticmethod
+    def sample(log_path: os.PathLike | str, offsets: Iterable[int] = ()) -> Optional[LogSample]:
+        """``sample_log``, or None when the log cannot be sampled (reader run start)."""
+        try:
+            return sample_log(log_path, offsets)
+        except OSError:
+            return None
+
     MAX_DONE = 200_000
     MAX_FAILED = 1_000
 
@@ -530,6 +636,9 @@ class Cursor:
         self.offset = 0
         self.inode: Optional[int] = None
         self.head: Optional[str] = None
+        self.tail: Optional[str] = None
+        self.size: Optional[int] = None        # size and mtime when saved: see rewritten()
+        self.mtime_ns: Optional[int] = None
         self.done: dict[str, int] = {}
         self.failed: list[str] = []
         if self.path.exists():
@@ -538,11 +647,17 @@ class Cursor:
                 self.offset = int(data.get("offset", 0))
                 self.inode = data.get("inode")
                 self.head = data.get("head")
+                tail = data.get("tail")
+                self.tail = tail if isinstance(tail, str) else None
+                size, mtime = data.get("size"), data.get("mtime_ns")
+                self.size = size if isinstance(size, int) and not isinstance(size, bool) else None
+                self.mtime_ns = mtime if isinstance(mtime, int) and not isinstance(mtime, bool) \
+                    else None
                 self.done = {str(k): int(v) for k, v in dict(data.get("done", {})).items()}
                 self.failed = [str(x) for x in data.get("failed", [])][-self.MAX_FAILED:]
             except (OSError, ValueError, TypeError, AttributeError):
                 self.offset, self.inode, self.done, self.failed = 0, None, {}, []
-                self.head = None
+                self.head = self.tail = self.size = self.mtime_ns = None
 
     def start_offset(self, log_path: os.PathLike | str) -> int:
         try:
@@ -551,13 +666,37 @@ class Cursor:
             return 0
         if self.offset <= 0 or self.inode != st.st_ino or st.st_size < self.offset:
             return 0
+        if self.size == st.st_size and self.mtime_ns is not None \
+                and self.mtime_ns != st.st_mtime_ns:
+            return 0      # same length but modified since saved: rewritten in place, read it all
         if self.head is not None and self.head != self._head(log_path):
             return 0
         with open(log_path, "rb") as f:
             f.seek(self.offset - 1)
             if f.read(1) != b"\n":
                 return 0
+        if self.tail is not None:             # content just before the offset must be unchanged
+            found = self.sample(log_path, [self.offset])
+            if found is None or found.tails.get(self.offset) != self.tail:
+                return 0
         return self.offset
+
+    def adopt_handled(self, parsed: ParsedLog, before: Optional[LogSample], recorded) -> None:
+        """Before a reread from the start of the same file (it was rewritten at the same
+        length, so ``start_offset`` refused the offset): an item that ends at or before the
+        old offset and whose record ``recorded(kind, id)`` already exists was handled, and is
+        not triaged again (a second model call each). That is the only evidence taken. An
+        item without a record, for instance a session id the rewrite introduced, is
+        processed: replaying is the conservative side. A different file, or one whose first
+        line changed, is a new generation and is read in full."""
+        if self.offset > 0 and before is not None and self.inode == before.inode \
+                and self.head == before.head:
+            for s in parsed.sessions.values():
+                if s.last_offset <= self.offset and recorded("session", s.session_id):
+                    self.done.setdefault(s.session_id, s.last_offset)
+            for c in parsed.campaigns.values():
+                if c.last_offset <= self.offset and recorded("campaign", c.campaign_id):
+                    self.done.setdefault(c.campaign_id, c.last_offset)
 
     def seen_session(self, sid: str) -> bool:
         return sid in self.done
@@ -571,38 +710,53 @@ class Cursor:
             self.failed.append(item_id)
             self.failed = self.failed[-self.MAX_FAILED:]
 
-    def advance(self, parsed: ParsedLog, log_path: os.PathLike | str) -> None:
+    def _stamp(self, log_path: os.PathLike | str, before: Optional[LogSample]) -> None:
+        """Record which log, and what content, the offset belongs to.
+
+        ``before`` is the sample the run took before it read; None means that sample failed,
+        and then nothing is certified. The log now must be ``before`` plus appended lines
+        (``rewritten``): then the fingerprint stored is of bytes the pre-read sample already
+        covered or that were appended after it. If the file was replaced, truncated or
+        rewritten, the offset does not describe the file now there: the cursor keeps no
+        inode, so the next run starts from the beginning (``done`` prevents repeats), and no
+        fingerprint, so it confirms nothing for rotation."""
+        after = None if before is None else self.sample(log_path, [self.offset, *before.tails])
+        if after is None or rewritten(before, after):
+            self.inode = self.head = self.tail = self.size = self.mtime_ns = None
+            return
+        self.inode, self.head = after.inode, after.head
+        self.tail = after.tails[self.offset]
+        self.size, self.mtime_ns = after.size, after.mtime_ns
+
+    def advance(self, parsed: ParsedLog, log_path: os.PathLike | str,
+                before: Optional[LogSample]) -> None:
         """Move the high-water mark past everything handled and prune ``done``."""
         firsts = [s.first_offset for s in parsed.sessions.values() if s.session_id not in self.done]
         firsts += [c.first_offset for c in parsed.campaigns.values()
                    if c.campaign_id not in self.done and c.first_offset >= 0]
         self.offset = min(firsts) if firsts else parsed.end_offset
-        try:
-            self.inode = os.stat(log_path).st_ino
-        except OSError:
-            self.inode = None
-        self.head = self._head(log_path)
+        self._stamp(log_path, before)
         # last_offset is exclusive: an item ending at or before the mark has no lines
-        # left to read, so it can never reappear.
-        self.done = {k: v for k, v in self.done.items() if v > self.offset}
+        # left to read, so it can never reappear. Not so when the stamp was refused: the
+        # next run rereads from 0, so keep every handled id (no second record or model call).
+        if self.inode is not None:
+            self.done = {k: v for k, v in self.done.items() if v > self.offset}
         if len(self.done) > self.MAX_DONE:
             keep = sorted(self.done.items(), key=lambda kv: kv[1])[-self.MAX_DONE:]
             self.done = dict(keep)
 
-    def set_position(self, offset: int, log_path: os.PathLike | str) -> None:
+    def set_position(self, offset: int, log_path: os.PathLike | str,
+                     before: Optional[LogSample]) -> None:
         """Set the high-water mark to ``offset`` (the end of a complete line) and record the
         log's identity for the rotation checks in ``start_offset``."""
         self.offset = offset
-        try:
-            self.inode = os.stat(log_path).st_ino
-        except OSError:
-            self.inode = None
-        self.head = self._head(log_path)
+        self._stamp(log_path, before)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"offset": self.offset, "inode": self.inode, "head": self.head, "done": self.done,
-                   "failed": self.failed}
+        payload = {"offset": self.offset, "inode": self.inode, "head": self.head,
+                   "tail": self.tail, "size": self.size, "mtime_ns": self.mtime_ns,
+                   "done": self.done, "failed": self.failed}
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".cursor-", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f)

@@ -13,7 +13,7 @@ halves share files, never a network connection.
 
 | Component | Location | Role |
 |---|---|---|
-| SSH honeypot | `SSH/ssh_server.py`, `agents/hooks.py` | The upstream DECEIVE server: a model plays a Linux shell. `ssh_server.py` stays close to upstream; each addition is a small call into `agents/hooks.py`, marked with an `agent layer` comment. |
+| SSH honeypot | `SSH/ssh_server.py`, `agents/hooks.py`, `agents/shell.py` | The upstream DECEIVE server: a model plays a Linux shell. `ssh_server.py` stays close to upstream; each addition is a small call into `agents/hooks.py`, marked with an `agent layer` comment. |
 | Listeners | `listeners/` | Low-interaction traps for SIP (UDP and TCP), FTP, Telnet, PostgreSQL, MySQL, MSSQL, Redis, SMTP, HTTP, HL7 MLLP and S3-compatible storage, all in one asyncio process (`python -m listeners`). |
 | Scenarios | `scenarios/` | One strict schema describing the fake target; loader, synthetic-data checker and describer. See [scenarios.md](scenarios.md). |
 | Budgets | `agents/budget.py` | Spend and concurrency limits for every model call, shared by the SSH and listener processes. |
@@ -22,6 +22,7 @@ halves share files, never a network connection.
 | Tuner | `agents/tuner.py` | Adjusts fake accounts, SIP extensions, lures and login thresholds in the overlay. |
 | Detect | `agents/detect.py` | Writes Sigma rule drafts and blocklist candidates to `detections/pending/`. |
 | Event export | `agents/ship.py` | Copies new event log lines to S3 as JSON lines for a SIEM (`[connector.s3_events]`, off by default). See [operations.md](operations.md#event-export-to-s3). |
+| Operator console | `agents/ui/` | `python -m agents ui`: a local web console over the records, queue, digests, tuner state, playbooks and detections. Read-only unless actions are on; loopback only. See [operations.md](operations.md#operator-console) and [security-model.md](security-model.md#operator-console). |
 | CLI | `agents/__main__.py` | `python -m agents <command>`; `run-all` runs triage, respond, digest, tune and detect in that order, then the event export when it is enabled. |
 
 ### SSH persona
@@ -36,12 +37,109 @@ Every persona model call goes through `agents.hooks.persona_invoke`, which:
 3. applies the source's tarpit delay, if a playbook set one.
 
 If the model call fails (provider error, timeout), the session continues with a plausible
-canned reply instead: `-bash: <command>: command not found` followed by a prompt, and
-`exit` or `logout` end the session. If the configured provider needs an API key from the
-environment (`anthropic`, `openai`, `gemini`, `azure`) and the variable is not set, the
-persona runs offline from the start: no network attempt is made and every command gets a
-canned reply. A warning is logged once at startup. Offline replies charge no tokens to any
-budget; the per-session command cap and the concurrency limits still apply.
+canned reply instead, from the deterministic shell in `agents/shell.py` (below), followed
+by a prompt; `exit` or `logout` end the session. If the configured provider needs an API
+key from the environment (`anthropic`, `openai`, `gemini`, `azure`) and the variable is not
+set, the persona runs offline from the start: no network attempt is made and every command
+gets a canned reply. A warning is logged once at startup. Offline replies charge no tokens
+to any budget; the per-session command cap and the concurrency limits still apply.
+
+#### Deterministic shell
+
+`agents/shell.py` is the one answerer for the SSH fallback and the Telnet trap's canned
+shell, so the two cannot disagree. It answers, from the scenario's host profile
+(`[identity]` and `[identity.hardware]`), the sensor seed and the clock, with no model and
+no subprocess:
+
+- identity and uptime: `uname` (all flags, real field order), `hostname`, `uptime` (also
+  `-p`, `-s`), `whoami`, `id`, `w`, `nproc`, `free` (`-b`, `-k`, `-m`, `-g`, `-h`, `-t`),
+  `df` (`-h`, paths), `ps` (plain, `aux`, `-ef`);
+- files: `/proc/cpuinfo`, `/proc/meminfo`, `/proc/version`, `/proc/uptime`,
+  `/proc/loadavg`, `/proc/mounts`, `/etc/os-release`, `/etc/issue`, `/etc/hostname`,
+  `/etc/passwd` (the scenario's users plus the login account), `/etc/shells`, and the
+  distribution's own release files (another distribution's are "No such file");
+- hardware: `lscpu`, `lspci`, `nvidia-smi` (plain, `-q`, `-L`, `--query-gpu` with CSV
+  output), or `command not found` when the profile has no GPU;
+- `which`, `command -v`, `ls` (and `cd`, `pwd`) of `/`, `/home`, `/tmp`, `/var/tmp`,
+  `/dev/shm`, `/root`, `/opt`, `/srv`, `/mnt`, `/media` and home directories, showing the
+  scenario's lures where they live;
+- the IoT botnet openers: `sh` (a nested shell, no output), `enable` (bash's list of
+  builtins: both front ends present bash, and a bot sending it reads nothing from the
+  reply), `system`, `shell` and `linuxshell` (`command not found`, as bash says), and
+  `busybox NAME` (`NAME: applet not found`), with the BusyBox version the distribution
+  release ships; RHEL and its rebuilds ship none, so there `busybox` is
+  `command not found`;
+- `wget`, `curl` and `tftp`, which exist but fail (no route, or no name resolution) without
+  any lookup or connection;
+- `echo` (including `-e` escapes) and the quiet builtins.
+
+A command given by path (`/bin/uname`, `/bin/./uname`, `/usr/bin/id`) answers the same.
+Pipelines of that output through `grep` (`-c`, `-i`, `-v`, `-n`, `-q`, `-F`, `-e`),
+`head`/`tail -n`, `cut -d -f/-c`, `wc` and `awk '{print $N, ...}'` (with `-F`) are
+evaluated in Python, as are `;`, `&&` and `||` lists of them. `grep` patterns are fixed
+strings plus `.`, `^` and `$`, matched by hand; no attacker text is ever compiled as a
+regular expression, and the module's own parsing of attacker text (words, `awk` programs,
+`cut` lists, counts, `echo -e` escapes) is a single linear pass.
+
+This code runs on the event loop, so one line's cost is bounded as a whole: every command
+and filter charges one work counter per character and per loop step, every command's output
+is capped at 128 KiB (the line's at 128 KiB too), and a command reads at most 8 files. A
+line over any of these limits falls back like an unknown line. The worst line we could
+construct on the largest valid profile (64 CPUs, 8 GPUs) costs about 12 ms. Input over
+4096 characters, more than 8 commands in a pipeline or 32 in a list, control characters,
+substitution, variables, globbing, and any command, option or file it does not
+know fall back too: to the model; without one, to a builtin's own output, the known tool's
+own error for an option or file it does not handle (`invalid option`, `No such file or
+directory`) or no output, and `command not found` only for a command the host does not
+have. Errors from the shell itself are worded as bash words them: `-bash: ...` in an
+interactive session, and over SSH exec `bash: line 1: ...` (bash 5.1 and later, by the
+scenario's distribution release) or `bash: ...` (older bash). `/proc/meminfo` and `free`
+report whole 4 kB pages.
+
+The canned shell also answers what IoT loaders send (Mirai, Gafgyt-style droppers): a list
+runs part by part, `ping`, `nc` and bare `busybox APPLET` print their real usage (recorded
+from the distribution's busybox package), and `/bin/echo`, `/bin/busybox` and
+`/proc/self/exe` read as the start of an ELF image for the host's machine
+(`agents/elfimage.py`), the same bytes through `cat`, `dd` and a `while read` loop. Files a
+Telnet session writes (`>x`, `cp`, `chmod`, `echo -ne ... >> x`) are kept in memory for
+that session (32 entries, 128 KiB) and never run. Binary bytes leave as the exact bytes;
+the event log and the model's history keep `\xNN` text instead.
+
+With a model and `[llm] local_shell_replies = true` (the default), a line the shell can
+answer is answered from the profile, by how far its commands could disagree with what the
+session has done (`agents.shell.FIXED`, `SESSION`, `STATE`; a line takes the highest):
+
+- Facts no command can change are answered locally for the whole session: the kernel
+  (`uname` without the nodename), `uptime`, `w`, `who`, `nproc`, `free`, `lscpu`, `lspci`,
+  `nvidia-smi` on a GPU host, the `/proc` CPU, memory, version, uptime and load files,
+  `echo`, the IoT openers and `busybox` applet probes.
+- Facts a session can change (`hostname`, `uname -n` and `-a`, `whoami`, `id`, `which`,
+  `command -v`, `ls`, `pwd`, `ps`, `df`, `sh`, every file outside those `/proc` files,
+  including `/etc/os-release` and the other release files, a file that does not exist, and
+  a program path that does not exist, such as `/usr/bin/xmr`) are answered locally only
+  until a model reply (fresh or cached) has answered a command in the session; after that
+  the model answers them, because it may have run `hostname x`, `useradd`, written a file
+  or downloaded a program. The model's own session opener does not count.
+- Commands that change the session (`cd`, `export`, `unset`, `history`, `wget`, `curl`,
+  `tftp`) always go to the model, which then owns the change.
+
+A local answer given after the model has answered ends with exactly the prompt the model
+last showed (the last line of its reply), and paths resolve from the directory that prompt
+shows: `user@host:DIR# `, or `[user@host ~]# ` and `[user@host /]# ` on RHEL. When the
+prompt has any other shape (`export PS1='$ '`, or RHEL's `[root@host tmp]# `, which shows
+only the last path component), the session gets no more local answers; the model answers
+everything from then on. Local answers cost no model call, count
+against the per-session command cap but not the model cap, follow the source's `shallow`
+mode, and are added to the session's chat history (each clipped to 4 KB) so the model's
+later replies agree with them; those characters count in the token estimate made before
+each model call. A session whose commands were all answered this way gets no model
+summary. When the model fails after it has moved the session to another directory, the
+fallback reply keeps the prompt (and working directory) the model last showed.
+
+The persona block tells the model the exact line bash prints for a program the host does
+not have (`-bash: NAME: command not found` in a login shell, `bash: line 1: NAME: command
+not found` over SSH exec on bash 5.1 and later), so it answers an unknown program the way
+the shell would instead of inventing output.
 
 A model reply that reads as the model talking and not as shell output (for example "As an
 AI", "I'm sorry, but", "I apologize, but", or a mention of its instructions or system
@@ -57,6 +155,26 @@ records the original reply (base64 in `details`, clipped to 2,000 characters). A
 the attacker typed themselves is allowed through. The check is a short list of patterns in
 `agents/hooks.py`; it catches the common ways a model steps out of the role, not every
 one.
+
+A model reply is first cut back to the one round the input asked for (`agents/onereply.py`),
+before it is sent, kept in the history or the reply cache, logged, or read for the prompt.
+The first line that starts with the session's prompt (`user@host:dir#`, or `[user@host
+dir]#` on RHEL; the host is the scenario's, the one in the prompt noted for the session,
+or the one the reply ends with, or any host when the prompt shows the session's own user)
+and has a command or more output after it ends the reply:
+an interactive reply keeps that prompt and nothing after it, an exec reply loses the prompt
+too. The attacker's own line echoed back after a prompt at the start of a reply, and a
+bare prompt in front of the output, are dropped (a line that is only the input, with no
+prompt in front, is kept: it may be the output). A reply is left whole when
+the input could print a prompt-shaped line itself (it contains `@`, a backtick, a
+backslash, `%` or a `$` expansion), and for content viewers only the session's exact
+current prompt counts, and nothing at all once the session has typed such an input. Each
+cut logs one `Reply cut` event (`cut_reason`, `dropped_chars`, `cuts_in_session` and a
+`dropped_sample` of at most 120 escaped characters; telnet: a `notice` event with the same
+`data`); the dropped text is never recorded as input. The template system prompt also asks
+for one round, and `[llm] max_tokens` caps the reply on the anthropic provider. No stop
+sequence is used: the prompt the model must print is the same text that starts an
+invented round.
 
 Sessions have a login timeout (60 s), an idle timeout (300 s) and an absolute lifetime
 (1800 s); each frees a concurrency slot. Chat history is dropped when a session closes. The
@@ -205,6 +323,49 @@ a short narrative, high-signal counts, honeytoken use and credential statistics.
 come from the analyst model when one is used and validate against a strict schema;
 otherwise they are computed by code.
 
+The narrative is laid out in parts so every record reads the same way:
+
+| Field | What it holds | Cap |
+|---|---|---|
+| `headline` | a few words naming the activity | 100 characters |
+| `actions` | what the source did, one short sentence each | 5 items, 160 characters each |
+| `assessment` | what it most likely means | 4 items, 160 characters each |
+| `not_seen` | what was looked for and not found | 5 items, 60 characters each |
+| `narrative` | one plain paragraph, always filled | 600 characters |
+| `clients` | campaigns: the most frequent client names the source announced | 3 items, 80 characters each |
+
+The model writes `headline`, `actions`, `assessment` and `not_seen`; without a model the
+rule-based triage fills them from the same facts it uses for judgement (signals, counts,
+dialed numbers, honeytokens). The parts are forgiving where the rest of the schema is
+strict: a part that is missing or of the wrong type is empty, an over-long one is clipped,
+control characters become spaces, and the record is still written. The model is asked to
+leave `narrative` empty and it is composed from the parts; a paragraph the model does give
+is kept. `narrative` stays for everything that already reads it (connectors, the
+`include_narrative` summary, search).
+
+Who, volume and target are never written by the model. They are derived from the record
+at display time (`triage.record_facts`): who from the source address, address count,
+username and `clients`; volume from connections, login attempts, commands or requests and
+high-signal counts; target from dialed numbers, SIP extensions, usernames tried and
+honeytokens. Records written before the parts existed have them empty and are shown as
+their paragraph.
+
+Example (a rule-based SIP record, as the digest shows it):
+
+```text
+1. MALICIOUS / IMPACT / sip from `198.51.100.7` (`campaign-sip-198_51_100_7-20261101T1200`)
+   - **`Toll-fraud probing over SIP`** (MALICIOUS)
+   - Who: `198.51.100.7`, `client "examplesip"`
+   - Volume: 6 connections, no login attempts, 6 requests, 6 x sip_dialed_number
+   - Target: `number 0015550100`, `number 01115550100`, `number 915550100`, `1 more number`
+   - What they did
+     - `Dialed 6 outside numbers`
+   - What it means
+     - `Hostile: the activity goes beyond scanning or guessing`
+     - `Looking for a route that places outbound calls at someone else's cost`
+   - Not seen: `login attempts`, `honeytoken use`
+```
+
 Deterministic rules set floors the model cannot lower:
 
 - In SSH sessions, code detects download-and-execute, persistence (cron, systemd, shell rc
@@ -226,7 +387,9 @@ cursor is saved after every item.
 
 The digest (`reports/daily/YYYY-MM-DD.md`) lists counts, the top three items (honeytoken
 use first, then judgement, stage, high-signal events and novelty), high-signal events,
-credential statistics per protocol, and SIP extensions and dialed numbers. Attacker strings
+credential statistics per protocol, and SIP extensions and dialed numbers. Each of the top
+three is laid out as above (headline, who, volume, target, what they did, what it means,
+not seen), or as its paragraph when the record has no parts. Attacker and model strings
 are rendered inside escaped code spans.
 
 ### Tuner
@@ -259,12 +422,25 @@ accounts.
 
 - Sigma rules for IOCs and high-signal behaviour seen across several sessions or sources.
   The rule body comes from a template in code; the model may only supply a title and
-  description, which are length-capped and limited to a safe character set. Each draft
-  lists the triage records it was built from.
+  description, which are length-capped and limited to a safe character set. Attacker values
+  are escaped for Sigma; each indicator type has its own log source, and addresses and
+  hashes get no rule. `pending/provenance.json` lists the triage records each draft was
+  built from. See [Portable formats](portable-formats.md).
 - `blocklist-candidates.csv`, one row per source across all protocols. Private, reserved
-  and documentation addresses and unverified sources are skipped.
+  and documentation addresses and unverified sources (see [Source proof](#source-proof))
+  are skipped. Each row carries `source_proven`, a `reason` from a fixed vocabulary and an
+  `expires` time; rows past their expiry are left out of the next run's file. See
+  [Using the intelligence outside the sensor](operations.md#using-the-intelligence-outside-the-sensor)
+  before acting on it.
 
 See [detections/README.md](../detections/README.md).
+
+### STIX export
+
+`python -m agents stix` (and `run-all`, when `[stix]` is enabled; off by default) writes a
+STIX 2.1 bundle to a local file: observed-data for proven sources and stored files, and
+indicators only for what passed the OTX connector's promotion rules or an operator's
+approval. No network connection. See [Portable formats](portable-formats.md).
 
 ## Data flow and trust boundaries
 
@@ -280,9 +456,9 @@ attacker --> listeners -----+--> event log --> agents     response runs, honeyto
 
 | Store | Written by | Read by | Docker volume |
 |---|---|---|---|
-| Event log, quarantine, budget state, sensor seed | SSH server, listeners | agents (read-only) | `frontend` |
-| Overlay, per-source state | agents | SSH server, listeners (read-only) | `overlay` |
-| Triage records, digests, response runs, approval queue, tuner snapshots, honeytoken registry, detection drafts, event export cursor | agents | operator | `agentdata` |
+| Event log, quarantine, budget state, sensor seed | SSH server, listeners | agents, operator console (read-only) | `frontend` |
+| Overlay, per-source state | agents | SSH server, listeners, operator console (read-only) | `overlay` |
+| Triage records, digests, response runs, approval queue, tuner snapshots, honeytoken registry, detection drafts, event export cursor | agents; operator console only with actions on (approval queue, blocklist, audit records) | operator, operator console | `agentdata` |
 | `config.ini`, host key, `prompt.txt` | operator | all (read-only) | bind mount |
 
 The sensor seed (`<data dir>/sensor_seed`, mode 0600, random on first start) drives every
@@ -320,7 +496,7 @@ SSH `message` values include `SSH connection received`, `User attempting to auth
 `details`), `Session summary` (summary in `details`, `judgement` field: `BENIGN`,
 `SUSPICIOUS`, `MALICIOUS`, or `UNKNOWN` when no summary was made, for example without a
 model), `Budget exceeded`
-(with `reason`), `Model error`, `Persona break`, `Session timeout` and
+(with `reason`), `Model error`, `Persona break`, `Reply cut`, `Session timeout` and
 `SSH connection closed`.
 
 Listener events add:
@@ -328,7 +504,7 @@ Listener events add:
 | Field | Meaning |
 |---|---|
 | `sensor_protocol` | `sip`, `ftp`, `telnet`, `postgres`, `mysql`, `mssql`, `redis`, `smtp`, `http`, `mllp`, `s3` (SSH lines carry `ssh`). |
-| `event` | `connection`, `auth_attempt`, `command`, `register`, `invite`, `options`, `limit`, `error`, `close`. |
+| `event` | `connection`, `auth_attempt`, `command`, `register`, `invite`, `options`, `limit`, `error`, `close`, `notice` (about the decoy itself, such as a cut persona reply). |
 | `transport` | `tcp` or `udp`. |
 | `username`, `password` | Submitted credentials, when the protocol reveals them. |
 | `client` | Client software string (User-Agent, connect attributes). |
@@ -338,6 +514,39 @@ Listener events add:
 Every attacker-supplied value is length-capped (512 characters) and has control characters
 escaped before it is written. Listener writes use `O_APPEND`, so lines from the SSH and
 listener processes never interleave.
+
+### Source proof
+
+A UDP datagram's source address is whatever the sender wrote, so a SIP event over UDP may
+name an address that never sent anything. Two flags say when the address is proven:
+
+| Field | On | Meaning |
+|---|---|---|
+| `data.source_verified` | every SIP request event over UDP (not `error` or `limit` lines); SIP `invite` over either transport | `true` when the address has completed a nonce round trip with this listener: it was sent a challenge nonce and came back with it, so it can receive packets at that address. `false` otherwise. |
+| `data.nonce_verified` | SIP `auth_attempt` (a REGISTER with credentials) and an answered `invite` | `true` when this request carries a nonce the trap issued to this same address. This is the round trip itself; it is what turns `source_verified` on for the address's later events. |
+
+When they are set:
+
+- An address becomes verified the first time a request from it carries a nonce issued to
+  it. From then on its UDP events carry `source_verified: true`, including the event that
+  proved it.
+- The listener remembers the 10,000 most recently verified addresses, in memory only. An
+  address that falls out of that list, or any address after a listener restart, is
+  unverified again until it completes another round trip.
+- Events from unverified UDP sources go through the low-value gate: the first of each kind
+  per source, then periodic lines with a `suppressed` count. A missing line does not mean
+  nothing arrived.
+- TCP events (every other listener, SIP over TCP, and SSH) do not need the flag. A completed
+  TCP handshake proves the address, so `transport: tcp` (or an SSH line) is proof on its
+  own, and `source_verified` may be absent there.
+
+A consumer that decides anything per address (blocking, alerting, reputation, counting
+distinct attackers) should keep only events where `transport` is `tcp`, or
+`data.source_verified` is `true`, or `data.nonce_verified` is `true`, and treat the rest
+as unattributed volume. Without that filter a forged-source flood can put any address,
+including a victim's or your own, into the result. Triage applies the same rule: campaigns
+seen only over UDP without a round trip are marked `unverified_source`, never raise
+severity, and never reach the blocklist candidates or Sigma drafts.
 
 ## Budgets
 
@@ -349,21 +558,83 @@ model is not called: the attacker gets a canned error and the session closes, an
 |---|---|
 | `max_line_bytes` (input is truncated) | 2048 |
 | `max_commands_per_session` | 200 |
+| `max_model_commands_per_session` (see below) | 50 |
 | `max_tokens_per_session` | 400,000 |
 | `max_tokens_per_ip_per_day` (IPv6 per /64) | 1,000,000 |
 | `max_tokens_per_day` (global) | 3,000,000 |
 | `max_concurrent_sessions` | 20 |
 | `max_concurrent_sessions_per_ip` | 3 |
+| `reply_cache_entries` (0 turns the reply cache off) | 2000 |
+| `reply_cache_max_age` (seconds) | 21600 |
 
 - The estimated cost (history length / 4 plus 512 output tokens) is reserved before the
   call and corrected from the provider's usage data afterwards, so concurrent sessions can
-  overshoot a cap by at most one estimate's error. Failed calls keep their charge.
+  overshoot a cap only by estimate error: admission is exact against estimates, but the
+  correction after a call is applied late, so with several calls in flight a cap can be
+  passed by the sum of their errors. Failed calls keep their charge.
 - Daily counters live in a JSON file in the data directory (`state_file`), updated under
   an exclusive file lock, so the SSH server and the listeners on one host share the caps
-  and a restart does not reset the day. A malformed file restarts the day from zero with a
-  warning.
+  and a restart does not reset the day. A reservation is one transaction under that lock:
+  it reloads the day's counters, checks the per-source and host-wide caps, and only then
+  writes the charge, so two processes cannot both take the last of a cap, and a refused
+  request charges nothing and does not count as a command. All of these limits are on
+  estimated tokens, not on what the provider bills. A malformed file restarts the day from
+  zero with a warning. If the file cannot be written, the caps still hold in memory and an
+  error is logged (see `BUDGET STATE NOT PERSISTED`).
 - A source in `shallow` mode (set by a playbook) gets canned replies only; `deep` doubles
-  its per-session and per-source limits. The global cap never changes.
+  its per-session and per-source limits (the model cap too). The global cap never changes.
+- `max_model_commands_per_session` counts the commands the model was asked, failed calls
+  included (a failed call still reserved its cost). Cached replies are looked up first and
+  still served past it. When a
+  session reaches it, the session is not closed: every later command is answered by the
+  deterministic shell, so an unknown command gets `command not found` and `exit` still
+  ends the session. One `Model cap reached` event (with `limit`) is logged per session; the
+  shell's answers are added to the history for the summary. Listener model calls (SQL,
+  HTTP) stop at the same cap and get their protocol's error. There is no per-source
+  counterpart: a source opening session after session to reset the cap is already bounded
+  by `max_tokens_per_ip_per_day` and `max_concurrent_sessions_per_ip`.
+- The reply cache (`agents/replycache.py`) keeps model replies in memory and serves one
+  again, with no model call and no tokens, to a session whose history so far is identical.
+  The key is a hash chained over the host (scenario and sensor seed), the login user,
+  interactive or exec, the persona block, and every turn so far: each input line and the
+  reply as the history holds it. Bots replay one script, so their sessions mostly hit. A
+  hit is added to the history, counts toward `max_commands_per_session` but not the model
+  cap, and counts as a model reply for the local-answer rule above. The session summary is
+  cached the same way.
+- A session uses the cache only while everything in its history is a function of its key:
+  a local answer that read neither the clock nor the source address
+  (`agents.shell.Answer.shareable`), a cached reply, or a model reply it has just stored.
+  It leaves the cache for good, neither reading nor writing it, as soon as its history gets
+  anything else: a local answer from `w`, `who`, `uptime`, `ps`, `/proc/uptime` or
+  `/proc/loadavg` (clock or address), a model error or fallback, a reply past the model
+  cap, a reply replaced because it broke character or misprinted an `echo`, or a model
+  reply that was not stored. A source with a planted token or a `deep` or `shallow` mode
+  never uses it, and neither does a session whose cache state was evicted (it never
+  restarts from the root key). Not stored, as a second line: replies that end the
+  session, replies that contain the session's address (whole, or cut to 16 characters as
+  `w` cuts IPv6), replies to lines whose real output changes between runs (`date`,
+  `uptime`, `ps`, `/dev/urandom`, `mktemp`, `openssl`, ...) and replies over 16 KB. The
+  cache is bounded by `reply_cache_entries` (least recently used out first) and
+  `reply_cache_max_age`, and is not kept across a restart, so a changed prompt, model or
+  scenario never serves an old reply.
+- Timing: a local or cached reply is as fast as a real shell, while a model reply takes
+  the model's latency, so a script can tell which commands reach the model. The
+  per-source tarpit does not cover this (it applies to flagged sources only, to every
+  reply). `[llm] local_reply_delay_ms` (default 0, at most 2000) waits a random half to all
+  of that time before a local, cached or capped reply in a model-backed session. It only
+  narrows the gap, since model latency varies far more, and it slows every scripted bot,
+  so it is off by default.
+- `[llm] prompt_caching` marks the persona request for the provider's prompt cache. It is
+  on by default for the Anthropic provider. For `aws` it is off by default and is used
+  only when set to `true`, and then only for model ids containing `anthropic.` or
+  `amazon.nova` (the families langchain-aws marks cache points for; other Bedrock models
+  reject them). Not every model in those families accepts cache points, so if the first
+  request with one is refused as invalid (Bedrock `ValidationException`, Anthropic 400),
+  it is retried without the cache point and caching stays off until restart, with one
+  `Prompt caching disabled` log line. It places one breakpoint on the last message, so the
+  system prompt, persona block and the session so far are read from the provider's cache
+  on the next command. Other providers are unchanged. The budget still charges the full
+  token count the provider reports.
 - Listener model calls (SQL, HTTP and Telnet fallbacks) use the same budget, take a session
   slot, run at most `llm_max_inflight` at a time, make one request with no retries, and
   fail closed when no budget is initialised.

@@ -14,19 +14,27 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.23 /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock .python-version ./
-RUN uv sync --frozen --no-dev --no-install-project --no-cache
+# --extra geoip: the reader for the optional [geoip] database files (no network use).
+RUN uv sync --frozen --no-dev --extra geoip --no-install-project --no-cache
 
-COPY SSH ./SSH
+# Only the files the honeypot loads; nothing else under SSH/ (keys, local config, deploy notes).
+COPY SSH/ssh_server.py SSH/prompt.txt SSH/config.ini.TEMPLATE /app/SSH/
+# The full license text, with both copyright notices, travels with the image.
+COPY LICENSE /app/LICENSE
 COPY agents ./agents
 COPY listeners ./listeners
 COPY scenarios ./scenarios
 COPY playbooks ./playbooks
+# The AWS bootstrap (deploy/aws/sensor.yaml) copies these out of the image onto the host:
+# the config renderer, and with the tailnet option the egress rules and the tailscaled unit.
+COPY deploy/aws/render_config.py ./deploy/aws/render_config.py
+COPY deploy/aws/host ./deploy/aws/host
 
 # Volume mount points owned by the runtime user, so fresh named volumes inherit the owner.
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin winnie \
-    && mkdir -p /data /agents /overlay \
-    && chown winnie:winnie /data /agents /overlay \
-    && chmod 0750 /data /agents /overlay
+    && mkdir -p /data /agents/reports/blocklist /overlay /blocklist /internetdb \
+    && chown winnie:winnie /data /agents /agents/reports /agents/reports/blocklist /overlay /blocklist /internetdb \
+    && chmod 0750 /data /agents /agents/reports /agents/reports/blocklist /overlay /blocklist /internetdb
 USER 10001
 
 EXPOSE 8022

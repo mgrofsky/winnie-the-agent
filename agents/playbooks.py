@@ -59,8 +59,9 @@ ACTION_TIERS: dict[str, ActionTier] = {
 SIGNALS = ("redis_takeover", "sql_exec_attempt", "sql_cred_dump", "smtp_relay_attempt",
            "sip_dialed_number", "quarantine_quota", "http_proxy_attempt", "ftp_upload",
            "s3_upload", "s3_bulk_download", "s3_planted_key",
-           # Deterministic SSH session signals (agents.triage.session_signals).
-           "download_execute", "persistence", "credential_file_read")
+           # Deterministic SSH session signals (agents.triage.session_signals); hardware_recon
+           # is also set on telnet campaigns.
+           "download_execute", "persistence", "credential_file_read", "hardware_recon")
 # Dialing prefixes treated as international or premium-rate (toll fraud targets).
 PREMIUM_PREFIXES = ("1900", "1976", "0900", "0906", "0909", "09", "+1900", "+44909", "+44906")
 DOMESTIC_PLUS = ("+1",)
@@ -220,7 +221,7 @@ def load_playbook(path: Path) -> Playbook:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
         pb = Playbook.model_validate(raw)
-    except (OSError, tomllib.TOMLDecodeError, ValidationError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, ValidationError, RecursionError) as exc:
         raise PlaybookError(f"{path.name}: {exc}") from exc
     if pb.name != path.stem:
         raise PlaybookError(f"{path.name}: name {pb.name!r} must match the file name")
