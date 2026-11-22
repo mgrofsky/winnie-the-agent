@@ -59,7 +59,7 @@ def reset_hooks():
     hooks.reset()
 
 
-# ---- the brief's table, row by row ----------------------------------------------------------
+# ---- common opening commands, one by one ----------------------------------------------------
 
 def test_openers_bash_does_not_know_are_command_not_found():
     assert one("sh") == ""
@@ -560,13 +560,13 @@ def test_event_detail_renders_the_three_cases_as_text_nodes():
     assert "innerHTML" not in body and "insertAdjacent" not in body
 
 
-def test_found_by_fuzzing():
+def test_wc_counts_a_binary_and_ls_l_of_an_empty_directory_is_its_total():
     # wc -c counts the bytes of a binary; ls -l of an empty directory is just its total
     assert one("cat /bin/echo | wc -c") == f"{elfimage.SIZE}\n"
     assert one("ls -l /mnt") == "total 0\n"
 
 
-def test_found_in_review():
+def test_redirection_and_file_edge_cases():
     h = host()
     a = shell.answer(h, "echo hi > /tmp/a > /tmp", now=NOW)
     assert a.output == "-bash: /tmp: Is a directory\n" and a.scope == shell.STATE
@@ -666,7 +666,7 @@ def test_a_copied_program_reads_its_input():
     assert out[3] == "data\n"
 
 
-# ---- review round 3: bounded work, pipeline input after a fallback, removed directories ----
+# ---- bounded work, pipeline input after a fallback, removed directories --------------------
 
 def _old_columns(names, width=80):
     """The layout search before it was bounded: every column count, for comparison."""
@@ -983,7 +983,7 @@ def test_plain_ls_hides_dot_files_the_session_made():
     assert out[10] == ".x\n"
 
 
-# ---- found by running the same sessions in ubuntu:22.04 bash and busybox 1.30.1 ash --------
+# ---- replies that match ubuntu:22.04 bash and busybox 1.30.1 ash ---------------------------
 
 def status(lines, h=None):
     """The exit status of the last line, after the others ran in the same session."""

@@ -507,7 +507,7 @@ def test_a_large_log_is_indexed_within_its_bounds(tmp_path):
     assert body["search"]["complete"] is False and body["next_before"] is not None
 
 
-# ---- review fixes: masking at cut points ---------------------------------------------------
+# ---- masking at cut points -----------------------------------------------------------------
 
 TOKEN = HONEYTOKEN_VALUE
 SHOWN = TOKEN[:2] + "......"
@@ -572,7 +572,7 @@ def test_a_token_split_by_a_hidden_character_is_still_masked(api, tree):
     no_token_part(items(api, session="telnet-z"))
 
 
-# ---- review fixes: cursors carry the log's identity ---------------------------------------
+# ---- cursors carry the log's identity -----------------------------------------------------
 
 def test_a_cursor_needs_the_log_id_it_came_with(api):
     body = items(api, per=4)
@@ -606,7 +606,7 @@ def test_another_process_hands_out_another_log_id(tree):
     assert items(a)["log_id"] != items(b)["log_id"]
 
 
-# ---- review fixes: facets keep the busiest services ---------------------------------------
+# ---- facets keep the busiest services -----------------------------------------------------
 
 def test_many_rare_services_do_not_crowd_out_real_ones(api, tree):
     junk = [listener(50, f"aa{i:04d}", f"junk-{i}", "connection") for i in range(600)]
@@ -629,7 +629,7 @@ def test_facet_counters_are_bounded():
     assert f["approximate"] is True and len(f["services"]) <= activity.TOP_SERVICES
 
 
-# ---- review fixes: every read is under the byte budget ------------------------------------
+# ---- every read is under the byte budget --------------------------------------------------
 
 LONG = 200_000
 
@@ -675,7 +675,7 @@ def test_ssh_session_view_and_replies_stop_at_the_read_budget(tmp_path, monkeypa
     assert body["items"][-1]["recorded"] is False
 
 
-# ---- review fixes: index memory ------------------------------------------------------------
+# ---- index memory --------------------------------------------------------------------------
 
 def test_entry_strings_are_capped():
     _, src, _, _, session, user, _ = classify(
@@ -707,7 +707,7 @@ def test_worst_case_entry_size_matches_the_documented_figure():
     assert activity.MAX_ENTRIES * per_entry < 300 * 1024 * 1024
 
 
-# ---- review fixes: SSH session order -------------------------------------------------------
+# ---- SSH session order ---------------------------------------------------------------------
 
 def test_ssh_turns_keep_transcript_order_and_untimed_lines_keep_file_order(api, tree):
     sid = "session-0000000000000000000000000000000b"
@@ -740,7 +740,7 @@ def test_an_ssh_view_outside_the_window_says_it_has_only_logins_and_turns(tmp_pa
     assert {e["kind"] for e in body["events"]} <= {"login", "input", "reply"}
 
 
-# ---- review fixes: the reply pairing guard -------------------------------------------------
+# ---- the reply pairing guard ---------------------------------------------------------------
 
 def test_replies_that_do_not_pair_with_the_command_are_not_shown(tmp_path):
     tree = build_tree(tmp_path / "own")

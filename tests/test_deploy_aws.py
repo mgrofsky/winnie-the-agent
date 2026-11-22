@@ -491,7 +491,7 @@ def _user_data_too_big(d):
     _step_edit(d, "TailscaleNodeStep", "$T serve status", "$T serve status\n" + "#" * 4000)
 
 
-# The review's cases: each passed the checker before it was tightened.
+# Narrower edits to the tailnet option: each must still be refused.
 
 def _join_flags_appended(d):
     _step_edit(d, "TailscaleNodeStep", "up --timeout=60s", "up --timeout=60s --netfilter-mode=on --ssh")
