@@ -342,31 +342,76 @@ mode.
 ### Event log permissions
 
 The log holds attempted usernames and passwords, so keep it readable only by the people and
-services that need it. The SSH server creates `ssh_log.log` with mode 0640 (a stricter
-umask, such as 0077, makes it 0600), the same as the listeners' event log. Earlier versions
-created it with the process umask, usually 0644, which lets every local account read it.
-A file that already exists keeps its mode, so check an existing sensor:
+services that need it. Two processes write `ssh_log.log`, the SSH server and the listeners,
+and either may be the one that creates it. Both create it owner-only, mode 0600, in the same
+`open` call (no later `chmod`, so there is no moment when it is wider; a stricter umask can
+only remove more), and both append. Nothing else in the shipped deployment creates it: the
+image, the compose files and the AWS bootstrap neither pre-create nor `touch` it, and the
+agents, exporter and console only read it.
+
+A file that already exists keeps its mode. Earlier versions created it 0644 (the SSH server,
+with the process umask) or 0640 (the listeners), so on an upgraded sensor check it and
+tighten it yourself:
 
 ```sh
 ls -ldn /data /data/ssh_log.log     # in Docker: docker compose exec ssh ls -ldn /data /data/ssh_log.log
 ```
 
-1. **Find the service user.** In the Docker files every service runs as UID 10001, so the
-   writer and the readers (agents, console, exporter) are the same user. Without Docker, it
-   is the account that runs `SSH/ssh_server.py` (`ps -o user= -p "$(pgrep -f ssh_server.py)"`).
+1. **Find the service user.** In the bundled Docker files and on the AWS host every service
+   (`ssh`, `listeners`, `agents`, `exporter`, `ui`) runs as UID 10001:10001, so the writers
+   and the readers are the same user and 0600 is enough; the console and exporter need no
+   group. Without Docker, it is the account that runs `SSH/ssh_server.py`
+   (`ps -o user= -p "$(pgrep -f ssh_server.py)"`), and the listeners must run as that same
+   account, or the second writer cannot append to a file the first created 0600.
 2. **List the authorized readers.** The accounts that run `python -m agents` (triage, ship,
    console) and any backup or log-forwarding job you added. Anyone else should have no
    access.
-3. **Tighten the log.** If the readers are the service user only, use `chmod 0600`. If
-   another account must read it, put it in a group and use `chgrp GROUP FILE; chmod 0640
-   FILE`. Do not go below what a configured reader needs: after the change, run
-   `python -m agents triage --dry-run` as each reader account and confirm it still reads
-   the log. Rotated copies and backups hold the same content; give them the same mode.
+3. **Tighten the log.** `chmod 0600` it, as the service user or root. It takes effect
+   immediately for the open file; no restart is needed. Run `python -m agents triage
+   --dry-run` as each reader account to confirm it still reads the log. Rotated copies and
+   backups hold the same content; give them the same mode.
 4. **Check the parent directory.** It must not be writable by others (anyone who can
    write there can replace the log) and should not be listable by them: `chmod 0750`, or
    0700 when only the service user reads. The image creates `/data` as 0750.
 
-The change takes effect immediately for the open file; no restart is needed.
+#### A separate reader account (optional)
+
+If a reader that is not the service user must read the log (a forwarder, a backup job, an
+analyst's account), give it access through a dedicated group, never by widening the mode for
+everyone. The mode stays 0640 only because you create the file that way: a writer that finds
+no file creates it 0600 and the group loses access. So the file has to exist, with the right
+owner, group and mode, before any writer runs.
+
+1. Create the group and add the authorized readers to it, and nobody else (for example
+   `groupadd winnie-log-readers; usermod -aG winnie-log-readers REVIEWER`).
+2. Keep the log in a directory of its own, owned by the service user, group
+   `winnie-log-readers`, mode 0750. Do not grant the group the data directory itself: it
+   also holds the quarantine, the sensor seed and the budget state. Moving the log means
+   every process must use the new path: `[honeypot] log_file` or `--log-file` for both
+   writers, `--log` for the agents, the exporter and the console, and a volume mount of the
+   new directory in each container (read-only for the readers). The stock compose files and
+   `sensor.yaml` pass these paths explicitly, so edit each command and mount there.
+3. Stop both writers, then give the file the right owner, group and mode. Do one of these,
+   never both:
+   - **No log exists yet (a new path, or a replacement after rotating).** Create it so that
+     an existing file is never overwritten; with `noclobber` the redirect fails instead of
+     truncating (it opens with `O_EXCL`), as root in bash or zsh:
+     `( umask 077; set -o noclobber; : > /path/ssh_log.log ) && chown SERVICE_USER:winnie-log-readers /path/ssh_log.log && chmod 0640 /path/ssh_log.log`.
+     It is never wider than 0600 until the final `chmod`.
+   - **A log already exists (an upgrade, or your data).** Do not re-create it. Check
+     `ls -ln`, then `chown SERVICE_USER:winnie-log-readers FILE` and `chmod 0640 FILE` in
+     place, or just `chmod 0600 FILE` if no group is needed.
+4. Start the writers. Both append to the file and leave its owner, group and mode alone.
+   Check with `ls -ln`, and read it as a group member.
+
+**Rotating.** Run the drain checks in [Rotating the event log](#rotating-the-event-log)
+before anything that removes or truncates the log: with the writers stopped, both readers
+must confirm the same boundary. Then either truncate in place (copy it, then `: > FILE` as
+the service user), which keeps the owner, group and mode, or rename it and create the
+replacement with the `noclobber` command above *before* the writers resume. Otherwise the
+first writer to log creates it 0600 and the readers lose access without any error. Give the
+archived copy the same group and mode, or a stricter one, and delete it on your retention
+schedule.
 
 Keep `sensor_seed` (on the `frontend` volume) across rebuilds: it determines all fake data
 and honeytoken values. A new seed changes every honeytoken, so earlier tokens are no longer
