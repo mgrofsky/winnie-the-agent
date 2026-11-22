@@ -19,8 +19,10 @@ On top of that SSH honeypot this project adds:
 - **Scenarios**: one TOML file describes the whole fake target (organisation, host, users,
   services, banners, accounts, fake data, HTTP pages and APIs, honeytokens), so every
   protocol on a sensor tells the same story. Six scenarios ship with the project.
-- **Budgets**: hard limits on model spend and concurrency, enforced in code before any
-  model call.
+- **Budgets**: every model call first reserves its estimated tokens against per-session,
+  per-source and daily token budgets, with concurrency limits, all enforced in code. They
+  are estimates, not provider billing, and calls in flight can pass a limit by the
+  estimate error.
 - **Triage**: one validated record per SSH session or per trap campaign, plus a daily digest.
 - **Where addresses are** (optional): country, city and network owner of each source,
   read from GeoLite2 or DB-IP Lite database files on disk (no network call), stored on
