@@ -566,3 +566,74 @@ def test_temperature_is_not_sent_unless_configured(ssh_module, monkeypatch):
     ssh_module.config["llm"]["temperature"] = "0.4"
     ssh_module.choose_llm()
     assert captured["temperature"] == 0.4
+
+
+# ---- event log permissions -------------------------------------------------------------------
+
+def _log_event(ssh_module, log_file, message):
+    _configure_minimal_logging(ssh_module, log_file)
+    ssh_module.logger.info(message)
+    for handler in ssh_module.logger.handlers:
+        handler.flush()
+        handler.close()
+
+
+def _mode(path):
+    return path.stat().st_mode & 0o777
+
+
+@pytest.mark.parametrize("umask, expected", [(0o022, 0o640), (0o077, 0o600), (0o000, 0o640)])
+def test_new_event_log_is_created_without_world_access(tmp_path, ssh_module, umask, expected):
+    import os
+
+    log_file = tmp_path / "ssh_log.log"
+    previous = os.umask(umask)
+    try:
+        _log_event(ssh_module, log_file, "first")
+    finally:
+        os.umask(previous)
+    assert _mode(log_file) == expected
+    assert json.loads(log_file.read_text())["message"] == "first"
+
+
+def test_reopening_the_event_log_appends_and_keeps_its_mode(tmp_path, ssh_module):
+    import os
+
+    log_file = tmp_path / "ssh_log.log"
+    previous = os.umask(0o022)
+    try:
+        _log_event(ssh_module, log_file, "before restart")
+        log_file.chmod(0o600)                       # an operator tightened it
+        _log_event(ssh_module, log_file, "after restart")
+    finally:
+        os.umask(previous)
+    assert [json.loads(line)["message"] for line in log_file.read_text().splitlines()] == [
+        "before restart", "after restart"]
+    assert _mode(log_file) == 0o600
+
+
+def test_preexisting_private_log_stays_private(tmp_path, ssh_module):
+    import os
+
+    log_file = tmp_path / "ssh_log.log"
+    log_file.write_text("")
+    log_file.chmod(0o600)
+    previous = os.umask(0o000)
+    try:
+        _log_event(ssh_module, log_file, "kept private")
+    finally:
+        os.umask(previous)
+    assert _mode(log_file) == 0o600
+
+
+def test_open_event_log_survives_rotation_by_rename(tmp_path, ssh_module):
+    log_file = tmp_path / "ssh_log.log"
+    _configure_minimal_logging(ssh_module, log_file)
+    ssh_module.logger.info("one")
+    log_file.rename(tmp_path / "ssh_log.log.1")     # rotation while the handler holds it open
+    ssh_module.logger.info("two")
+    for handler in ssh_module.logger.handlers:
+        handler.flush()
+        handler.close()
+    rotated = (tmp_path / "ssh_log.log.1").read_text()
+    assert "one" in rotated and "two" in rotated

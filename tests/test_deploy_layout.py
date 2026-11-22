@@ -75,11 +75,27 @@ def test_only_the_agents_get_aws_settings_and_only_the_region():
 RUNTIME_WRITTEN = {"data", "reports", "quarantine", "detections", "decoy"}
 
 
+SSH_RUNTIME_FILES = {"SSH/ssh_server.py", "SSH/prompt.txt", "SSH/config.ini.TEMPLATE"}
+
+
+def _copy_sources():
+    """Sources of the Dockerfile's COPY lines (copies from another stage excluded)."""
+    import re
+
+    out = []
+    for m in re.finditer(r"^COPY (?!--from)(.+)$", (ROOT / "Dockerfile").read_text(), re.M):
+        *sources, _dest = m.group(1).split()
+        out.extend(src.rstrip("/") for src in sources)
+    return out
+
+
 def test_image_contains_everything_loaded_at_runtime():
     import re
 
-    copied = {m.group(1).rstrip("/") for m in re.finditer(
-        r"^COPY (?!--from)(\S+) \./", (ROOT / "Dockerfile").read_text(), re.M)}
+    sources = _copy_sources()
+    # A whole directory is copied by name; SSH is copied file by file (checked below).
+    copied = {src for src in sources if "/" not in src}
+    copied |= {src.split("/")[0] for src in sources if src.startswith("SSH/")}
     # Every top-level directory the code reaches through REPO_ROOT.
     referenced = set()
     for pkg in ("agents", "listeners", "scenarios", "SSH"):
@@ -95,6 +111,25 @@ def test_image_contains_everything_loaded_at_runtime():
                                        path.read_text(), re.M))
     assert imported <= copied, f"imported but not in the image: {imported - copied}"
     assert {"SSH", "playbooks"} <= copied
+
+
+def test_image_copies_only_the_named_ssh_files_and_the_license():
+    text = (ROOT / "Dockerfile").read_text()
+    sources = _copy_sources()
+    # No directory-wide copy of SSH/: it would sweep in keys, local config and deploy notes.
+    assert "SSH" not in sources
+    assert {s for s in sources if s.startswith("SSH")} == SSH_RUNTIME_FILES
+    for src in SSH_RUNTIME_FILES:
+        assert (ROOT / src).is_file(), src
+    assert "COPY LICENSE /app/LICENSE" in text
+    license_text = (ROOT / "LICENSE").read_text()
+    assert "Splunk GitHub" in license_text and "Matt Grofsky" in license_text
+    # The build context also leaves out local deployment material and generated secrets.
+    ignored = (ROOT / ".dockerignore").read_text().split()
+    for pattern in ("SSH/DEPLOY/", "SSH/config.ini", "SSH/*host_key*", "SSH/*.pub"):
+        assert pattern in ignored, pattern
+    # The AWS bootstrap files stay in the image.
+    assert "COPY deploy/aws/render_config.py" in text and "COPY deploy/aws/host" in text
 
 
 class _OverrideLoader(yaml.SafeLoader):

@@ -666,6 +666,25 @@ def apply_args_to_config(args) -> None:
                 config['user_accounts'][account.strip()] = ''
 
 
+EVENT_LOG_MODE = 0o640
+
+
+class EventLogHandler(logging.FileHandler):
+    """Append-mode event log that is created 0640 (a stricter umask still wins).
+
+    The log holds attempted credentials, so a new file must never exist with a wider mode
+    than the listeners' event log (listeners/events.py). The mode applies only at creation;
+    an existing file keeps its permissions, and the handler holds the file open as before.
+    """
+
+    def _open(self):
+        def opener(path, flags):
+            return os.open(path, flags, EVENT_LOG_MODE)
+
+        return open(self.baseFilename, self.mode, encoding=self.encoding,
+                    errors=self.errors, opener=opener)
+
+
 def configure_logging() -> None:
     global logger
 
@@ -679,7 +698,7 @@ def configure_logging() -> None:
     logger.propagate = False
 
     log_file = resolve_config_output_path(config['honeypot'].get("log_file", "ssh_log.log"))
-    log_file_handler = logging.FileHandler(log_file)
+    log_file_handler = EventLogHandler(log_file)
     log_file_handler.setFormatter(JSONFormatter(sensor_name))
     logger.addHandler(log_file_handler)
     logger.addFilter(ContextFilter())
