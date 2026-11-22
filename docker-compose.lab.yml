@@ -1,8 +1,12 @@
 # Local lab override: every port on 127.0.0.1 and a high port, so the stack can run on a
 # workstation next to other services without exposing anything.
 #
-#   docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml up -d
-#   docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml down -v
+#   lab() { docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml "$@"; }
+#   lab --profile ui up -d --build
+#   lab --profile ui down          # keeps the volumes; add -v to delete captured lab data
+#
+# Needs Docker Compose 2.24.4 or newer (!override). To use another host port, change only the
+# number before the container port in a mapping below.
 #
 # Lab ports: SSH 12222, FTP 12121 (passive 30000-30019), Telnet 12323, SMTP 12525,
 # HTTP 18080, MySQL 13306, PostgreSQL 15432, Redis 16379, SIP 15060 (udp+tcp),

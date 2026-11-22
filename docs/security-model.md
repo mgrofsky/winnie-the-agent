@@ -79,8 +79,10 @@ line and appears in the daily digest.
 
 ### Bounded resources
 
-- Model spend: per session, per source per day (IPv6 per /64) and global daily token caps,
-  command caps and concurrency limits, reserved before every call
+- Model spend: per session, per source per day (IPv6 per /64) and global daily estimated
+  token caps, command caps and concurrency limits, reserved before every call (the host-wide
+  and per-source checks and the charge happen in one locked step, so processes sharing the
+  state file cannot both take the last of a cap)
   ([architecture.md](architecture.md#budgets)).
 - Listeners: connection slots globally, per source, per service and per source per service;
   rate limits; read timeouts; minimum-progress checks; byte and command caps per connection;

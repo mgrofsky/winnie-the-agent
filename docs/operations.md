@@ -117,13 +117,30 @@ net, not a substitute.
 
 ## Lab deployment
 
+The lab is a loopback demo for a workstation: every port is bound to 127.0.0.1, and it works
+without provider keys. The [README quick start](../README.md#quick-start-local-lab) walks
+through it from a clone to one SSH session in the console, including the ownership of the
+config and host key on Linux. For a sensor on the internet use
+[Before you deploy](#before-you-deploy), [Egress control in production](#egress-control-in-production)
+and the [AWS guide](../deploy/aws/README.md) instead. The lab override needs Docker Compose
+2.24.4 or newer (it uses `!override`).
+
+Use the same shell function as the quick start for every lab command, so the stack, the
+console, the logs and the teardown share one project and its volumes:
+
 ```bash
 cp SSH/config.ini.TEMPLATE SSH/config.ini
 ssh-keygen -t rsa -b 4096 -N "" -f SSH/ssh_host_key
 # in SSH/config.ini: [listeners] ftp_pasv_address = 127.0.0.1
-docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml up -d
-docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml logs -f
+lab() { docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml "$@"; }
+lab --profile ui up -d --build
+lab logs -f
 ```
+
+If a lab port is in use, change only the host side of that mapping in
+`docker-compose.lab.yml` (`"127.0.0.1:12222:8022"` to `"127.0.0.1:12223:8022"`) and use the
+new number in every client command. Stop the lab with `lab --profile ui down`. That keeps the
+volumes; `lab --profile ui down -v` also deletes them and the data the lab captured.
 
 Test with real clients against 127.0.0.1 and the lab ports. With the default
 `sip_provider` scenario, for example: `ssh -p 12222 root@127.0.0.1`,
@@ -134,7 +151,8 @@ few attempts from the same source, or at once for an account listed in the scena
 (`scenarios/<name>/scenario.toml` lists them).
 
 To check that the front-ends make no outbound connections, use the isolated override and
-run clients as containers on the same internal network:
+run clients as containers on the same internal network. It uses the same project name as the
+lab, so take the lab down first (`lab --profile ui down`):
 
 ```bash
 docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.isolated.yml up -d
@@ -228,18 +246,127 @@ Everything runs without any model configured:
 | Tracked list | `agentdata`: `/agents/reports/blocklist/tracked.json` | rewritten whole on every respond run while `track_before_enforce` is on; entries expire with the blocklist |
 | Sightings and transfer state | `agentdata`: `/agents/state/sightings.json`, `tracked_export_state.json`, `sightings_fetch_state.json` | no; the sightings file is replaced by each good fetch |
 
+Triage removes its own session and campaign records after `record_retention_days`; delete
+digests on whatever schedule your data policy sets.
+
+### Rotating the event log
+
 Rotate the event log yourself, and only when nothing is pending. The summary of every
-`triage`, `ship` and `run-all` run carries `log_rotation`: `{"safe": true}` when triage has
-no unfinished or deferred items left in the log and the export has shipped everything;
-otherwise `safe` is false, `pending` says what is waiting (bytes of the log still needed by
-triage, events not yet exported), and the run logs `event log not safe to rotate yet`.
-Rotating then would lose those sessions, campaigns or events. On a busy sensor some
-campaign is usually still open (its window plus 10 minutes), so rotate after a run that
-reports `safe`, for example in a quiet period or with the front-ends briefly stopped. The
-triage cursor notices a new file (different inode) or a truncated one and starts from the
-beginning. Prefer copy-and-truncate, because the SSH server keeps its log file open. Triage removes its own
-session and campaign records after `record_retention_days`; delete digests on whatever
-schedule your data policy sets.
+`triage`, `ship` and `run-all` run carries `log_rotation`:
+
+```json
+{"safe": true, "pending": [], "scope": "complete",
+ "log": {"generation": "5b0e1c9a77d2f410", "complete_bytes": 48211, "partial_bytes": 0,
+         "tail": "c41f0aa9e3b27d65"},
+ "readers": {"triage": {"state": "confirmed", "confirmed_offset": 48211, "behind_bytes": 0,
+                        "generation": "5b0e1c9a77d2f410", "tail": "c41f0aa9e3b27d65"}}}
+```
+
+The attestation is read from one open file descriptor: `generation` is an opaque id of the
+log file (it changes when the file is replaced, and when the first line changes after a
+truncate), `complete_bytes` counts only bytes up to the last newline (`partial_bytes` is an
+unfinished line), and `tail` fingerprints the last 4 KiB before that point. A reader's
+`generation`, `confirmed_offset` and `tail` come from its cursor, which saves them at the
+boundary it actually processed.
+
+`safe` is true only when every reader that must confirm shows the log's current
+`generation`, a `confirmed_offset` equal to `complete_bytes`, and a `tail` that matches the
+log's content there. Otherwise `safe` is false, `pending` says why, and the run logs `event
+log not safe to rotate yet`. Rotating then would lose those sessions, campaigns or events.
+A reader that is missing, behind, failed, disabled in this config, unknown, or positioned
+in a different generation (the file was replaced, rotated or truncated since it last ran,
+or rewritten in place, including a rewrite that keeps the size, the first line and the
+bytes at the boundary but moves the modification time) does not confirm. A reader also
+saves nothing for a file that changed under it while it ran: it must still be the sampled
+file plus appended lines. Neither does a cursor with no fingerprint (written by an older
+version): triage keeps resuming from it, because starting over would triage every session
+a second time, and its next run adds the fingerprint; the export sends the log once more
+from the start on its next run (delivery is at least once), even with no new events, and
+then records it. The check also says no when the log ends in an unfinished line (a writer is
+active), is not a regular file or cannot be read, when the configuration could not be read
+(the set of readers is then unknown), and when the log moved between the two samples it
+takes. An empty log, or one that was never created, holds nothing to lose, unless a reader
+failed or the configuration is in error.
+
+The readers that must confirm are triage, always; the export, when
+`[connector.s3_events] enabled` is true in the same config; and any reader named in
+`[agents] log_readers` (`triage`, `ship`). Each one's position is read from its cursor in
+the state directory (`triage_cursor.json`, `ship_cursor.json`), so a command reports on a
+reader it did not run: `triage` alone says the export is outstanding, and `ship` alone says
+triage is.
+
+- **Triage only (the default lab).** Nothing exports the log, so `triage` or `run-all`
+  reports `safe` once triage has finished everything in it. On a busy sensor some campaign
+  is usually still open (its window plus 10 minutes), so rotate after a run that reports
+  `safe`, in a quiet period or with the front-ends briefly stopped.
+- **Triage and export on one state directory.** `run-all` runs both and answers for both:
+  `safe` needs `readers.triage` and `readers.ship` confirmed at the same `generation` and
+  `confirmed_offset`, equal to `log.complete_bytes`.
+- **Separate state, as on the AWS sensor.** The agents container has the export off and the
+  exporter container has it on, each with its own state volume, so neither can read the
+  other's cursor. Both configs list `log_readers = triage, ship`, and each command reports
+  `scope: "partial"`, `safe: false` and the other reader as unconfirmed. That is expected:
+  a command that can see only its own reader reports that reader and never an all-clear.
+  Compare the two reports yourself:
+
+  1. Stop the writers, the `ssh` container and every `listeners` container, so the log
+     stops growing. Keep them stopped until the log is rotated.
+  2. Run `python -m agents triage` (or `run-all`) in the agents container and
+     `python -m agents ship` in the exporter container, with the flags from their compose
+     commands, once each.
+  3. In the two reports, `log.generation`, `log.complete_bytes` and `log.tail` must be
+     identical, `log.partial_bytes` must be 0, and each container's own reader must show
+     `"state": "confirmed"` with that `generation` and `tail` and a `confirmed_offset` equal
+     to `complete_bytes`. If any value differs, a reader is behind or the log changed
+     between the two runs: run both again. Triage can stay behind until the sessions that
+     were open when you stopped the writers count as finished (120 minutes idle, or a
+     logged close) and their campaigns' windows have passed; wait for that, or accept that
+     those sessions are not triaged.
+  4. Rotate while the writers are still stopped, then start them.
+
+  This needs no volume shared between the two containers: each one reads only its own
+  cursor, and you compare the two printed attestations.
+
+Events written between the check and the rotation are confirmed by no reader. With the
+writers stopped there are none, so keep them stopped until the rotation is done. If the
+writers must keep running, any rotation can lose the events written after the check (a
+truncation loses them outright, and a rename leaves them in the old file for the SSH
+server, which holds its log open, until it restarts). Check again immediately before
+rotating, and rotate only if `log.generation`, `log.complete_bytes` and `log.tail` are
+unchanged. A truncated or replaced log is a new generation: each reader starts it from the
+beginning on its next run, and the ids it already handled prevent repeats, so until each
+reader has run once on the new file `pending` reports a different generation. Prefer
+copy-and-truncate with the writers stopped, because the SSH server opens its log in append
+mode.
+
+### Event log permissions
+
+The log holds attempted usernames and passwords, so keep it readable only by the people and
+services that need it. The SSH server creates `ssh_log.log` with mode 0640 (a stricter
+umask, such as 0077, makes it 0600), the same as the listeners' event log. Earlier versions
+created it with the process umask, usually 0644, which lets every local account read it.
+A file that already exists keeps its mode, so check an existing sensor:
+
+```sh
+ls -ldn /data /data/ssh_log.log     # in Docker: docker compose exec ssh ls -ldn /data /data/ssh_log.log
+```
+
+1. **Find the service user.** In the Docker files every service runs as UID 10001, so the
+   writer and the readers (agents, console, exporter) are the same user. Without Docker, it
+   is the account that runs `SSH/ssh_server.py` (`ps -o user= -p "$(pgrep -f ssh_server.py)"`).
+2. **List the authorized readers.** The accounts that run `python -m agents` (triage, ship,
+   console) and any backup or log-forwarding job you added. Anyone else should have no
+   access.
+3. **Tighten the log.** If the readers are the service user only, use `chmod 0600`. If
+   another account must read it, put it in a group and use `chgrp GROUP FILE; chmod 0640
+   FILE`. Do not go below what a configured reader needs: after the change, run
+   `python -m agents triage --dry-run` as each reader account and confirm it still reads
+   the log. Rotated copies and backups hold the same content; give them the same mode.
+4. **Check the parent directory.** It must not be writable by others (anyone who can
+   write there can replace the log) and should not be listable by them: `chmod 0750`, or
+   0700 when only the service user reads. The image creates `/data` as 0750.
+
+The change takes effect immediately for the open file; no restart is needed.
 
 Keep `sensor_seed` (on the `frontend` volume) across rebuilds: it determines all fake data
 and honeytoken values. A new seed changes every honeytoken, so earlier tokens are no longer
@@ -296,7 +423,8 @@ writes at most `max_objects_per_run` objects; the rest waits for the next run.
 
 Delivery is at least once. The export keeps its own cursor in the state directory
 (`ship_cursor.json`), with the same rotation checks as the triage cursor (inode, a hash of
-the first line, and the newline just before the offset). The cursor moves only after a
+the first line, the newline just before the offset, and a fingerprint of the bytes before
+it). The cursor moves only after a
 successful `PutObject`, so lines in an object that failed or was interrupted are sent again
 in the next run, and a reader may see an event twice. Only complete lines are shipped; a
 line still being written waits. Malformed lines, and a single line larger than
@@ -1054,17 +1182,21 @@ The agents CLI defaults to paths inside the repository, which do not exist in th
 container. Pass the same directories the scheduled loop uses:
 
 ```bash
-dc="docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml"
-args="--config /config/config.ini --data-dir /data --reports-dir /agents/reports \
-  --state-dir /agents/state --detections-dir /agents/detections"
+lab() { docker compose -p winnie-lab -f docker-compose.yml -f docker-compose.lab.yml "$@"; }
+args=(--config /config/config.ini --data-dir /data --reports-dir /agents/reports
+      --state-dir /agents/state --detections-dir /agents/detections)
 
-$dc exec agents python -m agents queue $args
-$dc exec agents python -m agents approve a-0123456789ab --by alice $args
-$dc exec agents python -m agents tune --history $args
-$dc exec agents python -m agents tune --rollback 3 $args
-$dc exec agents python -m agents run-all --dry-run --log /data/ssh_log.log $args
-$dc exec agents python -m agents ship --dry-run --log /data/ssh_log.log $args
+lab exec agents python -m agents queue "${args[@]}"
+lab exec agents python -m agents approve a-0123456789ab --by alice "${args[@]}"
+lab exec agents python -m agents tune --history "${args[@]}"
+lab exec agents python -m agents tune --rollback 3 "${args[@]}"
+lab exec agents python -m agents run-all --dry-run --log /data/ssh_log.log "${args[@]}"
+lab exec agents python -m agents ship --dry-run --log /data/ssh_log.log "${args[@]}"
 ```
+
+`lab` is the function from [Lab deployment](#lab-deployment) and `args` is an array, so the
+snippets run unchanged in bash and zsh. On another stack, replace `lab` with your own
+`docker compose` command line.
 
 ## Operator console
 
@@ -1094,7 +1226,7 @@ starts and then every `RUN_ALL_INTERVAL_SECONDS` (an hour by default). To run on
 Docker](#running-agent-commands-in-docker):
 
 ```bash
-$dc exec agents python -m agents run-all --log /data/ssh_log.log $args
+lab exec agents python -m agents run-all --log /data/ssh_log.log "${args[@]}"
 ```
 
 ### Starting it
@@ -1112,6 +1244,11 @@ With Docker, from the same directory as the rest of the stack:
 ```bash
 docker compose --profile ui up -d ui
 ```
+
+In the local lab, use the `lab` function from [Lab deployment](#lab-deployment) instead
+(`lab --profile ui up -d ui`), so the console joins the same project and volumes as the
+lab's front-ends. A console started in a different project would see empty volumes. Every
+`docker compose` command in this section works the same way through `lab`.
 
 The `ui` service is off unless the profile is named. It uses the agents' image and
 directories, mounts every volume read-only, gets no model key, AWS setting or connector
@@ -1138,8 +1275,10 @@ while the host publishes the port on 127.0.0.1 only.
 At start the console logs a sign-in link with a random token, new on every start:
 
 ```bash
-docker compose logs ui          # or the terminal that runs python -m agents ui
+docker compose logs ui          # in the lab: lab logs ui; or the terminal that runs python -m agents ui
 ```
+
+The link is a secret: keep it, and the token in it, out of screenshots, tickets and chat.
 
 Open that link; it sets a session cookie. The session ends after 12 hours and whenever
 the console restarts; the page then shows "not signed in". The link itself stays valid

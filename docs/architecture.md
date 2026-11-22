@@ -569,11 +569,18 @@ model is not called: the attacker gets a canned error and the session closes, an
 
 - The estimated cost (history length / 4 plus 512 output tokens) is reserved before the
   call and corrected from the provider's usage data afterwards, so concurrent sessions can
-  overshoot a cap by at most one estimate's error. Failed calls keep their charge.
+  overshoot a cap only by estimate error: admission is exact against estimates, but the
+  correction after a call is applied late, so with several calls in flight a cap can be
+  passed by the sum of their errors. Failed calls keep their charge.
 - Daily counters live in a JSON file in the data directory (`state_file`), updated under
   an exclusive file lock, so the SSH server and the listeners on one host share the caps
-  and a restart does not reset the day. A malformed file restarts the day from zero with a
-  warning.
+  and a restart does not reset the day. A reservation is one transaction under that lock:
+  it reloads the day's counters, checks the per-source and host-wide caps, and only then
+  writes the charge, so two processes cannot both take the last of a cap, and a refused
+  request charges nothing and does not count as a command. All of these limits are on
+  estimated tokens, not on what the provider bills. A malformed file restarts the day from
+  zero with a warning. If the file cannot be written, the caps still hold in memory and an
+  error is logged (see `BUDGET STATE NOT PERSISTED`).
 - A source in `shallow` mode (set by a playbook) gets canned replies only; `deep` doubles
   its per-session and per-source limits (the model cap too). The global cap never changes.
 - `max_model_commands_per_session` counts the commands the model was asked, failed calls
