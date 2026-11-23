@@ -228,8 +228,9 @@ functions and gates (see [operations.md](operations.md#operator-console)).
   removes one sooner. The blocklist file is rewritten in full each time.
 
 The blocklist is written to `[respond] blocklist_file` (default
-`reports/blocklist/approved.txt`); nothing is pushed anywhere. Formats
-(`blocklist_format`):
+`reports/blocklist/approved.txt`); nothing is pushed anywhere except through the optional
+block connector. Your systems pull the file; [blocking.md](blocking.md) shows each format
+with an example and how a consumer should read it. Formats (`blocklist_format`):
 
 - `plain`: one address or network per line;
 - `csv`: `ip,approved_at,expires_at`;
@@ -248,7 +249,8 @@ instead of one:
    tracked list, blocks nothing and calls no connector. The entry is stored with status `tracked` and written to `tracked.json`, next to
    the blocklist file. The blocklist file (`plain`, `csv` or `nftables`) lists only
    enforced entries, so a tracked entry never reaches it. Your cloud can watch the tracked
-   list (see [operations.md](operations.md#tracked-list-and-sightings)).
+   list (see [operations.md](operations.md#tracked-list-and-sightings) and
+   [blocking.md](blocking.md)).
 2. **Sightings.** Your environment reports where else it saw a listed address, in a
    sightings file the operator console shows next to the entry. Sightings are display
    only. Nothing acts on them; they help a person decide.
@@ -284,8 +286,10 @@ Other rules:
 
 - Approving an address that is already enforced keeps it enforced and extends its expiry.
   Approving one that is tracked starts a new tracked entry with a new expiry.
-- `blocklist_ttl_days` applies to both stages. `unblock` removes tracked and enforced
-  entries alike, from both files.
+- `blocklist_ttl_days` applies to both stages and counts from approval. `enforce` does not
+  extend the expiry. `unblock` removes tracked and enforced entries alike, from both files.
+- Neither `unblock` nor expiry calls the block connector. The system behind it must expire
+  addresses on its own.
 - `tracked.json` is rewritten whole and atomically whenever the list changes and on every
   respond run while the switch is on, so its `generated_at` shows it is current and a
   removed or expired entry disappears from it.

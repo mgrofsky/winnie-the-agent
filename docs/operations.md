@@ -556,7 +556,8 @@ front-end volume.
 
 With `[respond] track_before_enforce = true`, approving a blocklist entry only tracks it,
 and blocking it is a second decision. The stages, the `enforce` command and what happens
-to existing entries are in [playbooks.md](playbooks.md#track-before-enforce). This section
+to existing entries are in [playbooks.md](playbooks.md#track-before-enforce). How your
+systems should pull the lists, with recipes, is in [blocking.md](blocking.md). This section
 covers the two files that connect the tracked list to the rest of your environment:
 
 - **Out:** `tracked.json`, written by respond next to the blocklist file. Your cloud can
@@ -749,7 +750,8 @@ tracked entries the screen is as before.
 The contract is the two JSON documents above: the tracked export going out and the
 sightings document coming in. Anything that can read one object and write another can take
 part. This repository has no adapter for any cloud, so every row below is a likely shape,
-not something that has been tested.
+not something that has been tested. [blocking.md](blocking.md#recipes) has short recipes
+for a WAF address set, a threat list and a host firewall, also not tested.
 
 | Platform | Out: the tracked export feeds | In: sightings come from | Status |
 |---|---|---|---|
@@ -1220,6 +1222,9 @@ trustworthy.
   credentials for your firewalls, WAF or SIEM rules; validate every entry on the receiving
   side (address syntax, not on the allow-list, within the size cap, has an expiry); and
   keep a way to remove everything that came from the sensor in one step.
+
+For the approved blocklist and the tracked list, [blocking.md](blocking.md#how-a-consumer-should-pull)
+turns these rules into steps for a consumer.
 
 ## Running agent commands in Docker
 
