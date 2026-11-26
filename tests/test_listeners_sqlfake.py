@@ -489,3 +489,15 @@ def test_sql_fail_safe_is_fast_on_pathological_input():
     stmt = "SELECT " + ",".join(f"f(c{i}" + ")" for i in range(2000)) + " FROM t" + " (" * 10_000
     _, elapsed = run_bounded(lambda: fake("postgres").run(stmt), 2.0)
     assert elapsed < 2.0
+
+
+@pytest.mark.parametrize("dialect,stmt", [
+    ("postgres", "REPAIR TABLE users"),
+    ("mssql", "REPAIR TABLE users"),
+    ("mysql", "REFRESH MATERIALIZED VIEW v"),
+    ("mysql", "DECLARE c CURSOR FOR SELECT 1"),
+    ("mssql", "PREPARE p FROM 'SELECT 1'"),
+])
+def test_sql_fail_safe_keeps_the_syntax_error_for_another_dialects_verbs(dialect, stmt):
+    answer = _run(fake(dialect).run(stmt))[-1]
+    assert isinstance(answer, SqlError) and answer.code in ("42601", "42000", "102")

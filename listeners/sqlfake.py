@@ -76,10 +76,15 @@ READ_VERBS = {
                         "desc"}),
     "mssql": frozenset({"select", "with"}),
 }
-WRITE_VERBS = frozenset({
-    "insert", "update", "delete", "merge", "replace", "create", "drop", "alter", "truncate",
-    "grant", "revoke", "comment", "analyze", "vacuum", "reindex", "cluster", "lock", "rename",
-    "set", "declare", "prepare", "deallocate", "refresh", "optimize", "repair"})
+_WRITE_COMMON = frozenset({"insert", "update", "delete", "create", "drop", "alter", "truncate",
+                           "grant", "revoke", "set"})
+WRITE_VERBS = {
+    "postgres": _WRITE_COMMON | {"merge", "comment", "analyze", "vacuum", "reindex", "cluster",
+                                 "lock", "refresh", "declare", "prepare", "deallocate"},
+    "mysql": _WRITE_COMMON | {"replace", "analyze", "lock", "rename", "optimize", "repair",
+                              "prepare", "deallocate"},
+    "mssql": _WRITE_COMMON | {"merge", "declare", "deallocate"},
+}
 ADMIN_VERBS = {
     "postgres": frozenset({"call", "load", "reassign", "copy"}),
     "mysql": frozenset({"call", "shutdown", "restart", "install", "uninstall", "load", "purge"}),
@@ -1005,7 +1010,7 @@ class FakeSql:
             return Result(self._fail_safe_columns(s, verb), [])
         if verb in ADMIN_VERBS[self.dialect]:
             return self.permission_error(verb, s)
-        if verb in WRITE_VERBS:
+        if verb in WRITE_VERBS[self.dialect]:
             tags = {"insert": "INSERT 0 0", "update": "UPDATE 0", "delete": "DELETE 0",
                     "merge": "MERGE 0", "replace": "INSERT 0 0"}
             return self._ok(tags.get(verb, verb.upper()))
