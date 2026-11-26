@@ -1084,14 +1084,18 @@ class Shell:
             return "No such file or directory"
         if _below_file(self, path):
             return "Not a directory"
-        if not self.directory(parent) and _absent(self, parent):
+        if not self.directory(parent) and _exists(self, parent) is False:
             return "No such file or directory"
         if parent in ("/bin", "/sbin", "/usr/bin", "/usr/sbin"):
             # /bin and /sbin are /usr/bin and /usr/sbin under another name: a file made in
             # one would be missing from the other's listing. Left to the model.
             raise _Unsupported
-        if (parent not in _dirs(self) and parent not in self.session.dirs) or path in _FILES \
-                or self.program(path) or path in {posixpath.normpath(p) for p in self.host.lures}:
+        # A dot name in a system directory ``ls`` does not list (``/var/.f``): the host's
+        # own entries there are plain names, so a new one is made without listing the rest.
+        hidden = parent in _DOT_DIRS and posixpath.basename(path).startswith(".")
+        if (parent not in _dirs(self) and parent not in self.session.dirs and not hidden) \
+                or path in _FILES or self.program(path) \
+                or path in {posixpath.normpath(p) for p in self.host.lures}:
             raise _Unsupported               # a host file, or a directory we cannot list
         if _denied(self, path) or (self.user != "root" and parent not in _OPEN_DIRS
                                    and parent != self.home
@@ -2848,7 +2852,9 @@ def _dirs(sh: Shell) -> dict[str, list[str]]:
     for path in s.dirs:
         names(path)
     for path in list(s.dirs) + list(s.files):
-        names(posixpath.dirname(path)).add(posixpath.basename(path))
+        parent = posixpath.dirname(path)
+        if parent in out or parent in touched:   # never a listing of a system directory
+            names(parent).add(posixpath.basename(path))
     for path in s.removed:
         # A removed entry leaves its parent's listing only while the parent still exists: a
         # file removed with its directory must not bring the directory back.
@@ -2934,6 +2940,11 @@ def _host_dirs(sh: Shell) -> dict[str, list[str]]:
 # Directories cd accepts whose contents ls does not list.
 _SYSTEM_DIRS = frozenset(("/etc", "/usr", "/var", "/proc", "/dev", "/run", "/var/run", "/sys",
                           "/boot", "/usr/lib", "/usr/share", "/var/log", "/var/lib"))
+
+
+# System directories where a session may make a dot file without a listing: not the kernel's
+# own file systems, and not /var/run, which is /run under another name.
+_DOT_DIRS = _SYSTEM_DIRS - {"/proc", "/sys", "/var/run"}
 
 
 def _denied(sh: Shell, path: str) -> bool:
