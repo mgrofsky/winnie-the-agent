@@ -282,8 +282,11 @@ Protocol notes:
   a client that requires encryption is logged and disconnected. Works with impacket
   `mssqlclient` and `sqlcmd` using ODBC Driver 13; ODBC Driver 18 requires encryption by
   default and is refused. RPC calls to `sp_executesql`, `sp_prepare`, `sp_execute`,
-  `sp_prepexec` and `sp_unprepare` bind their parameters into the statement and answer it;
-  any other procedure gets the EXECUTE permission error. Enabled in the `contact_center`
+  `sp_prepexec` and `sp_unprepare` bind their parameters into the statement (positional
+  values in declaration order, named values by name) and answer it; any other procedure gets
+  the EXECUTE permission error. A request that batches several calls gets each answered in
+  order, up to 20; the calls before a malformed one or past the 20th are answered, then the
+  protocol error is sent and the connection is closed. Enabled in the `contact_center`
   scenario.
 - **SQL** (all three): statements go to `listeners/sqlfake.py`, an in-memory fake engine.
   File, program and command-execution primitives get a believable permission error and a

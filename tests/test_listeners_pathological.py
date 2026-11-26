@@ -191,6 +191,13 @@ def _rpc(proc: int, params: bytes) -> bytes:
     return _tds(0x03, headers + b"\xff\xff" + proc.to_bytes(2, "little") + b"\x00\x00" + params)
 
 
+def _rpc_calls(calls: list[bytes], sep: bytes = b"\xff", tail: bytes = b"") -> bytes:
+    """One RPC request batching ``calls`` (each a ProcID 10 call body after its header)."""
+    headers = (22).to_bytes(4, "little") + (18).to_bytes(4, "little") + (2).to_bytes(2, "little") \
+        + b"\x00" * 8 + (1).to_bytes(4, "little")
+    return _tds(0x03, headers + sep.join(b"\xff\xff\x0a\x00\x00\x00" + c for c in calls) + tail)
+
+
 def _nv(text: str) -> bytes:
     raw = text.encode("utf-16-le")
     return b"\x00\x00\xe7" + (8000).to_bytes(2, "little") + b"\x09\x04\xd0\x00\x34" \
@@ -248,6 +255,14 @@ def _mssql_wire_payloads() -> list[bytes]:
         _tds(0x03, b"\x01"), _tds(0x03, b"\xff\xff"),
         _rpc(10, _nv("SELECT '" + "'" * 3000 + " @a") + _nv("@a int") + _int(1)),
         _rpc(10, _nv("SELECT " + "/*" * 3000 + " @a") + _nv("@a int") + _int(1)),
+        # Batched calls: far past the call cap, a run of separators, trailing flags, a valid
+        # call before a malformed one, and capped calls that each carry many parameters.
+        _rpc_calls([b""] * 100_000),
+        _rpc_calls([_nv("SELECT 1")], tail=b"\xff" * 50_000),
+        _rpc_calls([_nv("SELECT 1")] * 3, sep=b"\xfe", tail=b"\xfe"),
+        _rpc_calls([_nv("SELECT @a") + _nv("@a int") + _int(1), b"\x00\x00\x99"]),
+        _rpc_calls([stmt + decl + _int(7) * 2000] * 10),
+        _rpc_calls([_nv("SELECT 1") + _int(1) * 2099] * 20),
     ]
 
 
@@ -292,9 +307,10 @@ def test_sql_wire_parsers_reject_every_truncation_cleanly():
     rpc_body = (b"\xff\xff\x0a\x00\x00\x00" + _nv("SELECT @a") + _nv("@a int") + _int(3)
                 + b"\x00\x00\xe7\xff\xff\x09\x04\xd0\x00\x34" + (4).to_bytes(8, "little")
                 + b"\x04\x00\x00\x00a\x00b\x00\x00\x00\x00\x00")
+    two_calls = rpc_body + b"\xff" + b"\xff\xff\x0c\x00\x00\x00" + _int(1) + _int(2) + b"\xfe"
     rng = random.Random(7)
     samples = []
-    for good in (execute, change, rpc_body):
+    for good in (execute, change, rpc_body, two_calls):
         samples += [(good, good[:i]) for i in range(len(good))]
         for _ in range(300):
             bad = bytearray(good)
@@ -313,14 +329,23 @@ def test_sql_wire_parsers_reject_every_truncation_cleanly():
                 mysql.parse_change_user(data, 0xFFFFFFFF)
             except (ValueError, IndexError):
                 pass
-        else:
+        elif good is rpc_body:
             try:
                 mssql.parse_rpc(data)
             except (mssql.RpcMalformed, mssql.TooManyParams, ValueError, OverflowError):
                 pass
+        else:
+            for wide in (True, False):
+                calls, problem = mssql.parse_rpc_batch(data, wide)
+                assert problem in (None, "malformed", "too_many_params", "too_many_calls")
+                assert sum(len(c.raw) for c in calls) <= len(data)
     stmt.types = None
     assert mysql.parse_execute(execute, stmt) == ["5", "NULL", "'2024-01-02 03:04:05'",
                                                   "'01:02:03'", "'abc'"]
     assert mysql.parse_change_user(change, 0xFFFFFFFF)["attrs"] == {"key": "value"}
+    calls, problem = mssql.parse_rpc_batch(two_calls, True)
+    assert problem is None
+    assert [(c.name, len(c.params), c.no_exec) for c in calls] == [("sp_executesql", 4, False),
+                                                                   ("sp_execute", 2, True)]
     assert [p.literal for p in mssql.parse_rpc(rpc_body)[1]] == ["N'SELECT @a'", "N'@a int'",
                                                                  "3", "N'ab'"]

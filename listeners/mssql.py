@@ -6,10 +6,11 @@ connection is closed after the PRELOGIN reply. LOGIN7 is parsed (offset/length t
 UCS-2LE strings, password de-obfuscated: XOR 0xA5 then swap nibbles) and decided by
 ``conn.login``. After a fake login, SQL batches are answered by ``listeners.sqlfake``
 with every column rendered as NVARCHAR. RPC requests for sp_executesql, sp_prepare,
-sp_execute, sp_prepexec and sp_unprepare bind their parameters into the statement text as
-literals and answer it through the same engine, with a return status and DONEPROC; other
-procedures get the server's permission error. Nothing is executed. Enabled per scenario
-(contact_center turns it on).
+sp_execute, sp_prepexec and sp_unprepare bind their parameters (by position, then by name)
+into the statement text as literals and answer it through the same engine, with a return
+status and DONEPROC; other procedures get the server's permission error. A request that
+batches several calls gets each answered in order. Nothing is executed. Enabled per
+scenario (contact_center turns it on).
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import struct
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from listeners.base import Conn, ConnClosed, ListenerContext, ServiceSettings, start_tcp
 from listeners.sqlfake import (DEFAULT_VERSIONS, FakeSql, SqlError, cell_text, classify_dangerous,
@@ -369,6 +370,7 @@ PROC_IDS = {1: "sp_cursor", 2: "sp_cursoropen", 3: "sp_cursorprepare", 4: "sp_cu
 MAX_RPC_PARAMS = 2100          # the server's own parameter limit
 MAX_HANDLES = 64               # prepared handles one connection keeps (oldest dropped first)
 MAX_PROC_NAME = 128
+MAX_RPC_CALLS = 20             # calls one RPC request may batch (as many as statements a batch runs)
 
 # TDS data types by how the value length is carried.
 FIXED_TYPES = {0x1F: 0, 0x30: 1, 0x32: 1, 0x34: 2, 0x38: 4, 0x3A: 4, 0x3B: 4, 0x3C: 8,
@@ -598,9 +600,58 @@ def read_param_value(buf: bytes, pos: int) -> tuple[int, Any, str, int]:
     return t, value, literal, pos
 
 
-def parse_rpc(body: bytes) -> tuple[str, list[RpcParam]]:
+@dataclass
+class RpcCall:
+    name: str
+    params: list[RpcParam]
+    raw: bytes              # the call's own bytes, without the separator
+    no_exec: bool = False   # a NoExecFlag follows: the server answers it without running it
+
+
+def separators(wide: bool) -> bytes:
+    """Bytes that end one RPC of a batched request: BatchFlag 0x80 before TDS 7.2; BatchFlag
+    0xFF and NoExecFlag 0xFE from 7.2 (0x80 is then a valid 128-character name length)."""
+    return b"\xFF\xFE" if wide else b"\x80"
+
+
+def parse_rpc(body: bytes, wide: bool = True) -> tuple[str, list[RpcParam]]:
     """The first RPC of a request: procedure name and parameters."""
-    n, pos = _uint(body, 0, 2)
+    name, params, _ = _parse_call(body, 0, separators(wide))
+    return name, params
+
+
+def parse_rpc_batch(body: bytes, wide: bool) -> tuple[list[RpcCall], Optional[str]]:
+    """The RPCs of a request in order, and the problem that ends the request early, if any:
+    "too_many_params", "too_many_calls" (more than ``MAX_RPC_CALLS``) or "malformed". The
+    calls parsed before the problem are returned with it. A separator after the last call
+    is accepted."""
+    seps = separators(wide)
+    calls: list[RpcCall] = []
+    pos = 0
+    while True:
+        if len(calls) >= MAX_RPC_CALLS:
+            return calls, "too_many_calls"
+        start = pos
+        try:
+            name, params, pos = _parse_call(body, pos, seps)
+        except TooManyParams:
+            return calls, "too_many_params"
+        except (RpcMalformed, ValueError, OverflowError, struct.error):
+            return calls, "malformed"
+        call = RpcCall(name, params, body[start:pos])
+        calls.append(call)
+        if pos >= len(body):
+            return calls, None
+        call.no_exec = body[pos] == 0xFE and wide
+        pos += 1
+        if pos >= len(body):
+            return calls, None
+
+
+def _parse_call(body: bytes, pos: int, seps: bytes) -> tuple[str, list[RpcParam], int]:
+    """One RPC starting at ``pos``: name, parameters and the position after its last
+    parameter (the end of the body or a separator)."""
+    n, pos = _uint(body, pos, 2)
     if n == 0xFFFF:
         proc_id, pos = _uint(body, pos, 2)
         name = PROC_IDS.get(proc_id, f"#{proc_id}")
@@ -611,7 +662,7 @@ def parse_rpc(body: bytes) -> tuple[str, list[RpcParam]]:
         name = raw.decode("utf-16-le", "replace")
     _, pos = _take(body, pos, 2)                            # option flags
     params: list[RpcParam] = []
-    while pos < len(body) and body[pos] not in (0x80, 0xFE, 0xFF):
+    while pos < len(body) and body[pos] not in seps:
         if len(params) >= MAX_RPC_PARAMS:
             raise TooManyParams()
         nlen, pos = _uint(body, pos, 1)
@@ -621,7 +672,7 @@ def parse_rpc(body: bytes) -> tuple[str, list[RpcParam]]:
             raise RpcMalformed("encrypted parameter")
         t, value, literal, pos = read_param_value(body, pos)
         params.append(RpcParam(raw.decode("utf-16-le", "replace"), status, t, value, literal))
-    return name, params
+    return name, params, pos
 
 
 def proc_key(name: str) -> str:
@@ -699,7 +750,7 @@ def return_value(ordinal: int, name: str, value: int, wide: bool) -> bytes:
 
 
 def proc_error(number: int, message: str, server: str, wide: bool, klass: int = 16) -> bytes:
-    return message_token(0xAA, number, 1, klass, message, server, wide) + done_proc(0x0002, wide)
+    return message_token(0xAA, number, 1, klass, message, server, wide)
 
 
 def done_proc(status: int, wide: bool) -> bytes:
@@ -716,28 +767,61 @@ def wrong_text_type(param: str, server: str, wide: bool) -> bytes:
                       "'ntext/nchar/nvarchar'.", server, wide)
 
 
-async def _run_bound(fake: FakeSql, proc: str, decl: str, stmt: str,
-                     values: list[RpcParam]) -> list:
-    """Bind ``values`` to the names declared in ``decl`` and answer through the engine; a
-    declaration or argument mismatch gets the server's error instead."""
+def bind_values(proc: str, names: list[str], decl: str, stmt: str, values: list[RpcParam],
+                first: int) -> Union[dict[str, str], SqlError]:
+    """Literals for the declared ``names`` from ``values`` (the call's parameters from
+    ordinal ``first``, 1-based): unnamed values fill names in declaration order, named
+    values match case-insensitively. A positional value after a named one, an undeclared
+    name, a name given twice or a missing value gets the server's error."""
+    bound: dict[str, str] = {}
+    named = False
+    for i, p in enumerate(values):
+        if not p.name:
+            if named:
+                return SqlError("119", f"Must pass parameter number {first + i} and subsequent "
+                                "parameters as '@name = value'. After the form '@name = value' "
+                                "has been used, all subsequent parameters must be passed in the "
+                                "form '@name = value'.", errno=119, klass=15)
+            if i >= len(names):
+                return SqlError("8144", f"Procedure or function {proc} has too many arguments "
+                                "specified.", errno=8144)
+            bound[names[i]] = p.literal
+            continue
+        named = True
+        key = p.name.lower()
+        if key not in names:
+            return SqlError("8145", f"{wire_text(p.name, 128)} is not a parameter for procedure "
+                            f"{proc}.", errno=8145)
+        if key in bound:
+            return SqlError("8143", f"Parameter '{wire_text(p.name, 128)}' was supplied "
+                            "multiple times.", errno=8143)
+        bound[key] = p.literal
+    missing = next((n for n in names if n not in bound), None)
+    if missing is not None:
+        return SqlError("8178", f"The parameterized query '({wire_text(decl, 200)})"
+                        f"{wire_text(stmt, 200)}' expects the parameter '{missing}', which "
+                        "was not supplied.", errno=8178)
+    return bound
+
+
+async def _run_bound(fake: FakeSql, proc: str, decl: str, stmt: str, params: list[RpcParam],
+                     first: int) -> list:
+    """Bind ``params[first:]`` to the names declared in ``decl`` and answer through the
+    engine; a declaration or argument mismatch gets the server's error instead."""
     names = declared_names(decl)
     if names is None:
         return [fake.syntax_error(decl)]
-    if len(values) > len(names):
-        return [SqlError("8144", f"Procedure or function {proc} has too many arguments "
-                         "specified.", errno=8144)]
-    if len(values) < len(names):
-        return [SqlError("8178", f"The parameterized query '({wire_text(decl, 200)})"
-                         f"{wire_text(stmt, 200)}' expects the parameter "
-                         f"'{names[len(values)]}', which was not supplied.", errno=8178)]
-    literals = {n: v.literal for n, v in zip(names, values, strict=True)}
-    return await fake.run(bind_names(stmt, literals))
+    bound = bind_values(proc, names, decl, stmt, params[first:], first + 1)
+    if isinstance(bound, SqlError):
+        return [bound]
+    return await fake.run(bind_names(stmt, bound))
 
 
-def proc_reply(answers: list, server: str, wide: bool, fake: FakeSql, out_params: bytes = b"") -> bytes:
+def proc_reply(answers: list, server: str, wide: bool, fake: FakeSql,
+               out_params: bytes = b"") -> tuple[bytes, int]:
     failed = any(isinstance(a, SqlError) for a in answers)
-    return (render(answers, server, wide, fake, inproc=True) + return_status(0) + out_params
-            + done_proc(0x0002 if failed else 0, wide))
+    return (render(answers, server, wide, fake, inproc=True) + return_status(0) + out_params,
+            0x0002 if failed else 0)
 
 
 def call_text(name: str, params: list[RpcParam]) -> str:
@@ -751,41 +835,82 @@ def _text_param(params: list[RpcParam], i: int) -> Optional[RpcParam]:
     return params[i] if i < len(params) else None
 
 
+def protocol_error(server: str, wide: bool) -> bytes:
+    return message_token(0xAA, 4002, 1, 16, "The incoming tabular data stream (TDS) protocol "
+                         "stream is incorrect.", server, wide) + done(0x0002, 0, 0, wide)
+
+
 async def rpc(conn: Conn, fake: FakeSql, handles: Handles, body: bytes, server: str,
               wide: bool) -> tuple[bytes, bool]:
-    """The reply to one RPC request, and whether to close the connection after it."""
-    try:
-        name, params = parse_rpc(body)
-    except TooManyParams:
+    """The reply to one RPC request, and whether to close the connection after it. Each
+    batched call is answered in order and ends with a DONEPROC; every DONEPROC but the last
+    carries DONE_MORE, and a call that fails does not stop the ones after it. The calls
+    before a malformed one, or before the call cap, are answered before the protocol error
+    and the close."""
+    calls, problem = parse_rpc_batch(body, wide)
+    out = b""
+    for i, call in enumerate(calls):
+        data = {"procedure": wire_text(call.name, MAX_PROC_NAME), "params": len(call.params),
+                "text": call_text(call.name, call.params)[:800], "payload": call.raw[:400].hex()}
+        if len(calls) > 1 or problem:
+            data.update(call=i + 1, calls=len(calls))
+        if call.no_exec:
+            data["no_exec"] = True
+        conn.emit("command", "RPC request", data=data)
+        if call.no_exec:
+            tokens, status = skipped_call(fake, call, server, wide), 0x0002
+        else:
+            tokens, status = await rpc_call(conn, fake, handles, call, server, wide)
+        # A protocol error after the last call ends the reply with DONE, so DONEPROC is final
+        # only when nothing follows it.
+        last = i == len(calls) - 1 and problem is None
+        out += tokens + done_proc(status | (0 if last else 0x0001), wide)
+    if problem == "too_many_params":
         conn.emit("command", "RPC request", data={"reason": "too_many_params"})
-        return proc_error(8003, "The incoming request has too many parameters. The server "
+        out += proc_error(8003, "The incoming request has too many parameters. The server "
                           f"supports a maximum of {MAX_RPC_PARAMS} parameters. Reduce the number "
-                          "of parameters and resend the request.", server, wide), False
-    except (RpcMalformed, ValueError, OverflowError, struct.error):
-        conn.emit("error", "Malformed RPC request", data={"reason": "malformed",
+                          "of parameters and resend the request.", server, wide) \
+            + done_proc(0x0002, wide)
+    elif problem:
+        conn.emit("error", "Malformed RPC request", data={"reason": problem,
                                                           "payload": body[:200].hex()})
-        out = message_token(0xAA, 4002, 1, 16, "The incoming tabular data stream (TDS) protocol "
-                            "stream is incorrect.", server, wide)
-        return out + done(0x0002, 0, 0, wide), True
+        return out + protocol_error(server, wide), True
+    return out, False
+
+
+def skipped_call(fake: FakeSql, call: RpcCall, server: str, wide: bool) -> bytes:
+    """The answer to a call marked with NoExecFlag: the server does not run it and answers
+    as for a procedure that does not exist. An exec primitive is still logged as one."""
+    err = SqlError("2812", f"Could not find stored procedure '{safe_name(proc_key(call.name))}'.",
+                   errno=2812)
+    text = call_text(call.name, call.params)
+    danger = classify_dangerous(" ".join(text.split()).lower())
+    if danger:
+        fake._log(text, err, {"kind": "refused", "high_signal": True, "signal": "sql_exec_attempt",
+                              "match": danger[0], "rpc": True, "no_exec": True})
+    return proc_error(err.errno, err.message, server, wide)
+
+
+async def rpc_call(conn: Conn, fake: FakeSql, handles: Handles, call: RpcCall, server: str,
+                   wide: bool) -> tuple[bytes, int]:
+    """The tokens for one call, before its DONEPROC, and the DONEPROC status."""
+    name, params = call.name, call.params
     key = proc_key(name)
-    conn.emit("command", "RPC request", data={
-        "procedure": wire_text(name, MAX_PROC_NAME), "params": len(params),
-        "text": call_text(name, params)[:800], "payload": body[:400].hex()})
     if key in ("sp_executesql", "sp_prepare", "sp_prepexec"):
         # sp_executesql: @statement, @params, values; the others: @handle, @params, @stmt, ...
         si, di = (0, 1) if key == "sp_executesql" else (2, 1)
         stmt_name = "@statement" if key == "sp_executesql" else "@stmt"
         if key != "sp_executesql" and not params:
-            return not_supplied(key, "@handle", server, wide), False
+            return not_supplied(key, "@handle", server, wide), 0x0002
         stmt_p, decl_p = _text_param(params, si), _text_param(params, di)
         if decl_p is not None and decl_p.tds_type not in UNICODE_TYPES - {XMLTYPE} \
                 and decl_p.value is not None:
-            return wrong_text_type("@params", server, wide), False
+            return wrong_text_type("@params", server, wide), 0x0002
         if stmt_p is None:
             missing = "@params" if key != "sp_executesql" and decl_p is None else stmt_name
-            return not_supplied(key, missing, server, wide), False
+            return not_supplied(key, missing, server, wide), 0x0002
         if stmt_p.tds_type not in UNICODE_TYPES - {XMLTYPE}:
-            return wrong_text_type(stmt_name, server, wide), False
+            return wrong_text_type(stmt_name, server, wide), 0x0002
         stmt = stmt_p.value or ""
         decl = (decl_p.value or "") if decl_p is not None else ""
         out = b""
@@ -795,26 +920,25 @@ async def rpc(conn: Conn, fake: FakeSql, handles: Handles, body: bytes, server: 
                                                       "statement": stmt[:2000]})
             out = return_value(0, params[0].name, handle, wide)
             if key == "sp_prepare":
-                return return_status(0) + out + done_proc(0, wide), False
+                return return_status(0) + out, 0
         if stmt_p.value is None:
-            return proc_reply([], server, wide, fake, out), False
-        answers = await _run_bound(fake, key, decl, stmt,
-                                   params[3:] if key == "sp_prepexec" else params[2:])
-        return proc_reply(answers, server, wide, fake, out), False
+            return proc_reply([], server, wide, fake, out)
+        answers = await _run_bound(fake, key, decl, stmt, params,
+                                   3 if key == "sp_prepexec" else 2)
+        return proc_reply(answers, server, wide, fake, out)
     if key in ("sp_execute", "sp_unprepare"):
         handle_p = _text_param(params, 0)
         if handle_p is None:
-            return not_supplied(key, "@handle", server, wide), False
+            return not_supplied(key, "@handle", server, wide), 0x0002
         handle = handle_p.value if isinstance(handle_p.value, int) else None
         if handle is None or handle not in handles.stmts:
             return proc_error(8179, f"Could not find prepared statement with handle "
-                              f"{handle_p.literal}.", server, wide), False
+                              f"{handle_p.literal}.", server, wide), 0x0002
         if key == "sp_unprepare":
             del handles.stmts[handle]
-            return return_status(0) + done_proc(0, wide), False
+            return return_status(0), 0
         decl, stmt = handles.stmts[handle]
-        return proc_reply(await _run_bound(fake, key, decl, stmt, params[1:]), server, wide,
-                          fake), False
+        return proc_reply(await _run_bound(fake, key, decl, stmt, params, 1), server, wide, fake)
     # Any other procedure: the engine's high-signal refusal for exec primitives, otherwise
     # the server's EXECUTE permission error. Logged as the equivalent EXEC statement.
     text = call_text(name, params)
@@ -833,8 +957,7 @@ async def rpc(conn: Conn, fake: FakeSql, handles: Handles, body: bytes, server: 
             err = fake.permission_error("exec", text)
         meta = {"kind": "refused", "rpc": True}
     fake._log(text, err, meta)
-    return message_token(0xAA, err.errno or 50000, 1, err.klass, err.message, server, wide) \
-        + done_proc(0x0002, wide), False
+    return message_token(0xAA, err.errno or 50000, 1, err.klass, err.message, server, wide), 0x0002
 
 
 async def batch_loop(conn: Conn, fake: FakeSql, server: str, wide: bool) -> None:
@@ -858,9 +981,7 @@ async def batch_loop(conn: Conn, fake: FakeSql, server: str, wide: bool) -> None
         else:
             conn.emit("command", "Unsupported TDS packet", data={"type": ptype,
                                                                  "payload": payload[:200].hex()})
-            out = message_token(0xAA, 4002, 1, 16, "The incoming tabular data stream (TDS) protocol "
-                                "stream is incorrect.", server, wide)
-            await conn.write(packets(PKT_REPLY, out + done(0x0002, 0, 0, wide)))
+            await conn.write(packets(PKT_REPLY, protocol_error(server, wide)))
             return
 
 
