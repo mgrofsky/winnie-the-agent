@@ -122,7 +122,9 @@ class LogTail:
     truncation (new inode, a different first line, a size below the offset, or no newline
     just before the offset) resets the index through ``_clear`` and starts again. With
     ``tail_bytes``, a fresh index starts at the first line inside the last ``tail_bytes``
-    of the log instead of at its start (``start_offset`` says where). Nothing is written.
+    of the log instead of at its start (``start_offset`` says where), and an index that
+    falls further behind than one refresh reads restarts there too, so it always holds
+    the newest lines. Nothing is written.
     Subclasses hold ``_lock`` while reading their own state."""
 
     def __init__(self, path: Optional[os.PathLike | str], min_interval: float = 2.0,
@@ -194,9 +196,15 @@ class LogTail:
                 stale = f.read(1) != b"\n"
             if stale:
                 self._reset()
-            if self._offset == 0 and self.tail_bytes is not None \
-                    and st.st_size > self.tail_bytes:
-                self._offset = self.start_offset = _line_start(f, st.st_size - self.tail_bytes)
+            if self.tail_bytes is not None:
+                unread = st.st_size - self._offset
+                behind = self._offset > 0 and unread > max(self.tail_bytes,
+                                                           self.max_bytes_per_refresh)
+                if behind:
+                    self._clear()
+                if behind or (self._offset == 0 and unread > self.tail_bytes):
+                    self._offset = self.start_offset = _line_start(
+                        f, st.st_size - self.tail_bytes)
         self._identity, self._head = identity, head
         if st.st_size <= self._offset:
             self.caught_up = True

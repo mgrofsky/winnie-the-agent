@@ -330,6 +330,26 @@ def test_a_fresh_index_starts_at_a_line_inside_the_tail(tmp_path):
     assert idx.start_offset >= size - size // 3
 
 
+def test_an_index_left_far_behind_restarts_at_the_tail(tmp_path):
+    log = tmp_path / "log"
+    write_log(log, LINES)
+    size = log.stat().st_size
+    idx = EventIndex(log, min_interval=0, max_bytes_per_refresh=size, tail_bytes=size)
+    entries, info = idx.snapshot()
+    assert len(entries) == len(LINES) and info["older_outside"] is False
+    log_id = info["log_id"]
+    # The log grows by several refreshes' worth while nobody reads the index.
+    with open(log, "ab") as f:
+        for _ in range(4):
+            f.write(log.read_bytes()[:size])
+    entries, info = idx.snapshot()
+    grown = log.stat().st_size
+    assert info["caught_up"] is True and info["older_outside"] is True
+    assert info["log_id"] == log_id
+    assert entries[0][activity.OFF] >= grown - size
+    assert entries[-1][activity.OFF] + entries[-1][activity.LEN] == grown
+
+
 def test_one_refresh_reads_a_bounded_amount(tmp_path):
     log = tmp_path / "log"
     write_log(log, LINES)
