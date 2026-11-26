@@ -52,7 +52,11 @@ CASES = {
     "http": dict(probe_request=b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
                  payloads=[_line(b"GET /", b"%" * 4000 + b" HTTP/1.1"),
                            b"GET / HTTP/1.1\r\nX: " + b"," * 8000 + b"\r\n\r\n",
-                           b"GET //[x/ HTTP/1.1\r\n\r\n", b"GET /" + b"/" * 8000 + b" HTTP/1.1\r\n\r\n"]
+                           b"GET //[x/ HTTP/1.1\r\n\r\n", b"GET /" + b"/" * 8000 + b" HTTP/1.1\r\n\r\n",
+                           _line(b"GET /cgi-bin/", b"a/" * 1950 + b" HTTP/1.1"),
+                           _line(b"GET /.git/", b"./" * 1950 + b" HTTP/1.1"),
+                           _line(b"GET /api/v1/", b"%2e" * 1300 + b" HTTP/1.1"),
+                           _line(b"GET /", b"a." * 1950 + b" HTTP/1.1")]
                  + repeats("%/?[]:;,\r", 70_000)),
     "s3": dict(probe_request=b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
                payloads=[_line(b"GET /b/", b"%2e%2e/" * 500 + b" HTTP/1.1"),

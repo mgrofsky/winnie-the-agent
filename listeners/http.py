@@ -5,7 +5,10 @@ Parser caps: request line 8 KB, 50 headers, 16 KB of header bytes, body 64 KB an
 with Content-Length (chunked is refused with 411). Keep-alive is allowed and bounded by
 ``conn.command()``. Every request is logged. Unknown routes under ``api_prefix`` may be
 answered by the budgeted model (``llm_unknown_api_routes``) through a strict schema; the
-fallback is a plain 404. Nothing here makes an outbound connection.
+fallback is a plain 404. Other unknown paths get a canned answer for the most-probed paths
+(``CANNED_404``, lure files holding only issued tokens, the stack's own 403s), then for a
+plain GET the budgeted model (``llm_unknown_paths``) with its answer cached per path, then
+the stack's 404 page. Nothing here makes an outbound connection.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agents.llm import untrusted_block
 from listeners.base import Conn, ConnClosed, ListenerContext, ServiceSettings, start_tcp
+from listeners.ftp import AWS_CREDENTIALS_PATH, aws_profile
 from listeners.sqlfake import wire_text
 
 MAX_REQUEST_LINE = 8192
@@ -36,6 +40,8 @@ MAX_BODY = 65536
 MAX_LOG_BODY = 2048
 MAX_SESSIONS = 10000
 COOKIE_NAME = "session_id"
+MAX_PAGE_CACHE = 512        # model answers kept per listener, least recently used dropped
+MAX_MODEL_PATH = 200        # longer paths never reach the model
 
 REASONS = {200: "OK", 201: "Created", 204: "No Content", 301: "Moved Permanently", 302: "Found",
            400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
@@ -49,6 +55,39 @@ PASS_FIELDS = ("password", "pass", "pwd", "passwd", "j_password", "secret")
 
 _SESSIONS: "weakref.WeakKeyDictionary[ListenerContext, OrderedDict[str, dict]]" = \
     weakref.WeakKeyDictionary()
+# Per listener context: (method, path) -> (status, body, content type, rung). A 403 or 404
+# is kept without a body and rendered per request as the stack's own page.
+_PAGE_CACHE: "weakref.WeakKeyDictionary[ListenerContext, OrderedDict[tuple[str, str], tuple]]" = \
+    weakref.WeakKeyDictionary()
+
+# Unknown paths that every stack here answers with its 404: no scenario runs WordPress, PHP
+# info pages, Spring Boot actuators or a separate /config.json.
+CANNED_404 = frozenset({
+    "/favicon.ico", "/wp-login.php", "/xmlrpc.php", "/phpinfo.php", "/actuator",
+    "/actuator/health", "/actuator/env", "/admin", "/login", "/config.json"})
+ROBOTS_TXT = b"User-agent: *\nDisallow: /\n"
+GIT_HEAD = b"ref: refs/heads/main\n"
+# Honeytoken kinds written to a served /.env, one NAME=value line each.
+ENV_KINDS = ("db_password", "generic_password", "sip_trunk_password", "api_key", "bearer_token")
+# Paths that never reach the model: hidden files, secrets, archives, code and static assets.
+NO_MODEL_EXT = frozenset(
+    "asp aspx bak bz2 cfg cgi conf config crt css csv db dll eot env exe gif gz htaccess "
+    "htpasswd ico ini jar jpeg jpg js jsp key kdbx log map mp4 old orig p12 pem pfx php pl "
+    "png properties py rar rb sh sql sqlite svg swp tar tgz toml ttf txt war webp woff woff2 "
+    "xml yaml yml zip 7z".split())
+# Path prefixes and file names of other stacks or of secrets that never reach the model.
+NO_MODEL_PREFIX = ("/wp-", "/wordpress", "/actuator", "/phpmyadmin", "/pma", "/myadmin",
+                   "/mysql", "/cgi-bin", "/etc/", "/proc/", "/vendor/", "/node_modules/",
+                   "/server-status", "/server-info", "/console/h2", "/solr", "/jenkins")
+NO_MODEL_NAMES = frozenset(
+    "authorized_keys backup backups credentials docker-compose dump id_dsa id_ecdsa "
+    "id_ed25519 id_rsa known_hosts passwd secrets shadow web.config".split())
+UNSAFE_BODY = re.compile(
+    r"<\s*(script|iframe|object|embed|meta|link|base|form|applet|frame)\b|javascript:|"
+    r"\bon[a-z]{2,20}\s*=|-----BEGIN|AKIA[A-Z2-7]{16}|\b[sr]k_(live|test)_|"
+    r"(password|passwd|secret|api[_-]?key|access[_-]?key|token)[\"']?\s*[:=]\s*[\"']?"
+    r"[A-Za-z0-9+/_.-]{8,}", re.I)
+URL_HOST = re.compile(r"(?:[a-z][a-z0-9+.-]*:)?//([A-Za-z0-9.-]{1,253})", re.I)
 
 
 # Worked examples sent with a second model request (``ListenerContext.llm_json``).
@@ -62,12 +101,28 @@ HTTP_EXAMPLES = (
     '"{\\"error\\": \\"forbidden\\"}"}')
 
 
+# Worked examples for unknown paths outside the API prefix.
+PAGE_EXAMPLES = (
+    'request: GET /status\n'
+    'answer: {"status": 200, "content_type": "text/plain", "body": "OK"}\n'
+    'request: GET /internal/reports\n'
+    'answer: {"status": 403, "content_type": "text/html", "body": ""}')
+
+
 class LlmHttpAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal[200, 201, 400, 403, 404, 409, 422, 500]
     content_type: Literal["application/json", "text/plain"]
     body: str = Field(max_length=4096)
+
+
+class LlmPageAnswer(LlmHttpAnswer):
+    """The model's answer for an unknown path outside the API prefix: no redirects, no
+    headers, three content types."""
+
+    status: Literal[200, 403, 404, 500]
+    content_type: Literal["text/html", "application/json", "text/plain"]
 
 
 @dataclass
@@ -112,6 +167,7 @@ class HttpCfg:
     openapi_path: Optional[str] = None
     openapi: Optional[dict] = None
     llm_unknown: bool = False
+    llm_unknown_paths: bool = True
 
 
 DEFAULT_PAGES = [SimpleNamespace(path="/dashboard", title="Dashboard", requires_login=True,
@@ -138,6 +194,7 @@ def build_cfg(ctx: ListenerContext, settings: ServiceSettings) -> HttpCfg:
         cfg.openapi_path = svc.openapi_path
         cfg.openapi = svc.openapi
         cfg.llm_unknown = svc.llm_unknown_api_routes
+        cfg.llm_unknown_paths = svc.llm_unknown_paths
     else:
         cfg.server = settings.banner or "nginx"
         cfg.pages = list(DEFAULT_PAGES)
@@ -150,7 +207,24 @@ def server_token(server: str) -> str:
     return server.split()[0] if server.split() else "nginx"
 
 
-def error_page(status: int, server: str) -> bytes:
+def is_apache(server: str) -> bool:
+    return server_token(server).lower().startswith("apache")
+
+
+APACHE_MESSAGES = {403: "You don't have permission to access this resource.",
+                   404: "The requested URL was not found on this server."}
+
+
+def error_page(status: int, server: str, host: str = "localhost", port: int = 80) -> bytes:
+    """The server's own error page: Apache's for a 403 or 404 behind an Apache Server
+    header, nginx's otherwise."""
+    if is_apache(server) and status in APACHE_MESSAGES:
+        reason = REASONS[status]
+        return (f'<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">\n<html><head>\n'
+                f"<title>{status} {reason}</title>\n</head><body>\n<h1>{reason}</h1>\n"
+                f"<p>{html.escape(APACHE_MESSAGES[status], quote=False)}</p>\n<hr>\n"
+                f"<address>{html.escape(server)} Server at {html.escape(host)} Port {port}"
+                "</address>\n</body></html>\n").encode()
     title = f"{status} {REASONS.get(status, 'Error')}"
     return (f"<html>\r\n<head><title>{title}</title></head>\r\n<body>\r\n<center><h1>{title}"
             f"</h1></center>\r\n<hr><center>{html.escape(server_token(server))}</center>\r\n"
@@ -202,6 +276,30 @@ def sessions(ctx: ListenerContext) -> OrderedDict:
         store = OrderedDict()
         _SESSIONS[ctx] = store
     return store
+
+
+def page_cache(ctx: ListenerContext) -> OrderedDict:
+    store = _PAGE_CACHE.get(ctx)
+    if store is None:
+        store = OrderedDict()
+        _PAGE_CACHE[ctx] = store
+    return store
+
+
+def model_may_answer(method: str, path: str) -> bool:
+    """A plain GET of a short, printable path that names no hidden file, secret, archive,
+    script or static asset."""
+    if method != "GET" or len(path) > MAX_MODEL_PATH or path.lower().startswith(NO_MODEL_PREFIX):
+        return False
+    if not re.fullmatch(r"/[A-Za-z0-9/_.,~@+=-]*", path) or ".." in path or "//" in path:
+        return False
+    segments = [s for s in path.split("/") if s]
+    if any(s.startswith(".") or s.endswith("~") for s in segments):
+        return False
+    last = segments[-1] if segments else ""
+    if last.lower().split(".", 1)[0] in NO_MODEL_NAMES:
+        return False
+    return not ("." in last and last.rsplit(".", 1)[1].lower() in NO_MODEL_EXT)
 
 
 def parse_cookies(value: Optional[str]) -> dict[str, str]:
@@ -520,9 +618,151 @@ class Exchange:
                     self.log["rung"] = rung or "llm"
                     return ans
                 self.log["rung"] = "fallback"
-            return 404, error_page(404, cfg.server), "text/html", []
+            return self.error(404)
+        return await self.unknown_path(method)
+
+    # ---- unknown paths outside the API prefix --------------------------------------------
+
+    def error(self, status: int) -> tuple[int, bytes, str, list]:
+        """The stack's error page, with Apache's address line built from the Host header."""
+        host, port = self.cfg.hostname, 80
+        m = re.fullmatch(r"([A-Za-z0-9.-]{1,253})(?::(\d{1,5}))?", self.req.header("host") or "")
+        if m:
+            host = m.group(1)
+            port = int(m.group(2)) if m.group(2) and 0 < int(m.group(2)) < 65536 else 80
+        ctype = "text/html; charset=iso-8859-1" if is_apache(self.cfg.server) and status in \
+            APACHE_MESSAGES else "text/html"
+        return status, error_page(status, self.cfg.server, host, port), ctype, []
+
+    async def unknown_path(self, method: str) -> tuple[int, bytes, str, list]:
+        canned = self.canned(method)
+        if canned is not None:
+            self.log["route"] = "canned"
+            return canned
         self.log["route"] = "not_found"
-        return 404, error_page(404, cfg.server), "text/html", []
+        path = self.req.path
+        if not (self.cfg.llm_unknown_paths and self.ctx.json_llm is not None
+                and model_may_answer(method, path)):
+            return self.error(404)
+        self.log["route"] = "unknown_page"
+        cache, key = page_cache(self.ctx), (method, path)
+        hit = cache.get(key)
+        if hit is None:
+            ans = await self.ask_model(page=True)
+            rung = self.ctx.take_llm_rung(self.conn.task_name) or "llm"
+            hit = cache.get(key)    # an answer stored while this one was pending wins
+            if hit is None:
+                if ans is None:
+                    hit = (404, None, None, "fallback")
+                elif ans[0] in (403, 404):
+                    hit = (ans[0], None, None, rung)
+                else:
+                    hit = (ans[0], ans[1], ans[2], rung)
+                cache[key] = hit
+                while len(cache) > MAX_PAGE_CACHE:
+                    cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
+            self.log["cache_hit"] = True
+        status, body, ctype, rung = hit
+        self.log["rung"] = rung
+        if rung != "fallback":
+            self.log["llm"] = True
+        if body is None:
+            return self.error(status)
+        return status, body, ctype, []
+
+    def canned(self, method: str) -> Optional[tuple[int, bytes, str, list]]:
+        """Answers for the most-probed paths, or None. A lure file answers only when it
+        holds a token this sensor issued; without one the path is the stack's 404."""
+        path, apache = self.req.path, is_apache(self.cfg.server)
+        if (path in CANNED_404 and not self.has_paths_under(path)) or \
+                (not self.cfg.api_prefix and path.startswith("/api/v1/")):
+            self.log["canned"] = "not_found"
+            return self.error(404)
+        if path in ("/server-status", "/cgi-bin/") and apache:
+            self.log["canned"] = "forbidden"
+            return self.error(403)
+        if path.startswith("/cgi-bin/") or path in ("/server-status", "/cgi-bin"):
+            self.log["canned"] = "not_found"
+            return self.error(404)
+        files = {"/robots.txt": lambda: (ROBOTS_TXT, []),
+                 "/.env": self.lure_env,
+                 "/.git/config": self.lure_git_config,
+                 "/.git/HEAD": lambda: (GIT_HEAD, []) if self.lure_git_config()[0] else (b"", []),
+                 AWS_CREDENTIALS_PATH: self.lure_aws}
+        make = files.get(path)
+        if make is None:
+            return None
+        body, names = make()
+        if not body:
+            self.log["canned"] = "not_found"
+            return self.error(404)
+        self.log["canned"] = "file"
+        if method != "GET":     # a static file answers other methods with 405
+            return 405, error_page(405, self.cfg.server), "text/html", []
+        if names:
+            self.log.update(lure=path, lure_tokens=",".join(names)[:200])
+        ctype = "text/plain" if path == "/robots.txt" else "application/octet-stream"
+        return 200, body, ctype, []
+
+    def has_paths_under(self, path: str) -> bool:
+        """True when a configured page, route, login or API path lies below ``path``, so
+        the site treats it as a directory and not as a missing file."""
+        cfg, prefix = self.cfg, path.rstrip("/") + "/"
+        known = [p.path for p in cfg.pages] + [r.path for r in cfg.routes] + \
+            [cfg.login_path, cfg.api_prefix or ""]
+        return any(k.startswith(prefix) for k in known)
+
+    def scenario_tokens(self, kinds) -> list:
+        """The scenario's honeytokens of ``kinds`` as issued now (never a legacy value)."""
+        scen = self.ctx.scenario
+        if scen is None:
+            return []
+        return [t for t in scen.honeytokens.values() if t.kind in kinds]
+
+    def source_pair(self) -> Optional[tuple[str, str]]:
+        """The per-source key pair, only for a source marked ``plant_token``."""
+        entry = self.ctx.source(self.conn.src_ip)
+        if entry is None or not entry.plant_token:
+            return None
+        return self.ctx.source_token(self.conn.src_ip)
+
+    def lure_env(self) -> tuple[bytes, list[str]]:
+        lines, names = [], []
+        for t in self.scenario_tokens(ENV_KINDS):
+            lines.append(f"{t.name.upper()}={t.value}")
+            names.append(t.name)
+        pair = self.source_pair()
+        if pair is not None:
+            lines += [f"AWS_ACCESS_KEY_ID={pair[0]}", f"AWS_SECRET_ACCESS_KEY={pair[1]}"]
+            names.append("source_token")
+        else:
+            for t in self.scenario_tokens(("aws_access_key",))[:1]:
+                lines.append(f"AWS_ACCESS_KEY_ID={t.value}")
+                names.append(t.name)
+        if not lines:
+            return b"", []
+        head = ["APP_ENV=production", f"APP_URL=https://{self.cfg.hostname}.{self.cfg.domain}"]
+        return ("\n".join(head + lines) + "\n").encode(), names
+
+    def lure_git_config(self) -> tuple[bytes, list[str]]:
+        tokens = self.scenario_tokens(("bearer_token",)) or self.scenario_tokens(("api_key",))
+        if not tokens:
+            return b"", []
+        t, host = tokens[0], self.cfg.hostname
+        body = ("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n"
+                "\tlogallrefupdates = true\n[remote \"origin\"]\n"
+                f"\turl = https://oauth2:{t.value}@git.{self.cfg.domain}/ops/{host}.git\n"
+                "\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+                "[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n")
+        return body.encode(), [t.name]
+
+    def lure_aws(self) -> tuple[bytes, list[str]]:
+        pair = self.source_pair()
+        if pair is None:
+            return b"", []
+        return aws_profile("default", *pair).encode(), ["source_token"]
 
     def _same_host(self) -> bool:
         try:
@@ -650,27 +890,50 @@ class Exchange:
                     "apiKey": {"type": "apiKey", "in": "header", "name": self.cfg.api_key_header}}},
                 "paths": paths}
 
-    async def ask_model(self) -> Optional[tuple[int, bytes, str, list]]:
+    async def ask_model(self, page: bool = False) -> Optional[tuple[int, bytes, str, list]]:
+        """The model's answer for an unknown API route, or with ``page`` for an unknown path
+        outside the API prefix. A page answer is shared by every client, so the model sees
+        only the method and path, and a body with markup that runs, loads or redirects, or
+        anything credential-shaped, is refused."""
         cfg = self.cfg
-        known = ", ".join(f"{r.method} {r.path}" for r in cfg.routes)[:2000]
-        system = ("You emulate the JSON REST API of a decoy web application"
-                  f"{' for ' + cfg.org if cfg.org else ''}. Known routes: {known}. Answer the "
-                  "HTTP request in the untrusted block as that API would, as JSON "
-                  '{"status": <one of 200,201,400,403,404,409,422,500>, "content_type": '
-                  '"application/json" or "text/plain", "body": "<response body, at most 4096 '
-                  'characters>"}. Use small, plausible, invented data. Never add explanations.')
         req = self.req
-        payload = (f"{req.method} {req.path[:500]}{'?' + req.query[:500] if req.query else ''}\n"
-                   f"body: {req.body[:1000].decode('utf-8', 'replace')}")
+        if page:
+            pages = ", ".join(p.path for p in cfg.pages)[:1000]
+            system = ("You emulate the web server of a decoy web application"
+                      f"{' for ' + cfg.org if cfg.org else ''} (Server: {cfg.server}). Known "
+                      f"pages: {pages}. Answer the HTTP request in the untrusted block as that "
+                      'server would, as JSON {"status": <one of 200,403,404,500>, '
+                      '"content_type": "text/html", "application/json" or "text/plain", '
+                      '"body": "<response body, at most 4096 characters>"}. Plain, small, '
+                      "static content only: no scripts, forms, links to other sites, "
+                      "credentials, keys or tokens. Never add explanations.")
+            payload = f"{req.method if req.method != 'HEAD' else 'GET'} {req.path[:MAX_MODEL_PATH]}"
+            schema, examples = LlmPageAnswer, PAGE_EXAMPLES
+        else:
+            known = ", ".join(f"{r.method} {r.path}" for r in cfg.routes)[:2000]
+            system = ("You emulate the JSON REST API of a decoy web application"
+                      f"{' for ' + cfg.org if cfg.org else ''}. Known routes: {known}. Answer the "
+                      "HTTP request in the untrusted block as that API would, as JSON "
+                      '{"status": <one of 200,201,400,403,404,409,422,500>, "content_type": '
+                      '"application/json" or "text/plain", "body": "<response body, at most 4096 '
+                      'characters>"}. Use small, plausible, invented data. Never add explanations.')
+            payload = (f"{req.method} {req.path[:500]}{'?' + req.query[:500] if req.query else ''}\n"
+                       f"body: {req.body[:1000].decode('utf-8', 'replace')}")
+            schema, examples = LlmHttpAnswer, HTTP_EXAMPLES
         user = untrusted_block("HTTP request", payload, os.urandom(8).hex())
         try:
             raw = await self.ctx.llm_json(self.conn.task_name, self.conn.src_ip, system, user,
-                                          LlmHttpAnswer, examples=HTTP_EXAMPLES)
+                                          schema, examples=examples)
         except Exception:  # noqa: BLE001
             return None
-        ans = validate_http_answer(raw)
+        ans = validate_http_answer(raw, schema)
         if ans is None:
             return None
+        if page:
+            if not self.safe_page_body(ans.body):
+                return None
+            if ans.content_type == "text/html":
+                return ans.status, ans.body.encode("utf-8"), "text/html; charset=utf-8", []
         if ans.content_type == "application/json":
             try:
                 parsed = json.loads(ans.body)
@@ -681,14 +944,31 @@ class Exchange:
             return ans.status, json_bytes(parsed), "application/json", []
         return ans.status, wire_text(ans.body, 4096).encode("utf-8"), "text/plain; charset=utf-8", []
 
+    def safe_page_body(self, body: str) -> bool:
+        """The body as written and as a browser reads it: character references decoded
+        (twice, for a doubly encoded one), tabs and line breaks dropped and backslashes read
+        as slashes, the way a URL attribute is parsed."""
+        decoded = html.unescape(html.unescape(body))
+        decoded = re.sub(r"[\t\r\n\x00]", "", decoded).replace("\\", "/")
+        local = {self.cfg.hostname.lower(), self.cfg.domain.lower(), "localhost"}
+        for text in (body, decoded):
+            if UNSAFE_BODY.search(text):
+                return False
+            for m in URL_HOST.finditer(text):
+                host = m.group(1).lower().rstrip(".")
+                if host not in local and not host.endswith("." + self.cfg.domain.lower()):
+                    return False
+        return True
 
-def validate_http_answer(raw: Any) -> Optional[LlmHttpAnswer]:
+
+def validate_http_answer(raw: Any, schema: type[LlmHttpAnswer] = LlmHttpAnswer
+                         ) -> Optional[LlmHttpAnswer]:
     if raw is None:
         return None
     try:
         if isinstance(raw, BaseModel):
             raw = raw.model_dump()
-        return LlmHttpAnswer.model_validate(raw)
+        return schema.model_validate(raw)
     except Exception:  # noqa: BLE001
         return None
 

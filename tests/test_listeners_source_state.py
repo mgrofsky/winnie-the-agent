@@ -443,6 +443,45 @@ async def test_http_unplanted_source_gets_plain_config(tmp_path, servers):
     assert json.loads(out.partition(b"\r\n\r\n")[2]) == {"env": "prod"}
 
 
+async def test_http_lure_files_carry_the_marked_sources_own_pair(tmp_path, servers):
+    state = tmp_path / "source_state.json"
+    write_state(state, **{"127_0_0_1": {"plant_token": True}})
+    ctx, settings = http_ctx(str(state))
+    objs = await http.start(ctx, settings)
+    servers.extend(objs)
+    port = objs[0].sockets[0].getsockname()[1]
+
+    async def get(path):
+        out = await http_req(port, f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close"
+                                   "\r\n\r\n".encode())
+        return int(out.split(b" ", 2)[1]), out.partition(b"\r\n\r\n")[2].decode()
+
+    key_id, secret = source_token(SEED, ip_key(LOOP))
+    status, body = await get("/.aws/credentials")
+    assert status == 200 and body.startswith("[default]\n")
+    assert f"aws_access_key_id = {key_id}" in body and f"aws_secret_access_key = {secret}" in body
+    status, body = await get("/.env")
+    assert status == 200 and f"AWS_SECRET_ACCESS_KEY={secret}" in body
+    status, _ = await get("/.git/config")       # no scenario token: the 404
+    assert status == 404
+    await asyncio.sleep(0.05)
+    lures = [e["data"] for e in events(ctx.writer, "command") if e["data"].get("lure")]
+    assert [d["lure_tokens"] for d in lures] == ["source_token", "source_token"]
+
+
+async def test_http_unmarked_source_gets_no_lure_files(tmp_path, servers):
+    state = tmp_path / "source_state.json"
+    write_state(state, **{"203_0_113_5": {"plant_token": True}})
+    ctx, settings = http_ctx(str(state))
+    objs = await http.start(ctx, settings)
+    servers.extend(objs)
+    port = objs[0].sockets[0].getsockname()[1]
+    for path in ("/.aws/credentials", "/.env"):
+        out = await http_req(port, f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close"
+                                   "\r\n\r\n".encode())
+        assert out.startswith(b"HTTP/1.1 404 ")
+
+
 # ---- capture_more --------------------------------------------------------------------------
 
 async def _post_body(state: Optional[str], servers, body: bytes):

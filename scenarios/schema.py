@@ -388,6 +388,9 @@ class HttpService(ServiceBase):
     openapi_path: Optional[str] = Field(default=None, pattern=HTTP_PATH_RE)
     openapi: Optional[dict] = None
     llm_unknown_api_routes: bool = False
+    # Unknown paths outside the API prefix may be answered by the model when
+    # ``[listeners] llm`` is on.
+    llm_unknown_paths: bool = True
 
 
 class MllpService(ServiceBase):
