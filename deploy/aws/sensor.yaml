@@ -249,22 +249,27 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-  # Models on Amazon Bedrock: both empty (the default) adds nothing here. Deploy models.yaml
-  # with the same two values first; see the README, "Models on Bedrock". A model id is
-  # provider.name[:version]; an inference profile id adds a geographic prefix (us., us-gov.,
-  # eu., apac., jp., au. or global.). Current Anthropic models need the profile id.
+  # Models on Amazon Bedrock: all three empty (the default) adds nothing here. Deploy
+  # models.yaml with the same three values first; see the README, "Models on Bedrock". A
+  # model id is provider.name[:version]; an inference profile id adds a geographic prefix
+  # (us., us-gov., eu., apac., jp., au. or global.). Current Anthropic models need the
+  # profile id. Each is the Bedrock model or inference profile id for one caller, empty for
+  # none: the SSH persona, the analyst, and the listeners' model answers.
   PersonaModelId:
     Type: String
     Default: ""
     MaxLength: 100
     AllowedPattern: '^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
-    Description: Bedrock model or inference profile id for the SSH persona; empty for none.
   AnalystModelId:
     Type: String
     Default: ""
     MaxLength: 100
     AllowedPattern: '^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
-    Description: Bedrock model or inference profile id for the analyst; empty for none.
+  ListenerModelId:
+    Type: String
+    Default: ""
+    MaxLength: 100
+    AllowedPattern: '^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
 
 Mappings:
   # Listener services per scenario ("python -m listeners --list-scenarios"). SSH is always on.
@@ -294,7 +299,8 @@ Conditions:
   ConsoleStepOn: !Or [!Condition TailscaleOn, !Condition UiActionsOn]
   PersonaOn: !Not [!Equals [!Ref PersonaModelId, ""]]
   AnalystOn: !Not [!Equals [!Ref AnalystModelId, ""]]
-  ModelOn: !Or [!Condition PersonaOn, !Condition AnalystOn]
+  ListenerOn: !Not [!Equals [!Ref ListenerModelId, ""]]
+  ModelOn: !Or [!Condition PersonaOn, !Condition AnalystOn, !Condition ListenerOn]
   SipOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Sip], "true"]
   FtpOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Ftp], "true"]
   TelnetOn: !Equals [!FindInMap [ScenarioServices, !Ref Scenario, Telnet], "true"]
@@ -1334,22 +1340,22 @@ Resources:
                   EOF
                   /usr/local/sbin/sensor-console.sh || echo "console: FAILED ($?)"
                 - ""
-              # ModelOn only (PersonaModelId or AnalystModelId set), after the console step (it
-              # adds its overlay to the COMPOSE_FILE that step wrote) and before the stack starts.
-              # The endpoints and the model roles it uses are the models stack's (models.yaml).
-              # sensor-model.sh comes from the image (deploy/aws/host; its header explains it).
-              # Its setup run installs and starts its timer (every 15 minutes: credentials,
-              # firewall rules, and the endpoint's address) and adds its line to
-              # sensor-firewall.sh (so it runs again at every boot), writes the [llm] and
-              # [agents] settings into config.ini with render_config.py, writes the overlay
-              # that gives the ssh and agents containers their fixed addresses, the endpoint's
-              # name and each its own credentials directory, and then the first firewall rules
-              # and credentials. A failure is logged and the sensor starts with canned replies;
-              # the timer retries the credentials.
+              # ModelOn only (PersonaModelId, AnalystModelId or ListenerModelId set), after the
+              # console step (it adds its overlay to the COMPOSE_FILE that step wrote) and before
+              # the stack starts. The endpoints and the model roles it uses are the models
+              # stack's (models.yaml). sensor-model.sh comes from the image (deploy/aws/host; its
+              # header explains it). Its setup run installs and starts its timer (every 15
+              # minutes: credentials, firewall rules, and the endpoint's address) and adds its
+              # line to sensor-firewall.sh (so it runs again at every boot), writes the [llm],
+              # [agents] and [listeners] settings into config.ini with render_config.py, writes
+              # the overlay that gives the ssh, agents and listeners containers their fixed
+              # addresses, the endpoint's name and each its own credentials directory, and then
+              # the first firewall rules and credentials. A failure is logged and the sensor
+              # starts with canned replies; the timer retries the credentials.
               ModelStep: !If
                 - ModelOn
                 - !Sub |
-                  printf 'REGION=%s\nSUFFIX=%s\nVPC_CIDR=%s\nROLE_ARN=%s\nPERSONA_MODEL=%s\nANALYST_MODEL=%s\n' ${AWS::Region} ${AWS::URLSuffix} ${VpcCidr} arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-model "${PersonaModelId}" "${AnalystModelId}" > /etc/sensor-model.env
+                  printf 'REGION=%s\nSUFFIX=%s\nVPC_CIDR=%s\nROLE_ARN=%s\nPERSONA_MODEL=%s\nANALYST_MODEL=%s\nLISTENER_MODEL=%s\n' ${AWS::Region} ${AWS::URLSuffix} ${VpcCidr} arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-model "${PersonaModelId}" "${AnalystModelId}" "${ListenerModelId}" > /etc/sensor-model.env
                   docker run --rm --network none --entrypoint cat "$IMAGE" /app/deploy/aws/host/sensor-model.sh | install -m 0700 /dev/stdin /usr/local/sbin/sensor-model.sh
                   /usr/local/sbin/sensor-model.sh setup "$IMAGE" || echo "model: FAILED ($?)"
                 - ""

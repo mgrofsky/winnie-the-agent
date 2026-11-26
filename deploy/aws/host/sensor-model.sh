@@ -1,26 +1,27 @@
 #!/bin/bash
-# Model access on a sensor host with PersonaModelId or AnalystModelId set
+# Model access on a sensor host with PersonaModelId, AnalystModelId or ListenerModelId set
 # (deploy/aws/sensor.yaml, installed by its ModelStep; the endpoints and the roles are
 # deploy/aws/models.yaml's).
 #
-# The model's callers are the ssh container (PersonaModelId) and the agents container
-# (AnalystModelId). Both are bridged, run as uid 10001, cannot open a connection and cannot
-# reach the metadata service. Each caller gets exactly two things, and no other container
-# gets either:
+# The model's callers are the ssh container (PersonaModelId), the agents container
+# (AnalystModelId) and the listeners container (ListenerModelId). All three are bridged,
+# run as uid 10001, cannot open a connection and cannot reach the metadata service. Each
+# caller gets exactly two things, and no other container gets either:
 #   - one DOCKER-USER accept: from its fixed address to the bedrock-runtime endpoint's one
 #     address, tcp 443. The endpoint's name is pinned in its /etc/hosts, so it needs no DNS.
 #     When the address changes, the old accepts go and the pin is rewritten.
 #   - credentials of its own role (ssh: <NamePrefix>-model-persona, agents:
-#     <NamePrefix>-model-analyst), assumed here with the instance role through the sts
-#     endpoint for one hour, in its own tmpfs directory that only it mounts, read-only.
+#     <NamePrefix>-model-analyst, listeners: <NamePrefix>-model-listener), assumed here
+#     with the instance role through the sts endpoint for one hour, in its own tmpfs
+#     directory that only it mounts, read-only.
 #     boto3 reads them through credential_process and reads them again before they expire;
 #     the timer renews them every 15 minutes. Each role may only call bedrock:InvokeModel
 #     on its own caller's model, and only through the stack's bedrock-runtime endpoint.
 #
 #   sensor-model.sh setup IMAGE
-#                           the timer and the boot hook from IMAGE, config.ini's [llm] and
-#                           [agents], the compose overlay, then the rest (the bootstrap,
-#                           before the stack starts)
+#                           the timer and the boot hook from IMAGE, config.ini's [llm],
+#                           [agents] and [listeners], the compose overlay, then the rest
+#                           (the bootstrap, before the stack starts)
 #   sensor-model.sh         firewall rules, the overlay if the address changed, and
 #                           credentials (sensor-model.timer, and sensor-firewall.sh at boot)
 #
@@ -29,6 +30,8 @@
 # last good address is kept.
 set -euo pipefail
 . "${SENSOR_MODEL_ENV:-/etc/sensor-model.env}"
+# An env file without LISTENER_MODEL configures no listener caller.
+LISTENER_MODEL=${LISTENER_MODEL:-}
 D=${SENSOR_MODEL_DIR:-/run/sensor-model}
 S=${SENSOR_MODEL_STATE:-/var/lib/sensor-model}
 O=${SENSOR_HOME:-/opt/sensor}
@@ -36,7 +39,7 @@ F=${SENSOR_FIREWALL:-/usr/local/sbin/sensor-firewall.sh}
 U=${SENSOR_UNIT_DIR:-/etc/systemd/system}
 id='^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
 [[ $REGION =~ ^[a-z0-9-]{1,32}$ && $SUFFIX =~ ^[a-z0-9.]{1,32}$ && $PERSONA_MODEL =~ $id \
-   && $ANALYST_MODEL =~ $id && $ROLE_ARN =~ ^arn:aws[a-z-]*:iam::[0-9]{12}:role/[a-z0-9-]{1,40}$ \
+   && $ANALYST_MODEL =~ $id && $LISTENER_MODEL =~ $id && $ROLE_ARN =~ ^arn:aws[a-z-]*:iam::[0-9]{12}:role/[a-z0-9-]{1,40}$ \
    && $VPC_CIDR =~ ^[0-9.]{7,15}/[0-9]{1,2}$ ]] \
   && python3 -c 'import ipaddress as i,sys; n=i.ip_network(sys.argv[1]); sys.exit(not (n.is_private and 8 <= n.prefixlen <= 28))' "$VPC_CIDR" 2>/dev/null \
   || { echo "sensor-model: bad settings in the env file" >&2; exit 1; }
@@ -45,6 +48,7 @@ NAME=bedrock-runtime.$REGION.$SUFFIX
 callers=()
 [ -z "$PERSONA_MODEL" ] || callers+=(persona:172.30.0.10)
 [ -z "$ANALYST_MODEL" ] || callers+=(analyst:172.30.1.10)
+[ -z "$LISTENER_MODEL" ] || callers+=(listener:172.30.0.11)
 inside() { python3 -c 'import ipaddress as i,sys; sys.exit(i.ip_address(sys.argv[1]) not in i.ip_network(sys.argv[2]))' "$1" "$VPC_CIDR" 2>/dev/null; }
 
 # One run at a time: the timer's first run starts while setup is still running.
@@ -93,6 +97,7 @@ overlay() {
     echo "services:"
     [ -z "$PERSONA_MODEL" ] || svc ssh frontend 172.30.0.10 persona
     [ -z "$ANALYST_MODEL" ] || svc agents backend 172.30.1.10 analyst
+    [ -z "$LISTENER_MODEL" ] || svc listeners frontend 172.30.0.11 listener
   } > docker-compose.model.new.yml
   COMPOSE_FILE=$f:docker-compose.model.new.yml docker compose config --quiet
   mv -f docker-compose.model.new.yml docker-compose.model.yml
@@ -100,9 +105,10 @@ overlay() {
 
 if [ "${1:-}" = setup ]; then
   # The overlay first; config.ini changes only after it passed, so a failure here leaves
-  # the persona and analyst without a model rather than with a model they cannot reach.
+  # every caller without a model rather than with a model it cannot reach.
   overlay
-  python3 render_config.py models config.ini "$PERSONA_MODEL" "$ANALYST_MODEL" "$REGION"
+  python3 render_config.py models config.ini "$PERSONA_MODEL" "$ANALYST_MODEL" "$REGION" \
+    "$LISTENER_MODEL"
   chown 10001:10001 config.ini
   chmod 0400 config.ini
   { grep -v '^COMPOSE_FILE=' .env || :; echo "COMPOSE_FILE=$f:docker-compose.model.yml"; } > .env.new
@@ -116,7 +122,7 @@ for c in "${callers[@]}"; do
   iptables -w -C DOCKER-USER -s "${c#*:}" -d "$EP" -p tcp --dport 443 -j ACCEPT 2>/dev/null \
     || iptables -w -I DOCKER-USER 1 -s "${c#*:}" -d "$EP" -p tcp --dport 443 -j ACCEPT
 done
-stale='^-A DOCKER-USER -s (172\.30\.[01]\.10)/32 -d ([0-9.]+)/32 -p tcp -m tcp --dport 443 -j ACCEPT$'
+stale='^-A DOCKER-USER -s (172\.30\.0\.1[01]|172\.30\.1\.10)/32 -d ([0-9.]+)/32 -p tcp -m tcp --dport 443 -j ACCEPT$'
 rules=$(iptables -w -S DOCKER-USER)
 while read -r line; do
   [[ $line =~ $stale ]] && [ "${BASH_REMATCH[2]}" != "$EP" ] || continue
@@ -130,7 +136,7 @@ done <<< "$rules"
 if [ "${1:-}" != setup ] && [ -f docker-compose.model.yml ] \
     && [ "$(cat "$S/applied" 2>/dev/null || :)" != "$EP" ]; then
   overlay
-  for s in ssh agents; do
+  for s in ssh agents listeners; do
     grep -q "^  $s:" docker-compose.model.yml || continue
     [ -z "$(docker compose ps -q --status running "$s" 2>/dev/null || :)" ] \
       || docker compose up -d --no-deps "$s"

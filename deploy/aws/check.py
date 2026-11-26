@@ -1402,10 +1402,10 @@ def check_repository(doc: dict) -> list[str]:
 
 # ---- models on Bedrock --------------------------------------------------------------------
 
-# The two model switches, the same in sensor.yaml and models.yaml. A model id is
+# The three model switches, the same in sensor.yaml and models.yaml. A model id is
 # provider.name[:version] with an optional geographic inference profile prefix; names hold
 # no dots, so a profile's foundation model is its second and third parts.
-MODEL_PARAMS = ("PersonaModelId", "AnalystModelId")
+MODEL_PARAMS = ("PersonaModelId", "AnalystModelId", "ListenerModelId")
 PROFILE_PREFIXES = ("us", "us-gov", "eu", "apac", "jp", "au", "global")
 MODEL_ID = r"^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$"
 MODEL_IDS_GOOD = ("", "anthropic.claude-haiku-5-5", "amazon.nova-pro-v1:0",
@@ -1423,16 +1423,20 @@ MODEL_IDS_BAD = ("*", "anthropic.*", "anthropic.claude*", "us.*", "us.anthropic.
 MODEL_CONDITIONS = {
     "PersonaOn": {"Fn::Not": [{"Fn::Equals": [{"Ref": "PersonaModelId"}, ""]}]},
     "AnalystOn": {"Fn::Not": [{"Fn::Equals": [{"Ref": "AnalystModelId"}, ""]}]},
-    "ModelOn": {"Fn::Or": [{"Condition": "PersonaOn"}, {"Condition": "AnalystOn"}]},
+    "ListenerOn": {"Fn::Not": [{"Fn::Equals": [{"Ref": "ListenerModelId"}, ""]}]},
+    "ModelOn": {"Fn::Or": [{"Condition": "PersonaOn"}, {"Condition": "AnalystOn"},
+                           {"Condition": "ListenerOn"}]},
 }
-# The base of the callers' role names; sensor-model.sh appends -persona or -analyst.
+# The base of the callers' role names; sensor-model.sh appends -persona, -analyst or
+# -listener.
 MODEL_ROLE = "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-model"
 # The sensor's model step: settings, the script out of the image, the setup run. Nothing
 # else; everything it does is in deploy/aws/host/sensor-model.sh.
 MODEL_STEP_LINES = [
     "printf 'REGION=%s\\nSUFFIX=%s\\nVPC_CIDR=%s\\nROLE_ARN=%s\\nPERSONA_MODEL=%s\\n"
-    "ANALYST_MODEL=%s\\n' ${AWS::Region} ${AWS::URLSuffix} ${VpcCidr} " + MODEL_ROLE
-    + ' "${PersonaModelId}" "${AnalystModelId}" > /etc/sensor-model.env',
+    "ANALYST_MODEL=%s\\nLISTENER_MODEL=%s\\n' ${AWS::Region} ${AWS::URLSuffix} ${VpcCidr} "
+    + MODEL_ROLE + ' "${PersonaModelId}" "${AnalystModelId}" "${ListenerModelId}" > '
+    "/etc/sensor-model.env",
     'docker run --rm --network none --entrypoint cat "$IMAGE" '
     "/app/deploy/aws/host/sensor-model.sh | install -m 0700 /dev/stdin "
     "/usr/local/sbin/sensor-model.sh",
@@ -1484,7 +1488,8 @@ def check_model_switches(doc: dict) -> list[str]:
 # one address on tcp 443; the removal of caller accepts to any other address; nothing else.
 MODEL_SCRIPT = HOST_DIR / "sensor-model.sh"
 MODEL_CALLERS = ['[ -z "$PERSONA_MODEL" ] || callers+=(persona:172.30.0.10)',
-                 '[ -z "$ANALYST_MODEL" ] || callers+=(analyst:172.30.1.10)']
+                 '[ -z "$ANALYST_MODEL" ] || callers+=(analyst:172.30.1.10)',
+                 '[ -z "$LISTENER_MODEL" ] || callers+=(listener:172.30.0.11)']
 MODEL_RULES = [
     '  iptables -w -C DOCKER-USER -s "${c#*:}" -d "$EP" -p tcp --dport 443 -j ACCEPT 2>/dev/null \\',
     '    || iptables -w -I DOCKER-USER 1 -s "${c#*:}" -d "$EP" -p tcp --dport 443 -j ACCEPT',
@@ -1493,12 +1498,17 @@ MODEL_RULES = [
     '--dport 443 -j ACCEPT',
 ]
 # Each caller's overlay names its own credentials directory, which holds its own role's
-# credentials only: ssh (the persona) persona, agents (the analyst) analyst.
+# credentials only: ssh (the persona) persona, agents (the analyst) analyst, listeners
+# listener.
 MODEL_SERVICES = ['    [ -z "$PERSONA_MODEL" ] || svc ssh frontend 172.30.0.10 persona',
-                  '    [ -z "$ANALYST_MODEL" ] || svc agents backend 172.30.1.10 analyst']
+                  '    [ -z "$ANALYST_MODEL" ] || svc agents backend 172.30.1.10 analyst',
+                  '    [ -z "$LISTENER_MODEL" ] || svc listeners frontend 172.30.0.11 listener']
 MODEL_SCRIPT_FACTS = {
     "does not stop on errors": "set -euo pipefail",
     "does not use the model id pattern": "id='" + MODEL_ID + "'",
+    "does not check every model id":
+        "&& $ANALYST_MODEL =~ $id && $LISTENER_MODEL =~ $id && $ROLE_ARN =~ "
+        "^arn:aws[a-z-]*:iam::[0-9]{12}:role/[a-z0-9-]{1,40}$ \\",
     "does not check the VPC range":
         "&& python3 -c 'import ipaddress as i,sys; n=i.ip_network(sys.argv[1]); "
         "sys.exit(not (n.is_private and 8 <= n.prefixlen <= 28))' \"$VPC_CIDR\" 2>/dev/null \\",
@@ -1512,8 +1522,8 @@ MODEL_SCRIPT_FACTS = {
         '[[ $EP =~ ^[0-9]{1,3}(\\.[0-9]{1,3}){3}$ ]] && inside "$EP" \\',
     "does not start its timer": "systemctl enable --now sensor-model.timer",
     "does not remove accepts to an old address":
-        "stale='^-A DOCKER-USER -s (172\\.30\\.[01]\\.10)/32 -d ([0-9.]+)/32 -p tcp -m tcp "
-        "--dport 443 -j ACCEPT$'",
+        "stale='^-A DOCKER-USER -s (172\\.30\\.0\\.1[01]|172\\.30\\.1\\.10)/32 -d ([0-9.]+)/32 "
+        "-p tcp -m tcp --dport 443 -j ACCEPT$'",
     "removes more than caller accepts to an old address":
         '[[ $line =~ $stale ]] && [ "${BASH_REMATCH[2]}" != "$EP" ] || continue',
     "does not recreate only the callers when the address changed":
@@ -1529,6 +1539,7 @@ MODEL_SCRIPT_FACTS = {
     "does not keep the credentials root for root only": 'install -d -m 0700 "$D"',
     "does not check the overlay before it uses it":
         "COMPOSE_FILE=$f:docker-compose.model.new.yml docker compose config --quiet",
+    "does not recreate every caller when the address changed": "for s in ssh agents listeners; do",
 }
 # The only modes the script sets: config.ini and the credentials, both 0400.
 MODEL_CHMODS = ["chmod 0400 config.ini", 'chmod 0400 "$D/$1/creds.new" "$D/$1/config.new"']
@@ -1564,12 +1575,13 @@ def check_model_host(script: Optional[str] = None, units: Optional[dict] = None)
         if len([x for x in code if re.search(rf"(^|[;\s]|function\s+){fn}\s*\(\)", x)]) != 1:
             errors.append(f"sensor-model.sh defines {fn}() more than once")
     if [x for x in lines if "callers+=" in x] != MODEL_CALLERS:
-        errors.append("sensor-model.sh opens the endpoint to callers other than the ssh and "
-                      "agents containers' fixed addresses")
+        errors.append("sensor-model.sh opens the endpoint to callers other than the ssh, "
+                      "agents and listeners containers' fixed addresses")
     if [x for x in lines if re.search(r"\bsvc \w", x)] != MODEL_SERVICES \
             or MODEL_OVERLAY not in [x.strip() for x in lines]:
-        errors.append("sensor-model.sh's overlay changes more than the ssh and agents "
-                      "containers' address, endpoint name, own credentials mount and variables")
+        errors.append("sensor-model.sh's overlay changes more than the ssh, agents and "
+                      "listeners containers' address, endpoint name, own credentials mount and "
+                      "variables")
     for name, needed in MODEL_UNITS.items():
         if any(n not in units.get(name, "").splitlines() for n in needed):
             errors.append(f"{name} does not renew the credentials as required")
@@ -1581,19 +1593,28 @@ def check_model_host(script: Optional[str] = None, units: Optional[dict] = None)
 SAMPLE_ACCOUNT, SAMPLE_REGION = "123456789012", "us-east-1"
 MODEL_RESOURCES = {"BedrockEndpoint": "AWS::EC2::VPCEndpoint",
                    "StsEndpoint": "AWS::EC2::VPCEndpoint", "PersonaRole": "AWS::IAM::Role",
-                   "AnalystRole": "AWS::IAM::Role",
+                   "AnalystRole": "AWS::IAM::Role", "ListenerRole": "AWS::IAM::Role",
                    "InstanceAssumeModelRole": "AWS::IAM::RolePolicy"}
 # Each caller's role: its condition, its name (sensor-model.sh assumes MODEL_ROLE-<who>
 # into the directory only that caller mounts) and the parameter it may invoke.
 MODEL_CALLER_ROLES = {"PersonaRole": ("PersonaOn", "persona", "PersonaModelId"),
-                      "AnalystRole": ("AnalystOn", "analyst", "AnalystModelId")}
-MODEL_SAMPLES = [("us.anthropic.claude-haiku-5-5", ""), ("", "eu.anthropic.claude-haiku-5-5"),
-                 ("global.anthropic.claude-sonnet-5-5", "amazon.nova-pro-v1:0"),
-                 ("us.anthropic.claude-haiku-5-5", "us.anthropic.claude-sonnet-5-5"),
-                 ("apac.anthropic.claude-haiku-5-5", "us-gov.anthropic.claude-haiku-5-5"),
-                 ("jp.anthropic.claude-haiku-5-5", "au.anthropic.claude-haiku-5-5")]
+                      "AnalystRole": ("AnalystOn", "analyst", "AnalystModelId"),
+                      "ListenerRole": ("ListenerOn", "listener", "ListenerModelId")}
+# (persona, analyst, listener). Where two are set they differ, so a role that covered
+# another caller's model would show.
+MODEL_SAMPLES = [("us.anthropic.claude-haiku-5-5", "", ""),
+                 ("", "eu.anthropic.claude-haiku-5-5", ""),
+                 ("", "", "us.anthropic.claude-haiku-5-5"),
+                 ("global.anthropic.claude-sonnet-5-5", "amazon.nova-pro-v1:0", ""),
+                 ("us.anthropic.claude-haiku-5-5", "us.anthropic.claude-sonnet-5-5", ""),
+                 ("apac.anthropic.claude-haiku-5-5", "us-gov.anthropic.claude-haiku-5-5", ""),
+                 ("jp.anthropic.claude-haiku-5-5", "au.anthropic.claude-haiku-5-5", ""),
+                 ("us.anthropic.claude-sonnet-5-5", "", "us.anthropic.claude-haiku-5-5"),
+                 ("eu.anthropic.claude-haiku-5-5", "global.anthropic.claude-sonnet-5-5",
+                  "amazon.nova-pro-v1:0")]
 _IF = lambda cond, role: {"Fn::If": [cond, {"Fn::GetAtt": [role, "Arn"]}, {"Ref": "AWS::NoValue"}]}
-MODEL_ROLE_ARNS = [_IF("PersonaOn", "PersonaRole"), _IF("AnalystOn", "AnalystRole")]
+MODEL_ROLE_ARNS = [_IF("PersonaOn", "PersonaRole"), _IF("AnalystOn", "AnalystRole"),
+                   _IF("ListenerOn", "ListenerRole")]
 _NO_VALUE = object()
 
 
@@ -1650,14 +1671,15 @@ def evaluate(node, doc: dict, values: dict):
     return {k: evaluate(v, doc, values) for k, v in node.items()}
 
 
-def model_values(persona: str, analyst: str) -> dict:
+def model_values(persona: str, analyst: str, listener: str = "") -> dict:
     return {"AWS::Partition": "aws", "AWS::Region": SAMPLE_REGION,
             "AWS::AccountId": SAMPLE_ACCOUNT, "NamePrefix": "winnie-sensor",
-            "PersonaModelId": persona, "AnalystModelId": analyst,
+            "PersonaModelId": persona, "AnalystModelId": analyst, "ListenerModelId": listener,
             "VpcId": "vpc-0example", "SubnetId": "subnet-0example",
             "EndpointSecurityGroupId": "sg-0example", "BedrockEndpoint": "vpce-0bedrock",
             "PersonaRole.Arn": f"arn:aws:iam::{SAMPLE_ACCOUNT}:role/winnie-sensor-model-persona",
-            "AnalystRole.Arn": f"arn:aws:iam::{SAMPLE_ACCOUNT}:role/winnie-sensor-model-analyst"}
+            "AnalystRole.Arn": f"arn:aws:iam::{SAMPLE_ACCOUNT}:role/winnie-sensor-model-analyst",
+            "ListenerRole.Arn": f"arn:aws:iam::{SAMPLE_ACCOUNT}:role/winnie-sensor-model-listener"}
 
 
 def _grant_problems(label: str, statements: list, want: set, role: bool) -> list[str]:
@@ -1684,7 +1706,7 @@ def _grant_problems(label: str, statements: list, want: set, role: bool) -> list
 
 
 def check_models(doc: dict, raw: str = "") -> list[str]:
-    """models.yaml: two endpoints and a role per caller, each passing bedrock:InvokeModel on
+    """models.yaml: two endpoints and a role per caller (persona, analyst, listener), each passing bedrock:InvokeModel on
     exactly the configured models (each role: its own caller's model only), or assuming
     those roles, and nothing else."""
     errors: list[str] = []
@@ -1697,7 +1719,7 @@ def check_models(doc: dict, raw: str = "") -> list[str]:
             errors.append(f"no {kind} {name}")
     for name in res:
         if name not in MODEL_RESOURCES:
-            errors.append(f"resource {name} is not one of the five the option needs")
+            errors.append(f"resource {name} is not one of the six the option needs")
         want_cond = MODEL_CALLER_ROLES.get(name, (None,))[0]
         if (res.get(name) or {}).get("Condition") != want_cond:
             errors.append(f"resource {name} has a condition other than "
@@ -1741,14 +1763,14 @@ def check_models(doc: dict, raw: str = "") -> list[str]:
                  "Resource": MODEL_ROLE_ARNS}]}:
         errors.append("InstanceAssumeModelRole gives the instance role more than assuming "
                       "the callers' roles")
-    for persona, analyst in MODEL_SAMPLES:
-        values = model_values(persona, analyst)
-        label = f"with {persona or '-'} / {analyst or '-'}"
+    for persona, analyst, listener in MODEL_SAMPLES:
+        values = model_values(persona, analyst, listener)
+        label = f"with {persona or '-'} / {analyst or '-'} / {listener or '-'}"
         try:
             ep = evaluate(bedrock.get("PolicyDocument"), doc, values)["Statement"]
             errors += _grant_problems(f"{label} the endpoint policy", ep,
-                                      expected_grant(persona) | expected_grant(analyst),
-                                      role=False)
+                                      expected_grant(persona) | expected_grant(analyst)
+                                      | expected_grant(listener), role=False)
             for name, (cond, _, param) in MODEL_CALLER_ROLES.items():
                 if not evaluate(doc["Conditions"][cond], doc, values):
                     continue
@@ -1761,6 +1783,18 @@ def check_models(doc: dict, raw: str = "") -> list[str]:
     rules = doc.get("Rules") or {}
     if "NeedsAModel" not in rules:
         errors.append("no rule refuses a deploy with neither model set")
+    else:
+        # The rule refuses exactly a deploy with every model id empty.
+        try:
+            assertion = rules["NeedsAModel"]["Assertions"][0]["Assert"]
+            for ids in [("", "", "")] + [tuple("a.b" if i == j else "" for i in range(3))
+                                          for j in range(3)]:
+                values = dict(zip(MODEL_PARAMS, ids))
+                if bool(evaluate(assertion, doc, values)) != any(ids):
+                    errors.append("rule NeedsAModel does not refuse exactly a deploy with no "
+                                  f"model id set (with {' / '.join(i or '-' for i in ids)})")
+        except (KeyError, IndexError, TypeError, AttributeError, ValueError) as exc:
+            errors.append(f"rule NeedsAModel cannot be evaluated ({type(exc).__name__})")
     return ["models: " + e for e in errors]
 
 

@@ -1312,15 +1312,15 @@ SAMPLE = {"AWS::Region": "us-east-1", "AWS::AccountId": "123456789012",
 
 
 def _rendered(sensor, tailscale, actions, sign_in, persona="", analyst="", internetdb="false",
-              otx="false"):
+              otx="false", listener=""):
     """The user data CloudFormation would produce for these switches and SAMPLE values."""
     delivered, lookup = internetdb == "true", internetdb == "lookup"
     values = dict(SAMPLE, TailscaleEnabled=tailscale, UiActions=actions, UiTailnetSignIn=sign_in,
-                  PersonaModelId=persona, AnalystModelId=analyst,
+                  PersonaModelId=persona, AnalystModelId=analyst, ListenerModelId=listener,
                   InternetDbDelivered=str(delivered).lower(), InternetDbLookup=str(lookup).lower(),
                   OtxSubmit=otx)
     on = {"TailscaleOn": tailscale == "true", "UiActionsOn": actions == "true",
-          "ConsoleStepOn": "true" in (tailscale, actions), "ModelOn": bool(persona or analyst),
+          "ConsoleStepOn": "true" in (tailscale, actions), "ModelOn": bool(persona or analyst or listener),
           "InternetDbOn": delivered, "IdbLookupOn": lookup, "OtxOn": otx != "false",
           "IdbAnyOn": delivered or lookup,
           "HostEgressOn": tailscale == "true" or lookup or otx != "false"}
@@ -1974,18 +1974,22 @@ def test_models_template_passes_and_fits(models):
     assert check.deploy_copy_problems(raw) == []
 
 
-@pytest.mark.parametrize("persona, analyst", check.MODEL_SAMPLES + [("anthropic.claude-x", "")])
-def test_the_grant_is_exactly_the_configured_models(models, persona, analyst):
-    values = check.model_values(persona, analyst)
+@pytest.mark.parametrize("persona, analyst, listener",
+                         check.MODEL_SAMPLES + [("anthropic.claude-x", "", ""),
+                                                ("", "", "anthropic.claude-x")])
+def test_the_grant_is_exactly_the_configured_models(models, persona, analyst, listener):
+    values = check.model_values(persona, analyst, listener)
     res = models["Resources"]
     endpoint = check.evaluate(res["BedrockEndpoint"]["Properties"]["PolicyDocument"], models,
                               values)["Statement"]
     assert {r for st in endpoint for r in check.as_list(st["Resource"])} == (
-        check.expected_grant(persona) | check.expected_grant(analyst))
+        check.expected_grant(persona) | check.expected_grant(analyst)
+        | check.expected_grant(listener))
     assert all(st["Action"] == "bedrock:InvokeModel" for st in endpoint)
-    assert len(endpoint) == (persona != "") + (analyst != "")
-    # Each caller's role: its own model, nothing of the other caller's.
-    for name, model in (("PersonaRole", persona), ("AnalystRole", analyst)):
+    assert len(endpoint) == (persona != "") + (analyst != "") + (listener != "")
+    # Each caller's role: its own model, nothing of another caller's.
+    for name, model in (("PersonaRole", persona), ("AnalystRole", analyst),
+                        ("ListenerRole", listener)):
         if not model:
             continue
         role = check.evaluate(res[name]["Properties"]["Policies"][0]["PolicyDocument"],
@@ -2005,19 +2009,42 @@ def test_every_geographic_prefix_is_a_profile(prefix):
 
 
 def test_callers_roles_never_cover_each_other(models):
-    # Different models for the two callers: neither role's grant names the other's model.
+    # Different models for the three callers: no role's grant names another's model.
     persona, analyst = "us.anthropic.claude-haiku-5-5", "eu.anthropic.claude-sonnet-5-5"
-    values = check.model_values(persona, analyst)
+    listener = "apac.anthropic.claude-opus-5-5"
+    values = check.model_values(persona, analyst, listener)
     res = models["Resources"]
     got = {}
-    for name in ("PersonaRole", "AnalystRole"):
+    own = {"PersonaRole": persona, "AnalystRole": analyst, "ListenerRole": listener}
+    for name in own:
         st = check.evaluate(res[name]["Properties"]["Policies"][0]["PolicyDocument"], models,
                             values)["Statement"]
         got[name] = {r for s in st for r in check.as_list(s["Resource"])}
-    assert not got["PersonaRole"] & check.expected_grant(analyst)
-    assert not got["AnalystRole"] & check.expected_grant(persona)
+    for name, model in own.items():
+        assert got[name] == check.expected_grant(model)
+        for other in set(own.values()) - {model}:
+            assert not got[name] & check.expected_grant(other), (name, other)
     assert res["PersonaRole"]["Condition"] == "PersonaOn"
     assert res["AnalystRole"]["Condition"] == "AnalystOn"
+    assert res["ListenerRole"]["Condition"] == "ListenerOn"
+    # Assumed by the sensor's instance role alone, as the persona's role is.
+    assert res["ListenerRole"]["Properties"]["AssumeRolePolicyDocument"] == \
+        res["PersonaRole"]["Properties"]["AssumeRolePolicyDocument"]
+    assert res["ListenerRole"]["Properties"]["MaxSessionDuration"] == 3600
+
+
+def test_the_model_rule_refuses_only_a_deploy_with_no_model(models):
+    assertion = models["Rules"]["NeedsAModel"]["Assertions"][0]["Assert"]
+    for ids in [("", "", ""), ("a.b", "", ""), ("", "a.b", ""), ("", "", "a.b"),
+                ("a.b", "c.d", "e.f")]:
+        values = dict(zip(check.MODEL_PARAMS, ids))
+        assert bool(check.evaluate(assertion, models, values)) == any(ids), ids
+
+
+def test_model_outputs_name_every_callers_role(models):
+    outputs = models["Outputs"]
+    for name, (cond, _, _) in check.MODEL_CALLER_ROLES.items():
+        assert outputs[f"{name}Arn"] == {"Condition": cond, "Value": {"Fn::GetAtt": [name, "Arn"]}}
 
 
 def test_a_profile_grants_its_own_model_and_nothing_else():
@@ -2029,8 +2056,10 @@ def test_a_profile_grants_its_own_model_and_nothing_else():
 
 
 def test_model_id_pattern_is_the_same_in_both_templates(sensor, models):
+    # sensor.yaml keeps their descriptions in a comment (its deploy copy's size limit).
     for name in check.MODEL_PARAMS:
-        assert sensor["Parameters"][name] == models["Parameters"][name]
+        assert sensor["Parameters"][name] == {
+            k: v for k, v in models["Parameters"][name].items() if k != "Description"}
     pattern = check.MODEL_ID
     for good in check.MODEL_IDS_GOOD:
         assert re.fullmatch(pattern, good)
@@ -2042,7 +2071,7 @@ def _model_statement(d, where, who):
     res = d["Resources"]
     if where == "endpoint":
         doc = res["BedrockEndpoint"]["Properties"]["PolicyDocument"]
-        return doc["Statement"][0 if who == "Persona" else 1]["Fn::If"][1]
+        return doc["Statement"][["Persona", "Analyst", "Listener"].index(who)]["Fn::If"][1]
     return res[f"{who}Role"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"][0]
 
 
@@ -2201,6 +2230,55 @@ def _no_model_rule(d):
     del d["Rules"]["NeedsAModel"]
 
 
+def _listener_role_grants_persona_model(d):
+    st = _model_statement(d, "role", "Listener")
+    st["Resource"] = json_swap(st["Resource"], "ListenerModelId", "PersonaModelId")
+
+
+def _endpoint_without_listener(d):
+    d["Resources"]["BedrockEndpoint"]["Properties"]["PolicyDocument"]["Statement"].pop()
+
+
+def _listener_role_named_persona(d):
+    d["Resources"]["ListenerRole"]["Properties"]["RoleName"] = {
+        "Fn::Sub": "${NamePrefix}-model-persona"}
+
+
+def _listener_role_always(d):
+    del d["Resources"]["ListenerRole"]["Condition"]
+
+
+def _listener_role_any_endpoint(d):
+    del _model_statement(d, "role", "Listener")["Condition"]
+
+
+def _listener_trust_whole_account(d):
+    d["Resources"]["ListenerRole"]["Properties"]["AssumeRolePolicyDocument"]["Statement"][0][
+        "Principal"] = {"AWS": {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}}
+
+
+def _sts_without_listener(d):
+    d["Resources"]["StsEndpoint"]["Properties"]["PolicyDocument"]["Statement"][0][
+        "Resource"].pop()
+
+
+def _instance_without_listener(d):
+    d["Resources"]["InstanceAssumeModelRole"]["Properties"]["PolicyDocument"]["Statement"][0][
+        "Resource"].pop()
+
+
+def _model_rule_ignores_listener(d):
+    d["Rules"]["NeedsAModel"]["Assertions"][0]["Assert"]["Fn::Not"][0]["Fn::And"].pop()
+
+
+def _listener_default_on(d):
+    d["Parameters"]["ListenerModelId"]["Default"] = "us.anthropic.claude-haiku-5-5"
+
+
+def _listener_pattern_open(d):
+    d["Parameters"]["ListenerModelId"]["AllowedPattern"] = "^.*$"
+
+
 MODEL_BREAKS = {
     "the endpoint policy allows bedrock:*": _endpoint_any_bedrock,
     "the endpoint policy allows bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream":
@@ -2209,15 +2287,15 @@ MODEL_BREAKS = {
     "foundation-model/* beyond the configured models": _endpoint_any_foundation_model,
     "arn:aws:bedrock:*:123456789012:inference-profile/us.anthropic.claude-haiku-5-5 beyond":
         _endpoint_profile_any_region,
-    "with - / eu.anthropic.claude-haiku-5-5 the endpoint policy grants": _endpoint_persona_always,
+    "with - / eu.anthropic.claude-haiku-5-5 / - the endpoint policy grants": _endpoint_persona_always,
     # Each caller's role never covers the other caller's model.
-    "with jp.anthropic.claude-haiku-5-5 / au.anthropic.claude-haiku-5-5 the PersonaRole policy "
+    "with jp.anthropic.claude-haiku-5-5 / au.anthropic.claude-haiku-5-5 / - the PersonaRole policy "
     "grants arn:aws:bedrock:us-east-1:123456789012:inference-profile/au.anthropic.claude-haiku-5-5":
         _persona_role_grants_analyst_model,
-    "with us.anthropic.claude-haiku-5-5 / us.anthropic.claude-sonnet-5-5 the AnalystRole "
+    "with us.anthropic.claude-haiku-5-5 / us.anthropic.claude-sonnet-5-5 / - the AnalystRole "
     "policy grants arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5-5":
         _analyst_role_grants_persona_model,
-    "with us.anthropic.claude-haiku-5-5 / us.anthropic.claude-sonnet-5-5 the PersonaRole "
+    "with us.anthropic.claude-haiku-5-5 / us.anthropic.claude-sonnet-5-5 / - the PersonaRole "
     "policy grants arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5-5":
         _persona_role_grants_both,
     "PersonaRole is not named ${NamePrefix}-model-persona": _persona_role_named_analyst,
@@ -2235,7 +2313,7 @@ MODEL_BREAKS = {
     "PersonaRole has policies other than its one inline policy": _role_managed_policy,
     "PersonaRole sessions may last more than an hour": _role_long_sessions,
     "InstanceAssumeModelRole gives the instance role more than assuming": _instance_assumes_anything,
-    "resource OpenEgress is not one of the five": _extra_model_resource,
+    "resource OpenEgress is not one of the six": _extra_model_resource,
     "resource StsEndpoint has a condition other than none": _conditional_endpoint,
     "endpoint BedrockEndpoint is not behind the sensor's endpoint security group":
         _endpoint_own_group,
@@ -2245,10 +2323,30 @@ MODEL_BREAKS = {
     "parameter PersonaModelId accepts 'xx.anthropic.claude-x'": _model_pattern_any_prefix,
     "parameter PersonaModelId refuses a valid model id": _model_pattern_no_global,
     "parameter AnalystModelId refuses a valid model id": _model_pattern_no_eu,
-    "with jp.anthropic.claude-haiku-5-5 / au.anthropic.claude-haiku-5-5 the endpoint policy grants arn:aws:bedrock:us-east-1::foundation-model/jp.anthropic.claude-haiku-5-5":
+    "with jp.anthropic.claude-haiku-5-5 / au.anthropic.claude-haiku-5-5 / - the endpoint policy grants arn:aws:bedrock:us-east-1::foundation-model/jp.anthropic.claude-haiku-5-5":
         _profile_condition_misses_jp,
     "parameter PersonaModelId is not empty (off) by default": _model_default_on,
     "no rule refuses a deploy with neither model set": _no_model_rule,
+    # The listener caller, built as the other two are.
+    "with us.anthropic.claude-sonnet-5-5 / - / us.anthropic.claude-haiku-5-5 the ListenerRole "
+    "policy grants arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5-5":
+        _listener_role_grants_persona_model,
+    "with - / - / us.anthropic.claude-haiku-5-5 the endpoint policy lacks":
+        _endpoint_without_listener,
+    "ListenerRole is not named ${NamePrefix}-model-listener": _listener_role_named_persona,
+    "resource ListenerRole has a condition other than ListenerOn": _listener_role_always,
+    "the ListenerRole policy is not limited to the bedrock-runtime endpoint":
+        _listener_role_any_endpoint,
+    "ListenerRole can be assumed by more than the sensor's instance role":
+        _listener_trust_whole_account,
+    "endpoint StsEndpoint policy allows more than assuming the callers' roles":
+        _sts_without_listener,
+    "InstanceAssumeModelRole gives the instance role more than assuming":
+        _instance_without_listener,
+    "rule NeedsAModel does not refuse exactly a deploy with no model id set (with - / - / a.b)":
+        _model_rule_ignores_listener,
+    "parameter ListenerModelId is not empty (off) by default": _listener_default_on,
+    "parameter ListenerModelId accepts '*'": _listener_pattern_open,
 }
 
 
@@ -2318,23 +2416,27 @@ def test_each_sensor_model_rule_fires(sensor, expected):
 def test_with_both_models_off_the_bootstrap_has_no_model_step(sensor):
     for switches in SWITCHES:
         user_data = _rendered(sensor, *switches)
-        for needle in ("sensor-model", "bedrock", "PERSONA_MODEL", "AWS_CONFIG_FILE"):
+        for needle in ("sensor-model", "bedrock", "PERSONA_MODEL", "LISTENER_MODEL",
+                       "AWS_CONFIG_FILE"):
             assert needle not in user_data, needle
 
 
-@pytest.mark.parametrize("persona, analyst", [("us.anthropic.claude-haiku-5-5", ""),
-                                              ("", "anthropic.claude-haiku-5-5"),
-                                              ("global.anthropic.claude-sonnet-5-5",
-                                               "us.anthropic.claude-haiku-5-5")])
+@pytest.mark.parametrize("persona, analyst, listener", [
+    ("us.anthropic.claude-haiku-5-5", "", ""), ("", "anthropic.claude-haiku-5-5", ""),
+    ("", "", "us.anthropic.claude-haiku-5-5"),
+    ("global.anthropic.claude-sonnet-5-5", "us.anthropic.claude-haiku-5-5", ""),
+    ("us.anthropic.claude-sonnet-5-5", "", "eu.anthropic.claude-haiku-5-5")])
 def test_model_step_renders_valid_shell_and_names_the_model_role(sensor, tmp_path, persona,
-                                                                 analyst):
-    user_data = _rendered(sensor, "true", "true", "true", persona, analyst)
+                                                                 analyst, listener):
+    user_data = _rendered(sensor, "true", "true", "true", persona, analyst,
+                          listener=listener)
     path = tmp_path / "user-data"
     path.write_text(user_data)
     assert subprocess.run(["bash", "-n", str(path)]).returncode == 0
     settings = re.search(r"^printf 'REGION=.*> /etc/sensor-model\.env$", user_data, re.M).group(0)
     assert "arn:aws:iam::123456789012:role/winnie-sensor-model" in settings
-    assert f'"{persona}" "{analyst}"' in settings
+    assert f'"{persona}" "{analyst}" "{listener}" >' in settings
+    assert "LISTENER_MODEL=%s" in settings
     # After the console step, which writes COMPOSE_FILE first; before the stack starts.
     lines = user_data.splitlines()
     setup = lines.index('/usr/local/sbin/sensor-model.sh setup "$IMAGE" || echo "model: FAILED ($?)"')
@@ -2367,13 +2469,25 @@ def _model_host_edit(old, new, name="sensor-model.sh"):
 
 MODEL_HOST_BREAKS = {
     "sensor-model.sh has an extra rule": ("for c in", "iptables -w -I DOCKER-USER 1 -s 172.30.0.0/24 -j ACCEPT\nfor c in"),
-    "callers other than the ssh and agents containers' fixed addresses":
+    "callers other than the ssh, agents and listeners containers' fixed addresses":
         ("callers+=(persona:172.30.0.10)", "callers+=(persona:172.30.0.0/24)"),
     "overlay changes more than": ('extra_hosts: ["%s:%s"]', 'network_mode: host\\n    extra_hosts: ["%s:%s"]'),
     # ssh's mount must be the persona's directory, and only it.
-    "overlay changes more than the ssh and agents containers' address, endpoint name, own":
+    "overlay changes more than the ssh, agents and listeners containers' address, endpoint "
+    "name, own":
         ("svc ssh frontend 172.30.0.10 persona", "svc ssh frontend 172.30.0.10 analyst"),
     "own credentials mount": ('volumes: ["%s/%s:/model:ro"]', 'volumes: ["%s:/model:ro"]'),
+    # The listeners container: its own address and its own directory, nothing wider.
+    "opens the endpoint to callers other than the ssh, agents and listeners":
+        ("callers+=(listener:172.30.0.11)", "callers+=(listener:172.30.0.0/24)"),
+    "overlay changes more than the ssh, agents and listeners containers' address, endpoint "
+    "name, own credentials mount and variables":
+        ("svc listeners frontend 172.30.0.11 listener", "svc listeners frontend 172.30.0.11 persona"),
+    "does not check every model id": ("&& $LISTENER_MODEL =~ $id ", ""),
+    "does not remove accepts to an old address":
+        (r"(172\.30\.0\.1[01]|172\.30\.1\.10)", r"(172\.30\.[01]\.10)"),
+    "does not recreate every caller when the address changed":
+        ("for s in ssh agents listeners; do", "for s in ssh agents; do"),
     "does not ask for one-hour credentials of the caller's own role":
         ('--role-arn "$ROLE_ARN-$1"', '--role-arn "$ROLE_ARN-analyst"'),
     "does not write a caller's credentials into its own directory":
@@ -2389,7 +2503,7 @@ MODEL_HOST_BREAKS = {
     "does not check the VPC range": ("8 <= n.prefixlen <= 28", "0 <= n.prefixlen <= 32"),
     "does not start its timer": ("systemctl enable --now sensor-model.timer",
                                  "systemctl enable sensor-model.timer"),
-    "does not remove accepts to an old address": ("-j ACCEPT$'\nrules=", "-j NOTHING$'\nrules="),
+    "remove accepts to an old address": ("-j ACCEPT$'\nrules=", "-j NOTHING$'\nrules="),
     "removes more than caller accepts to an old address":
         ('[ "${BASH_REMATCH[2]}" != "$EP" ] || continue', 'true || continue'),
     "does not recreate only the callers when the address changed":
@@ -2454,7 +2568,7 @@ open(path, "w").write("".join(r + "\n" for r in rules))
 '''
 
 
-def _run_model(tmp_path, *, persona="us.anthropic.claude-haiku-5-5", analyst="",
+def _run_model(tmp_path, *, persona="us.anthropic.claude-haiku-5-5", analyst="", listener="",
                answer="10.64.0.37", saved=None, aws_fails=False, compose_fails=False,
                setup=True, env_text=None, running=False, script=None, up_fails=False):
     """Run host/sensor-model.sh with fakes on PATH. Returns (exit code, stderr, accept
@@ -2504,7 +2618,8 @@ def _run_model(tmp_path, *, persona="us.anthropic.claude-haiku-5-5", analyst="",
     env_file.write_text(env_text if env_text is not None else
                         "REGION=us-east-1\nSUFFIX=amazonaws.com\nVPC_CIDR=10.64.0.0/16\n"
                         "ROLE_ARN=arn:aws:iam::123456789012:role/winnie-sensor-model\n"
-                        f"PERSONA_MODEL={persona}\nANALYST_MODEL={analyst}\n")
+                        f"PERSONA_MODEL={persona}\nANALYST_MODEL={analyst}\n"
+                        f"LISTENER_MODEL={listener}\n")
     env = dict(os.environ, PATH=f"{bin_}:{os.environ['PATH']}", LOG=str(log),
                RULES=str(tmp_path / "rules"),
                SENSOR_MODEL_ENV=str(env_file), SENSOR_MODEL_DIR=str(creds),
@@ -2569,6 +2684,7 @@ def test_setup_gives_only_the_persona_a_path_and_credentials(tmp_path):
     assert (cp.get("llm", "llm_provider"), cp.get("llm", "model_name"),
             cp.get("llm", "aws_region")) == ("AWS", "us.anthropic.claude-haiku-5-5", "us-east-1")
     assert cp.get("agents", "provider") == "anthropic"          # analyst left without a model
+    assert cp.get("listeners", "llm") == "false"                # listeners too
     assert (home / ".env").read_text().splitlines() == [
         "COMPOSE_PROFILES=ui",
         "COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:"
@@ -2578,7 +2694,8 @@ def test_setup_gives_only_the_persona_a_path_and_credentials(tmp_path):
     assert (creds / "persona" / "config").read_text() == (
         "[default]\ncredential_process = cat /model/creds.json\n")
     assert _cred_modes(creds, "persona") == {"creds.json": 0o400, "config": 0o400}
-    assert sorted(p.name for p in creds.iterdir()) == ["persona"]   # no analyst directory
+    assert sorted(p.name for p in creds.iterdir()) == ["persona"]   # no other directory
+    assert "172.30.0.11" not in log
     assert not list(creds.rglob("*.new"))
     assert f"install -d -m 0500 -o 10001 -g 10001 {creds}/persona" in log
     assert f"install -d -m 0700 {creds}" in log
@@ -2617,6 +2734,174 @@ def test_setup_with_both_models_gives_each_caller_its_own_role_and_mount(tmp_pat
     cp = _cfg(home)
     assert (cp.get("agents", "provider"), cp.get("agents", "model")) == (
         "bedrock", "global.anthropic.claude-x")
+
+
+def test_setup_with_the_listener_model_gives_the_listeners_container_its_own_path_and_role(
+        tmp_path):
+    import json
+    import yaml
+    listener = "us.anthropic.claude-haiku-5-5"
+    code, err, accepts, home, creds, log = _run_model(tmp_path, persona="", listener=listener)
+    assert code == 0, err
+    assert accepts == [("172.30.0.11", "10.64.0.37")]
+    assert _chain(tmp_path) == [("172.30.0.11", "10.64.0.37")]
+    overlay = yaml.safe_load((home / "docker-compose.model.yml").read_text())
+    assert overlay == {"services": {"listeners": {
+        "networks": {"frontend": {"ipv4_address": "172.30.0.11"}},
+        "extra_hosts": ["bedrock-runtime.us-east-1.amazonaws.com:10.64.0.37"],
+        "environment": {"AWS_CONFIG_FILE": "/model/config", "AWS_EC2_METADATA_DISABLED": "true"},
+        "volumes": [f"{creds}/listener:/model:ro"]}}}
+    assert sorted(p.name for p in creds.iterdir()) == ["listener"]
+    got = json.loads((creds / "listener" / "creds.json").read_text())
+    assert got["AccessKeyId"] == "ASIA-winnie-sensor-model-listener"
+    assert _cred_modes(creds, "listener") == {"creds.json": 0o400, "config": 0o400}
+    assert "--role-arn arn:aws:iam::123456789012:role/winnie-sensor-model-listener " in log
+    assert "--role-session-name sensor-listener " in log
+    assert f"install -d -m 0500 -o 10001 -g 10001 {creds}/listener" in log
+    # Neither other caller gets anything.
+    assert "172.30.0.10" not in log and "172.30.1.10" not in log
+    cp = _cfg(home)
+    assert (cp.get("listeners", "llm"), cp.get("listeners", "model")) == ("true", listener)
+    assert cp.get("listeners", "telnet_persona", fallback=None) is None   # its default
+    # The listeners take provider and region from [agents]; the analyst's model is unchanged.
+    assert (cp.get("agents", "provider"), cp.get("agents", "aws_region")) == (
+        "bedrock", "us-east-1")
+    assert cp.get("agents", "model") == "claude-haiku-5-5"
+    assert cp.get("llm", "llm_provider") == "openai"                      # persona untouched
+
+
+def test_setup_with_all_three_models_gives_each_caller_its_own_role_and_mount(tmp_path):
+    import yaml
+    code, err, accepts, home, creds, log = _run_model(
+        tmp_path, persona="us.anthropic.claude-haiku-5-5", analyst="eu.anthropic.claude-x",
+        listener="global.anthropic.claude-y")
+    assert code == 0, err
+    assert sorted(accepts) == [("172.30.0.10", "10.64.0.37"), ("172.30.0.11", "10.64.0.37"),
+                               ("172.30.1.10", "10.64.0.37")]
+    overlay = yaml.safe_load((home / "docker-compose.model.yml").read_text())
+    assert {s: v["volumes"] for s, v in overlay["services"].items()} == {
+        "ssh": [f"{creds}/persona:/model:ro"], "agents": [f"{creds}/analyst:/model:ro"],
+        "listeners": [f"{creds}/listener:/model:ro"]}
+    cp = _cfg(home)
+    assert (cp.get("agents", "provider"), cp.get("agents", "model"),
+            cp.get("agents", "aws_region")) == ("bedrock", "eu.anthropic.claude-x", "us-east-1")
+    assert cp.get("listeners", "model") == "global.anthropic.claude-y"
+    assert cp.get("llm", "model_name") == "us.anthropic.claude-haiku-5-5"
+
+
+def test_a_new_address_moves_the_listeners_accept_and_recreates_it(tmp_path):
+    import yaml
+    kw = dict(persona="us.anthropic.claude-haiku-5-5", listener="us.anthropic.claude-y")
+    _run_model(tmp_path, **kw)
+    code, err, accepts, home, _, log = _run_model(tmp_path, answer="10.64.0.52", setup=False,
+                                                  running=True, **kw)
+    assert code == 0, err
+    assert _chain(tmp_path) == [("172.30.0.10", "10.64.0.52"), ("172.30.0.11", "10.64.0.52")]
+    assert "iptables -w -D DOCKER-USER -s 172.30.0.11 -d 10.64.0.37" in log
+    overlay = yaml.safe_load((home / "docker-compose.model.yml").read_text())
+    assert overlay["services"]["listeners"]["extra_hosts"] == [
+        "bedrock-runtime.us-east-1.amazonaws.com:10.64.0.52"]
+    assert [l for l in log.splitlines() if " up " in l] == [
+        "docker compose up -d --no-deps ssh", "docker compose up -d --no-deps listeners"]
+
+
+def test_an_env_file_without_the_listener_setting_still_runs(tmp_path):
+    text = ("REGION=us-east-1\nSUFFIX=amazonaws.com\nVPC_CIDR=10.64.0.0/16\n"
+            "ROLE_ARN=arn:aws:iam::123456789012:role/winnie-sensor-model\n"
+            "PERSONA_MODEL=us.anthropic.claude-x\nANALYST_MODEL=\n")
+    code, err, accepts, home, _, _ = _run_model(tmp_path, env_text=text)
+    assert code == 0, err
+    assert accepts == [("172.30.0.10", "10.64.0.37")]
+    assert _cfg(home).get("listeners", "llm") == "false"
+
+
+def _models_config(tmp_path, persona, analyst, listener):
+    """config.ini as the model step leaves it: the bootstrap's render, then the models form."""
+    cp = _render(None, tmp_path, "config.ini", "false", "false")
+    out = tmp_path / "config.ini"
+    subprocess.run([sys.executable, str(AWS / "render_config.py"), "models", str(out), persona,
+                    analyst, "us-east-1", listener], check=True, capture_output=True)
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.read(out, encoding="utf-8")
+    return cp
+
+
+def _mounted_credentials(tmp_path, monkeypatch, who):
+    """The environment the overlay gives a caller: AWS_CONFIG_FILE naming a config whose
+    default profile reads its own credentials file, and no other credential source."""
+    import datetime
+    import json
+    d = tmp_path / "model" / who
+    d.mkdir(parents=True)
+    expiry = (datetime.datetime.now(datetime.timezone.utc)
+              + datetime.timedelta(hours=1)).isoformat()
+    (d / "creds.json").write_text(json.dumps({
+        "Version": 1, "AccessKeyId": f"ASIA-{who}", "SecretAccessKey": "example-secret",
+        "SessionToken": "example-token", "Expiration": expiry}))
+    (d / "config").write_text(f"[default]\ncredential_process = cat {d / 'creds.json'}\n")
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE",
+                 "AWS_DEFAULT_PROFILE", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                 "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_WEB_IDENTITY_TOKEN_FILE",
+                 "AWS_ROLE_ARN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(d / "config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-shared-credentials"))
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+
+def test_listener_and_persona_ids_resolve_to_bedrock_through_the_mounted_credentials(
+        tmp_path, monkeypatch):
+    """Persona and listener ids set, analyst empty: the listeners' model is Bedrock with the
+    listener id, from [agents] provider and aws_region, signed with the default profile
+    (the mounted listener credentials); the telnet persona's [llm] is Bedrock with the
+    default profile too."""
+    import boto3
+    from agents import hooks
+    from agents.llm import BedrockJsonLLM, build_json_llm
+    persona, listener = "us.anthropic.claude-sonnet-5-5", "us.anthropic.claude-haiku-5-5"
+    cp = _models_config(tmp_path, persona, "", listener)
+    _mounted_credentials(tmp_path, monkeypatch, "listener")
+    section = cp["listeners"]
+    assert section.get("llm") == "true"
+    llm = build_json_llm(cp, section.get("model"), timeout=20)
+    assert isinstance(llm, BedrockJsonLLM)
+    assert llm.model == listener and llm.client.meta.region_name == "us-east-1"
+    creds = boto3.Session(region_name="us-east-1").get_credentials()
+    assert creds.get_frozen_credentials().access_key == "ASIA-listener"
+    # The telnet persona (same [llm] chain as SSH): provider AWS, profile "default".
+    assert hooks.provider_unavailable(cp) is None
+    assert (cp.get("llm", "llm_provider"), cp.get("llm", "model_name"),
+            cp.get("llm", "aws_credentials_profile")) == ("AWS", persona, "default")
+    creds = boto3.Session(profile_name="default", region_name="us-east-1").get_credentials()
+    assert creds.get_frozen_credentials().access_key == "ASIA-listener"
+
+
+def test_with_the_analyst_off_the_agents_container_still_runs_without_a_model(
+        tmp_path, monkeypatch):
+    """The listener id sets [agents] provider = bedrock in the shared config.ini; the agents
+    container, which then has no credentials, still gets no model and no error."""
+    from agents.llm import build_json_llm
+    cp = _models_config(tmp_path, "", "", "us.anthropic.claude-haiku-5-5")
+    _mounted_credentials(tmp_path, monkeypatch, "none")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "no-config"))
+    assert cp.get("agents", "provider") == "bedrock"
+    assert build_json_llm(cp) is None
+
+
+def test_the_models_form_turns_the_listeners_off_without_a_listener_id(tmp_path):
+    for args in ([], [""]):
+        _render(None, tmp_path, "config.ini", "false", "false")
+        out = tmp_path / "config.ini"
+        text = out.read_text().replace("\nllm = false\n", "\nllm = true\n", 1)
+        out.write_text(text)
+        subprocess.run([sys.executable, str(AWS / "render_config.py"), "models", str(out),
+                        "us.anthropic.claude-x", "", "us-east-1", *args],
+                       check=True, capture_output=True)
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.read(out, encoding="utf-8")
+        assert cp.get("listeners", "llm") == "false"
+        assert cp.get("listeners", "model") == "claude-haiku-5-5"
+        assert cp.get("agents", "provider") == "anthropic"
 
 
 def test_readable_credentials_are_caught(tmp_path):
@@ -2742,6 +3027,7 @@ def test_failed_credentials_leave_no_partial_file(tmp_path):
 
 @pytest.mark.parametrize("bad", ["PERSONA_MODEL=*", "PERSONA_MODEL='a.b;id'",
                                  "ANALYST_MODEL=anthropic.claude.x",
+                                 "LISTENER_MODEL=*", "LISTENER_MODEL='a.b;id'",
                                  "PERSONA_MODEL=ca.anthropic.claude-x",
                                  "ANALYST_MODEL=usgov.anthropic.claude-x",
                                  "ROLE_ARN=arn:aws:iam::123456789012:role/*",
@@ -2750,7 +3036,7 @@ def test_failed_credentials_leave_no_partial_file(tmp_path):
 def test_bad_settings_stop_before_anything(tmp_path, bad):
     good = ("REGION=us-east-1\nSUFFIX=amazonaws.com\nVPC_CIDR=10.64.0.0/16\n"
             "ROLE_ARN=arn:aws:iam::123456789012:role/winnie-sensor-model\n"
-            "PERSONA_MODEL=us.anthropic.claude-x\nANALYST_MODEL=\n")
+            "PERSONA_MODEL=us.anthropic.claude-x\nANALYST_MODEL=\nLISTENER_MODEL=\n")
     key = bad.split("=")[0]
     text = re.sub(rf"^{key}=.*$", lambda m: bad, good, flags=re.M)
     code, err, accepts, home, _, log = _run_model(tmp_path, env_text=text)
