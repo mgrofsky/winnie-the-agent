@@ -126,6 +126,34 @@ MYSQL_PRIVILEGE_ORDER = [
     "CREATE TEMPORARY TABLES", "LOCK TABLES", "EXECUTE", "REPLICATION SLAVE",
     "REPLICATION CLIENT", "CREATE VIEW", "SHOW VIEW", "CREATE ROUTINE", "ALTER ROUTINE",
     "CREATE USER", "EVENT", "TRIGGER", "CREATE TABLESPACE", "CREATE ROLE", "DROP ROLE"]
+# What GRANT ALL gives at each MySQL grant level; SHOW GRANTS prints ALL PRIVILEGES while
+# the account holds every one of them.
+MYSQL_ALL_PRIVILEGES = {
+    "global": MYSQL_PRIVILEGE_ORDER,
+    "database": ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "REFERENCES",
+                 "INDEX", "ALTER", "CREATE TEMPORARY TABLES", "LOCK TABLES", "EXECUTE",
+                 "CREATE VIEW", "SHOW VIEW", "CREATE ROUTINE", "ALTER ROUTINE", "EVENT",
+                 "TRIGGER"],
+    "table": ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "REFERENCES", "INDEX",
+              "ALTER", "CREATE VIEW", "SHOW VIEW", "TRIGGER"],
+}
+# What GRANT ALL gives on a PostgreSQL object, by the object's leading keyword; a bare
+# name, TABLE and ALL TABLES IN SCHEMA are tables.
+PG_ALL_PRIVILEGES = {
+    "table": ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"],
+    "database": ["CREATE", "CONNECT", "TEMPORARY"],
+    "schema": ["USAGE", "CREATE"],
+    "sequence": ["USAGE", "SELECT", "UPDATE"],
+    "function": ["EXECUTE"],
+    "language": ["USAGE"],
+    "tablespace": ["CREATE"],
+}
+# What SQL Server's GRANT ALL gives: on the database (no ON clause) and on a table or view.
+MSSQL_ALL_PERMISSIONS = {
+    "database": ["BACKUP DATABASE", "BACKUP LOG", "CREATE DEFAULT", "CREATE FUNCTION",
+                 "CREATE PROCEDURE", "CREATE RULE", "CREATE TABLE", "CREATE VIEW"],
+    "object": ["DELETE", "INSERT", "REFERENCES", "SELECT", "UPDATE"],
+}
 
 DEFAULT_VERSIONS = {
     "postgres": "15.6 (Ubuntu 15.6-0ubuntu0.23.10.1)",
@@ -835,6 +863,15 @@ class FakeSql:
         return SqlError("1060", "The number of rows provided for a TOP or FETCH clauses row "
                         "count parameter must be an integer.", errno=1060, klass=15)
 
+    def table_exists(self, name: str) -> SqlError:
+        name = safe_name(name)
+        if self.dialect == "postgres":
+            return SqlError("42P07", f'relation "{name}" already exists')
+        if self.dialect == "mysql":
+            return SqlError("42S01", f"Table '{name}' already exists", errno=1050)
+        return SqlError("2714", f"There is already an object named '{name}' in the database.",
+                        errno=2714)
+
     def no_db_selected(self) -> SqlError:
         return SqlError("3D000", "No database selected", errno=1046)
 
@@ -1511,11 +1548,13 @@ class FakeSql:
         self.created_chars -= sum(len(v) for r in rows for v in r if isinstance(v, str))
 
     def _create_table(self, parts: list[str], cols: list[tuple[str, str]],
-                      if_not_exists: bool) -> Optional[Answer]:
+                      if_not_exists: bool, temporary: bool = False) -> Optional[Answer]:
         """CREATE TABLE for this connection: the table goes into the named or current
         database, where SHOW TABLES and the catalog views list it and SELECT reads its
-        rows, until it or its database is dropped or the connection ends. A scenario
-        table of the same name stays as it is."""
+        rows, until it or its database is dropped or the connection ends. A name already
+        in that database (scenario, default or created) keeps its table and rows and
+        answers the server's existing-table error; IF NOT EXISTS, or a temporary table,
+        answers OK and changes nothing."""
         db = None
         for qual in parts[:-1]:
             db = db or self.catalog.get(_unquote_ident(qual).lower())
@@ -1526,13 +1565,11 @@ class FakeSql:
         name = _unquote_ident(raw)[:64]
         if self.dialect == "postgres" and raw[:1] != '"':
             name = name.lower()
-        existing = db.tables.get(name.lower())
-        if existing is not None and (not existing.created or if_not_exists):
-            return None
-        if existing is None and len(self.created) >= MAX_CREATED_TABLES:
+        if name.lower() in db.tables:
+            return None if if_not_exists or temporary else self.table_exists(name)
+        if len(self.created) >= MAX_CREATED_TABLES:
             return None
         t = TableInfo(name, cols[:40], db.name, db.schema, scenario=False, created=True)
-        self._clear_rows(_table_key(t))
         db.tables[name.lower()] = t
         self.created[_table_key(t)] = t
         return None
@@ -1548,7 +1585,9 @@ class FakeSql:
     def _session_database(self, s: str, verb: str) -> Optional[Answer]:
         """CREATE or DROP DATABASE for this connection: a created database is listed, can be
         selected with USE and holds the tables the session creates, until the connection
-        ends. Scenario and system databases stay as they are."""
+        ends. Dropping it drops its tables, its SQL Server users and roles, and PostgreSQL
+        grants ON DATABASE it; MySQL grants on it stay, as on the real server. Scenario and
+        system databases stay as they are."""
         m = re.match(r"^(create|drop)\s+(?:database|schema)\s+(if\s+(?:not\s+)?exists\s+)?"
                      r"([`\[\"]?[\w$-]{1,64}[`\]\"]?)", s, re.I)
         if not m:
@@ -1573,9 +1612,26 @@ class FakeSql:
                     self._drop_created(t)
             del self.catalog[key]
             self.session_dbs.discard(key)
+            self._drop_database_principals(key)
             if (self.database or "").lower() == key:
                 self.database = "" if self.dialect == "mysql" else "master"
         return None
+
+    def _drop_database_principals(self, key: str) -> None:
+        """What a dropped database takes with it: SQL Server users and roles scoped to it
+        (logins stay), and PostgreSQL privileges granted ON DATABASE it."""
+        if self.dialect == "mssql":
+            for k in [k for k in self.session_users if k[0] == "db" and k[2] == key]:
+                del self.session_users[k]
+        elif self.dialect == "postgres":
+            for u in self.session_users.values():
+                for obj in list(u.privileges):
+                    words = obj.split(None, 1)
+                    if len(words) == 2 and words[0].lower() == "database" \
+                            and any(_unquote_ident(n.strip()).lower() == key
+                                    for n in words[1].split(",")):
+                        del u.privileges[obj]
+                        u.grant_option.discard(obj)
 
     # ---- users, roles, logins and grants -----------------------------------------------------
 
@@ -1714,11 +1770,50 @@ class FakeSql:
                 self._apply_grant(u, verb, items, s[on[1]:target[0]] if on else None,
                                   with_grant)
 
+    def _all_privileges(self, key: str) -> Optional[list[str]]:
+        """The privileges GRANT ALL gives on a granted object key, or None for an object
+        kind the engine does not model (ALL is then kept as one word)."""
+        if self.dialect == "mysql":
+            level = "global" if key == "*.*" else "database" if key.endswith("*") else "table"
+            return MYSQL_ALL_PRIVILEGES[level]
+        words = key.lower().split()
+        if self.dialect == "postgres":
+            if words[:1] == ["all"] and len(words) > 1:
+                words = words[1:]
+            kind = words[0].rstrip("s") if len(words) > 1 else "table"
+            if kind in ("procedure", "routine"):
+                kind = "function"
+            if kind in ("foreign", "large", "type", "domain", "parameter"):
+                return None
+            if kind not in PG_ALL_PRIVILEGES:       # a bare table list: GRANT ALL ON a, b
+                kind = "table"
+            privs = PG_ALL_PRIVILEGES[kind]
+            if kind == "table" and int(self._pg_major()) >= 17:
+                privs = privs + ["MAINTAIN"]
+            return privs
+        if not key:
+            privs = MSSQL_ALL_PERMISSIONS["database"]
+            if (self.database or "").lower() == "master":
+                privs = ["CREATE DATABASE"] + privs
+            return privs
+        if "::" not in key or key.lower().startswith("object::"):
+            return MSSQL_ALL_PERMISSIONS["object"]
+        return None
+
+    def _privilege_names(self, key: str, held: list[str]) -> list[str]:
+        """How SHOW GRANTS (MySQL) names the privileges held on one object: ALL PRIVILEGES
+        while every privilege GRANT ALL gives there is held, otherwise the list."""
+        full = self._all_privileges(key) if self.dialect == "mysql" else None
+        if full is not None and set(full) <= set(held):
+            return ["ALL PRIVILEGES"] + [p for p in held if p not in full]
+        return held
+
     def _apply_grant(self, u: SessionUser, verb: str, items: list[str], obj: Optional[str],
                      with_grant: bool) -> None:
         privs = []
         for item in items:
             p = " ".join(item.split()).upper()[:64]
+            p = "TEMPORARY" if p == "TEMP" and self.dialect == "postgres" else p
             privs.append("ALL PRIVILEGES" if p in ("ALL", "ALL PRIVILEGES") else p)
         if obj is None and self.dialect != "mssql":
             if verb == "revoke" and "ALL PRIVILEGES" in privs:   # REVOKE ALL, GRANT OPTION
@@ -1744,7 +1839,10 @@ class FakeSql:
             if "GRANT OPTION" in privs:
                 u.grant_option.discard(key)
             if "ALL PRIVILEGES" in privs:
-                held.clear()
+                full = self._all_privileges(key) if self.dialect == "mssql" else None
+                if full is None:
+                    held.clear()
+                privs = privs + (full or [])      # SQL Server's REVOKE ALL takes ALL's set
             held[:] = [p for p in held if p not in privs]
             if not held:
                 del u.privileges[key]
@@ -1754,7 +1852,10 @@ class FakeSql:
             if len(u.privileges) >= MAX_USER_GRANTS:
                 return
             held = u.privileges.setdefault(key, [])
-        if "ALL PRIVILEGES" in privs or "ALL PRIVILEGES" in held:
+        full = self._all_privileges(key) if "ALL PRIVILEGES" in privs else None
+        if full is not None:      # ALL is stored as what it gives; a partial REVOKE keeps the rest
+            privs = full + [p for p in privs if p not in full and p != "ALL PRIVILEGES"]
+        if "ALL PRIVILEGES" in privs or "ALL PRIVILEGES" in held:     # an unmodeled kind
             held[:] = ["ALL PRIVILEGES"]
         else:
             held.extend(p for p in privs if p not in held)
@@ -1771,7 +1872,8 @@ class FakeSql:
         rows = [] if "*.*" in u.privileges else [[f"GRANT USAGE ON *.* TO {account}"]]
         for obj in sorted(u.privileges, key=lambda o: o != "*.*"):
             option = " WITH GRANT OPTION" if obj in u.grant_option else ""
-            rows.append([f"GRANT {', '.join(u.privileges[obj])} ON {obj} TO {account}{option}"])
+            names = ", ".join(self._privilege_names(obj, u.privileges[obj]))
+            rows.append([f"GRANT {names} ON {obj} TO {account}{option}"])
         if u.roles:
             rows.append([f"GRANT {','.join(u.roles)} TO {account}"])
         return rows
@@ -1791,11 +1893,11 @@ class FakeSql:
         if verb in ("grant", "revoke"):
             self._grant(s, verb)
         if verb == "create" and len(words) > 2 and words[1] == "table":
-            m = re.match(r"^create\s+(?:temporary\s+|temp\s+)?table\s+(if\s+not\s+exists\s+)?"
+            m = re.match(r"^create\s+(temporary\s+|temp\s+)?table\s+(if\s+not\s+exists\s+)?"
                          r"([`\"\[\]\w$.]+)\s*\((.*)\)", s, re.I | re.S)
             if m:
                 cols = []
-                for item in _split_top(m.group(3), r","):
+                for item in _split_top(m.group(4), r","):
                     tokens = item.split()
                     first = tokens[0] if tokens else ""
                     if first.lower() in ("primary", "unique", "key", "index", "constraint",
@@ -1807,7 +1909,8 @@ class FakeSql:
                         ty = re.match(r"[a-z_]\w*", tokens[1].lower()) if len(tokens) > 1 else None
                         cols.append((col.lower() if self.dialect == "postgres" and not quoted
                                      else col, ty.group(0)[:32] if ty else "text"))
-                answer = self._create_table(m.group(2).split("."), cols, bool(m.group(1)))
+                answer = self._create_table(m.group(3).split("."), cols, bool(m.group(2)),
+                                            bool(m.group(1)))
                 if answer is not None:
                     return answer
         if verb == "drop" and len(words) > 2 and words[1] == "table":
@@ -2460,7 +2563,8 @@ class FakeSql:
             line = f"created {u.kind}: {who}"
             if u.superuser:
                 line += " superuser"
-            grants = [f"{', '.join(p)}" + (f" ON {o}" if o else "") for o, p in u.privileges.items()]
+            grants = [", ".join(self._privilege_names(o, p)) + (f" ON {o}" if o else "")
+                      for o, p in u.privileges.items()]
             if grants:
                 line += "; granted " + "; ".join(grants)
             if u.roles:

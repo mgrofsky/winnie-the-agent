@@ -798,6 +798,99 @@ def test_postgres_created_tables_are_listed_by_pg_tables_and_dt():
 
 def test_a_created_table_does_not_replace_a_scenario_table():
     f = fake("mysql")
-    answers(f, "CREATE TABLE users (x int)", "INSERT INTO users VALUES (9)")
+    dup, guarded = answers(f, "CREATE TABLE users (x int)", "CREATE TABLE IF NOT EXISTS users (x int)")
+    assert dup == SqlError("42S01", "Table 'users' already exists", errno=1050)
+    assert not isinstance(guarded, SqlError)
+    answers(f, "INSERT INTO users VALUES (9)")
     assert len(answers(f, "SELECT * FROM users")[0].rows) == 3
     assert not f.created
+
+
+@pytest.mark.parametrize("dialect,error", [
+    ("mysql", SqlError("42S01", "Table 't' already exists", errno=1050)),
+    ("postgres", SqlError("42P07", 'relation "t" already exists')),
+    ("mssql", SqlError("2714", "There is already an object named 't' in the database.",
+                       errno=2714)),
+])
+def test_creating_a_created_table_again_keeps_it_and_its_rows(dialect, error):
+    f = fake(dialect)
+    answers(f, "CREATE TABLE t (a int, b varchar(10))", "INSERT INTO t VALUES (1, 'x')")
+    dup, guarded = answers(f, "CREATE TABLE t (z int)", "CREATE TABLE IF NOT EXISTS t (z int)")
+    assert dup == error
+    assert not isinstance(guarded, SqlError)
+    t = f.find_table(["t"])
+    assert [c for c, _ in t.columns] == ["a", "b"]
+    assert answers(f, "SELECT a, b FROM t")[0].rows == [[1, "x"]]
+
+
+def test_mysql_a_partial_revoke_of_all_leaves_the_rest_in_mysql_order():
+    f = fake("mysql")
+    answers(f, "CREATE USER bob", "GRANT ALL ON appdb.* TO bob", "GRANT ALL ON appdb.users TO bob",
+            "GRANT ALL PRIVILEGES ON *.* TO bob")
+    rows = answers(f, "SHOW GRANTS FOR bob")[0].rows
+    assert rows == [["GRANT ALL PRIVILEGES ON *.* TO `bob`@`%`"],
+                    ["GRANT ALL PRIVILEGES ON `appdb`.* TO `bob`@`%`"],
+                    ["GRANT ALL PRIVILEGES ON `appdb`.`users` TO `bob`@`%`"]]
+    answers(f, "REVOKE SELECT ON appdb.* FROM bob", "REVOKE DELETE, TRIGGER ON appdb.users FROM bob",
+            "REVOKE SHUTDOWN ON *.* FROM bob")
+    rows = answers(f, "SHOW GRANTS FOR bob")[0].rows
+    assert rows[1] == ["GRANT INSERT, UPDATE, DELETE, CREATE, DROP, REFERENCES, INDEX, ALTER, "
+                       "CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, CREATE VIEW, SHOW VIEW, "
+                       "CREATE ROUTINE, ALTER ROUTINE, EVENT, TRIGGER ON `appdb`.* TO `bob`@`%`"]
+    assert rows[2] == ["GRANT SELECT, INSERT, UPDATE, CREATE, DROP, REFERENCES, INDEX, ALTER, "
+                       "CREATE VIEW, SHOW VIEW ON `appdb`.`users` TO `bob`@`%`"]
+    assert rows[0][0].startswith("GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, "
+                                 "PROCESS, FILE,")
+    # Granting the missing privilege back is ALL again, and the model sees what the client sees.
+    answers(f, "GRANT SELECT ON appdb.* TO bob")
+    assert answers(f, "SHOW GRANTS FOR bob")[0].rows[1] == [
+        "GRANT ALL PRIVILEGES ON `appdb`.* TO `bob`@`%`"]
+    assert "ALL PRIVILEGES ON `appdb`.*" in f._context()
+    answers(f, "REVOKE ALL ON appdb.* FROM bob")
+    assert len(answers(f, "SHOW GRANTS FOR bob")[0].rows) == 2
+
+
+def test_postgres_and_mssql_grant_all_is_kept_as_the_privileges_it_gives():
+    f = fake("postgres")
+    answers(f, "CREATE ROLE app", "GRANT ALL ON TABLE users TO app",
+            "GRANT ALL PRIVILEGES ON DATABASE appdb TO app", "REVOKE TRUNCATE ON TABLE users FROM app",
+            "REVOKE TEMP ON DATABASE appdb FROM app")
+    privs = f.session_users[("role", "app", "")].privileges
+    assert privs["TABLE users"] == ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES", "TRIGGER"]
+    assert privs["DATABASE appdb"] == ["CREATE", "CONNECT"]
+    assert "ALL" not in f._context().split("earlier statements")[0]
+    answers(f, "GRANT ALL ON users, orders TO app", "REVOKE SELECT ON users, orders FROM app")
+    assert privs["users, orders"] == ["INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES",
+                                      "TRIGGER"]
+    m = fake("mssql")
+    answers(m, "CREATE USER app WITHOUT LOGIN", "GRANT ALL ON dbo.users TO app",
+            "REVOKE DELETE ON dbo.users FROM app", "GRANT ALL TO app")
+    privs = next(iter(m.session_users.values())).privileges
+    assert privs["dbo.users"] == ["INSERT", "REFERENCES", "SELECT", "UPDATE"]
+    assert privs[""][0] == "BACKUP DATABASE" and "CREATE TABLE" in privs[""]
+    answers(m, "GRANT CONNECT TO app", "REVOKE ALL FROM app")
+    assert privs[""] == ["CONNECT"]
+
+
+def test_mssql_dropping_a_created_database_drops_its_users_and_keeps_logins():
+    f = fake("mssql")
+    answers(f, "CREATE DATABASE loot", "CREATE LOGIN hax WITH PASSWORD = 'P@ssw0rd!'",
+            "USE loot", "CREATE USER hax FOR LOGIN hax", "CREATE ROLE ops",
+            "GRANT SELECT ON dbo.t TO hax", "USE master", "DROP DATABASE loot")
+    assert set(f.session_users) == {("login", "hax", "")}
+    assert "ON dbo.t" not in f._context().split("earlier statements")[0]
+    again = answers(f, "CREATE DATABASE loot", "USE loot", "CREATE USER hax FOR LOGIN hax",
+                    "CREATE LOGIN hax WITH PASSWORD = 'x'")
+    assert not any(isinstance(a, SqlError) for a in again[:3])
+    assert again[3].errno == 15025
+
+
+def test_dropping_a_created_database_keeps_mysql_grants_and_drops_postgres_database_grants():
+    f = fake("mysql")
+    answers(f, "CREATE DATABASE loot", "CREATE USER bob", "GRANT SELECT ON loot.* TO bob",
+            "DROP DATABASE loot")
+    assert ["GRANT SELECT ON `loot`.* TO `bob`@`%`"] in answers(f, "SHOW GRANTS FOR bob")[0].rows
+    p = fake("postgres")
+    answers(p, "CREATE DATABASE loot", "CREATE ROLE app", "GRANT CONNECT ON DATABASE loot TO app",
+            "GRANT SELECT ON users TO app", "DROP DATABASE loot")
+    assert list(p.session_users[("role", "app", "")].privileges) == ["users"]
