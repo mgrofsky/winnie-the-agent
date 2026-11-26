@@ -3,7 +3,7 @@
     python3 render_config.py SRC DST NAME SCENARIO PUBLIC_IP SMTP BUCKET PREFIX REGION OWNER \\
         TRACKED TRACKED_KEY NEVER_ACT_ON SHIP [INTERNETDB WANTED_KEY ANSWERS_KEY | lookup] \\
         [otx-dry-run | otx-send]
-    python3 render_config.py models DST PERSONA_MODEL ANALYST_MODEL REGION
+    python3 render_config.py models DST PERSONA_MODEL ANALYST_MODEL REGION [LISTENER_MODEL]
 
 deploy/aws/sensor.yaml copies this file out of the image (/app/deploy/aws/render_config.py)
 and runs it with the host's python3 (Amazon Linux 2023 ships 3.9, so nothing newer than
@@ -29,21 +29,29 @@ the addresses the host firewall pinned (/egress/otx-addresses). otx-dry-run keep
 true (written to a file, nothing sent); otx-send sets it false. Without it nothing about OTX
 is written.
 
-The models form edits DST in place (the model step, PersonaModelId / AnalystModelId): a
-non-empty persona model id sets [llm] to Bedrock with that model, a non-empty analyst model
-id sets [agents] the same way, both in REGION and with the default profile, whose
-credentials the step provides. An empty id leaves its section as it was.
+The models form edits DST in place (the model step, PersonaModelId / AnalystModelId /
+ListenerModelId): a non-empty persona model id sets [llm] to Bedrock with that model, a
+non-empty analyst model id sets [agents] the same way, both in REGION and with the default
+profile, whose credentials the step provides. An empty id leaves its section as it was. A
+non-empty listener model id sets [listeners] llm = true with that model; the listeners take
+their provider and region from [agents], so it also sets [agents] provider = bedrock and
+aws_region (not [agents] model, which stays the analyst's). An empty or missing listener
+model id sets [listeners] llm = false.
 """
 import configparser, re, sys
 if sys.argv[1:2] == ["models"]:
     dst, persona, analyst, region = sys.argv[2:6]
+    listener = sys.argv[6] if len(sys.argv) > 6 else ""
     src = dst
-    want = {}
+    want = {"listeners": {"llm": "false"}}
     if persona:
         want["llm"] = {"llm_provider": "AWS", "model_name": persona, "aws_region": region,
                        "aws_credentials_profile": "default"}
     if analyst:
         want["agents"] = {"provider": "bedrock", "model": analyst, "aws_region": region}
+    if listener:
+        want["listeners"] = {"llm": "true", "model": listener}
+        want.setdefault("agents", {}).update(provider="bedrock", aws_region=region)
 else:
     (src, dst, name, scenario, public_ip, smtp, bucket, prefix, region, owner, tracked,
      tracked_key, never, ship) = sys.argv[1:15]

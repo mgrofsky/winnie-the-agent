@@ -59,7 +59,7 @@ and one scoped role policy and opens nothing inbound.
 No model by default: the host has no route to a model API, so `[listeners] llm = false`,
 the SSH persona gives canned replies and triage is deterministic. [Models on
 Bedrock](#models-on-bedrock-optional) adds a private path to Amazon Bedrock for the persona,
-the analyst or both, in a second stack (`models.yaml`).
+the analyst, the listeners or any of them, in a second stack (`models.yaml`).
 
 ### Cost
 
@@ -880,17 +880,26 @@ already created stay on OTX; delete them there.
 `Description` text of `TrackedExport`, `AgentsIntervalSeconds`, `TailscaleEnabled` and
 `UiTailnetSignIn` moved into YAML comments above each parameter, as the InternetDB
 switches already do. The CloudFormation console no longer shows those four descriptions;
-nothing else changed. The deploy copy has about 180 bytes left.
+nothing else changed.
 
 Not proven without a real deploy: the SecureString read at boot, the bind mount of the key
 file, the resolution of `otx.alienvault.com` on Amazon Linux 2023, and a real submission.
 
 ## Models on Bedrock (optional)
 
-Off by default. With it off the sensor has no model: the SSH persona gives canned replies
-and triage is deterministic. With it on, the SSH persona, the analyst or both call a model
-on Amazon Bedrock in the sensor's own account and region, through a private endpoint,
-with nothing else opened.
+Off by default. With it off the sensor has no model: the SSH persona gives canned replies,
+triage is deterministic and the listeners answer with canned replies and protocol errors.
+With it on, the SSH persona, the analyst, the listeners' model answers or any of them call
+a model on Amazon Bedrock in the sensor's own account and region, through a private
+endpoint, with nothing else opened.
+
+| Parameter (both stacks) | Caller | Container | Role | `config.ini` |
+|---|---|---|---|---|
+| `PersonaModelId` | SSH persona | `ssh` | `<NamePrefix>-model-persona` | `[llm]` |
+| `AnalystModelId` | analyst | `agents` | `<NamePrefix>-model-analyst` | `[agents]` |
+| `ListenerModelId` | listeners (SQL, HTTP, Redis model answers) | `listeners` | `<NamePrefix>-model-listener` | `[listeners] llm = true`, `model`; `[agents] provider`, `aws_region` |
+
+Each is a Bedrock model or inference profile id, empty (the default) for none.
 
 Two parts, both needed:
 
@@ -898,16 +907,20 @@ Two parts, both needed:
   interface endpoints in the sensor's network, `bedrock-runtime` and `sts`, behind the
   existing endpoint security group (which already admits tcp 443 from the instance only,
   so no rule is added), and one role per caller: `<NamePrefix>-model-persona` (if
-  `PersonaModelId` is set) may call `bedrock:InvokeModel` on the persona's model only, and
-  `<NamePrefix>-model-analyst` (if `AnalystModelId` is set) on the analyst's model only,
+  `PersonaModelId` is set) may call `bedrock:InvokeModel` on the persona's model only,
+  `<NamePrefix>-model-analyst` (if `AnalystModelId` is set) on the analyst's model only, and
+  `<NamePrefix>-model-listener` (if `ListenerModelId` is set) on the listeners' model only,
   each only through that `bedrock-runtime` endpoint (`aws:SourceVpce`), for at most an
   hour per session. The instance role gets one permission, `sts:AssumeRole` on those
   roles, and nothing on Bedrock itself. It is a separate stack because `sensor.yaml`'s deploy copy must stay under
   CloudFormation's 51,200-byte inline template limit and these resources do not fit there.
-- **`PersonaModelId` and `AnalystModelId`** on the sensor stack, the same values as in
-  `models.yaml`. Either may be empty; empty means that part stays without a model. With
-  both empty (the default) `sensor.yaml` adds nothing and its user data is the same as
-  without the option. `sensor.yaml` itself never gains a resource for this.
+- **`PersonaModelId`, `AnalystModelId` and `ListenerModelId`** on the sensor stack, the
+  same values as in `models.yaml`. Any may be empty; empty means that part stays without
+  a model. With all three empty (the default) `sensor.yaml` adds nothing and its user data
+  is the same as without the option. `sensor.yaml` itself never gains a resource for this.
+  To fit its deploy copy under the 51,200-byte limit, the three parameters' descriptions
+  are a YAML comment above them in `sensor.yaml` (`models.yaml` keeps them); the deploy
+  copy has about 65 bytes left.
 
 A model id is either an inference profile id, a geographic prefix (`us.`, `us-gov.`,
 `eu.`, `apac.`, `jp.`, `au.` or `global.`) and then the model id
@@ -922,18 +935,18 @@ grant derives the profile's model from the parts of the id).
 
 ### Which API calls, and the grant
 
-Both clients use the Converse API without streaming: the persona through
-`langchain_aws` `ChatBedrockConverse` (`ainvoke`, never `astream`), the analyst through
-boto3 `converse`. IAM authorises Converse as `bedrock:InvokeModel`; there is no
+Every client uses the Converse API without streaming: the persona through
+`langchain_aws` `ChatBedrockConverse` (`ainvoke`, never `astream`), the analyst and the
+listeners through boto3 `converse`. IAM authorises Converse as `bedrock:InvokeModel`; there is no
 `bedrock:Converse` action. `bedrock:InvokeModelWithResponseStream` (what ConverseStream
 needs) is not granted, so a client that started streaming would be refused, not widened.
 `ChatBedrockConverse` (langchain-aws 1.4) also builds a `bedrock` control-plane client but
 calls it only for application inference profile ARNs, which the id pattern does not
 allow.
 
-The endpoint policy grants both callers' models; each caller's role grants its own model
-only, so the persona's credentials cannot invoke the analyst's model and the reverse
-(`check.py` evaluates both roles with different models for the two callers):
+The endpoint policy grants every configured caller's model; each caller's role grants its
+own model only, so no caller's credentials can invoke another caller's model (`check.py`
+evaluates every role with a different model for each caller):
 
 | Model id | Resources granted `bedrock:InvokeModel` |
 |---|---|
@@ -957,7 +970,8 @@ region where the model is offered on demand there. Seen on a real account with a
 profile: calls served in another region were denied by a region-restricting SCP until it
 excepted the profile (a condition on `bedrock:InferenceProfileArn` keeps the exception to
 that profile), and succeeded after. An organization policy that denies Bedrock outright
-needs the two model roles excepted in the same way.
+needs the model roles (persona, analyst and listener, whichever are deployed) excepted in
+the same way.
 
 **Model access.** The account must have access to each model enabled in the Bedrock
 console (Model access) in the sensor's region, and for a profile, in the regions it
@@ -975,9 +989,11 @@ run described below.
 
 ### Which containers make the calls, and what they gain
 
-The persona runs in the `ssh` container and the analyst in the `agents` container. Both
-are bridged (front-end network 172.30.0.0/24 and agents network 172.30.1.0/24), run as uid
-10001 with every capability dropped, and today can open no connection (`DOCKER-USER`
+The persona runs in the `ssh` container, the analyst in the `agents` container and the
+listeners' model answers in the `listeners` container. All three are bridged (`ssh` and
+`listeners` on the front-end network 172.30.0.0/24, `agents` on the agents network
+172.30.1.0/24), run as uid 10001 with every capability dropped, and today can open no
+connection (`DOCKER-USER`
 drops everything but replies) and cannot reach the metadata service (dropped, and the
 IMDS hop limit of 1 stops a bridged container's answer anyway). The option keeps all of
 that and adds, for exactly the containers whose model id is set:
@@ -986,15 +1002,16 @@ that and adds, for exactly the containers whose model id is set:
 |---|---|---|
 | `ssh` (persona; faces attackers) | no outbound connection, no metadata service, no AWS credentials | tcp 443 to one address, the `bedrock-runtime` endpoint's, from its fixed address 172.30.0.10; read-only credentials of `<NamePrefix>-model-persona` (the persona's model only) |
 | `agents` (analyst) | same as `ssh` | the same from 172.30.1.10, with `<NamePrefix>-model-analyst` (the analyst's model only) |
-| `listeners`, `ui` | no outbound connection, no metadata service, no AWS credentials | unchanged |
-| `exporter` (host network, instance role) | the instance role | can also assume the two model roles |
+| `listeners` (SQL, HTTP, Redis and Telnet traps; faces attackers) | same as `ssh` | the same from 172.30.0.11, with `<NamePrefix>-model-listener` (the listeners' model only) |
+| `ui` | no outbound connection, no metadata service, no AWS credentials | unchanged |
+| `exporter` (host network, instance role) | the instance role | can also assume the model roles |
 | host (root) | the instance role | assumes each configured caller's role every 15 minutes through the `sts` endpoint |
 
 How it is wired (`deploy/aws/host/sensor-model.sh`, run by the bootstrap's model step and
 then by `sensor-model.timer` and at every boot):
 
 - **Network.** One `DOCKER-USER` accept per caller: `-s 172.30.0.10 -d <endpoint address>
-  -p tcp --dport 443 -j ACCEPT` (and the same from 172.30.1.10). The endpoint's address is
+  -p tcp --dport 443 -j ACCEPT` (and the same from 172.30.1.10 and 172.30.0.11). The endpoint's address is
   looked up on the host and must be inside the VPC; the containers get the endpoint's name
   pinned in `/etc/hosts` (`extra_hosts`), so they need no DNS. Each caller is given its
   fixed address by a compose overlay (`docker-compose.model.yml`), added to
@@ -1003,13 +1020,14 @@ then by `sensor-model.timer` and at every boot):
   other address is removed (an old address may since belong to something else in the
   VPC), and then the overlay is rewritten with the new pin, checked by `docker compose
   config`, and only the running callers are recreated (`docker compose up -d --no-deps
-  ssh` or `agents`). If the new overlay is refused, the containers keep the old pin, which
+  ssh`, `agents` or `listeners`). If the new overlay is refused, the containers keep the old pin, which
   no rule lets them reach any more, so their calls fail until the next run succeeds.
 - **Credentials.** For each configured caller the host assumes that caller's role with
   the instance role (one-hour sessions) and writes the credentials to its own directory,
-  `/run/sensor-model/persona` or `/run/sensor-model/analyst` (tmpfs, directory uid 10001
-  mode 0500, files mode 0400, under a root-only `/run/sensor-model`). `ssh` mounts only
-  the persona's directory and `agents` only the analyst's, read-only, at `/model`. boto3
+  `/run/sensor-model/persona`, `/run/sensor-model/analyst` or `/run/sensor-model/listener`
+  (tmpfs, directory uid 10001 mode 0500, files mode 0400, under a root-only
+  `/run/sensor-model`). `ssh` mounts only the persona's directory, `agents` only the
+  analyst's and `listeners` only the listener's, read-only, at `/model`. boto3
   reads them through `credential_process = cat /model/creds.json`
   (`AWS_CONFIG_FILE=/model/config`) and reads them again before they expire. The bootstrap
   enables and starts `sensor-model.timer` (cloud-init runs after `timers.target`, so a
@@ -1019,8 +1037,30 @@ then by `sensor-model.timer` and at every boot):
   the metadata service. The instance role's credentials never reach a container.
 - **Config.** `render_config.py models` sets `[llm] llm_provider = AWS`, `model_name`,
   `aws_region` and `aws_credentials_profile = default` (persona) and `[agents] provider =
-  bedrock`, `model`, `aws_region` (analyst) in `config.ini`, only after the overlay has
-  passed `docker compose config`. `[listeners] llm` stays `false`.
+  bedrock`, `model`, `aws_region` (analyst) and `[listeners] llm = true`, `model`
+  (listeners) in `config.ini`, only after the overlay has passed `docker compose config`.
+  Without a listener id it writes `[listeners] llm = false`.
+- **Which keys the listeners read.** The listeners build their model from `[listeners]
+  model` with the provider and region of `[agents]` (`provider`, `aws_region`,
+  `aws_credentials_profile`). So a listener id also writes `[agents] provider = bedrock`
+  and `aws_region`, and never `[agents] model`, which stays the analyst's. With the
+  analyst id empty the `agents` container then reads `provider = bedrock` with the
+  template's model and has no credentials, so it runs without a model as before (it logs
+  "no AWS credentials for Bedrock" instead of "no Anthropic credentials", after boto3's
+  metadata-service lookup times out against the `DOCKER-USER` drop). No profile is
+  written, so boto3 uses its default chain: `AWS_CONFIG_FILE=/model/config`, the listener
+  role's credentials.
+- **The Telnet persona in the `listeners` container.** It uses the `[llm]` section, as
+  SSH does, so it is on only when `PersonaModelId` is set (`[llm] llm_provider = AWS`,
+  `aws_credentials_profile = default`) and `[listeners] telnet_persona` is left at its
+  default. In the `listeners` container the default profile is the listener role, which
+  may invoke the listeners' model only, so unless `ListenerModelId` and `PersonaModelId`
+  are the same id every Telnet command the persona sends to the model is refused: each
+  one logs a `Model error` event (`AccessDeniedException`) and gets the canned shell's
+  reply, and nothing stops the next command trying again. With a scenario that has Telnet
+  on (`sip-provider`), set the same id for both. The other way out, `[listeners]
+  telnet_persona = false`, is a hand edit of `config.ini` on the host (as root), and a
+  replaced instance renders `config.ini` again without it.
 
 **Why this is acceptable for the attacker-facing `ssh` container.** The persona sends
 attacker input to the model as text and never runs it; reaching the container's own
@@ -1032,9 +1072,20 @@ host they are refused everywhere; at most an hour of validity. They could spend 
 of the persona's model outside the persona's budget, up to the account's Bedrock quotas
 for that model, and nothing else: no other model, no other AWS action, no other address,
 no metadata service, no instance role. Watch the model's spend (a budget alarm on
-Bedrock) as the backstop. If both callers use the same model id, the persona's role can
-of course call that model too; give the analyst a different model if you want its quota
-kept apart.
+Bedrock) as the backstop. If two callers use the same model id, each one's role can of
+course call that model; give the analyst a different model if you want its quota kept
+apart.
+
+**The same for the `listeners` container.** It also faces attackers and also sends their
+input to the model only as text (`agents.llm.untrusted_block`), schema-checked, and never
+runs it. Before the option it can reach nothing: no outbound connection, no metadata
+service, no credentials. With `ListenerModelId` set a compromised `listeners` container
+gains the same as a compromised `ssh` container, for its own role: tcp 443 to the
+`bedrock-runtime` endpoint's one address from 172.30.0.11, and one-hour credentials that
+allow only `bedrock:InvokeModel` on the listeners' model through this VPC's endpoint. It
+gets no accept to the `sts` endpoint (the host assumes the role), no other model, no
+metadata service and no instance role. With `ListenerModelId` empty it gets no
+credentials directory, no overlay entry and no accept rule, so it is exactly as before.
 
 **The design not taken.** The obvious alternative is to let the callers use the instance
 role: raise the IMDS hop limit to 2 and allow their addresses to reach 169.254.169.254,
@@ -1056,6 +1107,11 @@ template defaults:
   source in `deep` mode gets twice the per-session and per-source limits; the daily total
   does not change. A day at the cap is therefore 3,000,000 tokens for the persona; once
   it is reached every session gets the canned reply until the next UTC day.
+- **Listeners** (`[budget]`, the same caps as the persona): every listener model call
+  (SQL, HTTP and Redis answers, and the Telnet persona) is charged to the same
+  per-session, per-source and daily token budgets as the SSH persona, and shares their
+  3,000,000-token daily total with it. `[listeners] llm_max_inflight` (4) bounds calls in
+  flight and `llm_attempts` (2) the requests per answer.
 - **Analyst** (`[agents]`): at most 20 calls per run and 500 per UTC day, each answer at
   most 2,048 output tokens, so a day at the cap is at most about 1,000,000 output tokens.
   Each call's input is a session or campaign summary that triage clips (commands,
@@ -1068,7 +1124,7 @@ The counters persist on the host, so a restart does not reset the day.
 
 The `sts` endpoint's private DNS name applies to the whole VPC, so every regional STS call
 from the sensor's network goes through it, not only the model step's. Its policy allows
-assuming the two model roles and `sts:GetCallerIdentity` (which needs no permission and
+assuming the model roles and `sts:GetCallerIdentity` (which needs no permission and
 only names the caller), and nothing else. So `aws sts get-caller-identity` in a session on
 the host works as before, but any other STS call from the host, such as an operator's
 `aws sts assume-role` into another role, is refused with `AccessDenied` while
@@ -1078,7 +1134,10 @@ the host works as before, but any other STS call from the host, such as an opera
 ### Cost
 
 Two more interface endpoints, each priced as one interface endpoint (about 7 USD a month
-in a typical region), plus the model's own token prices on Bedrock. Nothing else.
+in a typical region), plus the model's own token prices on Bedrock. Nothing else. The
+listeners' calls add tokens but no new cap: they are charged to the same `[budget]` caps
+as the persona (above), so a day at the cap is still 3,000,000 tokens for the two
+together.
 
 ### Turning it on
 
@@ -1090,13 +1149,14 @@ aws cloudformation deploy --stack-name winnie-models \
   --template-file deploy/aws/models.yaml --capabilities CAPABILITY_NAMED_IAM $S \
   --parameter-overrides NamePrefix=winnie-sensor VpcId=<VpcId> SubnetId=<SubnetId> \
     EndpointSecurityGroupId=<EndpointSecurityGroupId> \
-    PersonaModelId=us.anthropic.claude-haiku-5-5 AnalystModelId= \
+    PersonaModelId=us.anthropic.claude-haiku-5-5 AnalystModelId= ListenerModelId= \
   --no-execute-changeset
 ```
 
 Expect `Add` changes for `BedrockEndpoint`, `StsEndpoint`, `InstanceAssumeModelRole` and
-one role per model id set: `PersonaRole`, `AnalystRole` or both. Then a reviewed change set as in step 5 with the same
-`PersonaModelId` and `AnalystModelId` (the image must be built from this commit or later).
+one role per model id set: `PersonaRole`, `AnalystRole`, `ListenerRole` or several. Then a
+reviewed change set as in step 5 with the same `PersonaModelId`, `AnalystModelId` and
+`ListenerModelId` (the image must be built from this commit or later).
 Expect `Modify` of `LaunchTemplate` and the instance and its address association
 replaced, nothing else. Models stack first: the bootstrap waits up to two and a half
 minutes for the endpoint's private name and otherwise starts without a model.
@@ -1108,18 +1168,21 @@ Then check, on the host (`sudo -i`, `cd /opt/sensor`):
       (without waiting for a reboot).
 - [ ] `ls -l /run/sensor-model/*/` shows `creds.json` and `config` at `-r--------`, uid
       10001, in a directory per configured caller only; `docker inspect` of `ssh` shows
-      only `/run/sensor-model/persona` mounted, and of `agents` only
-      `/run/sensor-model/analyst`.
+      only `/run/sensor-model/persona` mounted, of `agents` only
+      `/run/sensor-model/analyst`, and of `listeners` only `/run/sensor-model/listener`.
 - [ ] `aws sts get-caller-identity` on the host names the instance role; `aws sts
       assume-role` into any other role is refused.
-- [ ] `iptables -S DOCKER-USER` shows one `-s 172.30.0.10/32 -d <address>/32 -p tcp -m tcp
-      --dport 443 -j ACCEPT` per configured caller, above the drops, and nothing else new.
+- [ ] `iptables -S DOCKER-USER` shows one `-s <caller>/32 -d <address>/32 -p tcp -m tcp
+      --dport 443 -j ACCEPT` per configured caller (172.30.0.10 `ssh`, 172.30.1.10
+      `agents`, 172.30.0.11 `listeners`), above the drops, and nothing else new.
 - [ ] The callers reach nothing else: `docker compose exec -T ssh python -c "import socket;
       socket.create_connection(('192.0.2.1', 443), timeout=5)"` times out, as does the
-      same to the `sts` endpoint's address; from `listeners`, a connection to the
-      `bedrock-runtime` endpoint's address times out too.
+      same to the `sts` endpoint's address; from `listeners` (when `ListenerModelId` is
+      empty), a connection to the `bedrock-runtime` endpoint's address times out too.
 - [ ] An SSH session to the sensor gets model replies, and the host log group shows no
       `Model error` events. With the analyst on, the next `run-all` reports `llm_used`.
+      With the listeners on, an unknown SQL statement after login gets an answer whose
+      event data says `llm`.
 - [ ] From outside the sensor's VPC, credentials copied from
       `/run/sensor-model/persona/creds.json` are refused for `bedrock-runtime converse`
       (the `aws:SourceVpce` condition). With both models on and different, the persona's
@@ -1128,7 +1191,7 @@ Then check, on the host (`sudo -i`, `cd /opt/sensor`):
 
 ### Rollback
 
-A change set on the sensor stack with both model ids empty (instance replaced, back to no
+A change set on the sensor stack with every model id empty (instance replaced, back to no
 model), then delete the `winnie-models` stack. Deleting the models stack alone leaves the
 sensor configured for a model it can no longer reach: every call fails and falls back to
 canned replies, and the timer logs a failure every 15 minutes.
@@ -1152,13 +1215,15 @@ a tailnet. Seen there:
 
 What is checked offline on every change: `check.py` evaluates the endpoint policy and each
 caller's role for sample ids (every geographic prefix among them) and refuses any
-widening, including a role that covers the other caller's model (the mutation tests in
-`tests/test_deploy_aws.py` cover each rule); the user data with both ids empty is byte for
+widening, including a role that covers another caller's model (the mutation tests in
+`tests/test_deploy_aws.py` cover each rule); the user data with every id empty is byte for
 byte what it was before the option for every console and tailnet switch combination; and
 `sensor-model.sh` runs in the tests against fake `aws`, `getent`, `iptables` and `docker`.
 
 Still unproven:
 
+- the listener caller (`ListenerModelId`) on a real host: it is built and tested offline
+  exactly as the other two, but has not been deployed;
 - that CloudFormation leaves `LaunchTemplate` and the instance alone on a stack updated
   to this template with both ids empty (the user data is the same, but the template text
   of the launch template is not; check the change set);
@@ -1192,7 +1257,7 @@ Still unproven:
   them on 443 is pointless.
 - Models only on Amazon Bedrock in the sensor's own account and region, and only through
   `models.yaml` (see [Models on Bedrock](#models-on-bedrock-optional)); no other model
-  provider has an egress path. `[listeners] llm` stays off.
+  provider has an egress path. `[listeners] llm` stays off unless `ListenerModelId` is set.
 - No direct Shodan InternetDB lookups from the agents container (`[connector.internetdb]`,
   see the operations guide): it reads attacker-influenced text and runs the model, and
   gets no egress. Either the exporter looks the addresses up

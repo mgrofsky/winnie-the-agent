@@ -4,13 +4,13 @@ Description: >-
   and region, after sensor.yaml: a bedrock-runtime and an sts interface endpoint in the
   sensor's network, and one role per caller that may only invoke that caller's model
   through that endpoint. The sensor host assumes each role and hands its credentials to
-  that caller's container alone. Deploy sensor.yaml with the same two model ids.
+  that caller's container alone. Deploy sensor.yaml with the same three model ids.
 
 # Why a separate stack: sensor.yaml's comment-stripped copy must stay under CloudFormation's
 # 51,200-byte inline template limit, and these resources do not fit there.
 #
-# Both clients use the Converse API (the persona through langchain_aws ChatBedrockConverse,
-# the analyst through boto3), and neither streams. Converse is authorised as
+# Every client uses the Converse API (the persona through langchain_aws ChatBedrockConverse,
+# the analyst and the listeners through boto3), and none streams. Converse is authorised as
 # bedrock:InvokeModel (there is no bedrock:Converse action); ConverseStream would need
 # bedrock:InvokeModelWithResponseStream, which is not granted, so a client that started
 # streaming would be refused rather than widen anything.
@@ -25,10 +25,11 @@ Description: >-
 #   (AllowedPattern), so it is the second and third parts. The id is padded with ".."
 #   before splitting so both parts exist whichever branch CloudFormation evaluates.
 #
-# One role per caller, not one shared role: the ssh container faces attackers, and with a
-# shared role its credentials could also invoke the analyst's model. Two roles keep each
-# grant a fixed part of this template that check.py evaluates offline; one role with a
-# session policy per caller would put the narrowing in the host script instead.
+# One role per caller, not one shared role: the ssh and listeners containers face
+# attackers, and with a shared role their credentials could also invoke another caller's
+# model. A role each keeps each grant a fixed part of this template that check.py evaluates
+# offline; one role with a session policy per caller would put the narrowing in the host
+# script instead.
 
 Parameters:
   NamePrefix:
@@ -60,10 +61,17 @@ Parameters:
     MaxLength: 100
     AllowedPattern: '^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
     Description: Bedrock model or inference profile id for the analyst; empty for none.
+  ListenerModelId:
+    Type: String
+    Default: ""
+    MaxLength: 100
+    AllowedPattern: '^(((us|us-gov|eu|apac|jp|au|global)\.)?[a-z0-9-]+\.[a-z0-9-]+(:[a-z0-9]+){0,2})?$'
+    Description: Bedrock model or inference profile id for the listeners; empty for none.
 
 Conditions:
   PersonaOn: !Not [!Equals [!Ref PersonaModelId, ""]]
   AnalystOn: !Not [!Equals [!Ref AnalystModelId, ""]]
+  ListenerOn: !Not [!Equals [!Ref ListenerModelId, ""]]
   PersonaProfile: !Or
     - !Equals [!Select [0, !Split [".", !Ref PersonaModelId]], us]
     - !Equals [!Select [0, !Split [".", !Ref PersonaModelId]], us-gov]
@@ -80,12 +88,20 @@ Conditions:
     - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], jp]
     - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], au]
     - !Equals [!Select [0, !Split [".", !Ref AnalystModelId]], global]
+  ListenerProfile: !Or
+    - !Equals [!Select [0, !Split [".", !Ref ListenerModelId]], us]
+    - !Equals [!Select [0, !Split [".", !Ref ListenerModelId]], us-gov]
+    - !Equals [!Select [0, !Split [".", !Ref ListenerModelId]], eu]
+    - !Equals [!Select [0, !Split [".", !Ref ListenerModelId]], apac]
+    - !Equals [!Select [0, !Split [".", !Ref ListenerModelId]], jp]
+    - !Equals [!Select [0, !Split [".", !Ref ListenerModelId]], au]
+    - !Equals [!Select [0, !Split [".", !Ref ListenerModelId]], global]
 
 Rules:
   NeedsAModel:
     Assertions:
-      - Assert: !Not [!And [!Equals [!Ref PersonaModelId, ""], !Equals [!Ref AnalystModelId, ""]]]
-        AssertDescription: Set PersonaModelId, AnalystModelId or both (with neither, do not deploy this stack).
+      - Assert: !Not [!And [!Equals [!Ref PersonaModelId, ""], !Equals [!Ref AnalystModelId, ""], !Equals [!Ref ListenerModelId, ""]]]
+        AssertDescription: Set PersonaModelId, AnalystModelId, ListenerModelId or more than one (with none, do not deploy this stack).
 
 Resources:
   # bedrock:InvokeModel on the configured models, for any principal that comes through this
@@ -132,6 +148,21 @@ Resources:
                       N: !Select [2, !Split [".", !Sub "${AnalystModelId}.."]]
                 - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${AnalystModelId}
             - !Ref AWS::NoValue
+          - !If
+            - ListenerOn
+            - Sid: Listener
+              Effect: Allow
+              Principal: "*"
+              Action: bedrock:InvokeModel
+              Resource: !If
+                - ListenerProfile
+                - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${ListenerModelId}
+                  - !Sub
+                    - arn:${AWS::Partition}:bedrock:*::foundation-model/${P}.${N}
+                    - P: !Select [1, !Split [".", !Sub "${ListenerModelId}.."]]
+                      N: !Select [2, !Split [".", !Sub "${ListenerModelId}.."]]
+                - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ListenerModelId}
+            - !Ref AWS::NoValue
 
   # Through this endpoint: assuming the callers' roles, and GetCallerIdentity. Its private
   # name answers for the whole VPC, so every other STS call from the sensor's network is
@@ -157,6 +188,7 @@ Resources:
             Resource:
               - !If [PersonaOn, !GetAtt PersonaRole.Arn, !Ref AWS::NoValue]
               - !If [AnalystOn, !GetAtt AnalystRole.Arn, !Ref AWS::NoValue]
+              - !If [ListenerOn, !GetAtt ListenerRole.Arn, !Ref AWS::NoValue]
           - Sid: WhoAmI
             Effect: Allow
             Principal: "*"
@@ -166,7 +198,8 @@ Resources:
   # The callers' roles, one each: its caller's model only, and only through the
   # bedrock-runtime endpoint (aws:SourceVpce), so the credentials are of no use anywhere
   # else. Sessions last at most an hour. Only the sensor's instance role may assume them.
-  # The ssh container gets PersonaRole's credentials, the agents container AnalystRole's.
+  # The ssh container gets PersonaRole's credentials, the agents container AnalystRole's and
+  # the listeners container ListenerRole's.
   PersonaRole:
     Type: AWS::IAM::Role
     Condition: PersonaOn
@@ -233,6 +266,39 @@ Resources:
                   StringEquals:
                     aws:SourceVpce: !Ref BedrockEndpoint
 
+  ListenerRole:
+    Type: AWS::IAM::Role
+    Condition: ListenerOn
+    Properties:
+      RoleName: !Sub ${NamePrefix}-model-listener
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${NamePrefix}-host
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-model
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Listener
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !If
+                  - ListenerProfile
+                  - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${ListenerModelId}
+                    - !Sub
+                      - arn:${AWS::Partition}:bedrock:*::foundation-model/${P}.${N}
+                      - P: !Select [1, !Split [".", !Sub "${ListenerModelId}.."]]
+                        N: !Select [2, !Split [".", !Sub "${ListenerModelId}.."]]
+                  - - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${ListenerModelId}
+                Condition:
+                  StringEquals:
+                    aws:SourceVpce: !Ref BedrockEndpoint
+
   # The sensor's instance role may assume the callers' roles and gets nothing on Bedrock
   # itself. Deleting this stack removes this policy with the rest.
   InstanceAssumeModelRole:
@@ -249,6 +315,7 @@ Resources:
             Resource:
               - !If [PersonaOn, !GetAtt PersonaRole.Arn, !Ref AWS::NoValue]
               - !If [AnalystOn, !GetAtt AnalystRole.Arn, !Ref AWS::NoValue]
+              - !If [ListenerOn, !GetAtt ListenerRole.Arn, !Ref AWS::NoValue]
 
 Outputs:
   PersonaRoleArn:
@@ -257,5 +324,8 @@ Outputs:
   AnalystRoleArn:
     Condition: AnalystOn
     Value: !GetAtt AnalystRole.Arn
+  ListenerRoleArn:
+    Condition: ListenerOn
+    Value: !GetAtt ListenerRole.Arn
   BedrockEndpointId:
     Value: !Ref BedrockEndpoint
