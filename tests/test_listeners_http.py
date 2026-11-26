@@ -11,13 +11,14 @@ from agents.llm import LLMOutputError
 from listeners import http
 from listeners.base import ListenerContext, ServiceSettings
 from listeners.events import EventWriter
-from scenarios.loader import LoadedScenario
+from scenarios.loader import Honeytoken, LoadedScenario
 from scenarios.schema import LoginPolicy, Scenario
+from scenarios.tokens import honeytoken_value
 
 POLICY = LoginPolicy(accept="after_n", after_n_min=2, after_n_max=2)
 
 
-def make_scenario(openapi=None) -> LoadedScenario:
+def make_scenario(openapi=None, tokens=(), **http_overrides) -> LoadedScenario:
     http_svc = {
         "enabled": True, "port": 0, "server_header": "nginx/1.24.0 (Ubuntu)",
         "login_path": "/portal/login", "login_title": "Northwind Patient Portal",
@@ -42,6 +43,7 @@ def make_scenario(openapi=None) -> LoadedScenario:
     }
     if openapi is not None:
         http_svc["openapi"] = openapi
+    http_svc.update(http_overrides)
     scn = Scenario.model_validate({
         "name": "t_portal", "title": "Test portal", "description": "test",
         "identity": {"org_name": "Northwind Clinic", "hostname": "web01",
@@ -55,7 +57,9 @@ def make_scenario(openapi=None) -> LoadedScenario:
                 "seed_rows": [[1, "Avery Hartwell"], [2, "Jordan Okonkwo"], [3, "Riley Lindqvist"]]}]}]},
         },
     })
-    return LoadedScenario(scenario=scn, seed="t")
+    issued = {name: Honeytoken(name, kind, honeytoken_value(kind, "t", "t_portal", name), ("x",))
+              for name, kind in tokens}
+    return LoadedScenario(scenario=scn, seed="t", honeytokens=issued)
 
 
 class RaisingLLM:
@@ -71,10 +75,11 @@ class FixedLLM:
         return self.obj
 
 
-async def start_server(json_llm=None, openapi=None):
-    scen = make_scenario(openapi)
+async def start_server(json_llm=None, openapi=None, tokens=(), **http_overrides):
+    scen = make_scenario(openapi, tokens, **http_overrides)
     ctx = ListenerContext(EventWriter(None), scenario=scen, bind_host="127.0.0.1",
-                          budget=Budget() if json_llm else None, json_llm=json_llm)
+                          budget=Budget() if json_llm else None, json_llm=json_llm,
+                          honeytokens=scen.recognised_tokens())
     settings = ServiceSettings(name="http", enabled=True, port=0, policy=POLICY,
                                accounts=scen.accounts_for("http"))
     ctx.settings["http"] = settings
@@ -462,3 +467,268 @@ async def test_http_ladder_deadline_stops_the_second_attempt():
     finally:
         await stop(servers)
     assert status == 404 and llm.calls == 1
+
+
+# ---- unknown paths outside the API prefix ---------------------------------------------------
+
+class PageLLM:
+    """Scripted page model that records what it was asked."""
+
+    def __init__(self, out):
+        self.out = out
+        self.users = []
+
+    @property
+    def calls(self):
+        return len(self.users)
+
+    def complete_json(self, system, user, schema):
+        self.users.append(user)
+        return self.out
+
+
+GOOD_PAGE = {"status": 200, "content_type": "text/html",
+             "body": "<html><body><h1>Maintenance</h1><p>Back soon.</p></body></html>"}
+
+
+def unknown_events(ctx, path):
+    return [e["data"] for e in events(ctx, "command") if e["data"]["path"] == path]
+
+
+CANNED_NOT_FOUND = ["/favicon.ico", "/wp-login.php", "/xmlrpc.php", "/phpinfo.php", "/actuator",
+                    "/actuator/health", "/actuator/env", "/admin", "/login", "/config.json",
+                    "/cgi-bin/", "/cgi-bin/test.cgi", "/server-status", "/.env", "/.git/config",
+                    "/.git/HEAD", "/.aws/credentials"]
+
+
+async def test_probed_paths_answer_canned_and_never_reach_the_model():
+    llm = PageLLM(GOOD_PAGE)
+    ctx, servers, port = await start_server(json_llm=llm)
+    try:
+        for path in CANNED_NOT_FOUND:
+            status, headers, body = await req(port, "GET", path)
+            assert status == 404, path
+            assert b"<center><h1>404 Not Found</h1></center>" in body and b"nginx/1.24.0" in body
+        status, headers, body = await req(port, "GET", "/robots.txt")
+        assert status == 200 and body == b"User-agent: *\nDisallow: /\n"
+        assert headers["content-type"] == "text/plain"
+        status, _, _ = await req(port, "POST", "/robots.txt", body=b"a=1")
+        assert status == 405
+        await settle()
+    finally:
+        await stop(servers)
+    assert llm.calls == 0
+    assert all(d["route"] == "canned" for p in CANNED_NOT_FOUND for d in unknown_events(ctx, p))
+
+
+async def test_probed_path_with_configured_paths_below_is_not_canned():
+    llm = PageLLM(GOOD_PAGE)
+    pages = [{"path": "/admin/users", "title": "Users", "body_html": "<p>x</p>"}]
+    ctx, servers, port = await start_server(json_llm=llm, pages=pages)
+    try:
+        status, _, _ = await req(port, "GET", "/admin")
+        assert status == 200
+        await settle()
+    finally:
+        await stop(servers)
+    assert llm.calls == 1 and unknown_events(ctx, "/admin")[0]["route"] == "unknown_page"
+
+
+async def test_api_v1_without_an_api_prefix_is_the_404():
+    llm = PageLLM(GOOD_PAGE)
+    ctx, servers, port = await start_server(json_llm=llm, api_prefix=None, routes=[])
+    try:
+        status, _, body = await req(port, "GET", "/api/v1/users")
+        assert status == 404 and b"404 Not Found" in body
+    finally:
+        await stop(servers)
+    assert llm.calls == 0
+
+
+async def test_lure_files_hold_only_issued_scenario_tokens():
+    tokens = (("crm_db_password", "db_password"), ("ops_bearer", "bearer_token"),
+              ("export_key", "aws_access_key"), ("host_key", "ssh_private_key_id"))
+    ctx, servers, port = await start_server(tokens=tokens)
+    issued = {t.name: t.value for t in ctx.scenario.honeytokens.values()}
+    try:
+        status, headers, body = await req(port, "GET", "/.env")
+        text = body.decode()
+        assert status == 200 and headers["content-type"] == "application/octet-stream"
+        assert f"CRM_DB_PASSWORD={issued['crm_db_password']}\n" in text
+        assert f"OPS_BEARER={issued['ops_bearer']}\n" in text
+        assert f"AWS_ACCESS_KEY_ID={issued['export_key']}\n" in text
+        assert issued["host_key"] not in text and "SECRET" not in text
+        assert "APP_URL=https://web01.northwind.test" in text
+        assert ctx.honeytoken_in(text) is not None
+        status, _, body = await req(port, "GET", "/.git/config")
+        assert status == 200
+        assert f"url = https://oauth2:{issued['ops_bearer']}@git.northwind.test/" in body.decode()
+        status, _, body = await req(port, "GET", "/.git/HEAD")
+        assert status == 200 and body == b"ref: refs/heads/main\n"
+        status, _, _ = await req(port, "GET", "/.aws/credentials")    # source not marked
+        assert status == 404
+        status, _, _ = await req(port, "POST", "/.env", body=b"x=1")
+        assert status == 405
+        await settle()
+    finally:
+        await stop(servers)
+    env = unknown_events(ctx, "/.env")[0]
+    assert env["lure"] == "/.env" and env["canned"] == "file"
+    posted = [d for d in unknown_events(ctx, "/.env") if d["method"] == "POST"][0]
+    assert "lure" not in posted and "lure_tokens" not in posted
+    assert set(env["lure_tokens"].split(",")) == {"crm_db_password", "ops_bearer", "export_key"}
+    assert unknown_events(ctx, "/.aws/credentials")[0]["canned"] == "not_found"
+
+
+async def test_apache_stack_answers_with_apache_pages():
+    ctx, servers, port = await start_server(server_header="Apache/2.4.62 (Debian)")
+    try:
+        status, headers, body = await req(port, "GET", "/server-status")
+        assert status == 403 and headers["content-type"] == "text/html; charset=iso-8859-1"
+        assert b"<h1>Forbidden</h1>" in body
+        assert b"<address>Apache/2.4.62 (Debian) Server at web01 Port 80</address>" in body
+        status, _, _ = await req(port, "GET", "/cgi-bin/")
+        assert status == 403
+        status, _, body = await req(port, "GET", "/cgi-bin/test.cgi")
+        assert status == 404 and b"The requested URL was not found on this server." in body
+        status, _, body = await req(port, "GET", "/nothing-here")
+        assert status == 404 and b"<h1>Not Found</h1>" in body and b"<center>" not in body
+    finally:
+        await stop(servers)
+
+
+async def test_cached_404_is_rendered_for_each_clients_host():
+    out = {"status": 404, "content_type": "text/html", "body": "<p>model wrote this</p>"}
+    llm = PageLLM(out)
+    ctx, servers, port = await start_server(json_llm=llm, server_header="Apache/2.4.62 (Debian)")
+    try:
+        _, _, first = await req(port, "GET", "/maintenance")
+        _, _, second = parse(await raw(port, b"GET /maintenance HTTP/1.1\r\nHost: "
+                                             b"portal.northwind.test:8443\r\nConnection: close"
+                                             b"\r\n\r\n"))
+    finally:
+        await stop(servers)
+    assert llm.calls == 1
+    assert b"Server at web01 Port 80" in first and b"model wrote this" not in first
+    assert b"Server at portal.northwind.test Port 8443" in second
+
+
+async def test_unknown_page_model_answer_is_cached_per_path():
+    llm = PageLLM(GOOD_PAGE)
+    ctx, servers, port = await start_server(json_llm=llm)
+    try:
+        for _ in range(2):
+            status, headers, body = await req(port, "GET", "/maintenance?probe=1")
+            assert status == 200 and b"<h1>Maintenance</h1>" in body
+            assert headers["content-type"] == "text/html; charset=utf-8"
+        status, headers, body = await req(port, "HEAD", "/maintenance")
+        assert status == 200 and body == b""
+        await settle()
+    finally:
+        await stop(servers)
+    assert llm.calls == 1
+    # The model sees the method and path only: never the query or a body.
+    assert "GET /maintenance" in llm.users[0] and "probe" not in llm.users[0]
+    logged = unknown_events(ctx, "/maintenance")
+    assert [d["route"] for d in logged] == ["unknown_page"] * 3
+    assert [d["rung"] for d in logged] == ["llm"] * 3 and [d.get("cache_hit") for d in logged] \
+        == [None, True, True]
+
+
+@pytest.mark.parametrize("out", [
+    {"status": 200, "content_type": "text/html", "body": "<p>hi</p><script>x()</script>"},
+    {"status": 200, "content_type": "text/html",
+     "body": '<meta http-equiv="refresh" content="0;url=/x">'},
+    {"status": 200, "content_type": "text/html", "body": '<a href="http://198.51.100.7/">x</a>'},
+    {"status": 200, "content_type": "text/html", "body": '<p onclick="x()">x</p>'},
+    {"status": 200, "content_type": "text/plain", "body": "password = Northwind2024x"},
+    {"status": 302, "content_type": "text/html", "body": "moved"},
+    {"status": 200, "content_type": "application/xml", "body": "<a/>"},
+    {"status": 200, "content_type": "application/json", "body": "not json"},
+])
+async def test_unsafe_or_invalid_page_answer_is_the_cached_404(out):
+    llm = PageLLM(out)
+    ctx, servers, port = await start_server(json_llm=llm)
+    try:
+        for _ in range(2):
+            status, _, body = await req(port, "GET", "/maintenance")
+            assert status == 404 and b"<center><h1>404 Not Found</h1></center>" in body
+        await settle()
+    finally:
+        await stop(servers)
+    assert 1 <= llm.calls <= 2      # an invalid answer may be asked again once, then cached
+    assert [d["rung"] for d in unknown_events(ctx, "/maintenance")] == ["fallback"] * 2
+
+
+async def test_local_links_and_json_pass_the_page_filter():
+    out = {"status": 200, "content_type": "application/json", "body": '{"status": "ok"}'}
+    ctx, servers, port = await start_server(json_llm=PageLLM(out))
+    try:
+        status, headers, body = await req(port, "GET", "/healthz")
+        assert status == 200 and json.loads(body) == {"status": "ok"}
+    finally:
+        await stop(servers)
+    ctx, servers, port = await start_server(json_llm=PageLLM(
+        {"status": 200, "content_type": "text/html",
+         "body": '<a href="https://intranet.northwind.test/help">Help</a>'}))
+    try:
+        status, _, _ = await req(port, "GET", "/help")
+        assert status == 200
+    finally:
+        await stop(servers)
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/.htaccess"), ("GET", "/backup.sql"), ("GET", "/index.php"), ("GET", "/app.js"),
+    ("GET", "/static/logo.png"), ("GET", "/.svn/entries"), ("GET", "/a/../b"),
+    ("GET", "/" + "a" * 300), ("POST", "/maintenance"), ("PUT", "/maintenance"),
+    ("GET", "/index.html~"), ("GET", "/cgi-bin/x"), ("GET", "/wp-admin/"),
+    ("GET", "/actuator/heapdump"), ("GET", "/phpmyadmin/"), ("GET", "/id_rsa"),
+    ("GET", "/backup"),
+])
+async def test_risky_paths_and_methods_never_reach_the_model(method, path):
+    llm = PageLLM(GOOD_PAGE)
+    ctx, servers, port = await start_server(json_llm=llm)
+    try:
+        status, _, _ = await req(port, method, path, body=b"a=1" if method != "GET" else b"")
+        assert status == 404
+    finally:
+        await stop(servers)
+    assert llm.calls == 0
+
+
+async def test_scenario_can_turn_the_page_model_off():
+    llm = PageLLM(GOOD_PAGE)
+    ctx, servers, port = await start_server(json_llm=llm, llm_unknown_paths=False)
+    try:
+        status, _, _ = await req(port, "GET", "/maintenance")
+        assert status == 404
+        await settle()
+    finally:
+        await stop(servers)
+    assert llm.calls == 0 and unknown_events(ctx, "/maintenance")[0]["route"] == "not_found"
+
+
+async def test_page_cache_is_bounded(monkeypatch):
+    monkeypatch.setattr(http, "MAX_PAGE_CACHE", 2)
+    llm = PageLLM(GOOD_PAGE)
+    ctx, servers, port = await start_server(json_llm=llm)
+    try:
+        for path in ("/a", "/b", "/c", "/a"):
+            await req(port, "GET", path)
+    finally:
+        await stop(servers)
+    assert len(http.page_cache(ctx)) == 2 and llm.calls == 4
+
+
+async def test_post_body_to_a_known_route_is_logged():
+    ctx, servers, port = await start_server()
+    try:
+        status, _, _ = await req(port, "POST", "/api/v1/notes",
+                                 {"Content-Type": "application/json"}, b'{"note": "hello"}')
+        assert status == 401
+        await settle()
+    finally:
+        await stop(servers)
+    data = unknown_events(ctx, "/api/v1/notes")[0]
+    assert data["body"] == '{"note": "hello"}' and data["body_bytes"] == 17

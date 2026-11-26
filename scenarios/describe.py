@@ -133,6 +133,7 @@ def describe(name: str, seed: str = "describe", scenarios_dir: Optional[str] = N
             if svc.api_prefix:
                 w(f"  API prefix: {svc.api_prefix} (API key header {svc.api_key_header}; "
                   f"LLM for unknown routes: {'yes' if svc.llm_unknown_api_routes else 'no'})")
+            w(f"  LLM for unknown paths: {'yes' if svc.llm_unknown_paths else 'no'}")
             for r in svc.routes:
                 if r.list_from:
                     src = f"list of {r.list_from}"

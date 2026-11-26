@@ -291,6 +291,12 @@ Protocol notes:
 - **HTTP**: login form and Basic, Bearer and API-key capture; after login a small site and
   JSON API built from the scenario. Unknown routes under the API prefix may be answered by
   the budgeted model when the scenario enables `llm_unknown_api_routes`; otherwise 404.
+  Other unknown paths get fixed answers for the most-probed paths (`/robots.txt`, lure
+  files that hold only honeytokens this sensor issued, the server's own 404 or 403), then
+  for a plain GET the budgeted model (`llm_unknown_paths`), which sees only the method and
+  path, answers with no headers, is filtered for scripts, redirects, foreign links and
+  credential-shaped text, and is cached per path; the fallback is the server's 404. The
+  event's `rung` is `llm`, `llm_retry` or `fallback`, with `cache_hit` on a cached answer.
 - **HL7 MLLP**: frames are logged and answered with an `AA` acknowledgement; nothing is
   forwarded.
 - **S3**: enough of the S3 REST API (plain HTTP, path-style and virtual-hosted) for the AWS

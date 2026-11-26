@@ -238,10 +238,18 @@ Service-specific keys:
   `set`) and `value`.
 - **`http`**: `server_header`, `login_path`, `login_title`, `branding`, `[[...pages]]`
   (`path`, `title`, `body_html`, `requires_login`), `api_prefix`, `api_key_header`,
-  `[[...routes]]`, `openapi_path`, `openapi`, `llm_unknown_api_routes`. A route has
+  `[[...routes]]`, `openapi_path`, `openapi`, `llm_unknown_api_routes`,
+  `llm_unknown_paths`. A route has
   `method`, `path` (may contain `{param}`), `auth` (`none`, `session`, `basic`, `bearer`,
   `api_key`, `any`), `status`, and exactly one source of content: `json_body`, `list_from`
   (`"db.table"`, with `list_limit`) or `item_from` (with `item_key`).
+  `llm_unknown_paths` (default true) lets the model answer a GET for an unknown path
+  outside `api_prefix` when `[listeners] llm` is on; the answer is cached per path, so
+  every client sees the same page. The most-probed paths have fixed answers: `/robots.txt`
+  disallows everything; `/.env`, `/.git/config` (with `/.git/HEAD`) and `/.aws/credentials`
+  are served only when they can hold the scenario's honeytokens or the source's planted
+  pair; everything else is the server's own 404 (or 403 for `/server-status` and
+  `/cgi-bin/` behind an Apache `server_header`).
 - **`mllp`**: `sending_facility`.
 - **`s3`**: `server_header`, `region`, `owner_name`, `get_max_bytes` (bytes one download
   sends, at most 16 MB) and `[[services.s3.buckets]]` with `name`, `region`, `created`,
