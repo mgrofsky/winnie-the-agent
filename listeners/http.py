@@ -945,13 +945,19 @@ class Exchange:
         return ans.status, wire_text(ans.body, 4096).encode("utf-8"), "text/plain; charset=utf-8", []
 
     def safe_page_body(self, body: str) -> bool:
-        if UNSAFE_BODY.search(body):
-            return False
+        """The body as written and as a browser reads it: character references decoded
+        (twice, for a doubly encoded one), tabs and line breaks dropped and backslashes read
+        as slashes, the way a URL attribute is parsed."""
+        decoded = html.unescape(html.unescape(body))
+        decoded = re.sub(r"[\t\r\n\x00]", "", decoded).replace("\\", "/")
         local = {self.cfg.hostname.lower(), self.cfg.domain.lower(), "localhost"}
-        for m in URL_HOST.finditer(body):
-            host = m.group(1).lower().rstrip(".")
-            if host not in local and not host.endswith("." + self.cfg.domain.lower()):
+        for text in (body, decoded):
+            if UNSAFE_BODY.search(text):
                 return False
+            for m in URL_HOST.finditer(text):
+                host = m.group(1).lower().rstrip(".")
+                if host not in local and not host.endswith("." + self.cfg.domain.lower()):
+                    return False
         return True
 
 
