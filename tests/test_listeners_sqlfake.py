@@ -9,6 +9,7 @@ import pytest
 
 from listeners.base import ListenerContext
 from listeners.events import EventWriter
+from listeners import sqlfake
 from listeners.sqlfake import FakeSql, Result, SqlError, like_match, strip_comments
 
 
@@ -223,6 +224,40 @@ def test_out_of_range_integers_give_server_errors(dialect, stmt, code):
 def test_largest_valid_limits_return_rows(dialect, stmt):
     answers = _run(fake(dialect).run(stmt))
     assert isinstance(answers[-1], Result) and len(answers[-1].rows) == 3
+
+
+def test_a_created_database_can_be_selected_and_written_to():
+    # The statements a database ransom script sends, in its order.
+    f = fake("mysql", database="")
+    script = ["SET AUTOCOMMIT=0", "CREATE DATABASE IF NOT EXISTS RECOVER_YOUR_DATA", "COMMIT",
+              "USE RECOVER_YOUR_DATA",
+              "CREATE TABLE RECOVER_YOUR_DATA (text VARCHAR(2048))",
+              "INSERT INTO RECOVER_YOUR_DATA (text) VALUES ('note')", "COMMIT"]
+    for stmt in script:
+        assert not isinstance(_run(f.run(stmt))[-1], SqlError), stmt
+    assert f.database == "RECOVER_YOUR_DATA"
+    listed = [r[0] for r in _run(f.run("SHOW DATABASES"))[-1].rows]
+    assert "RECOVER_YOUR_DATA" in listed
+    again = _run(f.run("CREATE DATABASE RECOVER_YOUR_DATA"))[-1]
+    assert isinstance(again, SqlError) and again.errno == 1007
+    assert not isinstance(_run(f.run("DROP DATABASE RECOVER_YOUR_DATA"))[-1], SqlError)
+    gone = _run(f.run("USE RECOVER_YOUR_DATA"))[-1]
+    assert isinstance(gone, SqlError) and gone.errno == 1049
+    # A database from another connection is not there.
+    other = _run(fake("mysql", database="").run("USE RECOVER_YOUR_DATA"))[-1]
+    assert isinstance(other, SqlError)
+
+
+def test_created_databases_are_bounded_and_scenario_ones_cannot_be_dropped():
+    f = fake("mysql")
+    for i in range(sqlfake.MAX_SESSION_DBS + 30):
+        _run(f.run(f"CREATE DATABASE d{i}"))
+    assert len(f.session_dbs) == sqlfake.MAX_SESSION_DBS
+    before = set(f.catalog) - f.session_dbs
+    for name in list(before):
+        _run(f.run(f"DROP DATABASE {name}"))
+    assert before <= set(f.catalog)
+    assert not isinstance(_run(fake("mssql").run("CREATE DATABASE x; USE x"))[-1], SqlError)
 
 
 def test_string_concatenation_and_login_functions_match_real_servers():

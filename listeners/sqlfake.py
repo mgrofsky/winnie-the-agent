@@ -149,6 +149,8 @@ class SqlError:
 
 
 Answer = Union[Result, SqlError]
+# Databases one connection can create (each is a name in the connection's catalog).
+MAX_SESSION_DBS = 20
 
 
 @dataclass
@@ -545,6 +547,7 @@ class FakeSql:
         self.catalog = self._build_catalog()
         self._row_cache: dict[tuple[str, str], list[list]] = {}
         self.created: dict[str, list[str]] = {}
+        self.session_dbs: set[str] = set()
         default = next((d.name for d in self.catalog.values() if not d.system), None)
         if dialect == "postgres":
             self.database = database or user
@@ -1170,6 +1173,35 @@ class FakeSql:
             n = nrows
         return self._ok(f"{verb.upper()} {n}", n)
 
+    def _session_database(self, s: str, verb: str) -> Optional[Answer]:
+        """CREATE or DROP DATABASE for this connection: a created database is listed, can be
+        selected with USE and holds the tables the session creates, until the connection
+        ends. Scenario and system databases stay as they are."""
+        m = re.match(r"^(create|drop)\s+(?:database|schema)\s+(if\s+(?:not\s+)?exists\s+)?"
+                     r"([`\[\"]?[\w$-]{1,64}[`\]\"]?)", s, re.I)
+        if not m:
+            return None
+        name = _unquote_ident(m.group(3))
+        key = name.lower()
+        existing = self.catalog.get(key)
+        if verb == "create":
+            if existing is not None:
+                if m.group(2) or self.dialect != "mysql":
+                    return None
+                return SqlError("HY000", f"Can't create database '{safe_name(name)}'; "
+                                "database exists", errno=1007)
+            if len(self.session_dbs) < MAX_SESSION_DBS:
+                schema = {"postgres": "public", "mssql": "dbo"}.get(self.dialect, name)
+                self.catalog[key] = DbInfo(name=name, schema=schema)
+                self.session_dbs.add(key)
+            return self._ok("CREATE DATABASE", 1) if self.dialect == "mysql" else None
+        if key in self.session_dbs:
+            del self.catalog[key]
+            self.session_dbs.discard(key)
+            if (self.database or "").lower() == key:
+                self.database = "" if self.dialect == "mysql" else "master"
+        return None
+
     def _ddl(self, s: str, low: str) -> Answer:
         words = [w for w in low.split() if w not in ("or", "replace", "unique", "temporary",
                                                      "temp", "if", "not", "exists", "global",
@@ -1190,8 +1222,11 @@ class FakeSql:
                         cols.append(_unquote_ident(first)[:63])
                 if len(self.created) < 50:
                     self.created[name] = cols[:40]
-        if verb == "create" and len(words) > 2 and words[1] == "database":
-            pass
+        if verb in ("create", "drop") and len(words) > 2 and words[1] in ("database", "schema") \
+                and (words[1] == "database" or self.dialect == "mysql"):
+            answer = self._session_database(s, verb)
+            if answer is not None:
+                return answer
         if verb in ("create", "drop", "alter", "comment") and len(words) > 1:
             obj = words[1]
             if obj in ("table", "index", "view", "database", "schema", "user", "role", "sequence",
