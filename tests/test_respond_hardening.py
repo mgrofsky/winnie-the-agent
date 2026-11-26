@@ -382,6 +382,9 @@ def test_old_approvals_and_response_records_are_aged_out(tmp_path):
     run(tmp_path, [pb(steps=[{"action": "export_blocklist"}])], queue_enforce=True)
     [a] = list_queue(tmp_path / "state", now=NOW)
     reject(a["id"], tmp_path / "state", by="o", now=NOW)
+    # Retention judges a decided approval by its file time: date the file as the decision.
+    decided = tmp_path / "state" / "approvals" / f"{a['id']}.json"
+    os.utime(decided, (NOW.timestamp(), NOW.timestamp()))
     later = NOW + datetime.timedelta(days=40)
     write(tmp_path / "reports", rec(rid="r2", ip="198.51.100.99", ))
     out = run(tmp_path, [pb(name="later_pb")], now=later, lookback_hours=24 * 60)
