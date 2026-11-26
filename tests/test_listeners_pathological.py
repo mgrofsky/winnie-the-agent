@@ -153,3 +153,174 @@ async def test_sql_engine_bounded_on_pathological_statements(dialect):
         except asyncio.TimeoutError:
             pytest.fail(f"{dialect}: statement did not finish: {stmt[:40]!r}")
         assert time.perf_counter() - start < 0.5, (dialect, stmt[:40])
+
+
+# ---- SQL wire parsers after login: prepared statements (MySQL) and RPC (MSSQL) ------------
+
+def _my(seq: int, payload: bytes) -> bytes:
+    return len(payload).to_bytes(3, "little") + bytes([seq]) + payload
+
+
+def _my_login() -> bytes:
+    flags = 0x200 | 0x8000 | 0x80000 | 0x200000          # PROTOCOL_41, SECURE, PLUGIN_AUTH, LENENC
+    return _my(1, flags.to_bytes(4, "little") + (1 << 24).to_bytes(4, "little") + b"\xff"
+               + b"\x00" * 23 + b"root\x00\x00mysql_native_password\x00")
+
+
+def _exec(stmt_id: int, rest: bytes) -> bytes:
+    return _my(0, b"\x17" + stmt_id.to_bytes(4, "little") + b"\x00\x01\x00\x00\x00" + rest)
+
+
+def _prep(sql: bytes) -> bytes:
+    return _my(0, b"\x16" + sql)
+
+
+def _tds(ptype: int, payload: bytes) -> bytes:
+    """One TDS message split into 32000-byte packets."""
+    out, step = b"", 32000
+    chunks = [payload[i:i + step] for i in range(0, len(payload), step)] or [b""]
+    for i, c in enumerate(chunks):
+        out += (bytes([ptype, 0x01 if i == len(chunks) - 1 else 0x00])
+                + (len(c) + 8).to_bytes(2, "big") + b"\x00\x00\x01\x00" + c)
+    return out
+
+
+def _rpc(proc: int, params: bytes) -> bytes:
+    headers = (22).to_bytes(4, "little") + (18).to_bytes(4, "little") + (2).to_bytes(2, "little") \
+        + b"\x00" * 8 + (1).to_bytes(4, "little")
+    return _tds(0x03, headers + b"\xff\xff" + proc.to_bytes(2, "little") + b"\x00\x00" + params)
+
+
+def _nv(text: str) -> bytes:
+    raw = text.encode("utf-16-le")
+    return b"\x00\x00\xe7" + (8000).to_bytes(2, "little") + b"\x09\x04\xd0\x00\x34" \
+        + len(raw).to_bytes(2, "little") + raw
+
+
+def _int(v: int) -> bytes:
+    return b"\x00\x00\x26\x04\x04" + v.to_bytes(4, "little", signed=True)
+
+
+def _mysql_wire_payloads() -> list[bytes]:
+    many = b"SELECT " + b",".join([b"?"] * 30_000)
+    return [
+        # 30000 markers, then an execute whose types run past the end of the packet.
+        _prep(many) + _exec(1, b"\x00" * 3750 + b"\x01" + b"\xfd\x00" * 100),
+        # Every parameter claims a 2^64-1 byte string; unknown type bytes read as strings.
+        _prep(b"SELECT ?, ?, ?") + _exec(1, b"\x00\x01" + b"\xee\x00\xfd\x00\x0c\x00"
+                                          + b"\xfe" + b"\xff" * 8),
+        # Bad temporal lengths, a parameter count mismatch, an execute with no types.
+        _prep(b"SELECT ?") + _exec(1, b"\x00\x01\x0c\x00\x63" + b"\x00" * 99)
+        + _exec(1, b"") + _exec(1, b"\x00\x00") + _exec(7, b"\x00"),
+        # Long data far past the caps, then an execute that uses it.
+        _prep(b"SELECT ? AS v") + b"".join(_my(0, b"\x18\x01\x00\x00\x00\x00\x00" + b"A" * 60_000)
+                                           for _ in range(12)) + _exec(1, b"\x00\x01\xfc\x00"),
+        # More statements than the cap, in one burst.
+        b"".join(_prep(b"SELECT ?") for _ in range(200)),
+        # Short and garbage commands.
+        b"".join(_my(0, bytes([c])) for c in (0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1f) * 50),
+        _my(0, b"\x11" + b"\xff" * 5000),
+        _my(0, b"\x11root\x00\xff" + b"x" * 10),
+        _my(0, b"\x11root\x00\x00\x00\x00\x00\x00\xfe" + b"\xff" * 8),
+        # Quote and comment runs in a prepared statement.
+        _prep(b"SELECT '" + b"\\'" * 30_000), _prep(b"SELECT " + b"/*" * 30_000),
+        _prep(b"SELECT " + b"-- ?\n" * 12_000), _prep(b"SELECT `" + b"``" * 30_000),
+    ]
+
+
+def _mssql_wire_payloads() -> list[bytes]:
+    stmt = _nv("SELECT " + ", ".join(f"@p{i}" for i in range(2000)))
+    decl = _nv(", ".join(f"@p{i} int" for i in range(2000)))
+    plp_tiny = (b"\x00\x00\xe7\xff\xff\x09\x04\xd0\x00\x34" + (10 ** 9).to_bytes(8, "little")
+                + b"\x01\x00\x00\x00A" * 150_000 + b"\x00\x00\x00\x00")
+    return [
+        _rpc(10, stmt + decl + _int(7) * 2000),                  # 2000 bound parameters
+        _rpc(10, stmt + decl),                                   # declared, none supplied
+        _rpc(10, _nv("SELECT 1") + _int(1) * 2200),              # past the parameter limit
+        _rpc(10, plp_tiny),                                      # 150000 one-byte PLP chunks
+        _rpc(10, b"\x00\x00\xe7\xff\xff\x09\x04\xd0\x00\x34" + b"\xff" * 7 + b"\xfe"
+             + b"\xff\xff\xff\xff"),                             # chunk length past the end
+        _rpc(10, b"\xff\x00" + b"@\x00" * 10),                   # name length past the end
+        _rpc(10, b"\x00\x00\x99"),                               # unknown type
+        _rpc(10, b"\x00\x00\x6a\x11\x26\xff\x05\x01\x00"),       # bad scale
+        _rpc(10, b"\x00\x00\x6f\x08\x08" + b"\xff" * 8),         # datetime out of range
+        _rpc(12, _int(5) + _int(1)), _rpc(15, b""), _rpc(11, _int(0)),
+        _tds(0x03, b"\x01"), _tds(0x03, b"\xff\xff"),
+        _rpc(10, _nv("SELECT '" + "'" * 3000 + " @a") + _nv("@a int") + _int(1)),
+        _rpc(10, _nv("SELECT " + "/*" * 3000 + " @a") + _nv("@a int") + _int(1)),
+    ]
+
+
+async def _mssql_login() -> bytes:
+    import test_listeners_mssql as tm  # module import: its tests are not collected here
+    return tm.login7("sa", "x")
+
+
+@pytest.mark.parametrize("name", ["mysql", "mssql"])
+async def test_sql_wire_parsers_survive_pathological_input(name, tmp_path):
+    ctx, servers, port = await _start(name, tmp_path)
+    if name == "mysql":
+        case = dict(preamble=[_my_login()], payloads=_mysql_wire_payloads())
+    else:
+        case = dict(preamble=[await _mssql_login()], payloads=_mssql_wire_payloads(), probe=False)
+    try:
+        result = await hammer(port, case.pop("payloads"), **case)
+    finally:
+        for s in servers:
+            s.close()
+    assert result.worst_payload_seconds < PAYLOAD_BOUND, result
+    assert result.worst_probe_seconds < PROBE_BOUND, result
+    assert not [e for e in ctx.writer.events if e["message"] == "Handler error"], \
+        [e["data"] for e in ctx.writer.events if e["message"] == "Handler error"]
+    assert any(e["event"] == "auth_attempt" and e["success"] for e in ctx.writer.events)
+
+
+def test_sql_wire_parsers_reject_every_truncation_cleanly():
+    """Each prefix of a valid packet parses or raises the parser's own error, never another."""
+    import random
+
+    from listeners import mssql, mysql
+
+    stmt = mysql.Prepared("SELECT ?, ?, ?, ?, ?", mysql.placeholders("SELECT ?, ?, ?, ?, ?"))
+    # LONGLONG 5, DOUBLE (NULL in the bitmap), DATETIME, TIME, VAR_STRING.
+    execute = (b"\x17\x01\x00\x00\x00\x00\x01\x00\x00\x00" + b"\x02" + b"\x01"
+               + b"\x08\x00\x05\x00\x0c\x00\x0b\x00\xfd\x00"
+               + (5).to_bytes(8, "little") + b"\x07\xe8\x07\x01\x02\x03\x04\x05"
+               + b"\x08\x00" + b"\x00" * 4 + b"\x01\x02\x03" + b"\x03abc")
+    change = b"\x11root\x00\x14" + b"x" * 20 + b"db\x00\xff\x00mysql_native_password\x00" \
+        + b"\x0a\x03key\x05value\x00"
+    rpc_body = (b"\xff\xff\x0a\x00\x00\x00" + _nv("SELECT @a") + _nv("@a int") + _int(3)
+                + b"\x00\x00\xe7\xff\xff\x09\x04\xd0\x00\x34" + (4).to_bytes(8, "little")
+                + b"\x04\x00\x00\x00a\x00b\x00\x00\x00\x00\x00")
+    rng = random.Random(7)
+    samples = []
+    for good in (execute, change, rpc_body):
+        samples += [(good, good[:i]) for i in range(len(good))]
+        for _ in range(300):
+            bad = bytearray(good)
+            for _ in range(rng.randint(1, 4)):
+                bad[rng.randrange(len(bad))] = rng.randrange(256)
+            samples.append((good, bytes(bad)))
+    for good, data in samples:
+        if good is execute:
+            stmt.types = None
+            try:
+                mysql.parse_execute(data, stmt)
+            except (ValueError, IndexError):
+                pass
+        elif good is change:
+            try:
+                mysql.parse_change_user(data, 0xFFFFFFFF)
+            except (ValueError, IndexError):
+                pass
+        else:
+            try:
+                mssql.parse_rpc(data)
+            except (mssql.RpcMalformed, mssql.TooManyParams, ValueError, OverflowError):
+                pass
+    stmt.types = None
+    assert mysql.parse_execute(execute, stmt) == ["5", "NULL", "'2024-01-02 03:04:05'",
+                                                  "'01:02:03'", "'abc'"]
+    assert mysql.parse_change_user(change, 0xFFFFFFFF)["attrs"] == {"key": "value"}
+    assert [p.literal for p in mssql.parse_rpc(rpc_body)[1]] == ["N'SELECT @a'", "N'@a int'",
+                                                                 "3", "N'ab'"]

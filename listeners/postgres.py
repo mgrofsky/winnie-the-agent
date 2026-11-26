@@ -8,7 +8,9 @@ the configured accounts and the bundled common-password list) or ``cleartext``.
 ``conn.login`` decides. ``password_encryption`` in SHOW/pg_settings follows the method.
 After a fake login the simple query protocol is answered by ``listeners.sqlfake``;
 the extended protocol (Parse/Bind/Describe/Execute/Sync) gets best-effort support so
-drivers do not hang. Nothing is executed.
+drivers do not hang: Bind substitutes the parameters into the statement as literals, and a
+Describe of a statement answers only a read statement through the engine, so a write or
+DDL statement runs once, at Execute. Nothing is executed.
 """
 
 from __future__ import annotations
@@ -21,8 +23,8 @@ from typing import Optional
 
 from listeners.base import Conn, ConnClosed, ListenerContext, ServiceSettings, start_tcp
 from listeners.wordlist import common_passwords
-from listeners.sqlfake import (DEFAULT_VERSIONS, FakeSql, Result, SqlError, cell_text,
-                               column_kind, wire_text)
+from listeners.sqlfake import (DEFAULT_VERSIONS, READ_VERBS, FakeSql, Result, SqlError,
+                               cell_text, column_kind, strip_comments, wire_text)
 
 SSL_REQUEST = 80877103
 GSS_REQUEST = 80877104
@@ -346,6 +348,9 @@ async def query_loop(conn: Conn, fake: FakeSql) -> None:
                     query = statements[name]
                     nparams = len(set(re.findall(r"\$(\d{1,3})", query)))
                     out = msg(b"t", struct.pack("!H", nparams) + struct.pack("!I", 25) * nparams)
+                    if not _is_read(query):
+                        await conn.write(out + msg(b"n"))
+                        continue
                     ans = await _describe_answer(conn, fake, substitute_params(query, []))
                     if isinstance(ans, SqlError):
                         await conn.write(error_response(ans.code, ans.message, ans.severity))
@@ -412,6 +417,12 @@ async def query_loop(conn: Conn, fake: FakeSql) -> None:
             await conn.write(error_response("26000", "prepared statement does not exist"
                                             if kind in (b"B", b"D", b"E") else "invalid message format"))
             skipping = True
+
+
+def _is_read(query: str) -> bool:
+    """True when the statement's first word is a read verb (it can return rows)."""
+    m = re.match(r"[\s(]*([A-Za-z]+)", strip_comments(query[:4096], "postgres"))
+    return bool(m) and m.group(1).lower() in READ_VERBS["postgres"]
 
 
 async def _run_one(fake: FakeSql, query: str):

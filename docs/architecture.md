@@ -270,13 +270,21 @@ Protocol notes:
 - **PostgreSQL**: SSL requests are declined; md5 password exchange by default (the password
   is recovered from the bundled common-password list when possible), `postgres_auth =
   cleartext` for the cleartext exchange. Simple query protocol, with best-effort extended
-  protocol support so drivers do not hang.
+  protocol support so drivers do not hang: Bind parameters are bound into the statement,
+  and a Describe of a prepared statement runs only a read, so a write runs once.
 - **MySQL**: `mysql_native_password` handshake without TLS; the password is recovered from
-  the scramble for native and `caching_sha2_password` clients.
+  the scramble for native and `caching_sha2_password` clients. Prepared statements
+  (`COM_STMT_PREPARE`, `EXECUTE`, `SEND_LONG_DATA`, `RESET`, `CLOSE`) bind parameters into
+  the statement as literals and answer with binary-protocol rows; at most 32 statements and
+  256 KB of long data per connection. `COM_CHANGE_USER` is a new login under the same
+  policy; `COM_SET_OPTION` turns multi-statement queries on and off.
 - **MSSQL**: TDS 7.x without TLS. `PRELOGIN` is answered with "encryption not supported";
   a client that requires encryption is logged and disconnected. Works with impacket
   `mssqlclient` and `sqlcmd` using ODBC Driver 13; ODBC Driver 18 requires encryption by
-  default and is refused. Enabled in the `contact_center` scenario.
+  default and is refused. RPC calls to `sp_executesql`, `sp_prepare`, `sp_execute`,
+  `sp_prepexec` and `sp_unprepare` bind their parameters into the statement and answer it;
+  any other procedure gets the EXECUTE permission error. Enabled in the `contact_center`
+  scenario.
 - **SQL** (all three): statements go to `listeners/sqlfake.py`, an in-memory fake engine.
   File, program and command-execution primitives get a believable permission error and a
   `sql_exec_attempt` signal; catalog queries and scenario tables get canned or generated

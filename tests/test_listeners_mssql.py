@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import struct
 
 import pytest
 
@@ -121,10 +122,25 @@ def parse_tokens(p: bytes) -> list:
                              body[8:8 + 2 * mlen].decode("utf-16-le")))
             else:
                 toks.append((t, body))
-        elif t == 0xFD:
-            toks.append(("done", int.from_bytes(p[pos:pos + 2], "little"),
+        elif t in (0xFD, 0xFE, 0xFF):
+            toks.append(({0xFD: "done", 0xFE: "doneproc", 0xFF: "doneinproc"}[t],
+                         int.from_bytes(p[pos:pos + 2], "little"),
                          int.from_bytes(p[pos + 4:pos + 12], "little")))
             pos += 12
+        elif t == 0x79:
+            toks.append(("status", int.from_bytes(p[pos:pos + 4], "little", signed=True)))
+            pos += 4
+        elif t == 0xAC:
+            ordinal = int.from_bytes(p[pos:pos + 2], "little")
+            nlen = p[pos + 2]
+            name = p[pos + 3:pos + 3 + 2 * nlen].decode("utf-16-le")
+            pos += 3 + 2 * nlen
+            assert p[pos] == 0x01                        # output parameter
+            pos += 1 + 4 + 2                             # status, user type, flags
+            assert p[pos:pos + 3] == b"\x26\x04\x04"
+            toks.append(("retval", ordinal, name,
+                         int.from_bytes(p[pos + 3:pos + 7], "little", signed=True)))
+            pos += 7
         elif t == 0x81:
             ncols = int.from_bytes(p[pos:pos + 2], "little")
             pos += 2
@@ -326,3 +342,223 @@ def test_prelogin_reply_parses_positionally_like_common_clients():
     # terminator, then VERSION (6 bytes) immediately followed by the ENCRYPTION byte.
     assert [reply[i] for i in (0, 5, 10, 15)] == [0x00, 0x01, 0x02, 0x03] and reply[20] == 0xFF
     assert reply[21 + 6] == ENCRYPT_NOT_SUP
+
+
+# ---- RPC ----------------------------------------------------------------------------------
+
+ALL_HEADERS = (22).to_bytes(4, "little") + (18).to_bytes(4, "little") + (2).to_bytes(2, "little") \
+    + b"\x00" * 8 + (1).to_bytes(4, "little")
+COLL = bytes([0x09, 0x04, 0xD0, 0x00, 0x34])
+
+
+def bname(name: str) -> bytes:
+    return bytes([len(name)]) + name.encode("utf-16-le")
+
+
+def p_nvarchar(value, name: str = "", plp: bool = False) -> bytes:
+    if value is None:
+        return bname(name) + b"\x00\xe7" + (8000).to_bytes(2, "little") + COLL + b"\xff\xff"
+    raw = value.encode("utf-16-le")
+    if plp:
+        chunks = b"".join(len(c).to_bytes(4, "little") + c for c in (raw[:6], raw[6:]) if c)
+        return (bname(name) + b"\x00\xe7\xff\xff" + COLL + len(raw).to_bytes(8, "little")
+                + chunks + b"\x00\x00\x00\x00")
+    return bname(name) + b"\x00\xe7" + (8000).to_bytes(2, "little") + COLL \
+        + len(raw).to_bytes(2, "little") + raw
+
+
+def p_varchar(value: str, name: str = "") -> bytes:
+    raw = value.encode("cp1252")
+    return bname(name) + b"\x00\xa7" + (8000).to_bytes(2, "little") + COLL \
+        + len(raw).to_bytes(2, "little") + raw
+
+
+def p_int(value, name: str = "", status: int = 0) -> bytes:
+    if value is None:
+        return bname(name) + bytes([status]) + b"\x26\x04\x00"
+    return bname(name) + bytes([status]) + b"\x26\x04\x04" + value.to_bytes(4, "little", signed=True)
+
+
+def rpc_packet(proc, params: list[bytes]) -> bytes:
+    if isinstance(proc, int):
+        head = b"\xff\xff" + proc.to_bytes(2, "little")
+    else:
+        head = len(proc).to_bytes(2, "little") + proc.encode("utf-16-le")
+    return tds_packet(0x03, ALL_HEADERS + head + b"\x00\x00" + b"".join(params))
+
+
+async def rpc_call(r, w, proc, params):
+    w.write(rpc_packet(proc, params))
+    return parse_tokens(await read_reply(r))
+
+
+def statements(ctx):
+    return [e["data"]["statement"] for e in ctx.writer.events if e["message"] == "SQL statement"]
+
+
+async def logged_in():
+    ctx, servers, port = await start_server()
+    await login(port, "sa", "a")
+    r, w, _ = await login(port, "sa", "b", db="CoreBanking")
+    return ctx, servers, r, w
+
+
+async def test_sp_executesql_binds_parameters_and_ends_with_doneproc():
+    ctx, servers, r, w = await logged_in()
+    try:
+        toks = await rpc_call(r, w, 10, [
+            p_nvarchar("SELECT holder FROM accounts WHERE account_id = @P0 AND holder <> '@P0'"),
+            p_nvarchar("@P0 int"), p_int(1001)])
+        assert toks == [("cols", ["holder"]), ("row", ["Morgan Pemberton"]),
+                        ("doneinproc", 0x0011, 1), ("status", 0), ("doneproc", 0, 0)]
+        tricky = "x'; DROP TABLE accounts; --"
+        toks = await rpc_call(r, w, "sys.sp_executesql", [
+            p_nvarchar("SELECT @name AS v, @@SPID AS s", "@stmt", plp=True),
+            p_nvarchar("@NAME nvarchar(100)", "@params"), p_nvarchar(tricky, "@NAME")])
+        assert toks[0] == ("cols", ["v", "s"]) and toks[1][1][0] == tricky
+        toks = await rpc_call(r, w, 10, [p_nvarchar("SELECT @a AS a, @b AS b"),
+                                         p_nvarchar("@a int, @b nvarchar(10)"),
+                                         p_int(None), p_nvarchar(None)])
+        assert toks[1] == ("row", [None, None])
+        w.close()
+        await asyncio.sleep(0.05)
+    finally:
+        await stop(servers)
+    assert statements(ctx) == [
+        "SELECT holder FROM accounts WHERE account_id = 1001 AND holder <> '@P0'",
+        "SELECT N'x''; DROP TABLE accounts; --' AS v, @@SPID AS s",
+        "SELECT NULL AS a, NULL AS b"]
+    rpcs = [e["data"] for e in events(ctx, "command") if e["message"] == "RPC request"]
+    assert [d["procedure"] for d in rpcs] == ["sp_executesql", "sys.sp_executesql", "sp_executesql"]
+    # The activity view shows ``text`` as what the client sent.
+    assert rpcs[0]["text"] == ("EXEC sp_executesql N'SELECT holder FROM accounts WHERE "
+                               "account_id = @P0 AND holder <> ''@P0''', N'@P0 int', 1001")
+
+
+async def test_prepare_execute_unprepare_and_prepexec():
+    ctx, servers, r, w = await logged_in()
+    try:
+        toks = await rpc_call(r, w, 11, [p_int(None, "@handle", status=1),
+                                         p_nvarchar("@P0 int"),
+                                         p_nvarchar("SELECT holder FROM accounts WHERE account_id = @P0"),
+                                         p_int(1)])
+        assert toks == [("status", 0), ("retval", 0, "@handle", 1), ("doneproc", 0, 0)]
+        toks = await rpc_call(r, w, 12, [p_int(1), p_int(1002)])
+        assert ("row", ["Casey Whitlock"]) in toks and toks[-1] == ("doneproc", 0, 0)
+        toks = await rpc_call(r, w, 15, [p_int(1)])
+        assert toks == [("status", 0), ("doneproc", 0, 0)]
+        toks = await rpc_call(r, w, 12, [p_int(1), p_int(1002)])
+        assert toks == [(0xAA, 8179, "Could not find prepared statement with handle 1."),
+                        ("doneproc", 0x0002, 0)]
+        toks = await rpc_call(r, w, 13, [p_int(None, "", status=1), p_nvarchar("@P0 int"),
+                                         p_nvarchar("SELECT holder FROM accounts WHERE account_id = @P0"),
+                                         p_int(1001)])
+        assert toks == [("cols", ["holder"]), ("row", ["Morgan Pemberton"]),
+                        ("doneinproc", 0x0011, 1), ("status", 0), ("retval", 0, "", 2),
+                        ("doneproc", 0, 0)]
+        w.close()
+        await asyncio.sleep(0.05)
+    finally:
+        await stop(servers)
+    assert statements(ctx) == ["SELECT holder FROM accounts WHERE account_id = 1002",
+                               "SELECT holder FROM accounts WHERE account_id = 1001"]
+
+
+async def test_rpc_argument_errors_and_other_procedures():
+    ctx, servers, r, w = await logged_in()
+    try:
+        toks = await rpc_call(r, w, 10, [])
+        assert toks[0][1:] == (201, "Procedure or function 'sp_executesql' expects parameter "
+                                    "'@statement', which was not supplied.")
+        toks = await rpc_call(r, w, 10, [p_varchar("SELECT 1")])
+        assert toks[0][1:] == (214, "Procedure expects parameter '@statement' of type "
+                                    "'ntext/nchar/nvarchar'.")
+        toks = await rpc_call(r, w, 10, [p_nvarchar("SELECT @a, @b"), p_nvarchar("@a int, @b int"),
+                                         p_int(1)])
+        assert toks[0][1:] == (8178, "The parameterized query '(@a int, @b int)SELECT @a, @b' "
+                                     "expects the parameter '@b', which was not supplied.")
+        assert toks[-1] == ("doneproc", 0x0002, 0)
+        toks = await rpc_call(r, w, 10, [p_nvarchar("SELECT @a"), p_nvarchar("@a int"),
+                                         p_int(1), p_int(2)])
+        assert toks[0][1:] == (8144, "Procedure or function sp_executesql has too many "
+                                     "arguments specified.")
+        toks = await rpc_call(r, w, "master..xp_cmdshell", [p_varchar("whoami")])
+        assert toks == [(0xAA, 229, "The EXECUTE permission was denied on the object "
+                                    "'xp_cmdshell', database 'mssqlsystemresource', schema 'sys'."),
+                        ("doneproc", 0x0002, 0)]
+        toks = await rpc_call(r, w, "dbo.GetBalance", [p_int(1001, "@id")])
+        assert toks[0][1:] == (229, "The EXECUTE permission was denied on the object "
+                                    "'GetBalance', database 'CoreBanking', schema 'dbo'.")
+        toks = await rpc_call(r, w, 2, [p_int(None, "", 1)])          # sp_cursoropen
+        assert toks[0][1] == 229 and "'sp_cursoropen'" in toks[0][2]
+        toks = await batch(r, w, "SELECT 1 AS one")
+        assert ("row", ["1"]) in toks
+        w.close()
+        await asyncio.sleep(0.05)
+    finally:
+        await stop(servers)
+    hs = [e["data"] for e in events(ctx, "command") if e["data"].get("high_signal")]
+    assert [(d["match"], d["statement"]) for d in hs] == [("xp_cmdshell",
+                                                           "EXEC master..xp_cmdshell 'whoami'")]
+
+
+async def test_malformed_rpc_gets_protocol_error_and_close():
+    ctx, servers, r, w = await logged_in()
+    try:
+        w.write(rpc_packet(10, [bname("") + b"\x00\x99\x01\x02"]))       # unknown type
+        toks = parse_tokens(await read_reply(r))
+        assert toks[0][1] == 4002
+        assert await asyncio.wait_for(r.read(), 5) == b""
+    finally:
+        await stop(servers)
+    assert any(e["data"].get("reason") == "malformed" for e in events(ctx, "error"))
+    assert not [e for e in ctx.writer.events if e["message"] == "Handler error"]
+
+
+async def test_too_many_rpc_parameters():
+    ctx, servers, r, w = await logged_in()
+    try:
+        toks = await rpc_call(r, w, 10, [p_nvarchar("SELECT 1")] + [p_int(1)] * 2100)
+        assert toks[0][1] == 8003 and toks[-1] == ("doneproc", 0x0002, 0)
+        toks = await batch(r, w, "SELECT 1 AS one")
+        assert ("row", ["1"]) in toks
+        w.close()
+    finally:
+        await stop(servers)
+
+
+def test_rpc_value_decoding():
+    def lit(param: bytes) -> str:
+        _, _, literal, pos = mssql.read_param_value(param, 0)
+        assert pos == len(param)
+        return literal
+
+    assert lit(b"\x6d\x08\x08" + struct.pack("<d", 1e-5)) == "1.0e-05"
+    assert lit(b"\x6a\x11\x0a\x02\x05\x00" + (12345).to_bytes(4, "little")) == "-123.45"
+    assert lit(b"\x24\x10\x10" + bytes(range(16))) == "'03020100-0504-0706-0809-0A0B0C0D0E0F'"
+    assert lit(b"\x28\x03" + (738885).to_bytes(3, "little")) == "'2024-01-01'"
+    units = (3 * 3600 + 4 * 60 + 5) * 10 ** 7
+    assert lit(b"\x2a\x07\x08" + units.to_bytes(5, "little") + (738885).to_bytes(3, "little")) \
+        == "'2024-01-01 03:04:05.0000000'"
+    assert lit(b"\x2b\x00\x08" + (3600).to_bytes(3, "little") + (738885).to_bytes(3, "little")
+               + (-300).to_bytes(2, "little", signed=True)) == "'2023-12-31 20:00:00 -05:00'"
+    assert lit(b"\x6f\x08\x08" + (45290).to_bytes(4, "little") + (300).to_bytes(4, "little")) \
+        == "'2024-01-01 00:00:01.000'"
+    assert lit(b"\x6e\x08\x08" + (0).to_bytes(4, "little") + (12345).to_bytes(4, "little")) == "1.2345"
+    assert lit(b"\xa5\x10\x00\x02\x00\xde\xad") == "0xDEAD"
+    big = 10 ** 37 + 7                                       # DECIMAL(38, 2) keeps every digit
+    assert lit(b"\x6a\x11\x26\x02\x11\x01" + big.to_bytes(16, "little")) \
+        == "100000000000000000000000000000000000.07"
+    assert lit(b"\x68\x01\x01\x01") == "1"
+    assert mssql.declared_names("@a int, @b decimal(10, 2) OUTPUT") == ["@a", "@b"]
+    assert mssql.declared_names("") == [] and mssql.declared_names("a int") is None
+    assert mssql.bind_names("SELECT @a, '@a', [@a], @A, @ab /* @a */ -- @a", {"@a": "1"}) \
+        == "SELECT 1, '@a', [@a], 1, @ab /* @a */ -- @a"
+
+
+def test_prepared_handles_are_capped_oldest_first():
+    h = mssql.Handles()
+    ids = [h.add("", f"SELECT {i}") for i in range(mssql.MAX_HANDLES + 1)]
+    assert ids == list(range(1, mssql.MAX_HANDLES + 2))
+    assert 1 not in h.stmts and len(h.stmts) == mssql.MAX_HANDLES
+    assert h.stmts[mssql.MAX_HANDLES + 1] == ("", f"SELECT {mssql.MAX_HANDLES}")

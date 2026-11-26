@@ -443,3 +443,72 @@ async def test_bind_with_bad_lengths_is_protocol_error_not_disconnect():
         await settle()
     finally:
         await stop(servers)
+
+
+def _m(kind, body):
+    return kind + struct.pack("!I", len(body) + 4) + body
+
+
+def _bind(params, fmts=()):
+    """Bind to the unnamed statement: params are (bytes or None)."""
+    body = b"\x00\x00" + struct.pack("!H", len(fmts)) + b"".join(struct.pack("!H", f) for f in fmts)
+    body += struct.pack("!H", len(params))
+    for v in params:
+        body += struct.pack("!i", -1) if v is None else struct.pack("!i", len(v)) + v
+    return _m(b"B", body + struct.pack("!H", 0))
+
+
+def _sql_events(ctx):
+    return [e["data"]["statement"] for e in ctx.writer.events if e["message"] == "SQL statement"]
+
+
+async def test_bind_parameters_reach_the_engine_bound():
+    ctx, servers, port = await start_server()
+    try:
+        await connect(port, "u", "1")
+        r, w, _ = await connect(port, "u", "2")
+        parse = _m(b"P", b"\x00SELECT full_name FROM patients WHERE id = $3 AND full_name <> $1 "
+                   b"AND note IS DISTINCT FROM $2\x00\x00\x00")
+        w.write(parse + _bind([b"O'Brien; --", None, struct.pack("!i", 2)], fmts=(0, 0, 1))
+                + _m(b"E", b"\x00" + struct.pack("!I", 0)) + _m(b"S", b""))
+        kinds = [k for k, _ in await read_until(r)]
+        assert kinds[:2] == [b"1", b"2"] and kinds[-1] == b"Z"
+        w.close()
+        await settle()
+    finally:
+        await stop(servers)
+    assert _sql_events(ctx) == ["SELECT full_name FROM patients WHERE id = 2 AND full_name <> "
+                                "'O''Brien; --' AND note IS DISTINCT FROM NULL"]
+
+
+async def test_describe_statement_does_not_run_writes_twice():
+    ctx, servers, port = await start_server()
+    try:
+        await connect(port, "u", "1")
+        r, w, _ = await connect(port, "u", "2")
+        execute = _m(b"E", b"\x00" + struct.pack("!I", 0))
+        for sql, tag in ((b"CREATE ROLE backup_svc LOGIN", b"CREATE ROLE"),
+                         (b"INSERT INTO patients (full_name) VALUES ($1)", b"INSERT 0 1")):
+            # asyncpg / PQdescribePrepared: Parse, Describe statement, Sync; Bind, Execute, Sync.
+            w.write(_m(b"P", b"\x00" + sql + b"\x00\x00\x00") + _m(b"D", b"S\x00") + _m(b"S", b""))
+            msgs = await read_until(r)
+            assert [k for k, _ in msgs] == [b"1", b"t", b"n", b"Z"]
+            params = [b"Pat Doe"] if b"$1" in sql else []
+            w.write(_bind(params) + execute + _m(b"S", b""))
+            msgs = await read_until(r)
+            assert [k for k, _ in msgs] == [b"2", b"C", b"Z"], msgs
+            assert msgs[1][1].rstrip(b"\x00") == tag
+        # A read is still described with its columns, however it is spelled.
+        for read in (b"SELECT full_name FROM patients WHERE id = $1", b"SELECT(1)",
+                     b"/* x */select*from patients"):
+            w.write(_m(b"P", b"\x00" + read + b"\x00\x00\x00") + _m(b"D", b"S\x00")
+                    + _m(b"S", b""))
+            assert [k for k, _ in await read_until(r)] == [b"1", b"t", b"T", b"Z"], read
+        w.close()
+        await settle()
+    finally:
+        await stop(servers)
+    logged = _sql_events(ctx)
+    assert logged.count("CREATE ROLE backup_svc LOGIN") == 1
+    assert logged.count("INSERT INTO patients (full_name) VALUES ('Pat Doe')") == 1
+    assert not [s for s in logged if s.startswith("INSERT") and "NULL" in s]
