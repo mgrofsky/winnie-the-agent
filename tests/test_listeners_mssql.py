@@ -223,7 +223,7 @@ async def test_after_n_then_session():
     assert all(e["data"]["signal"] == "sql_exec_attempt" for e in hs)
 
 
-async def test_unknown_query_with_failing_model_is_error_token():
+async def test_unknown_query_with_failing_model_gets_the_fail_safe():
     ctx, servers, port = await start_server(json_llm=RaisingLLM())
     try:
         await login(port, "sa", "a")
@@ -232,7 +232,11 @@ async def test_unknown_query_with_failing_model_is_error_token():
         assert toks[0] == (0xAA, 208, "Invalid object name 'accounts'.")  # master is current
         toks = await batch(r, w, "USE CoreBanking")
         assert toks[0][0] == 0xE3
+        # A plausible read the model cannot answer: an empty result set, not an error.
         toks = await batch(r, w, "SELECT HASHBYTES('SHA1', holder) FROM accounts")
+        assert toks[0] == ("cols", [""]) and not any(t[0] == "row" for t in toks)
+        assert toks[-1][0] == "done" and not toks[-1][1] & 0x0002
+        toks = await batch(r, w, "frobnicate accounts")
         assert toks[0][0] == 0xAA and toks[0][1] == 102
         assert toks[-1][0] == "done" and toks[-1][1] & 0x0002
         w.close()

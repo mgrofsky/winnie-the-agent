@@ -151,7 +151,18 @@ passes. The attacker instead gets what a shell would print: for `echo` or `print
 literal arguments the real output computed in code, for anything else empty output, then
 the prompt (`#` for root, `$` otherwise). The sent text also replaces the model's reply in
 the session history, so the model never sees its own break again. A `Persona break` event
-records the original reply (base64 in `details`, clipped to 2,000 characters). A phrase
+records the original reply (base64 in `details`, clipped to 2,000 characters).
+
+Before a reply is replaced, the model is asked again (`[llm] persona_retries`, default 1,
+at most 2, 0 replaces at once). This happens for a reply that breaks character, an empty
+interactive reply, a reply that is empty once code fences are stripped, and an `echo` or
+`printf` reply that misprints its literal text. The retry sends the same input with a short
+note in the persona block naming the problem and two example terminal replies. It is
+charged to the budget like any call and counts as one command with the first. The session
+history keeps only the reply that is sent. Each retry logs a `Persona retry` event with
+`reason` (`persona_break`, `empty` or `literal_mismatch`) and `attempt`; telnet logs it
+as a `notice`. If the last reply is still rejected, it is replaced as described here, and
+an empty reply after a retry is replaced the same way. A phrase
 the attacker typed themselves is allowed through. The check is a short list of patterns in
 `agents/hooks.py`; it catches the common ways a model steps out of the role, not every
 one.
@@ -263,7 +274,13 @@ Protocol notes:
   File, program and command-execution primitives get a believable permission error and a
   `sql_exec_attempt` signal; catalog queries and scenario tables get canned or generated
   answers; anything else may go to the budgeted model (when `[listeners] llm = true`)
-  through a strict schema, and otherwise gets a syntax error.
+  through a strict schema, with worked examples for the dialect on a second request.
+  When no answer comes, a statement that starts with a known verb for the dialect and has
+  balanced quotes and parentheses gets an answer by kind: an empty result set with
+  columns read from the select list for `SELECT`, `WITH`, `SHOW` and similar reads, OK
+  for a write or DDL, and a permission error for `CALL`, `EXEC` and admin verbs. Anything
+  else gets a syntax error. The statement's event has `kind` `llm`, `llm_retry` or
+  `fallback`.
 - **Redis**: RESP and inline protocol, fake per-connection keyspace. The takeover chain
   (`CONFIG SET dir/dbfilename`, `SAVE`, `SLAVEOF`/`REPLICAOF`, `MODULE LOAD`, `EVAL`,
   `FLUSHALL`) answers plausibly and is logged as high-signal; nothing touches disk or
@@ -496,7 +513,7 @@ SSH `message` values include `SSH connection received`, `User attempting to auth
 `details`), `Session summary` (summary in `details`, `judgement` field: `BENIGN`,
 `SUSPICIOUS`, `MALICIOUS`, or `UNKNOWN` when no summary was made, for example without a
 model), `Budget exceeded`
-(with `reason`), `Model error`, `Persona break`, `Reply cut`, `Session timeout` and
+(with `reason`), `Model error`, `Persona retry`, `Persona break`, `Reply cut`, `Session timeout` and
 `SSH connection closed`.
 
 Listener events add:
@@ -635,9 +652,16 @@ model is not called: the attacker gets a canned error and the session closes, an
   system prompt, persona block and the session so far are read from the provider's cache
   on the next command. Other providers are unchanged. The budget still charges the full
   token count the provider reports.
-- Listener model calls (SQL, HTTP and Telnet fallbacks) use the same budget, take a session
-  slot, run at most `llm_max_inflight` at a time, make one request with no retries, and
-  fail closed when no budget is initialised.
+- Listener model calls (SQL and HTTP fallbacks) use the same budget, take a session slot,
+  run at most `llm_max_inflight` at a time, and fail closed when no budget is initialised.
+  One answer takes up to `[listeners] llm_attempts` requests (default 2, 1 to 3). When an
+  answer fails the schema, the next request adds the caller's worked examples and one line
+  naming the problem. A timeout or provider error ends the call. All requests share
+  `llm_deadline` seconds (default 12, at most `llm_timeout`); a second request starts only
+  with at least 1 second left. Each request reserves budget; a later request does not
+  count as another model command. With `llm_attempts = 1` the one request gets
+  `llm_timeout`. HTTP request events carry `rung` (`llm`, `llm_retry` or `fallback`). Telnet
+  persona calls follow the SSH persona path, including `persona_retries`.
 - Analyst calls are capped per run (`[agents] max_llm_calls_per_run`, shared by all stages)
   and per UTC day (`max_analyst_calls_per_day`).
 

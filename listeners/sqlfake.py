@@ -8,8 +8,11 @@ Order of decisions for one statement:
    ``data.high_signal=true`` and ``data.signal="sql_exec_attempt"``;
 2. hardcoded answers (versions, session info, SHOW/SET/transactions, catalog listings,
    scenario tables, pretend writes);
-3. the budgeted model via ``ctx.llm_json`` with a strict schema (``LlmSqlAnswer``);
-4. fallback: a protocol-correct syntax error.
+3. the budgeted model via ``ctx.llm_json`` with a strict schema (``LlmSqlAnswer``) and
+   worked examples (``SQL_EXAMPLES``) for a second request;
+4. fallback (``FakeSql.fail_safe``): for a plausibly valid statement, an answer by
+   statement kind (an empty result set for a read, OK for a write or DDL, a permission
+   error for CALL/EXEC and admin verbs); otherwise a protocol-correct syntax error.
 
 Model output is only ever used as validated column names and capped cell values.
 """
@@ -36,6 +39,53 @@ MAX_CELL_CHARS = 1024
 MAX_STATEMENTS = 20
 MAX_STATEMENT_CHARS = 65536
 MAX_LLM_STATEMENT_CHARS = 2000
+
+# Worked examples sent with a second model request (``ListenerContext.llm_json``).
+SQL_EXAMPLES = {
+    "postgres": (
+        'statement: SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id '
+        'LIMIT 2\nanswer: {"columns": ["id", "name"], "rows": [[1001, "Acme Supply"], '
+        '[1002, "Birch Dental"]]}\n'
+        'statement: SELECT count(*) FROM invoices WHERE paid = false\n'
+        'answer: {"columns": ["count"], "rows": [[17]]}\n'
+        'statement: SELECT * FROM payroll_2024\n'
+        'answer: {"error": "relation \\"payroll_2024\\" does not exist"}'),
+    "mysql": (
+        'statement: SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id '
+        'LIMIT 2\nanswer: {"columns": ["id", "name"], "rows": [[1001, "Acme Supply"], '
+        '[1002, "Birch Dental"]]}\n'
+        'statement: SELECT COUNT(*) AS n FROM invoices WHERE paid = 0\n'
+        'answer: {"columns": ["n"], "rows": [[17]]}\n'
+        'statement: SELECT * FROM payroll_2024\n'
+        'answer: {"error": "Table \'appdb.payroll_2024\' doesn\'t exist"}'),
+    "mssql": (
+        'statement: SELECT TOP 2 o.id, c.name FROM orders o JOIN customers c ON c.id = '
+        'o.customer_id\nanswer: {"columns": ["id", "name"], "rows": [[1001, "Acme Supply"], '
+        '[1002, "Birch Dental"]]}\n'
+        'statement: SELECT COUNT(*) AS n FROM invoices WHERE paid = 0\n'
+        'answer: {"columns": ["n"], "rows": [[17]]}\n'
+        'statement: SELECT * FROM payroll_2024\n'
+        'answer: {"error": "Invalid object name \'payroll_2024\'."}'),
+}
+
+# First words of statements the fail-safe answers by kind, per dialect. Text that starts
+# with anything else gets a syntax error.
+READ_VERBS = {
+    "postgres": frozenset({"select", "with", "show", "values", "table", "explain"}),
+    "mysql": frozenset({"select", "with", "show", "values", "table", "explain", "describe",
+                        "desc"}),
+    "mssql": frozenset({"select", "with"}),
+}
+WRITE_VERBS = frozenset({
+    "insert", "update", "delete", "merge", "replace", "create", "drop", "alter", "truncate",
+    "grant", "revoke", "comment", "analyze", "vacuum", "reindex", "cluster", "lock", "rename",
+    "set", "declare", "prepare", "deallocate", "refresh", "optimize", "repair"})
+ADMIN_VERBS = {
+    "postgres": frozenset({"call", "load", "reassign", "copy"}),
+    "mysql": frozenset({"call", "shutdown", "restart", "install", "uninstall", "load", "purge"}),
+    "mssql": frozenset({"exec", "execute", "shutdown", "dbcc", "backup", "restore",
+                        "reconfigure", "bulk"}),
+}
 
 DEFAULT_VERSIONS = {
     "postgres": "15.6 (Ubuntu 15.6-0ubuntu0.23.10.1)",
@@ -217,6 +267,25 @@ def _mask(s: str) -> list[bool]:
             continue
         out.append(depth == 0)
     return out
+
+
+def _balanced(s: str) -> bool:
+    """True when every quote is closed and parentheses balance outside quotes."""
+    depth = 0
+    quote = ""
+    for ch in s:
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"`":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return not quote and depth == 0
 
 
 def _find_top(s: str, pattern: str, mask: Optional[list[bool]] = None, start: int = 0):
@@ -917,9 +986,121 @@ class FakeSql:
         if ans is not None:
             return ans, {"kind": "hardcoded"}
         llm = await self._ask_model(s)
+        rung = self.ctx.take_llm_rung(self.conn.task_name)
         if llm is not None:
-            return llm, {"kind": "llm"}
-        return self.syntax_error(s), {"kind": "fallback"}
+            return llm, {"kind": rung or "llm"}
+        return self.fail_safe(s, low), {"kind": "fallback"}
+
+    # ---- fail-safe -------------------------------------------------------------------------
+
+    def fail_safe(self, s: str, low: str) -> Answer:
+        """The answer when neither the hard-coded paths nor the model answered: by statement
+        kind for a plausibly valid statement (a known first word for the dialect, balanced
+        quotes and parentheses, more than the verb), otherwise a syntax error."""
+        words = low.split(None, 2)
+        verb = words[0] if words else ""
+        if len(words) < 2 or not _balanced(s):
+            return self.syntax_error(s)
+        if verb in READ_VERBS[self.dialect]:
+            return Result(self._fail_safe_columns(s, verb), [])
+        if verb in ADMIN_VERBS[self.dialect]:
+            return self.permission_error(verb, s)
+        if verb in WRITE_VERBS:
+            tags = {"insert": "INSERT 0 0", "update": "UPDATE 0", "delete": "DELETE 0",
+                    "merge": "MERGE 0", "replace": "INSERT 0 0"}
+            return self._ok(tags.get(verb, verb.upper()))
+        return self.syntax_error(s)
+
+    def _fail_safe_columns(self, s: str, verb: str) -> list[str]:
+        """Column names for an empty fail-safe result: the select list's aliases and
+        column names when they can be read, else one generic column. Never empty."""
+        d = self.dialect
+        generic = {"postgres": "?column?", "mysql": "result", "mssql": ""}[d]
+        if verb == "show":
+            if d == "postgres":
+                name = re.sub(r"[^\w.]", "", s.split()[-1].lower())[:63]
+                return [name or generic]
+            return ["Variable_name", "Value"]
+        if verb == "explain":
+            return ["QUERY PLAN"] if d == "postgres" else \
+                ["id", "select_type", "table", "type", "possible_keys", "key", "rows", "Extra"]
+        if verb in ("describe", "desc"):
+            return ["Field", "Type", "Null", "Key", "Default", "Extra"]
+        if verb == "values":
+            return ["column1"] if d == "postgres" else ["column_0"]
+        if verb == "table":
+            t = self.find_table(s.split()[1].split("."))
+            return [c for c, _ in t.columns][:20] if t is not None and t.columns else [generic]
+        mask = _mask(s)
+        sel = _find_top(s, r"\bselect\b", mask)
+        if sel is None:
+            return [generic]
+        start = sel[1]
+        m = re.match(r"\s*(?:top\s*\(?\s*\d+\s*\)?\s+)?(?:distinct\s+|all\s+)?", s[start:], re.I)
+        start += m.end() if m else 0
+        end = _find_top(s, r"\b(from|into|where|group\s+by|order\s+by|limit|union|intersect|"
+                           r"except|having|offset|fetch|for)\b", mask, start)
+        body = s[start:end[0] if end else len(s)]
+        table = None
+        if end and end[0] < len(s) and s[end[0]:end[1]].lower() == "from":
+            tm = re.match(r"\s*([`\"\[\]\w$.]+)", s[end[1]:])
+            table = self.find_table(tm.group(1).split(".")) if tm else None
+        names: list[str] = []
+        for item in _split_top(body, r",")[:20]:
+            expr, alias = _split_alias(item)
+            if alias:
+                names.append(alias)
+            elif expr == "*" or expr.endswith(".*"):
+                names.extend(c for c, _ in (table.columns if table is not None else []))
+            elif re.fullmatch(r"[`\"\[\]\w$.]+", expr) and not expr[0].isdigit():
+                names.append(_unquote_ident(expr.split(".")[-1]))
+            elif d == "mysql":
+                names.append(expr)
+            else:
+                fn = re.match(r"(\w+)\s*\(", expr)
+                names.append(fn.group(1).lower() if fn and d == "postgres" else generic)
+        names = [safe_name(n, 64) for n in names[:20]]
+        return names or [generic]
+
+    def permission_error(self, verb: str, s: str) -> SqlError:
+        """The server's permission error for a CALL, EXEC or admin statement."""
+        m = re.match(r"^\w+\s+([`\"\[\]\w$.]+)", s)
+        obj = safe_name(_unquote_ident(m.group(1).split(".")[-1]) if m else verb)
+        if self.dialect == "postgres":
+            if verb == "call":
+                return SqlError("42501", f"permission denied for procedure {obj}")
+            if verb == "load":
+                return SqlError("42501", f'access to library "{obj.strip(chr(39))}" is not allowed')
+            if verb == "reassign":
+                return SqlError("42501", "permission denied to reassign objects")
+            return SqlError("42501", f"permission denied for table {obj}")
+        if self.dialect == "mysql":
+            if verb == "call":
+                parts = [_unquote_ident(x) for x in m.group(1).split(".")] if m else []
+                routine_db = safe_name(parts[-2] if len(parts) > 1 and parts[-2]
+                                       else self.database or "mysql")
+                return SqlError("42000", f"execute command denied to user '{safe_name(self.user)}'@"
+                                f"'{safe_name(self.conn.src_ip)}' for routine "
+                                f"'{routine_db}.{obj}'", errno=1370)
+            privilege = {"shutdown": "SHUTDOWN", "restart": "SHUTDOWN",
+                         "purge": "SUPER or BINLOG_ADMIN"}.get(verb, "SUPER")
+            return SqlError("42000", f"Access denied; you need (at least one of) the {privilege} "
+                            "privilege(s) for this operation", errno=1227)
+        db = safe_name(self.database or "master")
+        if verb in ("exec", "execute"):
+            return SqlError("229", f"The EXECUTE permission was denied on the object '{obj}', "
+                            f"database '{db}', schema 'dbo'.", errno=229, klass=14)
+        if verb == "dbcc":
+            return SqlError("2571", f"User '{safe_name(self.user)}' does not have permission to "
+                            f"run DBCC {obj.upper()}.", errno=2571, klass=14)
+        if verb == "backup":
+            return SqlError("262", f"BACKUP DATABASE permission denied in database '{db}'.",
+                            errno=262, klass=14)
+        if verb == "reconfigure":
+            return SqlError("5812", "You do not have permission to run the RECONFIGURE "
+                            "statement.", errno=5812, klass=14)
+        return SqlError("297", "The user does not have permission to perform this action.",
+                        errno=297)
 
     # ---- credential tables ---------------------------------------------------------------
 
@@ -1812,7 +1993,7 @@ class FakeSql:
         user = untrusted_block("SQL statement", payload, os.urandom(8).hex())
         try:
             raw = await self.ctx.llm_json(self.conn.task_name, self.conn.src_ip, system, user,
-                                          LlmSqlAnswer)
+                                          LlmSqlAnswer, examples=SQL_EXAMPLES[self.dialect])
         except Exception:  # noqa: BLE001 - hostile/broken model output -> protocol error
             return None
         ans = validate_llm_answer(raw)

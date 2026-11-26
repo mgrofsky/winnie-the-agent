@@ -8,6 +8,7 @@ without it every model path fails closed with a canned reply.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
@@ -65,6 +66,8 @@ _source_view: Optional[SourceStateView] = None
 _seed: Optional[str] = None
 _offline_reason: Optional[str] = None   # set when the persona model cannot be used at all
 _local_replies = True   # answer host facts from the profile before asking the model
+MAX_PERSONA_RETRIES = 2
+_persona_retries = 1    # [llm] persona_retries
 
 # Providers whose client needs an API key from the environment; without it every call
 # would fail after network round trips, so the persona runs offline instead.
@@ -96,6 +99,7 @@ def init_runtime(config: ConfigParser, config_path: Optional[str], base_dir: str
     set_offline(provider_unavailable(config))
     set_local_replies(local_replies_enabled(config))
     set_local_delay(local_delay_ms(config))
+    set_persona_retries(persona_retries(config))
     _config_path = os.path.abspath(config_path) if config_path else None
     _cli_accounts = dict(cli_accounts or {})
     _overlay_path = str(runtime.overlay_path(config, base_dir))
@@ -150,6 +154,20 @@ def set_local_delay(ms: int) -> None:
     replies. 0 (the default) answers at once."""
     global _local_delay_ms
     _local_delay_ms = max(0, min(int(ms), MAX_LOCAL_DELAY_MS))
+
+
+def persona_retries(config: ConfigParser) -> int:
+    """``[llm] persona_retries`` (default 1, at most ``MAX_PERSONA_RETRIES``)."""
+    value = config["llm"].getint("persona_retries", fallback=1) if "llm" in config else 1
+    if value < 0:
+        raise ValueError("[llm] persona_retries must be 0 or more")
+    return min(value, MAX_PERSONA_RETRIES)
+
+
+def set_persona_retries(count: int) -> None:
+    """How many times a rejected persona reply is asked again (``persona_invoke``)."""
+    global _persona_retries
+    _persona_retries = max(0, min(int(count), MAX_PERSONA_RETRIES))
 
 
 def _track(table: dict, session_id: str, value) -> None:
@@ -347,6 +365,7 @@ def reset() -> None:
     _offline_reason = None
     _local_replies = True
     set_local_delay(0)
+    set_persona_retries(1)
     _source_view = None
     _seed = None
     _budget = None
@@ -840,6 +859,15 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
     A fresh model reply is cut back to one round (``_cut_reply``, ``agents.onereply``)
     before anything else reads it; the result then carries ``reply_cut`` (the logged
     fields) so a caller without a logger (telnet) can record the event.
+
+    A reply that breaks character, is empty (interactive) or empty once code fences are
+    stripped, or misprints a literal ``echo`` is asked again up to ``persona_retries``
+    times (``_retry_reason``, ``_persona_retry``): the same input with a short note and
+    examples added to the persona block. Each retry is charged to the budget but does not
+    count as another command, and the history keeps only the reply that is sent. One
+    "Persona retry" event per retry; the result carries ``persona_retry`` (the reasons).
+    When the last reply is still rejected, ``_model_reply`` replaces it, and an empty
+    reply after a retry becomes ``in_character_reply`` (never stored in the reply cache).
     """
     budget = _budget_or_none()
     host = shell_host(scenario)
@@ -967,16 +995,138 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
     if cut is not None:
         response = SimpleNamespace(content=cut["kept"],
                                    usage_metadata=getattr(response, "usage_metadata", None))
-    result = _model_reply(history, response, session_id=session_id, key=key, text=text,
+    retries: list[str] = []
+    reason = _retry_reason(response, text, interactive) if _persona_retries else None
+    while reason is not None and len(retries) < _persona_retries:
+        retried = await _persona_retry(
+            history, response, reason, len(retries) + 1, budget=budget,
+            session_id=session_id, src_ip=src_ip,
+            username=username, text=text, interactive=interactive, llm_config=llm_config,
+            host=host, shown_prompt=shown_prompt, logger=logger, log_extra=log_extra)
+        if retried is None:
+            break
+        retries.append(reason)
+        response, retry_cut = retried
+        cut = retry_cut or cut
+        reason = _retry_reason(response, text, interactive)
+    reply_key = key
+    if retries and not _content(response).strip():
+        # A replacement, not a model reply: never stored in the reply cache.
+        _leave(session_id)
+        reply_key = None
+        response = SimpleNamespace(content=in_character_reply(text, interactive, username,
+                                                              shown_prompt),
+                                   usage_metadata=getattr(response, "usage_metadata", None))
+        _replace_in_history(history, session_id, response.content)
+    result = _model_reply(history, response, session_id=session_id, key=reply_key, text=text,
                           interactive=interactive, username=username,
                           shown_prompt=shown_prompt, src_ip=src_ip, logger=logger,
                           log_extra=log_extra)
-    if cut is not None:
+    if cut is not None or retries:
         if not isinstance(result, SimpleNamespace):
             result = SimpleNamespace(content=result.content,
                                      usage_metadata=getattr(result, "usage_metadata", None))
+    if cut is not None:
         result.reply_cut = {k: v for k, v in cut.items() if k != "kept"}
+    if retries:
+        result.persona_retry = retries
     return result
+
+
+_RETRY_PROBLEMS = {
+    "persona_break": "it talked about itself instead of printing terminal output",
+    "empty": "it was empty",
+    "literal_mismatch": "it did not print the literal text the command echoes",
+}
+
+
+def _retry_reason(response, text: str, interactive: bool) -> Optional[str]:
+    """Why a fresh model reply would be replaced (``_model_reply``), or None when it is
+    sent: ``persona_break``, ``empty`` (interactive, or empty once fences are stripped),
+    ``literal_mismatch`` (interactive ``echo``/``printf`` of literal text)."""
+    content = _content(response)
+    if breaks_character(content, text):
+        return "persona_break"
+    unfenced = _strip_fences(content, text)
+    if not unfenced.strip() and (interactive or unfenced != content):
+        return "empty"
+    if interactive:
+        expected = (_literal_output(text) or "").strip()
+        if expected and expected not in unfenced:
+            return "literal_mismatch"
+    return None
+
+
+def _retry_note(reason: str, interactive: bool, prompt: str) -> str:
+    """The note added to the persona block for a retry: what was wrong and two examples
+    of a correct terminal reply."""
+    end = prompt if interactive else ""
+    nl = "\r\n" if interactive else "\n"
+    return ("\n\nNote: your previous reply to this input was rejected because "
+            f"{_RETRY_PROBLEMS[reason]}. Reply with exactly what the terminal prints for it"
+            f"{', ending with the prompt' if interactive else ''}, and nothing else. Examples "
+            f"of correct replies:\ninput: echo ok\nreply: {json.dumps('ok' + nl + end)}\n"
+            "input: nosuchtool --help\nreply: "
+            f"{json.dumps('-bash: nosuchtool: command not found' + nl + end)}")
+
+
+def _drop_last_turn(history, session_id: str, text: str) -> bool:
+    """Remove the input line and reply the chain just stored, when they are the last two
+    messages of the session's history. True when they were removed."""
+    getter = getattr(history, "get_session_history", None)
+    if not callable(getter):
+        return False
+    try:
+        messages = getter(session_id).messages
+    except Exception:  # noqa: BLE001 - a history store without this shape is left alone
+        return False
+    if len(messages) >= 2 and isinstance(messages[-1], AIMessage) and \
+            isinstance(messages[-2], HumanMessage) and messages[-2].content == text:
+        del messages[-2:]
+        return True
+    return False
+
+
+async def _persona_retry(history, response, reason: str, attempt: int, *, budget: Budget,
+                         session_id: str, src_ip: str, username: Optional[str], text: str,
+                         interactive: bool, llm_config: dict, host: shell.Host,
+                         shown_prompt: Optional[str], logger, log_extra: Optional[dict]):
+    """Ask the model once more for ``text``. Returns (response, cut fields or None), or
+    None when the budget refuses the call or the call fails; the history then holds the
+    rejected reply, for ``_model_reply`` to replace."""
+    refused, reservation = budget.reserve(session_id, src_ip, text, counts_as_command=False)
+    if refused is not None:
+        return None
+    _log(logger, "Persona retry", log_extra, reason=reason, attempt=attempt)
+    rejected = _content(response)
+    dropped = _drop_last_turn(history, session_id, text)
+    prompt = shown_prompt or shell_prompt(username, host.hostname)
+    try:
+        response = await history.ainvoke(
+            {
+                "messages": [HumanMessage(content=text)],
+                "username": username,
+                "interactive": interactive,
+                "decoy_profile": persona_fragment(session_id, src_ip)
+                + shell.persona_facts(host) + _not_found_hint(host, interactive)
+                + _retry_note(reason, interactive, prompt),
+            },
+            config=llm_config,
+        )
+    except Exception as exc:  # noqa: BLE001 - a provider failure keeps the first reply's path
+        _log(logger, "Model error", log_extra, error=type(exc).__name__,
+             error_detail=_clip_error(exc))
+        if dropped:
+            _remember(history, session_id, text, rejected)
+        return None
+    budget.commit(reservation, text, _content(response), usage_tokens=_usage_tokens(response))
+    cut = _cut_reply(history, response, session_id=session_id, text=text,
+                     interactive=interactive, username=username, host=host,
+                     shown_prompt=shown_prompt, logger=logger, log_extra=log_extra)
+    if cut is not None:
+        response = SimpleNamespace(content=cut["kept"],
+                                   usage_metadata=getattr(response, "usage_metadata", None))
+    return response, ({k: v for k, v in cut.items() if k != "kept"} if cut else None)
 
 
 def _model_reply(history, response, *, session_id: str, key: Optional[str], text: str,

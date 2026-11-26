@@ -31,9 +31,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from agents.budget import ip_key
+from agents.llm import LLMOutputError
 from agents.source_state import MAX_TARPIT_MS, SourceEntry, SourceStateView, \
     legacy_source_token, source_token, source_token_name
 from scenarios.tokens import TokenIndex
@@ -41,6 +42,11 @@ from listeners.events import MAX_DATA_KEYS, MAX_VALUE_CHARS, EventWriter, clean,
 from scenarios.schema import LoginPolicy
 
 T = TypeVar("T", bound=BaseModel)
+
+MAX_LLM_ATTEMPTS = 3
+MAX_LLM_EXAMPLES_CHARS = 2000      # worked examples a caller adds to a second request
+MIN_LLM_ATTEMPT_SECONDS = 1.0      # a second request starts only with this much time left
+MAX_LLM_RUNGS = 10_000             # sessions whose last answering rung is kept
 
 SERVICES = ("sip", "ftp", "telnet", "postgres", "mysql", "mssql", "redis", "smtp", "http", "mllp",
             "s3")
@@ -107,6 +113,8 @@ class Limits:
     ftp_pasv_per_ip: int = 2                # open passive listeners per source
     llm_max_inflight: int = 4           # concurrent model calls from SQL/HTTP fallbacks
     llm_timeout: float = 20.0
+    llm_attempts: int = 2               # requests per model answer, 1 to 3 (see llm_json)
+    llm_deadline: float = 12.0          # seconds for all attempts together, at most llm_timeout
 
     @classmethod
     def from_section(cls, section) -> "Limits":
@@ -387,6 +395,9 @@ class ListenerContext:
         self._llm_sem = asyncio.Semaphore(max(1, self.limits.llm_max_inflight))
         self._llm_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, self.limits.llm_max_inflight), thread_name_prefix="llm")
+        self.llm_clock: Callable[[], float] = time.monotonic
+        # session id -> "llm" or "llm_retry": the request that gave the last answer
+        self.llm_rungs: OrderedDict[str, str] = OrderedDict()
 
     def report_suppressed(self, now: Optional[float] = None) -> list[dict]:
         """Write one sensor-level line per protocol and pool for log lines the gate
@@ -476,17 +487,34 @@ class ListenerContext:
             return 0.0
         return min(entry.tarpit_ms, MAX_TARPIT_MS) / 1000.0
 
+    def take_llm_rung(self, session_id: str) -> Optional[str]:
+        """Which request gave the session's last ``llm_json`` answer ("llm" for the first,
+        "llm_retry" for a later one), or None when the last call gave no answer. Reading it
+        clears it."""
+        return self.llm_rungs.pop(session_id, None)
+
     async def llm_json(self, session_id: str, ip: str, system: str, user: str,
-                       schema: type[T]) -> Optional[T]:
+                       schema: type[T], examples: str = "") -> Optional[T]:
         """Budgeted, schema-validated model call. Returns None on any failure or limit;
         the caller must then render a believable protocol error.
 
         - The connection takes a model-session slot (same concurrency caps as SSH sessions).
-        - The estimated cost is reserved before the call; failed and timed-out calls keep it.
+        - The estimated cost is reserved before each request; failed and timed-out requests
+          keep it.
         - At most ``llm_max_inflight`` calls run at once, in a dedicated bounded thread pool;
-          when all slots are busy the call is not made. A timed-out call keeps its slot
-          until its thread really finishes, so threads can never pile up.
+          when all slots are busy the call is not made. A call holds its slot across its
+          requests. A timed-out call keeps its slot until its thread really finishes, so
+          threads can never pile up.
+        - Up to ``llm_attempts`` requests (1 to 3). When an answer fails schema validation
+          (the client's or the re-validation here), the next request adds ``examples`` (at
+          most ``MAX_LLM_EXAMPLES_CHARS``) and one line naming the problem to the system
+          prompt. A timeout or provider error ends the call. With more than one attempt,
+          all requests share ``llm_deadline`` seconds (at most ``llm_timeout``; 0 means
+          ``llm_timeout``), and a later request starts only with ``MIN_LLM_ATTEMPT_SECONDS``
+          left. A later request does not count as another model command.
+        - ``take_llm_rung(session_id)`` gives the request that answered.
         """
+        self.llm_rungs.pop(session_id, None)
         if self.json_llm is None or self.budget is None:
             return None
         if self.budget.session_commands(session_id) is None:
@@ -497,23 +525,85 @@ class ListenerContext:
         reason, reservation = self.budget.reserve(session_id, ip, system + user)
         if reason is not None:
             return None
+        attempts = min(MAX_LLM_ATTEMPTS, max(1, int(self.limits.llm_attempts)))
+        timeout = self.limits.llm_timeout
+        deadline = None
+        if attempts > 1:
+            budget_seconds = self.limits.llm_deadline
+            deadline = self.llm_clock() + (min(budget_seconds, timeout) if budget_seconds > 0
+                                           else timeout)
+        examples = (examples or "")[:MAX_LLM_EXAMPLES_CHARS]
+        prompt = system
         await self._llm_sem.acquire()
-        loop = asyncio.get_running_loop()
-        fut = loop.run_in_executor(self._llm_pool, self.json_llm.complete_json, system, user, schema)
+        fut: Optional[asyncio.Future] = None
         try:
-            result = await asyncio.wait_for(asyncio.shield(fut), timeout=self.limits.llm_timeout)
-        except Exception:  # noqa: BLE001 - any failure or timeout falls back to a protocol error
-            fut.add_done_callback(lambda _f: self._llm_sem.release())
+            loop = asyncio.get_running_loop()
+            for attempt in range(attempts):
+                wait = timeout
+                if deadline is not None:
+                    left = deadline - self.llm_clock()
+                    if left <= 0 or (attempt and left < MIN_LLM_ATTEMPT_SECONDS):
+                        return None
+                    wait = min(timeout, left)
+                if attempt:
+                    prompt = _retry_system(system, examples, problem)
+                    reason, reservation = self.budget.reserve(session_id, ip, prompt + user,
+                                                              counts_as_command=False)
+                    if reason is not None:
+                        return None
+                fut = loop.run_in_executor(self._llm_pool, self.json_llm.complete_json,
+                                           prompt, user, schema)
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(fut), timeout=wait)
+                except (LLMOutputError, ValidationError) as exc:
+                    problem = _llm_problem(exc, schema)
+                    continue
+                except Exception:  # noqa: BLE001 - a timeout or provider failure ends the call
+                    return None
+                try:
+                    # Never trust the client's object type: re-validate strictly against the schema.
+                    raw = result.model_dump() if isinstance(result, BaseModel) else result
+                    result = schema.model_validate(raw)
+                except Exception as exc:  # noqa: BLE001 - invalid output may be asked again
+                    problem = _llm_problem(exc, schema)
+                    continue
+                self.budget.commit(reservation, prompt + user, result.model_dump_json())
+                self.llm_rungs[session_id] = "llm" if attempt == 0 else "llm_retry"
+                while len(self.llm_rungs) > MAX_LLM_RUNGS:
+                    self.llm_rungs.popitem(last=False)
+                return result
             return None
-        self._llm_sem.release()
-        try:
-            # Never trust the client's object type: re-validate strictly against the schema.
-            raw = result.model_dump() if isinstance(result, BaseModel) else result
-            result = schema.model_validate(raw)
-        except Exception:  # noqa: BLE001 - invalid output falls back to a protocol error
-            return None
-        self.budget.commit(reservation, system + user, result.model_dump_json())
-        return result
+        finally:
+            # A request still running (timed out, or the caller was cancelled) keeps the
+            # slot until its thread ends.
+            if fut is not None and not fut.done():
+                fut.add_done_callback(lambda _f: self._llm_sem.release())
+            else:
+                self._llm_sem.release()
+
+
+def _llm_problem(exc: BaseException, schema: type[BaseModel]) -> str:
+    """One line naming why an answer was rejected: the schema's own field name and
+    pydantic's error type, never text from the model (an unexpected key is named only as
+    an extra field)."""
+    if isinstance(exc, ValidationError):
+        errors = exc.errors()
+        if errors:
+            kind = "".join(c for c in str(errors[0].get("type", "")) if c.isalnum() or c == "_")
+            loc = errors[0].get("loc", ())
+            field_name = loc[0] if loc and loc[0] in schema.model_fields else None
+            where = f"field {field_name}" if field_name else "the answer"
+            return f"{where} failed validation ({kind[:40] or 'invalid'})"
+    return "the answer was not JSON matching the schema"
+
+
+def _retry_system(system: str, examples: str, problem: str) -> str:
+    """The system prompt for a later request: the original, the problem, the examples."""
+    note = (f"\n\nYour previous answer was rejected: {problem}. Answer again with JSON that "
+            "matches the schema exactly, nothing else.")
+    if examples:
+        note += f"\nExamples of correct answers:\n{examples}"
+    return system + note
 
 
 class Conn:

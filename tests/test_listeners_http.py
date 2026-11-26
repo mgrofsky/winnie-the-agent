@@ -358,3 +358,107 @@ async def test_basic_token_without_colon_is_logged_as_the_secret_not_the_usernam
     basics = [a for a in events(ctx, "auth_attempt") if a["data"]["method"] == "basic"]
     assert basics and all("NoColonApiToken42" not in (a.get("username") or "") for a in basics)
     assert any(a["password"] == "NoColonApiToken42" for a in basics)
+
+
+# ---- reply ladder: model, model with examples, 404 ---------------------------------------
+
+class LadderLLM:
+    """Scripted JSON model: exceptions are raised, dicts validated like a real client."""
+
+    def __init__(self, *outputs, delay=0.0):
+        self.outputs = list(outputs)
+        self.systems = []
+        self.delay = delay
+
+    @property
+    def calls(self):
+        return len(self.systems)
+
+    def complete_json(self, system, user, schema):
+        import time
+
+        from pydantic import ValidationError
+
+        self.systems.append(system)
+        if self.delay:
+            time.sleep(self.delay)
+        out = self.outputs.pop(0) if len(self.outputs) > 1 else self.outputs[0]
+        if isinstance(out, BaseException):
+            raise out
+        try:
+            return schema.model_validate(out)
+        except ValidationError as exc:
+            raise LLMOutputError("invalid") from exc
+
+
+GOOD_API = {"status": 200, "content_type": "application/json", "body": '{"queue": "billing"}'}
+BAD_API = {"status": 302, "content_type": "text/html", "body": "<script>"}
+
+
+async def ladder_request(llm, **limits):
+    ctx, servers, port = await start_server(json_llm=llm)
+    for name, value in limits.items():
+        setattr(ctx.limits, name, value)
+    try:
+        status, _, body = await req(port, "GET", "/api/v2/queues/billing",
+                                    basic("apiuser", "s3cret"))
+        await settle()
+    finally:
+        await stop(servers)
+    rungs = [e["data"].get("rung") for e in events(ctx, "command")
+             if e["data"].get("route") == "api_unknown"]
+    return ctx, status, body, rungs
+
+
+async def test_http_ladder_first_answer_good():
+    llm = LadderLLM(GOOD_API)
+    ctx, status, body, rungs = await ladder_request(llm)
+    assert status == 200 and json.loads(body) == {"queue": "billing"}
+    assert llm.calls == 1 and rungs == ["llm"]
+
+
+async def test_http_ladder_second_answer_good_uses_examples():
+    llm = LadderLLM(BAD_API, GOOD_API)
+    ctx, status, body, rungs = await ladder_request(llm)
+    assert status == 200 and llm.calls == 2 and rungs == ["llm_retry"]
+    assert http.HTTP_EXAMPLES in llm.systems[1] and http.HTTP_EXAMPLES not in llm.systems[0]
+
+
+async def test_http_ladder_both_bad_is_the_404_page_and_charges_twice():
+    from agents.budget import OUTPUT_ESTIMATE_TOKENS
+
+    llm = LadderLLM(BAD_API)
+    ctx, status, body, rungs = await ladder_request(llm)
+    assert status == 404 and b"404 Not Found" in body
+    assert llm.calls == 2 and rungs == ["fallback"]
+    assert ctx.budget.global_tokens >= 2 * OUTPUT_ESTIMATE_TOKENS
+
+
+async def test_http_ladder_timeout_is_not_retried():
+    llm = LadderLLM(GOOD_API, delay=0.5)
+    ctx, status, _, rungs = await ladder_request(llm, llm_timeout=0.1)
+    assert status == 404 and llm.calls == 1 and rungs == ["fallback"]
+
+
+async def test_http_ladder_one_attempt_keeps_one_request():
+    llm = LadderLLM(BAD_API, GOOD_API)
+    ctx, status, _, rungs = await ladder_request(llm, llm_attempts=1)
+    assert status == 404 and llm.calls == 1 and rungs == ["fallback"]
+
+
+async def test_http_ladder_deadline_stops_the_second_attempt():
+    now = [0.0]
+
+    class Slow(LadderLLM):
+        def complete_json(self, system, user, schema):
+            now[0] += 11.5
+            return super().complete_json(system, user, schema)
+
+    llm = Slow(BAD_API, GOOD_API)
+    ctx, servers, port = await start_server(json_llm=llm)
+    ctx.llm_clock = lambda: now[0]
+    try:
+        status, _, _ = await req(port, "GET", "/api/v2/queues/billing", basic("apiuser", "s3cret"))
+    finally:
+        await stop(servers)
+    assert status == 404 and llm.calls == 1

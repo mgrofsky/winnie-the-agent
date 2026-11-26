@@ -251,6 +251,7 @@ async def test_honeytoken_never_crosses_sources_through_the_cache(tmp_path):
 
 async def test_replies_that_must_not_be_shared_are_not_cached():
     hooks.set_budget(Budget(BudgetConfig()))
+    hooks.set_persona_retries(0)      # one model call per line, so the count below is exact
     cache = cache_on()
     history = History({
         # non-volatile lines whose reply names the source: the whole address, and an IPv6
