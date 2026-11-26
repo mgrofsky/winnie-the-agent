@@ -25,8 +25,10 @@ trust boundary. A red arrow carries a credential. A dashed gray arrow is a read-
 
 ## Where the labels are shorter than the behavior
 
-- **"Front-ends only write events."** They also store uploads in quarantine, and the SSH
-  honeypot can call the persona model.
+- **"Front-ends only write events."** They also store uploads in quarantine, the SSH
+  honeypot can call the persona model, and, when `[listeners] llm` is on, the protocol traps can
+  call a model too (Telnet shell; SQL, HTTP and Redis answers), budgeted and schema-checked, with
+  their own key.
 - **"Nothing outside the honeypot changes without the operator's approval."** That covers
   enforce actions. Notifications, exports, lookups and OTX submission run without approval once
   enabled in the configuration.
