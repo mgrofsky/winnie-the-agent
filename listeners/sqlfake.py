@@ -19,6 +19,7 @@ Model output is only ever used as validated column names and capped cell values.
 
 from __future__ import annotations
 
+import collections
 import datetime
 import hashlib
 import json
@@ -90,6 +91,68 @@ ADMIN_VERBS = {
     "mysql": frozenset({"call", "shutdown", "restart", "install", "uninstall", "load", "purge"}),
     "mssql": frozenset({"exec", "execute", "shutdown", "dbcc", "backup", "restore",
                         "reconfigure", "bulk"}),
+}
+# First words the hard-coded write and DDL paths answer besides ``WRITE_VERBS``, per
+# dialect. A write or DDL verb from another dialect gets the syntax error.
+OTHER_VERBS = {
+    "postgres": frozenset({"discard", "reset", "listen", "unlisten", "notify", "checkpoint",
+                           "do"}),
+    "mysql": frozenset({"flush", "kill", "do", "reset"}),
+    "mssql": frozenset({"checkpoint", "kill"}),
+}
+# Object kinds after CREATE/DROP/ALTER that the dialect does not have.
+FOREIGN_OBJECTS = {
+    "postgres": frozenset({"login"}),
+    "mysql": frozenset({"extension", "policy", "login", "type"}),
+    "mssql": frozenset({"extension", "policy"}),
+}
+
+# State one connection creates, and the context sent with a model request.
+MAX_CREATED_TABLES = 50
+MAX_CREATED_ROWS = 100              # rows kept per created table
+MAX_CREATED_DATA_CHARS = 65536      # characters of cell text kept per connection
+MAX_SESSION_USERS = 20              # users, roles and logins per connection
+MAX_USER_GRANTS = 20                # objects and roles granted per user
+MAX_GRANT_PRIVILEGES = 40           # privileges per granted object
+MAX_CONTEXT_EXCHANGES = 12
+MAX_CONTEXT_STATEMENT_CHARS = 300
+MAX_CONTEXT_STATE_CHARS = 800
+MAX_CONTEXT_CHARS = 2000
+
+# The order MySQL lists static privileges in SHOW GRANTS.
+MYSQL_PRIVILEGE_ORDER = [
+    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "RELOAD", "SHUTDOWN", "PROCESS",
+    "FILE", "REFERENCES", "INDEX", "ALTER", "SHOW DATABASES", "SUPER",
+    "CREATE TEMPORARY TABLES", "LOCK TABLES", "EXECUTE", "REPLICATION SLAVE",
+    "REPLICATION CLIENT", "CREATE VIEW", "SHOW VIEW", "CREATE ROUTINE", "ALTER ROUTINE",
+    "CREATE USER", "EVENT", "TRIGGER", "CREATE TABLESPACE", "CREATE ROLE", "DROP ROLE"]
+# What GRANT ALL gives at each MySQL grant level; SHOW GRANTS prints ALL PRIVILEGES while
+# the account holds every one of them.
+MYSQL_ALL_PRIVILEGES = {
+    "global": MYSQL_PRIVILEGE_ORDER,
+    "database": ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "REFERENCES",
+                 "INDEX", "ALTER", "CREATE TEMPORARY TABLES", "LOCK TABLES", "EXECUTE",
+                 "CREATE VIEW", "SHOW VIEW", "CREATE ROUTINE", "ALTER ROUTINE", "EVENT",
+                 "TRIGGER"],
+    "table": ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "REFERENCES", "INDEX",
+              "ALTER", "CREATE VIEW", "SHOW VIEW", "TRIGGER"],
+}
+# What GRANT ALL gives on a PostgreSQL object, by the object's leading keyword; a bare
+# name, TABLE and ALL TABLES IN SCHEMA are tables.
+PG_ALL_PRIVILEGES = {
+    "table": ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"],
+    "database": ["CREATE", "CONNECT", "TEMPORARY"],
+    "schema": ["USAGE", "CREATE"],
+    "sequence": ["USAGE", "SELECT", "UPDATE"],
+    "function": ["EXECUTE"],
+    "language": ["USAGE"],
+    "tablespace": ["CREATE"],
+}
+# What SQL Server's GRANT ALL gives: on the database (no ON clause) and on a table or view.
+MSSQL_ALL_PERMISSIONS = {
+    "database": ["BACKUP DATABASE", "BACKUP LOG", "CREATE DEFAULT", "CREATE FUNCTION",
+                 "CREATE PROCEDURE", "CREATE RULE", "CREATE TABLE", "CREATE VIEW"],
+    "object": ["DELETE", "INSERT", "REFERENCES", "SELECT", "UPDATE"],
 }
 
 DEFAULT_VERSIONS = {
@@ -215,6 +278,7 @@ class TableInfo:
     db: str
     schema: str
     scenario: bool = True
+    created: bool = False    # made by this connection (rows in ``FakeSql.created_rows``)
 
 
 @dataclass
@@ -223,6 +287,22 @@ class DbInfo:
     schema: str
     tables: dict[str, TableInfo] = field(default_factory=dict)
     system: bool = False
+
+
+@dataclass
+class SessionUser:
+    """A user, role or login one connection created, with what it was granted."""
+    name: str
+    kind: str                # the CREATE statement's object: user, role, group or login
+    host: str = "%"          # MySQL account host
+    login: bool = True
+    superuser: bool = False
+    createdb: bool = False
+    createrole: bool = False
+    # Granted object (as written, normalized for MySQL) -> privileges, in grant order.
+    privileges: dict[str, list[str]] = field(default_factory=dict)
+    grant_option: set[str] = field(default_factory=set)
+    roles: list[str] = field(default_factory=list)   # roles granted to it
 
 
 # ---- text helpers -------------------------------------------------------------------------
@@ -245,6 +325,26 @@ def _unquote_ident(s: str) -> str:
     if len(s) >= 2 and s[0] in "\"`[" and s[-1] in "\"`]":
         return s[1:-1]
     return s
+
+
+def _table_key(t: TableInfo) -> tuple[str, str]:
+    return t.db.lower(), t.name.lower()
+
+
+def _unquote_name(s: str) -> str:
+    """An identifier or a single-quoted account part without its quotes."""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == "'" and s[-1] == "'":
+        return s[1:-1].replace("''", "'")
+    return _unquote_ident(s)
+
+
+# A MySQL account: name, then an optional @host; each part quoted or bare.
+_ACCOUNT_RX = re.compile(r"('(?:[^']|'')*'|\"[^\"]*\"|`[^`]*`|[\w$.-]+)"
+                         r"(?:\s*@\s*('(?:[^']|'')*'|\"[^\"]*\"|`[^`]*`|[\w$.%:-]+))?")
+# A PostgreSQL role name, or an MSSQL principal name.
+_PG_NAME_RX = re.compile(r"(\"(?:[^\"]|\"\")+\"|[A-Za-z_][\w$]*)")
+_MSSQL_NAME_RX = re.compile(r"(\[[^\]]+\]|\"[^\"]+\"|[A-Za-z_#@][\w$#@.\\-]*)")
 
 
 def _mask(s: str) -> list[bool]:
@@ -620,8 +720,14 @@ class FakeSql:
         self.started = datetime.datetime(2026, 1, 1, 3, 12, 44)
         self.catalog = self._build_catalog()
         self._row_cache: dict[tuple[str, str], list[list]] = {}
-        self.created: dict[str, list[str]] = {}
+        # Tables this connection created, by (database, table) in lower case; each is also
+        # in its database's ``tables`` so catalog reads list it.
+        self.created: dict[tuple[str, str], TableInfo] = {}
+        self.created_rows: dict[tuple[str, str], list[list]] = {}
+        self.created_chars = 0
         self.session_dbs: set[str] = set()
+        self.session_users: dict[tuple[str, str, str], SessionUser] = {}
+        self.history: collections.deque[str] = collections.deque(maxlen=MAX_CONTEXT_EXCHANGES)
         default = next((d.name for d in self.catalog.values() if not d.system), None)
         if dialect == "postgres":
             self.database = database or user
@@ -666,6 +772,8 @@ class FakeSql:
         return self.catalog.get((self.database or "").lower())
 
     def table_rows(self, t: TableInfo) -> list[list]:
+        if t.created:
+            return self.created_rows.get(_table_key(t), [])
         key = (t.db, t.name)
         if key not in self._row_cache:
             if t.scenario and self.ctx.scenario is not None:
@@ -754,6 +862,15 @@ class FakeSql:
                             f"use near '{safe_name(rest.strip(), 80)}' at line 1", errno=1064)
         return SqlError("1060", "The number of rows provided for a TOP or FETCH clauses row "
                         "count parameter must be an integer.", errno=1060, klass=15)
+
+    def table_exists(self, name: str) -> SqlError:
+        name = safe_name(name)
+        if self.dialect == "postgres":
+            return SqlError("42P07", f'relation "{name}" already exists')
+        if self.dialect == "mysql":
+            return SqlError("42S01", f"Table '{name}' already exists", errno=1050)
+        return SqlError("2714", f"There is already an object named '{name}' in the database.",
+                        errno=2714)
 
     def no_db_selected(self) -> SqlError:
         return SqlError("3D000", "No database selected", errno=1046)
@@ -972,6 +1089,9 @@ class FakeSql:
             data["honeytoken"] = token
             data["high_signal"] = True
         self.conn.emit("command", "SQL statement", username=self.user, data=data)
+        if stmt.strip():
+            text = _CTRL.sub(" ", " ".join(stmt.split()))[:MAX_CONTEXT_STATEMENT_CHARS]
+            self.history.append(f"{text} -> {data['result']}")
 
     async def _one(self, stmt: str) -> tuple[Answer, dict]:
         s = " ".join(stmt.split())
@@ -1163,11 +1283,16 @@ class FakeSql:
             return Result(["DATABASE_NAME", "DATABASE_SIZE", "REMARKS"], rows)
         if re.match(r"^select\b", low):
             return self._select(s, low)
+        verb = re.match(r"^\w*", low).group(0)
         if re.match(r"^(insert|update|delete|replace|merge|upsert)\b", low):
+            if verb not in WRITE_VERBS[self.dialect]:
+                return self.syntax_error(s)
             return self._write(s, low)
         if re.match(r"^(create|drop|alter|truncate|grant|revoke|comment|analyze|vacuum|reindex|"
                     r"cluster|lock|discard|reset|deallocate|listen|unlisten|notify|checkpoint|"
                     r"flush|optimize|kill|rename|do)\b", low):
+            if verb not in WRITE_VERBS[self.dialect] | OTHER_VERBS[self.dialect]:
+                return self.syntax_error(s)
             return self._ddl(s, low)
         return None
 
@@ -1257,6 +1382,15 @@ class FakeSql:
             items = sorted(self.mysql_status().items())
             return Result(["Variable_name", "Value"],
                           [[k, v] for k, v in self._filter_like(items, low)])
+        m = re.match(r"^show\s+grants\s+for\s+(.+?)(?:\s+using\s+.*)?$", s, re.I)
+        acct = _ACCOUNT_RX.fullmatch(m.group(1).strip()) if m else None
+        if acct:
+            host = _unquote_name(acct.group(2)) if acct.group(2) else "%"
+            created = self.session_users.get(self._user_key("user", _unquote_name(acct.group(1)),
+                                                            host))
+            if created is not None:
+                return Result([f"Grants for {safe_name(created.name)}@{safe_name(created.host)}"],
+                              self._mysql_grants(created))
         if re.match(r"^show\s+grants\b", low):
             u = safe_name(self.user)
             rows = [[f"GRANT USAGE ON *.* TO `{u}`@`%`"]]
@@ -1344,25 +1478,116 @@ class FakeSql:
             return self.syntax_error(s)
         parts = m.group(1).split(".")
         t = self.find_table(parts)
-        name = _unquote_ident(parts[-1]).lower()
-        if t is None and name not in self.created:
+        if t is None:
             if self.dialect == "mysql" and not self.database and len(parts) == 1:
                 return self.no_db_selected()
             return self.no_table(_unquote_ident(parts[-1]))
         if verb in ("insert", "replace", "upsert"):
             n = len(re.findall(r"\)\s*,\s*\(", s)) + 1 if _w(low, "values") else 1
+            if t.created:
+                self._store_insert(t, s[m.end():])
             return self._ok(f"INSERT 0 {n}", n)
-        nrows = len(self.table_rows(t)) if t is not None else 0
+        nrows = len(self.table_rows(t))
         if _w(low, "where"):
             n = 1 if nrows else 0
         else:
             n = nrows
+            if t.created and verb == "delete":
+                self._clear_rows(_table_key(t))
         return self._ok(f"{verb.upper()} {n}", n)
+
+    def _store_insert(self, t: TableInfo, rest: str) -> None:
+        """Keep the rows of ``INSERT INTO <created table> [(columns)] VALUES (...), ...``
+        when every value is a literal, so a later SELECT returns them. Rows past
+        ``MAX_CREATED_ROWS`` per table or ``MAX_CREATED_DATA_CHARS`` per connection, and
+        any other INSERT form, leave the table as it is."""
+        cols = [c for c, _ in t.columns]
+        if not cols:
+            return
+        rest = rest.strip()
+        target = list(range(len(cols)))
+        if rest.startswith("("):
+            m = re.match(r"\(([^()]*)\)\s*", rest)
+            if not m:
+                return
+            lower = [c.lower() for c in cols]
+            names = [_unquote_ident(c).lower() for c in _split_top(m.group(1), r",")]
+            if len(set(names)) != len(names) or any(n not in lower for n in names):
+                return
+            target = [lower.index(n) for n in names]
+            rest = rest[m.end():]
+        m = re.match(r"values?\s*", rest, re.I)
+        if not m:
+            return
+        rows, chars = [], 0
+        for tup in _split_top(rest[m.end():], r","):
+            if len(tup) < 2 or tup[0] != "(" or tup[-1] != ")":
+                return
+            row: list = [None] * len(cols)
+            values = _split_top(tup[1:-1], r",")
+            if len(values) != len(target):
+                return
+            for idx, raw in zip(target, values):
+                ok, value = _literal(raw)
+                if not ok or (raw.startswith('"') and self.dialect != "mysql") or \
+                        (self.dialect == "mysql" and "\\" in raw):
+                    return
+                if isinstance(value, str):
+                    value = value[:MAX_CELL_CHARS]
+                    chars += len(value)
+                row[idx] = value
+            rows.append(row)
+        stored = self.created_rows.setdefault(_table_key(t), [])
+        room = MAX_CREATED_ROWS - len(stored)
+        if rows[:room] and self.created_chars + chars <= MAX_CREATED_DATA_CHARS:
+            stored.extend(rows[:room])
+            self.created_chars += sum(len(v) for r in rows[:room] for v in r if isinstance(v, str))
+
+    def _clear_rows(self, key: tuple[str, str]) -> None:
+        rows = self.created_rows.pop(key, [])
+        self.created_chars -= sum(len(v) for r in rows for v in r if isinstance(v, str))
+
+    def _create_table(self, parts: list[str], cols: list[tuple[str, str]],
+                      if_not_exists: bool, temporary: bool = False) -> Optional[Answer]:
+        """CREATE TABLE for this connection: the table goes into the named or current
+        database, where SHOW TABLES and the catalog views list it and SELECT reads its
+        rows, until it or its database is dropped or the connection ends. A name already
+        in that database (scenario, default or created) keeps its table and rows and
+        answers the server's existing-table error; IF NOT EXISTS, or a temporary table,
+        answers OK and changes nothing."""
+        db = None
+        for qual in parts[:-1]:
+            db = db or self.catalog.get(_unquote_ident(qual).lower())
+        db = db or self.current_db()
+        if db is None:
+            return self.no_db_selected() if self.dialect == "mysql" else None
+        raw = parts[-1].strip()
+        name = _unquote_ident(raw)[:64]
+        if self.dialect == "postgres" and raw[:1] != '"':
+            name = name.lower()
+        if name.lower() in db.tables:
+            return None if if_not_exists or temporary else self.table_exists(name)
+        if len(self.created) >= MAX_CREATED_TABLES:
+            return None
+        t = TableInfo(name, cols[:40], db.name, db.schema, scenario=False, created=True)
+        db.tables[name.lower()] = t
+        self.created[_table_key(t)] = t
+        return None
+
+    def _drop_created(self, t: TableInfo) -> None:
+        key = _table_key(t)
+        self._clear_rows(key)
+        self.created.pop(key, None)
+        db = self.catalog.get(key[0])
+        if db is not None:
+            db.tables.pop(key[1], None)
 
     def _session_database(self, s: str, verb: str) -> Optional[Answer]:
         """CREATE or DROP DATABASE for this connection: a created database is listed, can be
         selected with USE and holds the tables the session creates, until the connection
-        ends. Scenario and system databases stay as they are."""
+        ends. Dropping it drops its tables, its SQL Server users and roles, and PostgreSQL
+        grants ON DATABASE it; MySQL grants on it stay, as on the real server. Scenario and
+        system databases stay as they are."""
         m = re.match(r"^(create|drop)\s+(?:database|schema)\s+(if\s+(?:not\s+)?exists\s+)?"
                      r"([`\[\"]?[\w$-]{1,64}[`\]\"]?)", s, re.I)
         if not m:
@@ -1382,32 +1607,324 @@ class FakeSql:
                 self.session_dbs.add(key)
             return self._ok("CREATE DATABASE", 1) if self.dialect == "mysql" else None
         if key in self.session_dbs:
+            for t in list(self.catalog[key].tables.values()):
+                if t.created:
+                    self._drop_created(t)
             del self.catalog[key]
             self.session_dbs.discard(key)
+            self._drop_database_principals(key)
             if (self.database or "").lower() == key:
                 self.database = "" if self.dialect == "mysql" else "master"
         return None
+
+    def _drop_database_principals(self, key: str) -> None:
+        """What a dropped database takes with it: SQL Server users and roles scoped to it
+        (logins stay), and PostgreSQL privileges granted ON DATABASE it."""
+        if self.dialect == "mssql":
+            for k in [k for k in self.session_users if k[0] == "db" and k[2] == key]:
+                del self.session_users[k]
+        elif self.dialect == "postgres":
+            for u in self.session_users.values():
+                for obj in list(u.privileges):
+                    words = obj.split(None, 1)
+                    if len(words) == 2 and words[0].lower() == "database" \
+                            and any(_unquote_ident(n.strip()).lower() == key
+                                    for n in words[1].split(",")):
+                        del u.privileges[obj]
+                        u.grant_option.discard(obj)
+
+    # ---- users, roles, logins and grants -----------------------------------------------------
+
+    def _user_key(self, kind: str, name: str, host: str = "%") -> tuple[str, str, str]:
+        """MySQL accounts are name and host; PostgreSQL roles share one namespace; MSSQL
+        logins are server-wide and users and roles belong to the current database."""
+        if self.dialect == "mysql":
+            return ("account", name, host.lower())
+        if self.dialect == "postgres":
+            return ("role", name, "")
+        if kind == "login":
+            return ("login", name.lower(), "")
+        return ("db", name.lower(), (self.database or "").lower())
+
+    def _principals(self, text: str) -> list[tuple[str, str]]:
+        """(name, host) for each item of a comma-separated user, role or login list; the
+        host is MySQL's (``%`` when absent) and empty for the other dialects."""
+        out = []
+        for item in _split_top(text, r",")[:MAX_SESSION_USERS]:
+            if self.dialect == "mysql":
+                m = _ACCOUNT_RX.match(item)
+                if m:
+                    host = _unquote_name(m.group(2))[:255] if m.group(2) else "%"
+                    out.append((_unquote_name(m.group(1))[:64], host))
+            elif self.dialect == "postgres":
+                m = _PG_NAME_RX.match(item)
+                if m:
+                    tok = m.group(1)
+                    name = tok[1:-1].replace('""', '"') if tok[0] == '"' else tok.lower()
+                    out.append((name[:63], ""))
+            else:
+                m = _MSSQL_NAME_RX.match(item)
+                if m:
+                    out.append((_unquote_ident(m.group(1))[:128], ""))
+        return out
+
+    def _find_user(self, name: str, host: str) -> Optional[SessionUser]:
+        for kind in (("user", "login") if self.dialect == "mssql" else ("user",)):
+            u = self.session_users.get(self._user_key(kind, name, host))
+            if u is not None:
+                return u
+        return None
+
+    @staticmethod
+    def _role_options(u: SessionUser, body: str) -> None:
+        """PostgreSQL role attributes from CREATE/ALTER ROLE options."""
+        text = re.sub(r"'(?:[^']|'')*'", "''", body.lower())
+        for m in re.finditer(r"\b(no)?(login|superuser|createdb|createrole)\b", text):
+            setattr(u, m.group(2), m.group(1) is None)
+
+    def _exists_error(self, obj: str, names: list[tuple[str, str]]) -> SqlError:
+        name = safe_name(names[0][0])
+        if self.dialect == "mysql":
+            accounts = ",".join(f"'{safe_name(n)}'@'{safe_name(h)}'" for n, h in names)
+            return SqlError("HY000", f"Operation CREATE {obj.upper()} failed for {accounts}",
+                            errno=1396)
+        if self.dialect == "postgres":
+            return SqlError("42710", f'role "{name}" already exists')
+        if obj == "login":
+            return SqlError("15025", f"The server principal '{name}' already exists.",
+                            errno=15025)
+        return SqlError("15023", f"User, group, or role '{name}' already exists in the current "
+                        "database.", errno=15023)
+
+    def _account_ddl(self, s: str, verb: str, obj: str) -> Optional[Answer]:
+        """CREATE, DROP and ALTER of a user, role or login for this connection: a created
+        name is listed by the user and role reads and can be granted to, until the
+        connection ends. Creating a name the connection already created is the server's
+        error. None means the generic DDL answer."""
+        m = re.match(rf"^\w+\s+{obj}\s+(if\s+(?:not\s+)?exists\s+)?(.+)$", s, re.I | re.S)
+        if not m or re.match(r"mapping\b", m.group(2), re.I):    # CREATE USER MAPPING
+            return None
+        guarded, body = bool(m.group(1)), m.group(2)
+        names = self._principals(body)
+        if self.dialect != "mysql" and verb != "drop":
+            names = names[:1]
+        if not names:
+            return None
+        if verb == "drop":
+            for n, h in names:
+                self.session_users.pop(self._user_key(obj, n, h), None)
+            return None
+        if verb == "alter":
+            u = self._find_user(*names[0]) if self.dialect == "postgres" else None
+            if u is not None:
+                self._role_options(u, body)
+                r = re.search(r"\brename\s+to\s+(\S+)", body, re.I)
+                renamed = self._principals(r.group(1)) if r else []
+                key = self._user_key(obj, *renamed[0]) if renamed else None
+                if key is not None and key not in self.session_users:
+                    del self.session_users[self._user_key(obj, u.name)]
+                    u.name = renamed[0][0]
+                    self.session_users[key] = u
+            return None
+        keys = [(self._user_key(obj, n, h), n, h) for n, h in names]
+        taken = [(n, h) for key, n, h in keys if key in self.session_users]
+        if taken and not guarded:
+            return self._exists_error(obj, taken)
+        for key, n, h in keys:
+            if key in self.session_users or len(self.session_users) >= MAX_SESSION_USERS:
+                continue
+            u = SessionUser(n, obj, host=h if self.dialect == "mysql" else "%")
+            u.login = obj in ("user", "login")
+            if self.dialect == "postgres":
+                self._role_options(u, body)
+            self.session_users[key] = u
+        return None
+
+    def _mysql_grant_object(self, obj: str) -> str:
+        """``db.*``, ``*.*`` or ``db.table`` the way SHOW GRANTS prints it."""
+        obj = re.sub(r"^(table|function|procedure)\s+", "", obj.strip(), flags=re.I)
+        parts = [p.strip() for p in obj.split(".")][:2]
+        if len(parts) == 1 and self.database:
+            parts = [self.database, parts[0]]
+        return ".".join(p if p == "*" else f"`{safe_name(_unquote_ident(p))}`" for p in parts)
+
+    def _grant(self, s: str, verb: str) -> None:
+        """Record a GRANT or REVOKE whose grantees this connection created: privileges on
+        an object, or (MySQL, PostgreSQL) roles granted to a user."""
+        mask = _mask(s)
+        on = _find_top(s, r"\bon\b", mask)
+        keyword = r"\bto\b" if verb == "grant" else (
+            r"\b(from|to)\b" if self.dialect == "mssql" else r"\bfrom\b")
+        target = _find_top(s, keyword, mask, on[1] if on else 0)
+        if target is None:
+            return
+        head = s[len(verb):(on or target)[0]].strip()
+        head = re.sub(r"^(grant|admin)\s+option\s+for\s+", "", head, flags=re.I)
+        items = [i for i in _split_top(head, r",") if i][:MAX_GRANT_PRIVILEGES]
+        tail = s[target[1]:]
+        cut = _find_top(tail, r"\b(with|granted|as|cascade|restrict|require)\b")
+        with_grant = re.search(r"\bwith\s+grant\s+option\b", tail, re.I) is not None
+        for name, host in self._principals(tail[:cut[0]] if cut else tail):
+            u = self._find_user(name, host)
+            if u is not None:
+                self._apply_grant(u, verb, items, s[on[1]:target[0]] if on else None,
+                                  with_grant)
+
+    def _all_privileges(self, key: str) -> Optional[list[str]]:
+        """The privileges GRANT ALL gives on a granted object key, or None for an object
+        kind the engine does not model (ALL is then kept as one word)."""
+        if self.dialect == "mysql":
+            level = "global" if key == "*.*" else "database" if key.endswith("*") else "table"
+            return MYSQL_ALL_PRIVILEGES[level]
+        words = key.lower().split()
+        if self.dialect == "postgres":
+            if words[:1] == ["all"] and len(words) > 1:
+                words = words[1:]
+            kind = words[0].rstrip("s") if len(words) > 1 else "table"
+            if kind in ("procedure", "routine"):
+                kind = "function"
+            if kind in ("foreign", "large", "type", "domain", "parameter"):
+                return None
+            if kind not in PG_ALL_PRIVILEGES:       # a bare table list: GRANT ALL ON a, b
+                kind = "table"
+            privs = PG_ALL_PRIVILEGES[kind]
+            if kind == "table" and int(self._pg_major()) >= 17:
+                privs = privs + ["MAINTAIN"]
+            return privs
+        if not key:
+            privs = MSSQL_ALL_PERMISSIONS["database"]
+            if (self.database or "").lower() == "master":
+                privs = ["CREATE DATABASE"] + privs
+            return privs
+        if "::" not in key or key.lower().startswith("object::"):
+            return MSSQL_ALL_PERMISSIONS["object"]
+        return None
+
+    def _privilege_names(self, key: str, held: list[str]) -> list[str]:
+        """How SHOW GRANTS (MySQL) names the privileges held on one object: ALL PRIVILEGES
+        while every privilege GRANT ALL gives there is held, otherwise the list."""
+        full = self._all_privileges(key) if self.dialect == "mysql" else None
+        if full is not None and set(full) <= set(held):
+            return ["ALL PRIVILEGES"] + [p for p in held if p not in full]
+        return held
+
+    def _apply_grant(self, u: SessionUser, verb: str, items: list[str], obj: Optional[str],
+                     with_grant: bool) -> None:
+        privs = []
+        for item in items:
+            p = " ".join(item.split()).upper()[:64]
+            p = "TEMPORARY" if p == "TEMP" and self.dialect == "postgres" else p
+            privs.append("ALL PRIVILEGES" if p in ("ALL", "ALL PRIVILEGES") else p)
+        if obj is None and self.dialect != "mssql":
+            if verb == "revoke" and "ALL PRIVILEGES" in privs:   # REVOKE ALL, GRANT OPTION
+                u.privileges.clear()
+                u.grant_option.clear()
+                return
+            roles = []
+            for n, h in self._principals(",".join(items)):
+                roles.append(f"`{safe_name(n)}`@`{safe_name(h)}`" if self.dialect == "mysql"
+                             else safe_name(n))
+            if verb == "grant":
+                u.roles.extend(r for r in roles if r not in u.roles)
+                del u.roles[MAX_USER_GRANTS:]
+            else:
+                u.roles[:] = [r for r in u.roles if r not in roles]
+            return
+        key = self._mysql_grant_object(obj) if self.dialect == "mysql" and obj is not None \
+            else " ".join((obj or "").split())[:128]
+        held = u.privileges.get(key)
+        if verb == "revoke":
+            if held is None:
+                return
+            if "GRANT OPTION" in privs:
+                u.grant_option.discard(key)
+            if "ALL PRIVILEGES" in privs:
+                full = self._all_privileges(key) if self.dialect == "mssql" else None
+                if full is None:
+                    held.clear()
+                privs = privs + (full or [])      # SQL Server's REVOKE ALL takes ALL's set
+            held[:] = [p for p in held if p not in privs]
+            if not held:
+                del u.privileges[key]
+                u.grant_option.discard(key)
+            return
+        if held is None:
+            if len(u.privileges) >= MAX_USER_GRANTS:
+                return
+            held = u.privileges.setdefault(key, [])
+        full = self._all_privileges(key) if "ALL PRIVILEGES" in privs else None
+        if full is not None:      # ALL is stored as what it gives; a partial REVOKE keeps the rest
+            privs = full + [p for p in privs if p not in full and p != "ALL PRIVILEGES"]
+        if "ALL PRIVILEGES" in privs or "ALL PRIVILEGES" in held:     # an unmodeled kind
+            held[:] = ["ALL PRIVILEGES"]
+        else:
+            held.extend(p for p in privs if p not in held)
+            del held[MAX_GRANT_PRIVILEGES:]
+            if self.dialect == "mysql":
+                order = {p: i for i, p in enumerate(MYSQL_PRIVILEGE_ORDER)}
+                held.sort(key=lambda p: order.get(p, len(order)))
+        if with_grant:
+            u.grant_option.add(key)
+
+    def _mysql_grants(self, u: SessionUser) -> list[list]:
+        """SHOW GRANTS rows for an account this connection created."""
+        account = f"`{safe_name(u.name)}`@`{safe_name(u.host)}`"
+        rows = [] if "*.*" in u.privileges else [[f"GRANT USAGE ON *.* TO {account}"]]
+        for obj in sorted(u.privileges, key=lambda o: o != "*.*"):
+            option = " WITH GRANT OPTION" if obj in u.grant_option else ""
+            names = ", ".join(self._privilege_names(obj, u.privileges[obj]))
+            rows.append([f"GRANT {names} ON {obj} TO {account}{option}"])
+        if u.roles:
+            rows.append([f"GRANT {','.join(u.roles)} TO {account}"])
+        return rows
 
     def _ddl(self, s: str, low: str) -> Answer:
         words = [w for w in low.split() if w not in ("or", "replace", "unique", "temporary",
                                                      "temp", "if", "not", "exists", "global",
                                                      "local", "materialized", "unlogged")]
         verb = words[0]
+        if verb in ("create", "drop", "alter") and len(words) > 1:
+            if words[1] in FOREIGN_OBJECTS[self.dialect]:
+                return self.syntax_error(s)
+            if words[1] in ("user", "role", "group", "login"):
+                answer = self._account_ddl(s, verb, words[1])
+                if answer is not None:
+                    return answer
+        if verb in ("grant", "revoke"):
+            self._grant(s, verb)
         if verb == "create" and len(words) > 2 and words[1] == "table":
-            m = re.match(r"^create\s+(?:temporary\s+|temp\s+)?table\s+(?:if\s+not\s+exists\s+)?"
+            m = re.match(r"^create\s+(temporary\s+|temp\s+)?table\s+(if\s+not\s+exists\s+)?"
                          r"([`\"\[\]\w$.]+)\s*\((.*)\)", s, re.I | re.S)
             if m:
-                name = _unquote_ident(m.group(1).split(".")[-1]).lower()
                 cols = []
-                for item in _split_top(m.group(2), r","):
-                    first = item.split()[0] if item.split() else ""
+                for item in _split_top(m.group(4), r","):
+                    tokens = item.split()
+                    first = tokens[0] if tokens else ""
                     if first.lower() in ("primary", "unique", "key", "index", "constraint",
                                          "foreign", "check", "fulltext"):
                         continue
                     if first:
-                        cols.append(_unquote_ident(first)[:63])
-                if len(self.created) < 50:
-                    self.created[name] = cols[:40]
+                        col = _unquote_ident(first)[:63]
+                        quoted = first[0] in "\"`["
+                        ty = re.match(r"[a-z_]\w*", tokens[1].lower()) if len(tokens) > 1 else None
+                        cols.append((col.lower() if self.dialect == "postgres" and not quoted
+                                     else col, ty.group(0)[:32] if ty else "text"))
+                answer = self._create_table(m.group(3).split("."), cols, bool(m.group(2)),
+                                            bool(m.group(1)))
+                if answer is not None:
+                    return answer
+        if verb == "drop" and len(words) > 2 and words[1] == "table":
+            m = re.match(r"^drop\s+(?:temporary\s+)?table\s+(?:if\s+exists\s+)?(.+?)"
+                         r"(?:\s+(?:cascade|restrict))?$", s, re.I | re.S)
+            for item in _split_top(m.group(1), r",") if m else []:
+                t = self.find_table(item.split("."))
+                if t is not None and t.created:
+                    self._drop_created(t)
+        if verb == "truncate" and len(words) > 1:
+            target = words[2] if words[1] == "table" and len(words) > 2 else words[1]
+            t = self.find_table(target.split("."))
+            if t is not None and t.created:
+                self._clear_rows(_table_key(t))
         if verb in ("create", "drop") and len(words) > 2 and words[1] in ("database", "schema") \
                 and (words[1] == "database" or self.dialect == "mysql"):
             answer = self._session_database(s, verb)
@@ -1415,6 +1932,8 @@ class FakeSql:
                 return answer
         if verb in ("create", "drop", "alter", "comment") and len(words) > 1:
             obj = words[1]
+            if self.dialect == "postgres" and obj in ("user", "group"):
+                obj = "role"     # PostgreSQL tags CREATE USER and CREATE GROUP as CREATE ROLE
             if obj in ("table", "index", "view", "database", "schema", "user", "role", "sequence",
                        "function", "procedure", "trigger", "extension", "type", "policy",
                        "event", "login"):
@@ -1483,9 +2002,6 @@ class FakeSql:
                                  distinct=distinct, top=top)
         t = self.find_table(parts)
         if t is None:
-            created = self.created.get(_unquote_ident(parts[-1]).lower())
-            if created is not None:
-                return Result(created or ["?column?"], [])
             if self.dialect == "mysql" and not self.database and len(parts) == 1:
                 return self.no_db_selected()
             return self.no_table(_unquote_ident(parts[-1]))
@@ -1709,11 +2225,12 @@ class FakeSql:
                     "pg_statio_user_tables"):
             rows = []
             for i, t in enumerate(cur.tables.values() if cur else []):
-                rows.append({"schemaname": t.schema, "tablename": t.name, "tableowner": "postgres",
+                owner = self.user if t.created else "postgres"
+                rows.append({"schemaname": t.schema, "tablename": t.name, "tableowner": owner,
                              "relname": t.name, "relkind": "r", "relnamespace": 2200,
                              "oid": 16400 + i * 7, "relid": 16400 + i * 7, "nspname": t.schema,
                              "schema": t.schema, "name": t.name, "type": "table",
-                             "owner": "postgres", "n_live_tup": len(self.table_rows(t)),
+                             "owner": owner, "n_live_tup": len(self.table_rows(t)),
                              "reltuples": float(len(self.table_rows(t))), "relowner": 10,
                              "hasindexes": True, "hasrules": False, "hastriggers": False,
                              "rowsecurity": False, "tablespace": None,
@@ -1740,14 +2257,12 @@ class FakeSql:
             rows = []
             for i, n in enumerate(names):
                 sup = n == "postgres"
-                rows.append({"usename": n, "rolname": n, "usesysid": 10 + i * 6000,
-                             "oid": 10 + i * 6000, "usesuper": sup, "rolsuper": sup,
-                             "usecreatedb": sup, "rolcreatedb": sup, "rolcreaterole": sup,
-                             "rolinherit": True, "rolcanlogin": True, "rolreplication": sup,
-                             "rolbypassrls": sup, "rolconnlimit": -1, "passwd": "********",
-                             "rolpassword": "********", "valuntil": None, "rolvaliduntil": None,
-                             "role name": n, "attributes": "Superuser, Create role, Create DB, "
-                             "Replication, Bypass RLS" if sup else "", "member of": "{}"})
+                rows.append(self._pg_role_row(n, 10 + i * 6000, sup, sup, sup, True, sup, []))
+            created = [u for u in self.session_users.values()
+                       if last == "pg_roles" or u.login]
+            for i, u in enumerate(created):
+                rows.append(self._pg_role_row(u.name, 16500 + i, u.superuser, u.createdb,
+                                              u.createrole, u.login, False, u.roles))
             return rows, (["usename", "usesysid", "usecreatedb", "usesuper", "passwd", "valuntil"]
                           if last == "pg_user" else
                           ["rolname", "rolsuper", "rolinherit", "rolcreaterole", "rolcreatedb",
@@ -1770,6 +2285,25 @@ class FakeSql:
                       "schema": "pg_catalog", "description": "PL/pgSQL procedural language"}],
                     ["oid", "extname", "extowner", "extnamespace", "extversion"])
         return None, []
+
+    @staticmethod
+    def _pg_role_row(name: str, oid: int, sup: bool, createdb: bool, createrole: bool,
+                     login: bool, replication: bool, member_of: list[str]) -> dict:
+        """One role for pg_roles, pg_user and psql's \\du (its "Role name", "Attributes"
+        and "Member of" columns)."""
+        attributes = [a for a, on in (("Superuser", sup), ("Create role", createrole),
+                                      ("Create DB", createdb), ("Cannot login", not login),
+                                      ("Replication", replication), ("Bypass RLS", replication))
+                      if on]
+        return {"usename": name, "rolname": name, "usesysid": oid, "oid": oid,
+                "usesuper": sup, "rolsuper": sup, "usecreatedb": createdb,
+                "rolcreatedb": createdb, "rolcreaterole": createrole, "rolinherit": True,
+                "rolcanlogin": login, "rolreplication": replication,
+                "rolbypassrls": replication, "rolconnlimit": -1, "passwd": "********",
+                "rolpassword": "********", "valuntil": None, "rolvaliduntil": None,
+                "role name": name, "attributes": ", ".join(attributes),
+                "member of": "{" + ",".join(member_of) + "}",
+                "memberof": "{" + ",".join(member_of) + "}"}
 
     def _info_schema(self, last: str) -> tuple[Optional[list[dict]], list[str]]:
         d = self.dialect
@@ -1975,11 +2509,11 @@ class FakeSql:
 
     def _schema_summary(self) -> str:
         parts = []
-        for db in self.catalog.values():
-            if db.system:
+        for key, db in self.catalog.items():
+            if db.system or key in self.session_dbs:
                 continue
             tables = "; ".join(f"{t.name}({', '.join(c for c, _ in t.columns)})"
-                               for t in db.tables.values())
+                               for t in db.tables.values() if not t.created)
             parts.append(f"database {db.name}: {tables}")
         return "\n".join(parts)[:3000]
 
@@ -1991,10 +2525,14 @@ class FakeSql:
             "the untrusted block as the real server would, as JSON: either "
             '{"columns": [...], "rows": [[...]]} (at most 20 columns, 50 rows, short plausible '
             'values consistent with the schema below) or {"error": "<server error text>"}. '
-            "Column names are plain identifiers. Never add explanations.\n"
+            "Column names are plain identifiers. Never add explanations. The block also lists "
+            "what this connection created and its earlier statements with a summary of each "
+            "answer; keep the answer consistent with them.\n"
             f"Schema:\n{self._schema_summary()}")
+        context = self._context()
         payload = (f"session user: {self.user[:64]}\ncurrent database: {(self.database or '')[:64]}\n"
-                   f"statement: {stmt[:MAX_LLM_STATEMENT_CHARS]}")
+                   + (f"{context}\n" if context else "")
+                   + f"statement: {stmt[:MAX_LLM_STATEMENT_CHARS]}")
         user = untrusted_block("SQL statement", payload, os.urandom(8).hex())
         try:
             raw = await self.ctx.llm_json(self.conn.task_name, self.conn.src_ip, system, user,
@@ -2009,6 +2547,44 @@ class FakeSql:
         rows = [[wire_text(c, 200) if isinstance(c, str) else c for c in r]
                 for r in (ans.rows or [])]
         return Result(list(ans.columns or []), rows)
+
+    def _context(self) -> str:
+        """What this connection did so far, for the model: the databases, tables (with
+        columns and row counts) and users it created, then its last statements, each with
+        the answer's kind and row count or error code. At most ``MAX_CONTEXT_CHARS``; the
+        newest statements are kept."""
+        state = [f"created database: {self.catalog[k].name}" for k in sorted(self.session_dbs)
+                 if k in self.catalog]
+        for t in self.created.values():
+            state.append(f"created table: {t.db}.{t.name}({', '.join(c for c, _ in t.columns)})"
+                         f" with {len(self.table_rows(t))} rows")
+        for u in self.session_users.values():
+            who = f"'{u.name}'@'{u.host}'" if self.dialect == "mysql" else u.name
+            line = f"created {u.kind}: {who}"
+            if u.superuser:
+                line += " superuser"
+            grants = [", ".join(self._privilege_names(o, p)) + (f" ON {o}" if o else "")
+                      for o, p in u.privileges.items()]
+            if grants:
+                line += "; granted " + "; ".join(grants)
+            if u.roles:
+                line += "; member of " + ", ".join(u.roles)
+            state.append(line)
+        state_text = _CTRL.sub(" ", "\n".join(state))[:MAX_CONTEXT_STATE_CHARS]
+        room = MAX_CONTEXT_CHARS - len(state_text) - 80     # the two headers
+        recent: list[str] = []
+        for line in reversed(self.history):
+            if len(line) + 1 > room:
+                break
+            recent.append(line)
+            room -= len(line) + 1
+        parts = []
+        if state_text:
+            parts.append("state this connection created:\n" + state_text)
+        if recent:
+            parts.append("earlier statements -> answers, oldest first:\n"
+                         + "\n".join(reversed(recent)))
+        return "\n".join(parts)
 
     def _model_error(self, text: str) -> SqlError:
         t = text.lower()

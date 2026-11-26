@@ -280,7 +280,20 @@ Protocol notes:
   columns read from the select list for `SELECT`, `WITH`, `SHOW` and similar reads, OK
   for a write or DDL, and a permission error for `CALL`, `EXEC` and admin verbs. Anything
   else gets a syntax error. The statement's event has `kind` `llm`, `llm_retry` or
-  `fallback`.
+  `fallback`. A write or DDL verb from another dialect (`VACUUM` on MySQL, `REPLACE INTO`
+  on PostgreSQL, `CREATE LOGIN` outside MSSQL) gets the dialect's syntax error.
+  Each connection keeps what it creates until it ends: databases, tables with their
+  columns and the rows of `INSERT ... VALUES` with literal values (at most 50 tables, 100
+  rows per table, 64 KiB of text), and users, roles and logins with what `GRANT` and
+  `REVOKE` give them (at most 20 names, 20 grants each). A created table belongs to the
+  database that was current (or named) when it was made: `SHOW TABLES`,
+  `information_schema.tables`, `pg_tables`, psql's `\dt` and `sys.tables` list it for that
+  database, `SELECT` and `COUNT(*)` return its rows, and dropping a created database drops
+  its tables. A scenario table keeps its name and rows; `pg_roles`, `pg_user` and psql's `\du` list created
+  roles, and MySQL `SHOW GRANTS FOR` shows a created account's grants. Reads of
+  `mysql.user` and `sys.sql_logins` stay refused. A model request carries this state and
+  the connection's last 12 statements, each with its answer's kind and row count or error
+  code (at most 2000 characters, inside the untrusted block).
 - **Redis**: RESP and inline protocol, fake per-connection keyspace. The takeover chain
   (`CONFIG SET dir/dbfilename`, `SAVE`, `SLAVEOF`/`REPLICAOF`, `MODULE LOAD`, `EVAL`,
   `FLUSHALL`) answers plausibly and is logged as high-signal; nothing touches disk or
