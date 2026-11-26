@@ -74,6 +74,7 @@ MAX_MULTIPART_PER_SOURCE = 32
 MAX_TAGGED_PER_SOURCE = 1000         # objects with tags set by one source
 MAX_OBJECT_TAGS = 10
 MAX_LIST_PARTS = 1000
+MAX_UPLOAD_ID = 256                  # longest upload-id-marker kept from a request
 MAX_SOURCES = 5000
 KEEP_UPLOAD_BYTES = 65_536           # an upload this small is echoed back on GET
 KEEP_TOTAL_BYTES = 16 * 1024 * 1024  # all kept upload bytes together
@@ -862,6 +863,22 @@ class Page:
     last: Optional[str]
 
 
+def _after_upload_markers(ups: list, key_marker: str, id_marker: str) -> list:
+    """The uploads, sorted by (key, initiated, upload id), that come after the markers:
+    keys after ``key_marker``, plus uploads of ``key_marker`` itself after ``id_marker``.
+    A known marker id resumes after that upload in listing order; an unknown one compares
+    upload ids as strings."""
+    if not id_marker:
+        return [u for u in ups if u[0] > key_marker]
+    same = [u for u in ups if u[0] == key_marker]
+    ids = [u[2] for u in same]
+    if id_marker in ids:
+        same = same[ids.index(id_marker) + 1:]
+    else:
+        same = [u for u in same if u[2] > id_marker]
+    return same + [u for u in ups if u[0] > key_marker]
+
+
 def list_page(cat: Catalog, ip: str, bucket: BucketView, prefix: str, delimiter: str,
               after: str, max_keys: int) -> Page:
     contents: list[ObjMeta] = []
@@ -1526,9 +1543,13 @@ class Exchange:
         await self.send(204, b"", content_type=None)
 
     async def copy_object(self, bucket: BucketView) -> None:
-        raw = unquote(self.req.header("x-amz-copy-source") or "")[:2 * MAX_KEY_BYTES]
-        self.log["copy_source"] = raw[:500]
-        path = raw.split("?", 1)[0].lstrip("/")
+        # The query suffix (?versionId=) is split off the encoded header, so an encoded
+        # "%3F" in the key stays part of the key.
+        header = (self.req.header("x-amz-copy-source") or "")[:6 * MAX_KEY_BYTES]
+        encoded, sep, query = header.partition("?")
+        raw = unquote(encoded)[:2 * MAX_KEY_BYTES]
+        self.log["copy_source"] = (raw + sep + query[:100])[:500]
+        path = raw.lstrip("/")
         src_name, _, src_key = path.partition("/")
         if not src_name or not src_key:
             raise S3Error("InvalidArgument", "Copy Source must mention the source bucket and "
@@ -1634,9 +1655,15 @@ class Exchange:
     async def list_multipart_uploads(self, bucket: BucketView) -> None:
         prefix = self.q.get("prefix", "")[:MAX_KEY_BYTES]
         max_uploads = min(self._int_param("max-uploads", MAX_LIST_KEYS), MAX_LIST_KEYS)
+        key_marker = self.q.get("key-marker", "")[:MAX_KEY_BYTES]
+        # S3 ignores upload-id-marker unless key-marker is set.
+        id_marker = self.q.get("upload-id-marker", "")[:MAX_UPLOAD_ID] if key_marker else ""
         ups = sorted(((m["key"], m["initiated"], uid)
                       for uid, m in self.cat.source(self.ip).multipart.items()
                       if m["bucket"] == bucket.name and m["key"].startswith(prefix)))
+        if key_marker:
+            ups = _after_upload_markers(ups, key_marker, id_marker)
+            self.log.update(key_marker=key_marker[:200], upload_id_marker=id_marker[:100])
         truncated = len(ups) > max_uploads
         ups = ups[:max_uploads]
         items = "".join(f"<Upload><Key>{xml_text(k)}</Key><UploadId>{uid}</UploadId>"
@@ -1646,8 +1673,8 @@ class Exchange:
         next_id = ups[-1][2] if ups else ""
         prefix_xml = f"<Prefix>{xml_text(prefix)}</Prefix>" if "prefix" in self.q else ""
         body = (f'{XML_DECL}<ListMultipartUploadsResult xmlns="{XMLNS}"><Bucket>'
-                f"{xml_text(bucket.name)}</Bucket><KeyMarker></KeyMarker><UploadIdMarker>"
-                f"</UploadIdMarker><NextKeyMarker>{next_key}</NextKeyMarker>"
+                f"{xml_text(bucket.name)}</Bucket><KeyMarker>{xml_text(key_marker)}</KeyMarker>"
+                f"<UploadIdMarker>{xml_text(id_marker)}</UploadIdMarker><NextKeyMarker>{next_key}</NextKeyMarker>"
                 f"<NextUploadIdMarker>{next_id}</NextUploadIdMarker>{prefix_xml}<MaxUploads>"
                 f"{max_uploads}</MaxUploads><IsTruncated>{str(truncated).lower()}"
                 f"</IsTruncated>{items}</ListMultipartUploadsResult>")

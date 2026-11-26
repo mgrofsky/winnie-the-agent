@@ -784,6 +784,50 @@ def test_multipart_listings_and_parts(server):
     assert "Uploads" not in c.list_multipart_uploads(Bucket="nw-config-backup")
 
 
+def test_multipart_upload_listing_pages_by_key_and_upload_id_markers(server):
+    c = server.client()
+    made = [(k, c.create_multipart_upload(Bucket="nw-config-backup", Key=k)["UploadId"])
+            for k in ("a.sql", "b.sql", "b.sql", "b.sql", "c.sql")]
+    seen, kw = [], {}
+    while True:
+        page = c.list_multipart_uploads(Bucket="nw-config-backup", MaxUploads=2, **kw)
+        seen += [(u["Key"], u["UploadId"]) for u in page.get("Uploads", [])]
+        if not page["IsTruncated"]:
+            break
+        kw = dict(KeyMarker=page["NextKeyMarker"], UploadIdMarker=page["NextUploadIdMarker"])
+        assert len(seen) < 10
+    assert seen == made
+    # key-marker alone skips every upload of that key; upload-id-marker needs key-marker.
+    rest = c.list_multipart_uploads(Bucket="nw-config-backup", KeyMarker="b.sql")
+    assert [u["Key"] for u in rest["Uploads"]] == ["c.sql"] and rest["KeyMarker"] == "b.sql"
+    alone = c.list_multipart_uploads(Bucket="nw-config-backup", UploadIdMarker=made[2][1])
+    assert len(alone["Uploads"]) == 5
+    # An unknown upload id compares as a string.
+    later = c.list_multipart_uploads(Bucket="nw-config-backup", KeyMarker="b.sql",
+                                     UploadIdMarker="~")
+    assert [u["Key"] for u in later["Uploads"]] == ["c.sql"]
+    assert len(c.list_multipart_uploads(Bucket="nw-config-backup", KeyMarker="b.sql",
+                                        UploadIdMarker="-")["Uploads"]) == 4
+    long = c.list_multipart_uploads(Bucket="nw-config-backup", KeyMarker="z" * 1000,
+                                    UploadIdMarker="u" * 1000)
+    assert "Uploads" not in long and len(long["UploadIdMarker"]) == s3.MAX_UPLOAD_ID
+
+
+def test_copy_source_key_with_an_encoded_question_mark(server):
+    c = server.client()
+    c.put_object(Bucket="nw-config-backup", Key="odd?name.txt", Body=b"odd\n")
+    c.copy_object(Bucket="nw-config-backup", Key="copy1.txt",
+                  CopySource={"Bucket": "nw-config-backup", "Key": "odd?name.txt"})
+    c.copy_object(Bucket="nw-config-backup", Key="copy2.txt",
+                  CopySource={"Bucket": "nw-config-backup", "Key": "odd?name.txt",
+                              "VersionId": "null"})
+    for key in ("copy1.txt", "copy2.txt"):
+        assert c.get_object(Bucket="nw-config-backup", Key=key)["Body"].read() == b"odd\n"
+    logged = [e["data"]["copy_source"] for e in server.commands("CopyObject")]
+    assert logged == ["nw-config-backup/odd?name.txt",
+                      "nw-config-backup/odd?name.txt?versionId=null"]
+
+
 def test_object_tagging_versioning_and_bucket_tagging(server):
     c = server.client()
     assert c.get_object_tagging(Bucket="nw-config-backup", Key=".env")["TagSet"] == []

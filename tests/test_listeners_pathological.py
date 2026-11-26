@@ -80,6 +80,10 @@ CASES = {
                          b"PUT /b/k HTTP/1.1\r\nContent-Length: 99999999999999\r\n\r\n",
                          b"PUT /b/k HTTP/1.1\r\nx-amz-copy-source: " + b"%2F" * 2000
                          + b"\r\n\r\n",
+                         b"PUT /b/k HTTP/1.1\r\nx-amz-copy-source: " + b"?%3F" * 1700
+                         + b"\r\n\r\n",
+                         b"GET /b?uploads&key-marker=" + b"%7F" * 1200 + b"&upload-id-marker="
+                         + b"%2F" * 1200 + b" HTTP/1.1\r\n\r\n",
                          b"PUT /b/k?tagging HTTP/1.1\r\nContent-Length: 60000\r\n\r\n"
                          + b"<Tag><Key>" * 6000]
                + repeats("%/?[]:;,&=\r", 70_000)),
