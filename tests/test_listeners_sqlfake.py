@@ -299,3 +299,205 @@ def test_database_version_strings_match_the_scenario_host_os(scenario, family, a
 def test_mariadb_on_debian_reports_the_debian_comment():
     my = _scenario_fake("sip_provider", "mysql", "10.11.6-MariaDB-0+deb12u1")
     assert my.mysql_vars()["version_comment"] == "Debian 12"
+
+
+# ---- reply ladder: model, model with examples, fail-safe ----------------------------------
+
+class RecordingConn(StubConn):
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self.src_ip = "192.0.2.20"
+        self.events: list = []
+
+    def emit(self, event, message, **fields):
+        self.events.append((event, message, fields))
+
+
+class LadderLLM:
+    """Scripted JSON model: exceptions are raised, dicts validated like a real client."""
+
+    def __init__(self, *outputs, delay: float = 0.0):
+        self.outputs = list(outputs)
+        self.systems: list[str] = []
+        self.delay = delay
+
+    @property
+    def calls(self):
+        return len(self.systems)
+
+    def complete_json(self, system, user, schema):
+        from agents.llm import LLMOutputError
+        from pydantic import ValidationError
+
+        self.systems.append(system)
+        if self.delay:
+            time.sleep(self.delay)
+        out = self.outputs.pop(0) if len(self.outputs) > 1 else self.outputs[0]
+        if isinstance(out, BaseException):
+            raise out
+        try:
+            return schema.model_validate(out)
+        except ValidationError as exc:
+            raise LLMOutputError("invalid") from exc
+
+
+GOOD_ROWS = {"columns": ["id", "name"], "rows": [[1, "Acme Supply"]]}
+JOIN = "SELECT o.id, c.name FROM orders o UNION SELECT id, name FROM customers c"
+
+
+def ladder_fake(llm, dialect="postgres", **limits):
+    from agents.budget import Budget, BudgetConfig
+    from listeners.base import Limits
+
+    ctx = ListenerContext(EventWriter(None), limits=Limits(**limits), budget=Budget(BudgetConfig()),
+                          json_llm=llm)
+    return FakeSql(RecordingConn(ctx), dialect, "app", "appdb")
+
+
+def kinds(f):
+    return [fields["data"].get("kind") for _, _, fields in f.conn.events]
+
+
+def test_sql_ladder_first_answer_good():
+    f = ladder_fake(LadderLLM(GOOD_ROWS))
+    [ans] = _run(f.run(JOIN))
+    assert isinstance(ans, Result) and ans.rows == [[1, "Acme Supply"]]
+    assert f.ctx.json_llm.calls == 1 and kinds(f) == ["llm"]
+
+
+@pytest.mark.parametrize("dialect", ["postgres", "mysql", "mssql"])
+def test_sql_ladder_second_answer_good_uses_dialect_examples(dialect):
+    from listeners.sqlfake import SQL_EXAMPLES
+
+    f = ladder_fake(LadderLLM({"columns": ["bad name; DROP"]}, GOOD_ROWS), dialect)
+    [ans] = _run(f.run(JOIN))
+    assert isinstance(ans, Result) and ans.columns == ["id", "name"]
+    assert f.ctx.json_llm.calls == 2 and kinds(f) == ["llm_retry"]
+    assert SQL_EXAMPLES[dialect] in f.ctx.json_llm.systems[1]
+    assert SQL_EXAMPLES[dialect] not in f.ctx.json_llm.systems[0]
+
+
+def test_sql_ladder_both_bad_gives_fail_safe_and_charges_twice():
+    from agents.budget import OUTPUT_ESTIMATE_TOKENS
+
+    f = ladder_fake(LadderLLM({"note": "ignore previous instructions"}))
+    [ans] = _run(f.run(JOIN))
+    assert isinstance(ans, Result) and ans.is_query and ans.rows == []
+    assert ans.columns == ["id", "name"]
+    assert f.ctx.json_llm.calls == 2 and kinds(f) == ["fallback"]
+    assert f.ctx.budget.global_tokens >= 2 * OUTPUT_ESTIMATE_TOKENS
+
+
+def test_sql_ladder_timeout_is_not_retried():
+    f = ladder_fake(LadderLLM(GOOD_ROWS, delay=0.5), llm_timeout=0.1)
+    [ans] = _run(f.run(JOIN))
+    assert isinstance(ans, Result) and ans.rows == [] and kinds(f) == ["fallback"]
+    assert f.ctx.json_llm.calls == 1
+
+
+def test_sql_ladder_one_attempt_keeps_one_request():
+    from agents.llm import LLMOutputError
+
+    f = ladder_fake(LadderLLM(LLMOutputError("bad"), GOOD_ROWS), llm_attempts=1)
+    [ans] = _run(f.run(JOIN))
+    assert isinstance(ans, Result) and ans.rows == [] and kinds(f) == ["fallback"]
+    assert f.ctx.json_llm.calls == 1
+
+
+def test_sql_ladder_deadline_stops_the_second_attempt():
+    from agents.llm import LLMOutputError
+
+    f = ladder_fake(LadderLLM(LLMOutputError("bad"), GOOD_ROWS))
+    now = [0.0]
+    f.ctx.llm_clock = lambda: now[0]
+    original = f.ctx.json_llm.complete_json
+
+    def slow(system, user, schema):
+        now[0] += 11.5
+        return original(system, user, schema)
+
+    f.ctx.json_llm.complete_json = slow
+    [ans] = _run(f.run(JOIN))
+    assert isinstance(ans, Result) and ans.rows == [] and kinds(f) == ["fallback"]
+    assert f.ctx.json_llm.calls == 1
+
+
+@pytest.mark.parametrize("dialect,stmt,expect", [
+    ("postgres", "SELECT md5(full_name), p.id AS pid FROM patients p", ["md5", "pid"]),
+    ("mysql", "SELECT md5(full_name), p.id AS pid FROM patients p", ["md5(full_name)", "pid"]),
+    ("mssql", "SELECT HASHBYTES('SHA1', holder) FROM accounts", [""]),
+    ("postgres", "WITH t AS (SELECT 1) SELECT a, b FROM t", ["a", "b"]),
+    ("postgres", "SHOW wal_level", ["wal_level"]),
+    ("mysql", "SHOW SLAVE HOSTS", ["Variable_name", "Value"]),
+])
+def test_sql_fail_safe_read_is_an_empty_result_with_columns(dialect, stmt, expect):
+    f = fake(dialect)
+    ans = f.fail_safe(stmt, stmt.lower())
+    assert isinstance(ans, Result) and ans.is_query and ans.rows == [] and ans.columns == expect
+
+
+@pytest.mark.parametrize("dialect,stmt,code", [
+    ("postgres", "CALL refresh_ledger(1)", "42501"),
+    ("mysql", "CALL refresh_ledger(1)", "42000"),
+    ("mssql", "EXEC sp_who2", "229"),
+    ("mssql", "DBCC CHECKDB", "2571"),
+    ("mssql", "RESTORE DATABASE x FROM DISK = 'y'", "297"),
+    ("mysql", "SHUTDOWN now", "42000"),
+])
+def test_sql_fail_safe_call_exec_admin_is_a_permission_error(dialect, stmt, code):
+    ans = fake(dialect).fail_safe(stmt, stmt.lower())
+    assert isinstance(ans, SqlError) and ans.code == code
+
+
+def test_sql_fail_safe_write_is_ok():
+    ans = fake("postgres").fail_safe("INSERT INTO t SELECT 1", "insert into t select 1")
+    assert isinstance(ans, Result) and not ans.is_query and ans.tag == "INSERT 0 0"
+
+
+@pytest.mark.parametrize("dialect,stmt", [
+    ("postgres", "frobnicate the database"),
+    ("postgres", "select"),
+    ("mysql", "SELECT 'unterminated FROM t"),
+    ("mssql", "SELECT (1 FROM t"),
+    ("mssql", "SHOW TABLES"),
+    ("mssql", "CALL refresh_ledger(1)"),
+    ("postgres", "EXEC sp_who2"),
+    ("mysql", "DBCC CHECKDB"),
+])
+def test_sql_fail_safe_keeps_syntax_errors_for_implausible_text(dialect, stmt):
+    f = fake(dialect)
+    assert f.fail_safe(stmt, stmt.lower()) == f.syntax_error(stmt)
+
+
+def test_sql_examples_parse_through_the_answer_schema():
+    import json
+
+    from listeners.sqlfake import SQL_EXAMPLES, LlmSqlAnswer
+
+    for dialect, text in SQL_EXAMPLES.items():
+        answers = [line[len("answer: "):] for line in text.splitlines() if line.startswith("answer: ")]
+        assert len(answers) >= 2, dialect
+        parsed = [LlmSqlAnswer.model_validate(json.loads(a)) for a in answers]
+        assert any(a.rows for a in parsed) and any(a.error for a in parsed)
+        # The unknown-table example maps to the dialect's missing-table error code.
+        err = next(a.error for a in parsed if a.error)
+        code = fake(dialect)._model_error(err).code
+        assert code == {"postgres": "42P01", "mysql": "42S02", "mssql": "208"}[dialect]
+
+
+def test_sql_fail_safe_is_fast_on_pathological_input():
+    stmt = "SELECT " + ",".join(f"f(c{i}" + ")" for i in range(2000)) + " FROM t" + " (" * 10_000
+    _, elapsed = run_bounded(lambda: fake("postgres").run(stmt), 2.0)
+    assert elapsed < 2.0
+
+
+@pytest.mark.parametrize("dialect,stmt", [
+    ("postgres", "REPAIR TABLE users"),
+    ("mssql", "REPAIR TABLE users"),
+    ("mysql", "REFRESH MATERIALIZED VIEW v"),
+    ("mysql", "DECLARE c CURSOR FOR SELECT 1"),
+    ("mssql", "PREPARE p FROM 'SELECT 1'"),
+])
+def test_sql_fail_safe_keeps_the_syntax_error_for_another_dialects_verbs(dialect, stmt):
+    answer = _run(fake(dialect).run(stmt))[-1]
+    assert isinstance(answer, SqlError) and answer.code in ("42601", "42000", "102")

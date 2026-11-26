@@ -106,6 +106,12 @@ local_shell_replies = true
 # next to model replies. 0 answers at once.
 local_reply_delay_ms = 0
 
+# When a model reply breaks character, is empty, or misprints a literal echo, ask the model
+# this many more times (0 to 2) with a short note and two example replies before falling
+# back to the shell's own reply. A retry costs tokens like any call and counts as one
+# command with the first. 0 replaces the reply at once.
+persona_retries = 1
+
 # Mark the persona prompt for the provider's prompt cache. Default: on for anthropic; off
 # for aws, because not every Claude or Nova model on Bedrock accepts cache points. Set to
 # true to use it on aws (Claude and Nova model ids only). If the first request with a
@@ -280,6 +286,13 @@ llm = false
 model = claude-haiku-5-5
 llm_max_inflight = 4
 llm_timeout = 20
+# Requests per answer (1 to 3). When an answer fails the schema, the next request adds
+# worked examples and names the problem. A timeout or provider error is not retried.
+llm_attempts = 2
+# Seconds all requests for one answer share, at most llm_timeout (0 means llm_timeout).
+# A second request starts only with at least 1 second left. With llm_attempts = 1 the one
+# request gets llm_timeout.
+llm_deadline = 12
 # With llm = true and the [llm] provider's key set, telnet sessions use the SSH persona
 # model; false keeps the canned telnet shell.
 #telnet_persona = true

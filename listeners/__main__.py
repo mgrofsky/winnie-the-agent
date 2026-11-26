@@ -93,8 +93,9 @@ def build_context(config: ConfigParser, base: Path, scenario_name: Optional[str]
     if str(section.get("llm", "false")).lower() in ("1", "true", "yes", "on"):
         from agents.llm import build_json_llm
 
-        # Same provider as the analyst agents. One logical call is one request: no SDK
-        # retries, no validation retry.
+        # Same provider as the analyst agents. Each client call is one request: no SDK
+        # retries, no validation retry. ListenerContext.llm_json decides on a second request
+        # ([listeners] llm_attempts).
         json_llm = build_json_llm(config, section.get("model"), timeout=limits.llm_timeout,
                                   sdk_max_retries=0, validation_retries=0)
 
@@ -113,6 +114,7 @@ def build_context(config: ConfigParser, base: Path, scenario_name: Optional[str]
     hooks.set_source_state(ctx.source_state, seed)
     hooks.set_local_replies(hooks.local_replies_enabled(config))
     hooks.set_local_delay(hooks.local_delay_ms(config))
+    hooks.set_persona_retries(hooks.persona_retries(config))
     ctx.overlay_path = overlay  # type: ignore[attr-defined]
     ctx.ftp_pasv_ports = parse_port_range(section.get("ftp_pasv_ports", ""))
     ctx.ftp_pasv_address = (section.get("ftp_pasv_address", "") or "").strip() or None

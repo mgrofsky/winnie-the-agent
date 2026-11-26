@@ -260,7 +260,8 @@ async def test_model_fallback_and_valid_answer():
             if expect_rows:
                 assert cols == ["calls"] and rows == [["17"]]
             else:
-                assert first[0] == 0xFF and int.from_bytes(first[1:3], "little") == 1064
+                # the fail-safe: an empty result set with the select list's columns
+                assert cols == ["calls"] and rows == []
             c.w.close()
             await asyncio.sleep(0.05)
         finally:

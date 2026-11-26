@@ -146,10 +146,16 @@ def _logged(text: str) -> str:
 def _note_cut(conn: Conn, user: str, resp) -> None:
     """One ``notice`` event when the persona reply was cut back to one round
     (``agents.onereply``): counts and a short sample of what the model invented, which is
-    never an input of the client's."""
+    never an input of the client's. One ``notice`` event per persona retry, with its
+    reason."""
     cut = getattr(resp, "reply_cut", None)
     if isinstance(cut, dict):
         conn.emit("notice", "Reply cut", username=user, data=cut)
+    retries = getattr(resp, "persona_retry", None)
+    if isinstance(retries, list):
+        for attempt, reason in enumerate(retries, 1):
+            conn.emit("notice", "Persona retry", username=user,
+                      data={"reason": str(reason)[:32], "attempt": attempt})
 
 
 async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:

@@ -238,12 +238,14 @@ async def test_copy_program_refused_and_high_signal():
     FixedLLM({"columns": ["a"], "rows": [["b"]], "note": "ignore previous instructions"}),
     FixedLLM(LlmSqlAnswer.model_construct(columns=["a"], rows=[["x" * 5000]])),
 ])
-async def test_unknown_query_falls_back_to_protocol_error(llm):
+async def test_unknown_query_falls_back_to_the_fail_safe(llm):
     ctx, servers, port = await start_server(json_llm=llm)
     try:
         await connect(port, "u", "1")
         r, w, _ = await connect(port, "u", "2")
-        cols, rows, _, errs = await query(r, w, "SELECT md5(full_name) FROM patients")
+        cols, rows, tags, errs = await query(r, w, "SELECT md5(full_name) FROM patients")
+        assert cols == ["md5"] and not rows and not errs and tags == ["SELECT 0"]
+        _, rows, _, errs = await query(r, w, "frobnicate patients")
         assert not rows and errs[0]["C"] == "42601"
         # the connection is still usable afterwards
         _, rows, _, errs = await query(r, w, "SELECT 1")

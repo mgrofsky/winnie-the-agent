@@ -51,6 +51,17 @@ _SESSIONS: "weakref.WeakKeyDictionary[ListenerContext, OrderedDict[str, dict]]" 
     weakref.WeakKeyDictionary()
 
 
+# Worked examples sent with a second model request (``ListenerContext.llm_json``).
+HTTP_EXAMPLES = (
+    'request: GET /api/v1/orders?limit=2\n'
+    'answer: {"status": 200, "content_type": "application/json", "body": '
+    '"{\\"items\\": [{\\"id\\": 1001, \\"status\\": \\"shipped\\"}, {\\"id\\": 1002, '
+    '\\"status\\": \\"open\\"}], \\"total\\": 2}"}\n'
+    'request: DELETE /api/v1/admin/users/7\n'
+    'answer: {"status": 403, "content_type": "application/json", "body": '
+    '"{\\"error\\": \\"forbidden\\"}"}')
+
+
 class LlmHttpAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -503,9 +514,12 @@ class Exchange:
                 return self.unauthorized_api()
             if cfg.llm_unknown:
                 ans = await self.ask_model()
+                rung = self.ctx.take_llm_rung(self.conn.task_name)
                 if ans is not None:
                     self.log["llm"] = True
+                    self.log["rung"] = rung or "llm"
                     return ans
+                self.log["rung"] = "fallback"
             return 404, error_page(404, cfg.server), "text/html", []
         self.log["route"] = "not_found"
         return 404, error_page(404, cfg.server), "text/html", []
@@ -651,7 +665,7 @@ class Exchange:
         user = untrusted_block("HTTP request", payload, os.urandom(8).hex())
         try:
             raw = await self.ctx.llm_json(self.conn.task_name, self.conn.src_ip, system, user,
-                                          LlmHttpAnswer)
+                                          LlmHttpAnswer, examples=HTTP_EXAMPLES)
         except Exception:  # noqa: BLE001
             return None
         ans = validate_http_answer(raw)

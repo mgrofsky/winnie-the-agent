@@ -560,3 +560,211 @@ def test_bedrock_converse_turns_the_marker_into_cache_points(monkeypatch):
     llm._apply_cache_points({"type": "ephemeral"}, system, messages)
     assert system[-1] == {"cachePoint": {"type": "default"}}
     assert messages[-1]["content"][-1] == {"cachePoint": {"type": "default"}}
+
+
+# ---- persona retry: ask again before the in-character replacement -------------------------
+
+class _StoringHistory:
+    """Stands in for RunnableWithMessageHistory: answers from a list, stores each turn in
+    the session history like the real chain, and records the persona block it was sent."""
+
+    def __init__(self, *replies, fail_on=()):
+        self.replies = list(replies)
+        self.profiles: list[str] = []
+        self.fail_on = set(fail_on)
+        self.store: dict = {}
+
+    def get_session_history(self, session_id):
+        from langchain_core.chat_history import InMemoryChatMessageHistory
+
+        return self.store.setdefault(session_id, InMemoryChatMessageHistory())
+
+    async def ainvoke(self, payload, config=None):
+        from types import SimpleNamespace
+
+        from langchain_core.messages import AIMessage
+
+        self.profiles.append(payload["decoy_profile"])
+        if len(self.profiles) in self.fail_on:
+            raise RuntimeError("provider down")
+        reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+        sid = config["configurable"]["session_id"]
+        self.get_session_history(sid).add_messages(
+            [payload["messages"][-1], AIMessage(content=reply)])
+        return SimpleNamespace(content=reply, usage_metadata={"total_tokens": 300})
+
+    @property
+    def calls(self):
+        return len(self.profiles)
+
+
+PROMPT = "root@srv01:~# "
+BREAK = "As an AI, I cannot run commands.\r\n" + PROMPT
+
+
+async def _retry_ask(tmp_path, history, text, interactive=True, retries=None, events=None):
+    from agents.budget import Budget, BudgetConfig
+
+    budget = Budget(BudgetConfig(state_file=str(tmp_path / "budget.json")))
+    hooks.set_budget(budget)
+    hooks.set_local_replies(False)
+    if retries is not None:
+        hooks.set_persona_retries(retries)
+    assert hooks.session_open("s-retry", "192.0.2.30") is None
+
+    class _Logger:
+        def info(self, message, extra=None):
+            if events is not None:
+                events.append((message, extra or {}))
+
+    r = await hooks.persona_invoke(
+        history, session_id="s-retry", src_ip="192.0.2.30", username="root", text=text,
+        interactive=interactive, llm_config={"configurable": {"session_id": "s-retry"}},
+        logger=_Logger(), log_extra={})
+    return r, budget
+
+
+def _turns(history):
+    return [(type(m).__name__, m.content) for m in history.store["s-retry"].messages]
+
+
+async def test_persona_good_first_reply_is_one_call(tmp_path):
+    history = _StoringHistory("uid=0(root)\r\n" + PROMPT)
+    r, budget = await _retry_ask(tmp_path, history, "id")
+    assert r.content == "uid=0(root)\r\n" + PROMPT and history.calls == 1
+    assert not hasattr(r, "persona_retry")
+
+
+@pytest.mark.parametrize("first,text,reason", [
+    (BREAK, "id", "persona_break"),
+    ("", "id", "empty"),
+    ("```\n```", "id", "empty"),
+    ("bye\r\n" + PROMPT, "echo hello", "literal_mismatch"),
+])
+async def test_persona_bad_reply_then_good_sends_the_second(tmp_path, first, text, reason):
+    good = ("hello\r\n" if text.startswith("echo") else "uid=0(root)\r\n") + PROMPT
+    history = _StoringHistory(first, good)
+    events = []
+    r, budget = await _retry_ask(tmp_path, history, text, events=events)
+    assert r.content == good and r.persona_retry == [reason] and history.calls == 2
+    # The history holds only the reply that was sent.
+    assert _turns(history) == [("HumanMessage", text), ("AIMessage", good)]
+    # The retry carries a note with examples in the persona block, not in the input.
+    assert "rejected" not in history.profiles[0] and "rejected" in history.profiles[1]
+    assert "nosuchtool" in history.profiles[1]
+    retry = [e for m, e in events if m == "Persona retry"]
+    assert retry == [{"reason": reason, "attempt": 1}]
+    assert not any(m == "Persona break" for m, _ in events)
+    # Charged twice, counted once.
+    assert budget.model_commands("s-retry") == 1
+    assert budget.global_tokens >= 600
+
+
+async def test_persona_both_bad_falls_back_in_character(tmp_path):
+    history = _StoringHistory(BREAK)
+    events = []
+    r, budget = await _retry_ask(tmp_path, history, "id", events=events)
+    assert r.content == PROMPT and r.persona_break and history.calls == 2
+    assert _turns(history) == [("HumanMessage", "id"), ("AIMessage", PROMPT)]
+    assert [m for m, _ in events if m in ("Persona retry", "Persona break")] == \
+        ["Persona retry", "Persona break"]
+    assert budget.model_commands("s-retry") == 1 and budget.global_tokens >= 600
+
+
+async def test_persona_empty_after_retry_becomes_the_in_character_reply(tmp_path):
+    history = _StoringHistory("")
+    r, _ = await _retry_ask(tmp_path, history, "id")
+    assert r.content == PROMPT and history.calls == 2
+    assert _turns(history) == [("HumanMessage", "id"), ("AIMessage", PROMPT)]
+
+
+async def test_persona_empty_after_retry_is_not_cached(tmp_path):
+    from agents.replycache import ReplyCache
+
+    hooks.set_reply_cache(ReplyCache(100, 3600))
+    history = _StoringHistory("")
+    r, _ = await _retry_ask(tmp_path, history, "id")
+    assert r.content == PROMPT and len(hooks.reply_cache()) == 0
+
+
+async def test_persona_retries_zero_keeps_todays_behavior(tmp_path):
+    history = _StoringHistory("")
+    r, _ = await _retry_ask(tmp_path, history, "id", retries=0)
+    assert r.content == "" and history.calls == 1           # an empty reply is sent as-is
+    history = _StoringHistory(BREAK)
+    r, _ = await _retry_ask(tmp_path, history, "id", retries=0)
+    assert r.content == PROMPT and r.persona_break and history.calls == 1
+
+
+async def test_persona_retries_two_asks_twice_more(tmp_path):
+    history = _StoringHistory(BREAK, BREAK, "uid=0(root)\r\n" + PROMPT)
+    r, budget = await _retry_ask(tmp_path, history, "id", retries=2)
+    assert r.content == "uid=0(root)\r\n" + PROMPT and history.calls == 3
+    assert r.persona_retry == ["persona_break", "persona_break"]
+    assert budget.model_commands("s-retry") == 1
+
+
+async def test_persona_exec_empty_reply_is_not_retried(tmp_path):
+    history = _StoringHistory("")
+    r, _ = await _retry_ask(tmp_path, history, "mkdir -p /tmp/x", interactive=False)
+    assert r.content == "" and history.calls == 1
+
+
+async def test_persona_provider_error_is_not_retried(tmp_path):
+    history = _StoringHistory("unused", fail_on={1})
+    events = []
+    r, _ = await _retry_ask(tmp_path, history, "id", events=events)
+    assert history.calls == 1 and not any(m == "Persona retry" for m, _ in events)
+
+
+async def test_persona_failed_retry_keeps_one_turn_and_the_in_character_reply(tmp_path):
+    history = _StoringHistory(BREAK, fail_on={2})
+    r, _ = await _retry_ask(tmp_path, history, "id")
+    assert r.content == PROMPT and history.calls == 2
+    assert _turns(history) == [("HumanMessage", "id"), ("AIMessage", PROMPT)]
+
+
+async def test_persona_retry_refused_by_the_budget_is_skipped(tmp_path):
+    from agents.budget import Budget, BudgetConfig
+
+    hooks.set_local_replies(False)
+    budget = Budget(BudgetConfig(state_file=str(tmp_path / "budget.json")))
+    hooks.set_budget(budget)
+    history = _StoringHistory(BREAK)
+    real_reserve = budget.reserve
+
+    def reserve(session_id, ip, text, counts_as_command=True):
+        if not counts_as_command:
+            return "max_tokens_per_session", None
+        return real_reserve(session_id, ip, text, counts_as_command)
+
+    budget.reserve = reserve
+    r = await hooks.persona_invoke(
+        history, session_id="s-retry", src_ip="192.0.2.30", username="root", text="id",
+        interactive=True, llm_config={"configurable": {"session_id": "s-retry"}})
+    assert r.content == PROMPT and history.calls == 1 and not getattr(r, "budget_exceeded", False)
+
+
+def test_persona_retries_config():
+    cp = ConfigParser()
+    assert hooks.persona_retries(cp) == 1
+    cp.read_string("[llm]\npersona_retries = 0\n")
+    assert hooks.persona_retries(cp) == 0
+    cp.read_string("[llm]\npersona_retries = 9\n")
+    assert hooks.persona_retries(cp) == hooks.MAX_PERSONA_RETRIES == 2
+    cp.read_string("[llm]\npersona_retries = -1\n")
+    with pytest.raises(ValueError):
+        hooks.persona_retries(cp)
+
+
+def test_telnet_logs_each_persona_retry():
+    from types import SimpleNamespace
+
+    from listeners import telnet
+
+    seen = []
+    conn = SimpleNamespace(emit=lambda *a, **k: seen.append((a, k)))
+    telnet._note_cut(conn, "root", SimpleNamespace(persona_retry=["persona_break", "empty"]))
+    assert [(a[1], k["data"]) for a, k in seen] == [
+        ("Persona retry", {"reason": "persona_break", "attempt": 1}),
+        ("Persona retry", {"reason": "empty", "attempt": 2})]
