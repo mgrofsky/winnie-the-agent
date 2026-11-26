@@ -10,7 +10,7 @@ import socket
 import pytest
 
 from listeners import smtp
-from listeners.base import ListenerContext, ServiceSettings
+from listeners.base import Limits, ListenerContext, ServiceSettings
 from listeners.events import EventWriter
 from scenarios.schema import LoginPolicy
 
@@ -23,9 +23,9 @@ def b64(s: str) -> str:
 async def smtp_server():
     servers = []
 
-    async def _start(accept="after_n"):
+    async def _start(accept="after_n", limits=None):
         writer = EventWriter(None)
-        ctx = ListenerContext(writer, bind_host="127.0.0.1", seed="test")
+        ctx = ListenerContext(writer, bind_host="127.0.0.1", seed="test", limits=limits)
         settings = ServiceSettings(name="smtp", enabled=True, port=0,
                                    policy=LoginPolicy(accept=accept, after_n_min=2, after_n_max=2))
         ctx.settings["smtp"] = settings
@@ -96,7 +96,8 @@ async def test_smtp_auth_fail_then_success_and_message(smtp_server, no_outbound)
     assert (await s.read()).startswith("220 mail.example.com ESMTP Postfix")
     ehlo = await s("EHLO scanner.example.net")
     assert "250-AUTH PLAIN LOGIN" in ehlo and ehlo.rstrip().endswith("250 SMTPUTF8")
-    assert (await s("STARTTLS")).startswith("454")
+    assert "STARTTLS" not in ehlo
+    assert await s("STARTTLS") == "502 5.5.1 Error: command not implemented\r\n"
     # AUTH LOGIN with continuation, wrong
     assert await s("AUTH LOGIN") == "334 VXNlcm5hbWU6\r\n"
     assert await s(b64("info@example.com")) == "334 UGFzc3dvcmQ6\r\n"
@@ -181,3 +182,63 @@ async def test_auth_lines_pipelined_after_a_refused_auth_are_logged_as_secrets(s
         data = e.get("data") or {}
         assert secret_b64 not in str(data.get("input", "")) and secret_b64 not in str(data.get("cmd", ""))
     assert any(e.get("password") == secret_b64 for e in writer.events)
+
+
+async def test_smtp_postfix_answers_for_help_expn_etrn_starttls(smtp_server):
+    writer, reader, w = await smtp_server(accept="all")
+    s = Session(reader, w)
+    await s.read()
+    assert await s("ETRN example.com") == "503 Error: send HELO/EHLO first\r\n"
+    await s("EHLO scanner.example.net")
+    assert await s("HELP") == "502 5.5.2 Error: command not recognized\r\n"
+    assert await s("EXPN root") == "502 5.5.2 Error: command not recognized\r\n"
+    assert await s("ETRN") == "500 Syntax: ETRN domain\r\n"
+    assert await s("ETRN a b") == "500 Syntax: ETRN domain\r\n"
+    assert await s("ETRN bad_host!") == "501 Error: invalid parameter syntax\r\n"
+    assert await s("ETRN @example.com") == \
+        "554 5.7.1 <example.com>: Etrn command rejected: Access denied\r\n"
+    assert await s("STARTTLS now") == "501 5.5.4 Syntax: STARTTLS\r\n"
+    assert (await s("MAIL FROM:<a@example.com>")).startswith("250")
+    assert await s("STARTTLS") == "502 5.5.1 Error: command not implemented\r\n"
+    assert await s("ETRN example.com") == "503 Error: MAIL transaction in progress\r\n"
+    w.close()
+
+
+async def test_smtp_advertised_size_is_what_data_accepts(smtp_server):
+    writer, reader, w = await smtp_server(accept="all", limits=Limits(max_conn_bytes=200_000))
+    s = Session(reader, w)
+    await s.read()
+    ehlo = await s("EHLO scanner.example.net")
+    size = int(next(line for line in ehlo.split("\r\n") if "SIZE" in line).split()[-1])
+    assert size == smtp.size_limit(ListenerContext(EventWriter(None),
+                                                   limits=Limits(max_conn_bytes=200_000)))
+    assert size <= 200_000 - smtp.SIZE_HEADROOM and size % 1024 == 0
+    assert await s(f"MAIL FROM:<a@example.com> SIZE={size + 1}") == \
+        "552 5.3.4 Message size exceeds fixed limit\r\n"
+    assert (await s(f"MAIL FROM:<a@example.com> SIZE={size}")).startswith("250")
+    assert (await s("RCPT TO:<postmaster@example.com>")).startswith("250")
+    assert (await s("DATA")).startswith("354")
+    line = "x" * 998 + "\r\n"
+    body = line * (size // 1000 - 2)                  # just under the advertised size
+    w.write(b"Subject: t\r\n\r\n" + body.encode() + b".\r\n")
+    await w.drain()
+    assert (await s.read()).startswith("250 2.0.0 Ok: queued as")
+    w.close()
+    default = smtp.size_limit(ListenerContext(EventWriter(None)))
+    assert default == 983_040            # 1 MiB connection cap minus headroom
+
+
+async def test_smtp_message_over_size_gets_552(smtp_server):
+    writer, reader, w = await smtp_server(accept="all", limits=Limits(max_conn_bytes=200_000))
+    s = Session(reader, w)
+    await s.read()
+    await s("EHLO scanner.example.net")
+    size = smtp.size_limit(ListenerContext(EventWriter(None), limits=Limits(max_conn_bytes=200_000)))
+    assert (await s("MAIL FROM:<a@example.com>")).startswith("250")
+    assert (await s("RCPT TO:<postmaster@example.com>")).startswith("250")
+    assert (await s("DATA")).startswith("354")
+    w.write(("y" * 998 + "\r\n").encode() * (size // 1000 + 2) + b".\r\n")
+    await w.drain()
+    assert await s.read() == "552 5.3.4 Error: message file too big\r\n"
+    assert (await s("NOOP")).startswith("250")
+    w.close()

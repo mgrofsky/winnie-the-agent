@@ -17,7 +17,10 @@ PutObject and UploadPart bodies stream into the capped quarantine with the same 
 cap, quotas and truncation as FTP uploads (``Expect: 100-continue`` and ``aws-chunked``
 payloads are handled; ``Transfer-Encoding`` is refused as S3 does). An upload appears in
 listings for that source only, for ``UPLOAD_WINDOW`` seconds; DeleteObject pretends to
-succeed. Nothing an attacker sends is executed, fetched or connected to.
+succeed. CopyObject copies between the objects the source can see (scenario objects and
+its own uploads) into that same per-source state; object tags, multipart uploads and their
+parts are per source too, with the same window and caps. Nothing an attacker sends is
+executed, fetched or connected to.
 """
 
 from __future__ import annotations
@@ -68,6 +71,10 @@ UPLOAD_WINDOW = 3600.0               # an upload stays visible to its source thi
 MAX_UPLOADS_PER_SOURCE = 200
 MAX_DELETED_PER_SOURCE = 1000
 MAX_MULTIPART_PER_SOURCE = 32
+MAX_TAGGED_PER_SOURCE = 1000         # objects with tags set by one source
+MAX_OBJECT_TAGS = 10
+MAX_LIST_PARTS = 1000
+MAX_UPLOAD_ID = 256                  # longest upload-id-marker kept from a request
 MAX_SOURCES = 5000
 KEEP_UPLOAD_BYTES = 65_536           # an upload this small is echoed back on GET
 KEEP_TOTAL_BYTES = 16 * 1024 * 1024  # all kept upload bytes together
@@ -96,6 +103,8 @@ ERRORS = {
     "InvalidBucketName": (400, "The specified bucket is not valid."),
     "InvalidPart": (400, "One or more of the specified parts could not be found."),
     "InvalidRange": (416, "The requested range is not satisfiable"),
+    "InvalidRequest": (400, "Invalid Request"),
+    "InvalidTag": (400, "The tag provided was not a valid tag."),
     "MalformedXML": (400, "The XML you provided was not well-formed or did not validate "
                           "against our published schema"),
     "MaxMessageLengthExceeded": (400, "Your request was too big."),
@@ -104,6 +113,7 @@ ERRORS = {
     "NoSuchBucket": (404, "The specified bucket does not exist"),
     "NoSuchBucketPolicy": (404, "The bucket policy does not exist"),
     "NoSuchKey": (404, "The specified key does not exist."),
+    "NoSuchTagSet": (404, "The TagSet does not exist"),
     "NoSuchUpload": (404, "The specified upload does not exist. The upload ID may be invalid, "
                           "or the upload may have been aborted or completed."),
     "NotImplemented": (501, "A header you provided implies functionality that is not "
@@ -627,6 +637,7 @@ class Upload:
     content_type: str
     content: Optional[bytes]
     expires: float
+    origin: Optional[tuple[str, str]] = None    # (bucket, key) whose body a copy serves
 
 
 @dataclass
@@ -634,6 +645,7 @@ class SourceView:
     uploads: OrderedDict = field(default_factory=OrderedDict)    # (bucket, key) -> Upload
     deleted: dict = field(default_factory=dict)                   # (bucket, key) -> expires
     multipart: OrderedDict = field(default_factory=OrderedDict)  # upload id -> dict
+    tags: OrderedDict = field(default_factory=OrderedDict)       # (bucket, key) -> (tags, expires)
     downloads: deque = field(default_factory=deque)               # (time, bytes)
     bulk_signalled: float = -1e18
 
@@ -703,6 +715,8 @@ class Catalog:
             view.deleted.pop(k, None)
         for k in [k for k, m in view.multipart.items() if m["expires"] < now]:
             view.multipart.pop(k, None)
+        for k in [k for k, (_t, exp) in view.tags.items() if exp < now]:
+            view.tags.pop(k, None)
         return view
 
     def _release(self, uploads) -> None:
@@ -711,8 +725,10 @@ class Catalog:
                 self.kept_bytes -= len(u.content)
 
     def add_upload(self, ip: str, bucket: str, key: str, size: int, etag: str,
-                   content_type: str, content: Optional[bytes]) -> None:
+                   content_type: str, content: Optional[bytes],
+                   origin: Optional[tuple[str, str]] = None) -> None:
         view = self.source(ip)
+        view.tags.pop((bucket, key), None)
         if content is not None and (len(content) > KEEP_UPLOAD_BYTES
                                     or self.kept_bytes + len(content) > KEEP_TOTAL_BYTES):
             content = None
@@ -720,7 +736,7 @@ class Catalog:
         if old is not None:
             self._release([old])
         view.uploads[(bucket, key)] = Upload(size, etag, time.time(), content_type, content,
-                                             time.monotonic() + UPLOAD_WINDOW)
+                                             time.monotonic() + UPLOAD_WINDOW, origin)
         if content is not None:
             self.kept_bytes += len(content)
         view.deleted.pop((bucket, key), None)
@@ -730,6 +746,7 @@ class Catalog:
 
     def delete(self, ip: str, bucket: str, key: str) -> None:
         view = self.source(ip)
+        view.tags.pop((bucket, key), None)
         old = view.uploads.pop((bucket, key), None)
         if old is not None:
             self._release([old])
@@ -772,9 +789,33 @@ class Catalog:
             if up is not None and up.content is not None:
                 yield up.content[start:end]
                 return
-            meta = ObjMeta(meta.bucket, meta.key, meta.size, meta.etag, meta.mtime,
+            origin = up.origin if up is not None else None
+            if origin is not None:
+                view = self.bucket(origin[0])
+                src = view.meta(origin[1]) if view is not None else None
+                if view is not None and src is not None and src.size == meta.size:
+                    yield from view.body(src, start, end)
+                    return
+            ob, ok = origin or (meta.bucket, meta.key)
+            meta = ObjMeta(ob, ok, meta.size, meta.etag, meta.mtime,
                            "binary/octet-stream", "filler", self.seed)
         yield from bucket.body(meta, start, end)
+
+    def copy(self, ip: str, src_bucket: BucketView, src: ObjMeta, bucket: str, key: str,
+             content_type: str) -> None:
+        """Store a copy of ``src`` at ``bucket/key`` for this source: kept bytes are copied,
+        anything else serves the source's own body (or the same filler)."""
+        content: Optional[bytes] = None
+        origin: Optional[tuple[str, str]] = (src_bucket.name, src.key)
+        if src.kind == "planted":
+            content, origin = self.planted_for(ip, src_bucket.name), None
+        elif src.kind == "upload":
+            up = self.source(ip).uploads.get((src_bucket.name, src.key))
+            if up is not None and up.content is not None:
+                content, origin = up.content, None
+            elif up is not None and up.origin is not None:
+                origin = up.origin
+        self.add_upload(ip, bucket, key, src.size, src.etag, content_type, content, origin)
 
     def listing_keys(self, bucket: str, ip: str) -> list[str]:
         """Every key the source would see in ``bucket`` (tests and small buckets)."""
@@ -820,6 +861,22 @@ class Page:
     prefixes: list[str]
     truncated: bool
     last: Optional[str]
+
+
+def _after_upload_markers(ups: list, key_marker: str, id_marker: str) -> list:
+    """The uploads, sorted by (key, initiated, upload id), that come after the markers:
+    keys after ``key_marker``, plus uploads of ``key_marker`` itself after ``id_marker``.
+    A known marker id resumes after that upload in listing order; an unknown one compares
+    upload ids as strings."""
+    if not id_marker:
+        return [u for u in ups if u[0] > key_marker]
+    same = [u for u in ups if u[0] == key_marker]
+    ids = [u[2] for u in same]
+    if id_marker in ids:
+        same = same[ids.index(id_marker) + 1:]
+    else:
+        same = [u for u in same if u[2] > id_marker]
+    return same + [u for u in ups if u[0] > key_marker]
 
 
 def list_page(cat: Catalog, ip: str, bucket: BucketView, prefix: str, delimiter: str,
@@ -920,7 +977,9 @@ def classify(method: str, bucket: Optional[str], key: str, q: dict[str, str],
             return "ListParts"
         if sub("acl"):
             return "GetObjectAcl"
-        if sub("tagging") or sub("attributes") or sub("retention") or sub("legal-hold"):
+        if sub("tagging"):
+            return "GetObjectTagging"
+        if sub("attributes") or sub("retention") or sub("legal-hold"):
             return "GetObjectConfig"
         return "GetObject"
     if method == "HEAD":
@@ -929,15 +988,17 @@ def classify(method: str, bucket: Optional[str], key: str, q: dict[str, str],
         copy = req.header("x-amz-copy-source") is not None
         if sub("uploadId") and sub("partNumber"):
             return "UploadPartCopy" if copy else "UploadPart"
+        if sub("tagging"):
+            return "PutObjectTagging"
         if copy:
             return "CopyObject"
-        if sub("acl") or sub("tagging") or sub("retention") or sub("legal-hold"):
+        if sub("acl") or sub("retention") or sub("legal-hold"):
             return "PutObjectConfig"
         return "PutObject"
     if method == "DELETE":
         if sub("uploadId"):
             return "AbortMultipartUpload"
-        return "DeleteObjectConfig" if sub("tagging") else "DeleteObject"
+        return "DeleteObjectTagging" if sub("tagging") else "DeleteObject"
     if sub("uploads"):
         return "CreateMultipartUpload"
     if sub("uploadId"):
@@ -948,10 +1009,11 @@ def classify(method: str, bucket: Optional[str], key: str, q: dict[str, str],
 UPLOAD_OPS = ("PutObject", "UploadPart")
 ANON_LIST_OPS = ("ListObjects", "ListObjectsV2")
 ANON_READ_OPS = ("GetObject", "HeadObject")
-DENIED_OPS = ("ListMultipartUploads", "ListObjectVersions", "CreateBucket", "PutBucketConfig",
-              "DeleteBucket", "DeleteBucketConfig", "PostObject", "ListParts", "GetObjectAcl",
-              "GetObjectConfig", "UploadPartCopy", "CopyObject", "PutObjectConfig",
-              "DeleteObjectConfig", "PostObjectConfig")
+DENIED_OPS = ("ListObjectVersions", "CreateBucket", "PutBucketConfig", "DeleteBucket",
+              "DeleteBucketConfig", "PostObject", "GetObjectAcl", "GetObjectConfig",
+              "UploadPartCopy", "PutObjectConfig", "PostObjectConfig")
+ALLOWED_BUCKET_GETS = ("GetBucketLocation", "GetBucketAcl", "GetBucketPolicy",
+                       "GetBucketVersioning", "GetBucketTagging")
 
 
 class BodyStream:
@@ -1162,8 +1224,7 @@ class Exchange:
                         and (bucket.spec.public_list or bucket.spec.public_read))):
                 return
             raise S3Error("AccessDenied")
-        if op in DENIED_OPS or op.startswith("GetBucket") and op not in (
-                "GetBucketLocation", "GetBucketAcl", "GetBucketPolicy"):
+        if op in DENIED_OPS or op.startswith("GetBucket") and op not in ALLOWED_BUCKET_GETS:
             raise S3Error("AccessDenied")
         if bucket is not None and op != "GetBucketLocation" and self.auth.region \
                 and self.auth.region != bucket.region:
@@ -1215,6 +1276,12 @@ class Exchange:
             "CreateMultipartUpload": self.create_multipart,
             "CompleteMultipartUpload": self.complete_multipart,
             "AbortMultipartUpload": self.abort_multipart,
+            "ListMultipartUploads": self.list_multipart_uploads, "ListParts": self.list_parts,
+            "CopyObject": self.copy_object, "GetObjectTagging": self.get_object_tagging,
+            "PutObjectTagging": self.put_object_tagging,
+            "DeleteObjectTagging": self.delete_object_tagging,
+            "GetBucketVersioning": self.bucket_versioning,
+            "GetBucketTagging": self.bucket_tagging,
         }.get(op)
         if handler is None:
             raise S3Error("AccessDenied")
@@ -1285,7 +1352,7 @@ class Exchange:
         if raw is None:
             return default
         if not re.fullmatch(r"\d{1,9}", raw):
-            raise S3Error("InvalidArgument", "Provided max-keys not an integer or within "
+            raise S3Error("InvalidArgument", f"Provided {name} not an integer or within "
                           "integer range", ArgumentName=name, ArgumentValue=raw[:64])
         return int(raw)
 
@@ -1419,6 +1486,100 @@ class Exchange:
                 self.log.update(signal="s3_bulk_download", high_signal=True)
             self.log.update(window_downloads=len(view.downloads), window_bytes=total)
 
+    async def bucket_versioning(self, bucket: BucketView) -> None:
+        # A bucket that never had versioning enabled: an empty configuration.
+        await self.send(200, f'{XML_DECL}<VersioningConfiguration xmlns="{XMLNS}"/>'.encode())
+
+    async def bucket_tagging(self, bucket: BucketView) -> None:
+        raise S3Error("NoSuchTagSet", BucketName=bucket.name)
+
+    def _tag_target(self, bucket: BucketView) -> ObjMeta:
+        meta = self.cat.object(self.ip, bucket, self.key)
+        if meta is None:
+            raise S3Error("NoSuchKey", Key=self.key[:MAX_KEY_BYTES])
+        return meta
+
+    async def get_object_tagging(self, bucket: BucketView) -> None:
+        self._tag_target(bucket)
+        tags, _ = self.cat.source(self.ip).tags.get((bucket.name, self.key), ([], 0))
+        body = "".join(f"<Tag><Key>{xml_text(k)}</Key><Value>{xml_text(v)}</Value></Tag>"
+                       for k, v in tags)
+        await self.send(200, f'{XML_DECL}<Tagging xmlns="{XMLNS}"><TagSet>{body}</TagSet>'
+                             "</Tagging>".encode())
+
+    async def put_object_tagging(self, bucket: BucketView) -> None:
+        self._tag_target(bucket)
+        text = self.req.body.decode("utf-8", "replace")
+        if "<Tagging" not in text or "<TagSet" not in text:
+            raise S3Error("MalformedXML")
+        tags: list[tuple[str, str]] = []
+        for block in _xml_blocks(text, "Tag")[:MAX_OBJECT_TAGS + 1]:
+            k, v = _xml_blocks(block, "Key")[:1], _xml_blocks(block, "Value")[:1]
+            if not k or not v:
+                raise S3Error("MalformedXML")
+            tags.append((_xml_unescape(k[0]), _xml_unescape(v[0])))
+        if len(tags) > MAX_OBJECT_TAGS:
+            raise S3Error("BadRequest", "Object tags cannot be greater than 10")
+        keys = [k for k, _ in tags]
+        if any(not k for k in keys):
+            raise S3Error("InvalidTag", "The TagKey you have provided is invalid")
+        if any(len(k) > 128 for k in keys):
+            raise S3Error("InvalidTag", "The TagKey you have provided is too long, max 128")
+        if any(len(v) > 256 for _, v in tags):
+            raise S3Error("InvalidTag", "The TagValue you have provided is too long, max 256")
+        if len(set(keys)) != len(keys):
+            raise S3Error("InvalidTag", "Cannot provide multiple Tags with the same key")
+        view = self.cat.source(self.ip)
+        view.tags.pop((bucket.name, self.key), None)
+        view.tags[(bucket.name, self.key)] = (tags, time.monotonic() + UPLOAD_WINDOW)
+        while len(view.tags) > MAX_TAGGED_PER_SOURCE:
+            view.tags.popitem(last=False)
+        self.log["tag_count"] = len(tags)
+        await self.send(200, b"", content_type=None)
+
+    async def delete_object_tagging(self, bucket: BucketView) -> None:
+        self._tag_target(bucket)
+        self.cat.source(self.ip).tags.pop((bucket.name, self.key), None)
+        await self.send(204, b"", content_type=None)
+
+    async def copy_object(self, bucket: BucketView) -> None:
+        # The query suffix (?versionId=) is split off the encoded header, so an encoded
+        # "%3F" in the key stays part of the key.
+        header = (self.req.header("x-amz-copy-source") or "")[:6 * MAX_KEY_BYTES]
+        encoded, sep, query = header.partition("?")
+        raw = unquote(encoded)[:2 * MAX_KEY_BYTES]
+        self.log["copy_source"] = (raw + sep + query[:100])[:500]
+        path = raw.lstrip("/")
+        src_name, _, src_key = path.partition("/")
+        if not src_name or not src_key:
+            raise S3Error("InvalidArgument", "Copy Source must mention the source bucket and "
+                          "key: sourcebucket/sourcekey", ArgumentName="x-amz-copy-source",
+                          ArgumentValue=raw[:200])
+        if len(self.key.encode()) > MAX_KEY_BYTES:
+            raise S3Error("InvalidArgument", "Your key is too long", ArgumentName="key")
+        src_bucket = self.cat.bucket(src_name)
+        if src_bucket is None:
+            raise S3Error("NoSuchBucket", BucketName=src_name[:255])
+        src = self.cat.object(self.ip, src_bucket, src_key)
+        if src is None:
+            raise S3Error("NoSuchKey", Key=src_key[:MAX_KEY_BYTES])
+        replace = (self.req.header("x-amz-metadata-directive") or "").upper() == "REPLACE"
+        if src_bucket.name == bucket.name and src_key == self.key and not replace:
+            raise S3Error("InvalidRequest", "This copy request is illegal because it is trying "
+                          "to copy an object to itself without changing the object's metadata, "
+                          "storage class, website redirect location or encryption attributes.")
+        if src.size > MAX_OBJECT_SIZE:
+            raise S3Error("InvalidRequest", "The specified copy source is larger than the "
+                          f"maximum allowable size for a copy source: {MAX_OBJECT_SIZE}")
+        content_type = (self.req.header("content-type") or "binary/octet-stream") if replace \
+            else src.content_type
+        self.cat.copy(self.ip, src_bucket, src, bucket.name, self.key, content_type)
+        self.log["size"] = src.size
+        body = (f'{XML_DECL}<CopyObjectResult xmlns="{XMLNS}"><LastModified>'
+                f"{iso_date(time.time())}</LastModified><ETag>&quot;{src.etag}&quot;</ETag>"
+                "</CopyObjectResult>")
+        await self.send(200, body.encode())
+
     async def delete_object(self, bucket: BucketView) -> None:
         self.cat.delete(self.ip, bucket.name, self.key)
         await self.send(204, b"", content_type=None)
@@ -1445,6 +1606,7 @@ class Exchange:
         view.multipart[uid] = {"bucket": bucket.name, "key": self.key, "parts": {},
                                "content_type": self.req.header("content-type")
                                or "binary/octet-stream",
+                               "initiated": time.time(),
                                "expires": time.monotonic() + UPLOAD_WINDOW}
         while len(view.multipart) > MAX_MULTIPART_PER_SOURCE:
             view.multipart.popitem(last=False)
@@ -1484,6 +1646,60 @@ class Exchange:
                 f"{xml_text(quote(self.key))}</Location><Bucket>{xml_text(bucket.name)}"
                 f"</Bucket><Key>{xml_text(self.key)}</Key><ETag>&quot;{etag}&quot;</ETag>"
                 "</CompleteMultipartUploadResult>")
+        await self.send(200, body.encode())
+
+    def _initiator(self) -> str:
+        return (f"<Initiator><ID>{self.cat.owner_id}</ID><DisplayName>"
+                f"{xml_text(self.cat.owner_name)}</DisplayName></Initiator>{self._owner()}")
+
+    async def list_multipart_uploads(self, bucket: BucketView) -> None:
+        prefix = self.q.get("prefix", "")[:MAX_KEY_BYTES]
+        max_uploads = min(self._int_param("max-uploads", MAX_LIST_KEYS), MAX_LIST_KEYS)
+        key_marker = self.q.get("key-marker", "")[:MAX_KEY_BYTES]
+        # S3 ignores upload-id-marker unless key-marker is set.
+        id_marker = self.q.get("upload-id-marker", "")[:MAX_UPLOAD_ID] if key_marker else ""
+        ups = sorted(((m["key"], m["initiated"], uid)
+                      for uid, m in self.cat.source(self.ip).multipart.items()
+                      if m["bucket"] == bucket.name and m["key"].startswith(prefix)))
+        if key_marker:
+            ups = _after_upload_markers(ups, key_marker, id_marker)
+            self.log.update(key_marker=key_marker[:200], upload_id_marker=id_marker[:100])
+        truncated = len(ups) > max_uploads
+        ups = ups[:max_uploads]
+        items = "".join(f"<Upload><Key>{xml_text(k)}</Key><UploadId>{uid}</UploadId>"
+                        f"{self._initiator()}<StorageClass>STANDARD</StorageClass><Initiated>"
+                        f"{iso_date(t)}</Initiated></Upload>" for k, t, uid in ups)
+        next_key = xml_text(ups[-1][0]) if ups else ""
+        next_id = ups[-1][2] if ups else ""
+        prefix_xml = f"<Prefix>{xml_text(prefix)}</Prefix>" if "prefix" in self.q else ""
+        body = (f'{XML_DECL}<ListMultipartUploadsResult xmlns="{XMLNS}"><Bucket>'
+                f"{xml_text(bucket.name)}</Bucket><KeyMarker>{xml_text(key_marker)}</KeyMarker>"
+                f"<UploadIdMarker>{xml_text(id_marker)}</UploadIdMarker><NextKeyMarker>{next_key}</NextKeyMarker>"
+                f"<NextUploadIdMarker>{next_id}</NextUploadIdMarker>{prefix_xml}<MaxUploads>"
+                f"{max_uploads}</MaxUploads><IsTruncated>{str(truncated).lower()}"
+                f"</IsTruncated>{items}</ListMultipartUploadsResult>")
+        self.log["returned"] = len(ups)
+        await self.send(200, body.encode())
+
+    async def list_parts(self, bucket: BucketView) -> None:
+        mpu = self._multipart(bucket)
+        max_parts = min(self._int_param("max-parts", MAX_LIST_PARTS), MAX_LIST_PARTS)
+        marker = self._int_param("part-number-marker", 0)
+        numbers = sorted(n for n in mpu["parts"] if n > marker)
+        truncated = len(numbers) > max_parts
+        numbers = numbers[:max_parts]
+        parts = "".join(f"<Part><PartNumber>{n}</PartNumber><LastModified>"
+                        f"{iso_date(mpu['parts'][n][2])}</LastModified><ETag>&quot;"
+                        f"{mpu['parts'][n][1]}&quot;</ETag><Size>{mpu['parts'][n][0]}</Size>"
+                        "</Part>" for n in numbers)
+        body = (f'{XML_DECL}<ListPartsResult xmlns="{XMLNS}"><Bucket>{xml_text(bucket.name)}'
+                f"</Bucket><Key>{xml_text(self.key)}</Key><UploadId>{xml_text(self.q.get('uploadId'))}"
+                f"</UploadId>{self._initiator()}<StorageClass>STANDARD</StorageClass>"
+                f"<PartNumberMarker>{marker}</PartNumberMarker><NextPartNumberMarker>"
+                f"{numbers[-1] if numbers else 0}</NextPartNumberMarker><MaxParts>{max_parts}"
+                f"</MaxParts><IsTruncated>{str(truncated).lower()}</IsTruncated>{parts}"
+                "</ListPartsResult>")
+        self.log["returned"] = len(numbers)
         await self.send(200, body.encode())
 
     async def abort_multipart(self, bucket: BucketView) -> None:
@@ -1548,7 +1764,7 @@ class Exchange:
                         "aws:kms" if (sse or "").startswith("aws:kms") else "AES256"))
         if self.op == "UploadPart":
             assert mpu is not None and part is not None
-            mpu["parts"][part] = (fields["size"], etag)
+            mpu["parts"][part] = (fields["size"], etag, time.time())
         else:
             self.cat.add_upload(self.ip, bucket.name, self.key, fields["size"], etag,
                                 req.header("content-type") or "binary/octet-stream", kept)
@@ -1708,6 +1924,22 @@ class Exchange:
         conn.emit("command", f"{self.op} {self.bucket_name or ''}/{self.key[:150]}".rstrip("/"),
                   client=req.header("user-agent"), username=conn.authenticated_as
                   if self.auth.scheme != "anonymous" else None, data=data)
+
+
+def _xml_blocks(text: str, tag: str, limit: int = 64) -> list[str]:
+    """The text of up to ``limit`` ``<tag>...</tag>`` elements, in one linear scan."""
+    out: list[str] = []
+    start, open_tag, close_tag = 0, f"<{tag}>", f"</{tag}>"
+    while len(out) < limit:
+        i = text.find(open_tag, start)
+        if i < 0:
+            break
+        j = text.find(close_tag, i + len(open_tag))
+        if j < 0:
+            break
+        out.append(text[i + len(open_tag):j])
+        start = j + len(close_tag)
+    return out
 
 
 def _xml_unescape(text: str) -> str:

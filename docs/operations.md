@@ -20,7 +20,8 @@ sensor may run and what it may reach.
   (smaller) response to the spoofed address, within per-source and global rate caps. Keep
   `sip_udp_slack_bytes = 0` on internet-facing sensors unless you need to answer minimal
   REGISTERs.
-- **HL7.** The MLLP trap acknowledges any HL7 v2 message. If a real clinical system is
+- **HL7.** The MLLP trap acknowledges any HL7 v2 message and answers patient queries
+  (`QRY^A19`, `QBP^Q22`) with "no data found". If a real clinical system is
   misconfigured to send to it, the log will contain real patient data and the sender will
   believe delivery succeeded. Only expose it where no real HL7 sender can reach it by
   mistake, and treat its log as potentially regulated health data.

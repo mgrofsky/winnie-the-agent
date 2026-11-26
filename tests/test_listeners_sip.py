@@ -684,3 +684,58 @@ async def test_listener_process_writes_suppression_summaries_on_its_own():
     await asyncio.sleep(0.3)
     task.cancel()
     assert any(e["data"].get("reason") == "suppressed_summary" for e in writer.events)
+
+
+BIG_SDP = SDP + "".join(f"a=rtpmap:{96 + i} telephone-event/8000\r\na=fmtp:{96 + i} 0-16\r\n"
+                        for i in range(20))
+
+
+async def test_verified_udp_invite_gets_trying_ringing_final_within_request_size(sip_server):
+    _, writer, transport, client, _, _ = await sip_server(accept="all")
+    assert code_of(await register(transport, client, "100", "1234", 1)) == 200
+    invite = request("INVITE", "sip:0044201234567@127.0.0.1", call_id="big-1", cseq=7)
+    invite = invite.replace(b"Content-Length: 0\r\n\r\n",
+                            f"Content-Type: application/sdp\r\nContent-Length: "
+                            f"{len(BIG_SDP)}\r\n\r\n{BIG_SDP}".encode())
+    transport.sendto(invite)
+    got = [await client.recv() for _ in range(3)]
+    assert [code_of(r) for r in got[:2]] == [100, 180] and code_of(got[2]) in (486, 480)
+    assert await client.drain() == []
+    assert sum(len(r) for r in got) <= len(invite)
+    to = lambda r: re.search(rb"\r\n(?:To|t): ([^\r]*)", r).group(1)  # noqa: E731
+    assert b";tag=" not in to(got[0])                            # 100 Trying carries no tag
+    assert b";tag=" in to(got[1]) and to(got[1]) == to(got[2])
+    assert all(b"v=0" not in r for r in got)                     # never any SDP
+
+
+async def test_small_or_unverified_udp_invite_gets_only_the_final(sip_server):
+    _, writer, transport, client, _, _ = await sip_server(accept="all")
+    # Unverified source: a Proxy-Authorization with a nonce the trap never issued.
+    forged = {"realm": "asterisk", "nonce": "1/feedface"}
+    big = minimal("INVITE", "sip:0044201234567@127.0.0.1", call_id="f-1", body=BIG_SDP)
+    big = big.replace(b"Content-Type:", proxy_authorization(forged).encode() + b"Content-Type:", 1)
+    transport.sendto(big)
+    final = await client.recv()
+    assert code_of(final) in (486, 480) and await client.drain() == []
+    # Verified source, but a request too small for three responses: the final alone.
+    assert code_of(await register(transport, client, "100", "1234", 1)) == 200
+    transport.sendto(request("INVITE", "sip:0044201234567@127.0.0.1", call_id="s-1", cseq=9))
+    final = await client.recv()
+    assert code_of(final) in (486, 480) and await client.drain() == []
+
+
+async def test_provisionals_never_take_the_final_responses_allowance(sip_server):
+    from listeners.base import SlidingRate
+    ctx, writer, transport, client, _, _ = await sip_server(accept="all")
+    assert code_of(await register(transport, client, "100", "1234", 1)) == 200
+    ctx.udp_resp_rate = SlidingRate(4)          # 4 responses per minute for this source
+    invite = request("INVITE", "sip:0044201234567@127.0.0.1", call_id="lim-1", cseq=7)
+    invite = invite.replace(b"Content-Length: 0\r\n\r\n",
+                            f"Content-Type: application/sdp\r\nContent-Length: "
+                            f"{len(BIG_SDP)}\r\n\r\n{BIG_SDP}".encode())
+    transport.sendto(invite)
+    got = [await client.recv() for _ in range(3)]
+    assert [code_of(r) for r in got[:2]] == [100, 180]       # 3 of 4 used
+    transport.sendto(invite.replace(b"lim-1", b"lim-2"))
+    final = await client.recv()                                # 1 left: the final alone
+    assert code_of(final) in (486, 480) and await client.drain() == []

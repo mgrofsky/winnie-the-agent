@@ -115,7 +115,7 @@ async def test_ftp_fail_then_login_browse_retr_stor(ftp_server, tmp_path):
     assert out["stor"].startswith("226")
     assert "shell.sh" in out["after"]
     assert out["too_big"].startswith("552")
-    assert out["port"].startswith("500")
+    assert out["port"] == "500 Illegal PORT command."
     assert out["quit"].startswith("221")
 
     attempts = events(writer, "auth_attempt")
@@ -563,3 +563,72 @@ async def test_mlst_and_site_answer_like_the_advertised_server(ftp_server):
     assert await c.cmd("SITE UMASK 022") == "200 UMASK set to 0022"
     assert await c.cmd("SITE CPFR /etc/passwd") == "500 Unknown SITE command."
     assert await c.cmd("NOOP") == "200 NOOP ok."
+
+
+async def test_ftp_vsftpd_help_stat_allo_rmd_and_active_mode(ftp_server):
+    ctx, writer, port = await ftp_server(accept="all")
+    reader, w = await asyncio.open_connection("127.0.0.1", port)
+    pre = Ctl(reader, w)
+    await pre.line()
+    assert await pre.cmd("HELP") == "530 Please login with USER and PASS."
+    w.close()
+    c = await Ctl.login(port)
+    assert await c.cmd("HELP") == "214-The following commands are recognized."
+    body = [await c.line() for _ in range(5)]
+    assert body[0] == " ABOR ACCT ALLO APPE CDUP CWD  DELE EPRT EPSV FEAT HELP LIST MDTM MKD"
+    assert body[3] == " XPWD XRMD" and body[4] == "214 Help OK."
+    assert await c.cmd("STAT") == "211-FTP server status:"
+    stat = [await c.line() for _ in range(10)]
+    assert stat[0] == "     Connected to 127.0.0.1" and stat[1] == "     Logged in as a"
+    assert stat[2] == "     TYPE: ASCII" and stat[8] == "     vsFTPd 3.0.3 - secure, fast, stable"
+    assert stat[9] == "211 End of status"
+    assert await c.cmd("TYPE I") == "200 Switching to Binary mode."
+    assert await c.cmd("STAT") == "211-FTP server status:"
+    assert [await c.line() for _ in range(10)][2] == "     TYPE: BINARY"
+    assert await c.cmd("ALLO 1024") == "202 ALLO command ignored."
+    assert await c.cmd("MKD /tmpdir/sub") == '257 "/tmpdir/sub" created'
+    assert await c.cmd("RMD /tmpdir") == "550 Remove directory operation failed."
+    assert await c.cmd("RMD /tmpdir/sub") == "250 Remove directory operation successful."
+    assert await c.cmd("RMD /tmpdir") == "250 Remove directory operation successful."
+    assert await c.cmd("RMD /voicemail") == "550 Remove directory operation failed."
+    assert await c.cmd("RMD /nope") == "550 Remove directory operation failed."
+    # Active mode stays refused, with vsftpd's reply for each case, and drops a pending PASV.
+    assert await c.cmd("PORT 127,0,0,1,31,144") == "500 Illegal PORT command."
+    assert await c.cmd("PORT 198,51,100,9,31,144") == "500 Illegal PORT command."
+    assert await c.cmd("PORT x") == "500 Illegal PORT command."
+    assert await c.cmd("EPRT |1|127.0.0.1|8080|") == "500 Illegal EPRT command."
+    assert await c.cmd("EPRT |1|198.51.100.9|8080|") == "500 Illegal EPRT command."
+    assert await c.cmd("EPRT |1|bogus|8080|") == "500 Bad EPRT command."
+    assert await c.cmd("EPRT #1#127.0.0.1#8080#") == "500 Bad EPRT command."
+    assert await c.cmd("EPRT |3|127.0.0.1|8080|") == "500 Bad EPRT protocol."
+    assert await c.cmd("EPRT |2|::1|8080|") == "500 Bad EPRT protocol."     # IPv4 socket
+    await c.pasv()
+    assert await c.cmd("PORT 127,0,0,1,31,144") == "500 Illegal PORT command."
+    assert await c.cmd("LIST") == "425 Use PORT or PASV first."
+    active = [e for e in events(writer, "command") if e["data"].get("signal") == "ftp_active_mode"]
+    assert len(active) == 10
+
+
+async def test_ftp_proftpd_banner_family(ftp_server):
+    ctx, writer, port = await ftp_server(accept="all")
+    ctx.settings["ftp"].banner = "220 ProFTPD 1.3.8 Server (Northwind Files) [192.0.2.10]"
+    c = await Ctl.login(port)
+    assert await c.cmd("HELP") == \
+        "214-The following commands are recognized (* =>'s unimplemented):"
+    first = await c.line()
+    assert first == " CWD     XCWD    CDUP    XCUP    SMNT*   QUIT    PORT    PASV    "
+    while not (line := await c.line()).startswith("214 "):
+        assert line.startswith(" ")
+    assert line.startswith("214 Direct comments to root@")
+    assert await c.cmd("STAT") == "211-Status of 'Northwind Files'"
+    assert [await c.line() for _ in range(5)] == [
+        " Connected from 127.0.0.1 (127.0.0.1)", " Logged in as a",
+        " TYPE: ASCII, STRUcture: File, Mode: Stream", " No data connection",
+        "211 End of status"]
+    assert await c.cmd("ALLO 10") == "202 No storage allocation necessary"
+    assert await c.cmd("SITE CHMOD 777 /voicemail/README.txt") == "200 SITE CHMOD command successful"
+    assert await c.cmd("SITE CHMOD 777 /nope") == "550 /nope: No such file or directory"
+    assert await c.cmd("SITE CPFR /etc/passwd") == "500 'SITE CPFR' not understood"
+    assert await c.cmd("RMD /voicemail") == "550 /voicemail: Directory not empty"
+    assert await c.cmd("MKD /e") == '257 "/e" created'
+    assert await c.cmd("RMD /e") == "250 RMD command successful"

@@ -4,7 +4,11 @@ Passive mode only. PASV/EPSV open a listener on ``ctx.bind_host`` (first free po
 ``ctx.ftp_pasv_ports``, or an ephemeral port) that accepts exactly one connection, only
 from the control connection's source IP, with a timeout. The 227 reply advertises
 ``ctx.ftp_pasv_address`` or else the control connection's local address, never the bind
-address. PORT/EPRT are refused so the honeypot never connects out.
+address. PORT/EPRT are refused with vsftpd's own replies (what a client behind NAT gets
+from it), so the honeypot never connects out.
+
+Replies follow the banner's server family: vsftpd by default, ProFTPD when the banner names
+it (HELP, STAT, ALLO, SITE and RMD answers).
 
 STOR streams to the capped quarantine (``ctx.quarantine``) while reading. Upload bytes are
 bounded by the quarantine caps, not the control connection's byte cap: an upload over the
@@ -25,6 +29,7 @@ import struct
 import gzip
 import ipaddress
 import posixpath
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -45,6 +50,18 @@ DEFAULT_TREE = {
 }
 FEATURES = ["EPSV", "MDTM", "PASV", "REST STREAM", "SIZE", "TVFS", "UTF8",
             "MLST type*;size*;modify*;perm*;"]
+VSFTPD_HELP = ("214-The following commands are recognized.\r\n"
+               " ABOR ACCT ALLO APPE CDUP CWD  DELE EPRT EPSV FEAT HELP LIST MDTM MKD\r\n"
+               " MODE NLST NOOP OPTS PASS PASV PORT PWD  QUIT REIN REST RETR RMD  RNFR\r\n"
+               " RNTO SITE SIZE SMNT STAT STOR STOU STRU SYST TYPE USER XCUP XCWD XMKD\r\n"
+               " XPWD XRMD\r\n"
+               "214 Help OK.\r\n")
+PROFTPD_COMMANDS = ("CWD XCWD CDUP XCUP SMNT* QUIT PORT PASV EPRT EPSV ALLO* RNFR RNTO DELE "
+                    "MDTM RMD XRMD MKD XMKD PWD XPWD SIZE SYST HELP NOOP FEAT OPTS HOST CLNT "
+                    "AUTH* CCC* CONF* ENC* MIC* PBSZ* PROT* TYPE STRU MODE RETR STOR STOU APPE "
+                    "REST ABOR RANG USER PASS ACCT* REIN* LIST NLST STAT SITE MLSD MLST").split()
+VSFTPD_VERSION_RE = re.compile(r"vsftpd\s+(\d{1,2}\.\d{1,2}\.\d{1,2})", re.IGNORECASE)
+PROFTPD_NAME_RE = re.compile(r"proftpd[^()]*\(([\x20-\x27\x2a-\x7e]{1,64})\)", re.IGNORECASE)
 
 
 @dataclass
@@ -238,6 +255,28 @@ def same_source(peer_ip: str, control_ip: str) -> bool:
     return _plain_ip(str(peer_ip)) == _plain_ip(str(control_ip))
 
 
+def eprt_refusal(arg: str, local_ipv6: bool) -> str:
+    """vsftpd's reply to an EPRT it does not follow: the parse error for a malformed
+    argument, otherwise the bounce-protection refusal."""
+    parts = arg.split("|", 4)
+    if len(parts) < 2 or parts[0]:
+        return "500 Bad EPRT command."
+    proto = parts[1].split("|")[0]
+    if proto not in ("1", "2") or (proto == "2" and not local_ipv6):
+        return "500 Bad EPRT protocol."
+    if len(parts) != 5 or parts[4]:
+        return "500 Bad EPRT command."
+    try:
+        ip = ipaddress.ip_address(parts[2].split("%", 1)[0])
+    except ValueError:
+        return "500 Bad EPRT command."
+    if ip.version != (4 if proto == "1" else 6):
+        return "500 Bad EPRT command."
+    if not parts[3].isdigit() or len(parts[3]) > 5 or int(parts[3]) > 65535:
+        return "500 Bad EPRT command."
+    return "500 Illegal EPRT command."
+
+
 def pasv_host(conn: Conn) -> Optional[str]:
     """The IPv4 address for a 227 reply: configured, else the control connection's local
     address (what the client actually reached, e.g. the published host address)."""
@@ -355,8 +394,17 @@ class FtpSession:
         self.tree: Optional[Tree] = None
         self.passive: Optional[Passive] = None
         self.rnfr: Optional[str] = None
+        self.ascii = True             # TYPE as STAT reports it
         svc = self.ctx.scenario.scenario.services.ftp if self.ctx.scenario is not None else None
         self.retr_max = svc.retr_max_bytes if svc is not None else 65536
+        banner = settings.banner or DEFAULT_BANNER
+        self.family = "proftpd" if "proftpd" in banner.lower() else "vsftpd"
+        m = VSFTPD_VERSION_RE.search(banner)
+        self.vsftpd_version = m.group(1) if m else "3.0.5"
+        m = PROFTPD_NAME_RE.search(banner)
+        self.server_name = m.group(1).strip() if m else "ProFTPD Default Installation"
+        host = self.ctx.scenario.hostname if self.ctx.scenario is not None else "localhost"
+        self.admin = f"root@{host}"
 
     async def reply(self, text: str) -> None:
         await self.conn.write(text + "\r\n")
@@ -410,8 +458,7 @@ class FtpSession:
                 await self.reply("530 Login incorrect.")
             return True
         simple = {"SYST": "215 UNIX Type: L8", "NOOP": "200 NOOP ok.",
-                  "OPTS": "200 Always in UTF8 mode.", "ABOR": "225 No transfer to ABOR.",
-                  "HELP": "214 Help OK."}
+                  "OPTS": "200 Always in UTF8 mode.", "ABOR": "225 No transfer to ABOR."}
         if cmd in simple:
             await self.reply(simple[cmd])
             return True
@@ -441,7 +488,8 @@ class FtpSession:
             self.cwd = posixpath.dirname(self.cwd) or "/"
             await self.reply("250 Directory successfully changed.")
         elif cmd == "TYPE":
-            mode = "ASCII" if arg.upper().startswith("A") else "Binary"
+            self.ascii = arg.upper().startswith("A")
+            mode = "ASCII" if self.ascii else "Binary"
             await self.reply(f"200 Switching to {mode} mode.")
         elif cmd in ("MODE", "STRU"):
             await self.reply("200 Mode set to S." if cmd == "MODE" else "200 Structure set to F.")
@@ -450,7 +498,7 @@ class FtpSession:
         elif cmd in ("PORT", "EPRT"):
             self.conn.emit("command", "FTP active mode refused",
                            data={"cmd": cmd, "arg": arg, "signal": "ftp_active_mode"})
-            await self.reply("500 Illegal PORT command.")
+            await self.port(cmd, arg)
         elif cmd in ("PASV", "EPSV"):
             await self.open_passive(cmd)
         elif cmd in ("LIST", "NLST", "MLSD"):
@@ -479,12 +527,7 @@ class FtpSession:
             else:
                 await self.reply(f'257 "{p}" created')
         elif cmd in ("RMD", "XRMD"):
-            p = self.path(arg)
-            if p in tree.dirs and p != "/":
-                tree.dirs.discard(p)
-                await self.reply("250 Remove directory operation successful.")
-            else:
-                await self.reply("550 Remove directory operation failed.")
+            await self.rmd(arg)
         elif cmd == "RNFR":
             p = self.path(arg)
             if p in tree.files or p in tree.dirs:
@@ -520,8 +563,15 @@ class FtpSession:
             await self.conn.write(f"250-Listing {p}\r\n {facts} {p}\r\n250 End\r\n")
         elif cmd == "SITE":
             await self.site(arg)
-        elif cmd in ("STAT",):
+        elif cmd == "STAT" and not arg:
+            await self.stat()
+        elif cmd == "STAT":
             await self.reply("211 FTP server status: connected, logged in as " + (self.user or ""))
+        elif cmd == "HELP":
+            await self.help()
+        elif cmd == "ALLO":
+            await self.reply("202 No storage allocation necessary" if self.family == "proftpd"
+                             else "202 ALLO command ignored.")
         elif cmd in ("AUTH", "PBSZ", "PROT"):
             await self.reply("530 Please login with USER and PASS.")
         else:
@@ -561,6 +611,73 @@ class FtpSession:
         h = host.replace(".", ",")
         await self.reply(f"227 Entering Passive Mode ({h},{port // 256},{port % 256}).")
 
+    async def port(self, cmd: str, arg: str) -> None:
+        """PORT/EPRT refused with vsftpd's replies. Like vsftpd, either one first drops a
+        pending passive listener."""
+        if self.passive is not None:
+            self.passive.close()
+            self.passive = None
+        if cmd == "PORT":
+            await self.reply("500 Illegal PORT command.")
+            return
+        local_ipv6 = ":" in _plain_ip(str(self.conn.dst_ip))
+        await self.reply(eprt_refusal(arg, local_ipv6))
+
+    async def rmd(self, arg: str) -> None:
+        tree = self.tree
+        assert tree is not None
+        p = self.path(arg)
+        name = arg[:200] or p
+        pro = self.family == "proftpd"
+        if p not in tree.dirs or p == "/":
+            await self.reply(f"550 {name}: No such file or directory" if pro
+                             else "550 Remove directory operation failed.")
+            return
+        prefix = p + "/"
+        keep = [f for f in tree.files if f.startswith(prefix)
+                and posixpath.basename(f) == ".keep" and posixpath.dirname(f) == p]
+        if any(f.startswith(prefix) for f in tree.files if f not in keep) or \
+                any(d.startswith(prefix) for d in tree.dirs):
+            await self.reply(f"550 {name}: Directory not empty" if pro
+                             else "550 Remove directory operation failed.")
+            return
+        for f in keep:
+            tree.files.pop(f, None)
+        tree.dirs.discard(p)
+        await self.reply("250 RMD command successful" if pro
+                         else "250 Remove directory operation successful.")
+
+    async def help(self) -> None:
+        if self.family == "vsftpd":
+            await self.conn.write(VSFTPD_HELP)
+            return
+        rows = [PROFTPD_COMMANDS[i:i + 8] for i in range(0, len(PROFTPD_COMMANDS), 8)]
+        body = "".join(" " + "".join(f"{c:<8}" for c in row) + "\r\n" for row in rows)
+        await self.conn.write("214-The following commands are recognized (* =>'s "
+                              f"unimplemented):\r\n{body}214 Direct comments to {self.admin}\r\n")
+
+    async def stat(self) -> None:
+        mode = "ASCII" if self.ascii else "BINARY"
+        ip = self.conn.src_ip
+        if self.family == "proftpd":
+            await self.conn.write(f"211-Status of '{self.server_name}'\r\n"
+                                  f" Connected from {ip} ({ip})\r\n"
+                                  f" Logged in as {self.user or ''}\r\n"
+                                  f" TYPE: {mode}, STRUcture: File, Mode: Stream\r\n"
+                                  " No data connection\r\n211 End of status\r\n")
+            return
+        await self.conn.write("211-FTP server status:\r\n"
+                              f"     Connected to {ip}\r\n"
+                              f"     Logged in as {self.user or ''}\r\n"
+                              f"     TYPE: {mode}\r\n"
+                              "     No session bandwidth limit\r\n"
+                              "     Session timeout in seconds is 300\r\n"
+                              "     Control connection is plain text\r\n"
+                              "     Data connections will be plain text\r\n"
+                              "     At session startup, client count was 1\r\n"
+                              f"     vsFTPd {self.vsftpd_version} - secure, fast, stable\r\n"
+                              "211 End of status\r\n")
+
     async def data_conn(self) -> Optional[tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
         if self.passive is None:
             await self.reply("425 Use PORT or PASV first.")
@@ -586,7 +703,9 @@ class FtpSession:
         """vsftpd's SITE subcommands: CHMOD (nothing changes), UMASK and HELP."""
         sub, _, rest = arg.partition(" ")
         sub, rest = sub.upper(), rest.strip()
-        if sub == "HELP":
+        if self.family == "proftpd":
+            await self.proftpd_site(sub[:32], rest)
+        elif sub == "HELP":
             await self.reply("214 CHMOD UMASK HELP")
         elif sub == "CHMOD":
             target = rest.partition(" ")[2].strip()
@@ -606,6 +725,25 @@ class FtpSession:
                 await self.reply(f"200 UMASK set to {int(digits, 8):04o}")
         else:
             await self.reply("500 Unknown SITE command.")
+
+    async def proftpd_site(self, sub: str, rest: str) -> None:
+        """ProFTPD's core SITE subcommands: CHMOD (nothing changes), CHGRP and HELP."""
+        tree = self.tree
+        assert tree is not None
+        if sub == "HELP":
+            await self.conn.write("214-The following SITE commands are recognized (* =>'s "
+                                  "unimplemented)\r\n CHGRP   CHMOD   HELP    \r\n"
+                                  f"214 Direct comments to {self.admin}\r\n")
+        elif sub in ("CHMOD", "CHGRP"):
+            target = rest.partition(" ")[2].strip()
+            if not target:
+                await self.reply(f"500 'SITE {sub}' not understood")
+            elif self.path(target) in tree.files or self.path(target) in tree.dirs:
+                await self.reply(f"200 SITE {sub} command successful")
+            else:
+                await self.reply(f"550 {target[:200]}: No such file or directory")
+        else:
+            await self.reply(f"500 'SITE {sub}' not understood")
 
     async def send_listing(self, cmd: str, arg: str) -> None:
         args = [a for a in arg.split() if not a.startswith("-")]

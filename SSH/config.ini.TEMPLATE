@@ -280,8 +280,9 @@ ftp_pasv_accept_timeout = 30
 ftp_pasv_per_ip = 2
 # PostgreSQL password exchange: md5 (default) or cleartext.
 #postgres_auth = md5
-# Free-form answers (unknown SQL and API routes after login, unknown web paths, telnet
-# persona) use the budgeted model only when this is true; otherwise protocol errors.
+# Free-form answers (unknown SQL and API routes after login, Redis commands the trap does
+# not implement, unknown web paths, telnet persona) use the budgeted model only when this
+# is true; otherwise protocol errors.
 llm = false
 model = claude-haiku-5-5
 llm_max_inflight = 4

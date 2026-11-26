@@ -44,8 +44,9 @@ provider, and a malicious operator.
 ### Front-ends do not connect out
 
 No listener opens an outbound connection: FTP active mode is refused, and passive data
-connections are accepted only from the control connection's source. The S3 trap refuses
-`CopyObject` and never resolves a URL, endpoint or bucket name it is given. The only outbound
+connections are accepted only from the control connection's source. The S3 trap's `CopyObject` copies only
+between objects the source can already see, in memory, and the trap never resolves a URL,
+endpoint or bucket name it is given. The only outbound
 traffic a front-end originates is a model API call, when a model is configured. Enforce
 this with a host firewall as well (see [operations.md](operations.md#egress-control-in-production)).
 
@@ -66,7 +67,11 @@ update cannot block or change a decision.
 
 Over UDP, SIP sends at most one response per request, never larger than the request by
 default (`sip_udp_slack_bytes` can allow up to 512 extra bytes), ignores SIP responses and
-requests with more than 5 Via hops, and caps responses per source and globally. Datagrams
+requests with more than 5 Via hops, and caps responses per source and globally. The one
+exception is an answered `INVITE` from a source that has completed a nonce round trip (so
+its address is not forged): it gets `100 Trying` and `180 Ringing` before the final
+response, only when all three together fit in the same size limit, so the bytes sent
+never exceed the request. Datagrams
 over the size limit are dropped.
 
 Spoofed-source floods are bounded too: a per-source limit and then a global inbound limit
