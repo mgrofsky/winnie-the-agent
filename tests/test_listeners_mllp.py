@@ -142,3 +142,60 @@ async def test_mllp_trickled_frame_scan_is_linear(monkeypatch):
     with pytest.raises(ConnClosed):
         await captured["handler"](conn2)
     assert len(conn2.written) == 3 and all(b"MSA|AA|MSG00042" in w for w in conn2.written)
+
+
+QBP = ("MSH|^~\\&|PDQ_CONSUMER|CLINIC|EHR|HOSP|20260301120000||QBP^Q22^QBP_Q21|Q0001|P|2.5\r"
+       "QPD|IHE PDQ Query|QT-77|@PID.5.1^DOE~@PID.7^19700101\r"
+       "RCP|I|10^RD\r")
+QRY = ("MSH|^~\\&|LAB|ACME_LAB|EHR|HOSP|20260301120000||QRY^A19|Q0002|P|2.3\r"
+       "QRD|20260301120000|R|I|QID-9||||1^RD|MRN12345678^DOE^JANE|DEM\r")
+
+
+async def test_mllp_queries_get_no_data_found_responses(mllp_server):
+    writer, reader, w = await mllp_server()
+    w.write(frame(QBP))
+    await w.drain()
+    segs = (await read_frame(reader)).rstrip("\r").split("\r")
+    msh = segs[0].split("|")
+    assert msh[8] == "RSP^K22^RSP_K21" and msh[11] == "2.5" and msh[4] == "PDQ_CONSUMER"
+    assert segs[1] == "MSA|AA|Q0001"
+    assert segs[2] == "QAK|QT-77|NF|IHE PDQ Query"
+    assert segs[3] == "QPD|IHE PDQ Query|QT-77|@PID.5.1^DOE~@PID.7^19700101"
+    assert len(segs) == 4                                   # no PID: nothing found
+    w.write(frame(QRY))
+    await w.drain()
+    segs = (await read_frame(reader)).rstrip("\r").split("\r")
+    assert segs[0].split("|")[8] == "ADR^A19" and segs[1] == "MSA|AA|Q0002"
+    assert segs[2] == "QAK|QID-9|NF"
+    assert segs[3] == "QRD|20260301120000|R|I|QID-9||||1^RD|MRN12345678^DOE^JANE|DEM"
+    msgs = [e["data"] for e in writer.events if e["event"] == "command"]
+    assert msgs[0]["response"] == "RSP^K22" and msgs[0]["query_status"] == "NF"
+    assert msgs[1]["response"] == "ADR^A19"
+    # Other separators in the request are re-encoded with the standard ones.
+    w.write(frame("MSH#*!/%#A#B#C#D#20260101##QBP*Q22*QBP_Q21#Q3#P#2.5\r"
+                  "QPD#Name*X#T1#@PID.5.1*SMITH!@PID.8*F\r"))
+    await w.drain()
+    segs = (await read_frame(reader)).rstrip("\r").split("\r")
+    assert segs[2] == "QAK|T1|NF|Name^X" and segs[3] == "QPD|Name^X|T1|@PID.5.1^SMITH~@PID.8^F"
+    # A longer code that merely starts with a query's code gets the plain ACK.
+    w.write(frame(QBP.replace("QBP^Q22^QBP_Q21", "QBPX^Q22X^QBP_Q21")))
+    await w.drain()
+    segs = (await read_frame(reader)).rstrip("\r").split("\r")
+    assert segs[0].split("|")[8] == "ACK^Q22^ACK" and segs[1] == "MSA|AA|Q0001"
+    w.close()
+
+
+async def test_mllp_query_echo_cannot_inject_segments_or_grow(mllp_server):
+    writer, reader, w = await mllp_server()
+    evil = ("MSH|^~\\&|A|B|C|D|20260101||QBP^Q22^QBP_Q21|Q9|P|2.5\r"
+            "QPD|Q22^x\\X0D\\MSA|T|" + "~".join(["@PID.3^" + "9" * 500] * 50)
+            + "|" + "|".join(["f"] * 400) + "\r")
+    w.write(frame(evil))
+    await w.drain()
+    resp = await read_frame(reader)
+    segs = resp.rstrip("\r").split("\r")
+    assert [s[:3] for s in segs] == ["MSH", "MSA", "QAK", "QPD"]
+    qpd = segs[3].split("|")
+    assert len(qpd) <= 13 and qpd[3].count("~") <= 4 and len(resp) < 2000
+    assert "\\" not in segs[3] and "X0D" in segs[3]          # escape text kept as plain data
+    w.close()

@@ -111,7 +111,7 @@ class Limits:
     quarantine_per_ip_bytes: int = 20_971_520
     ftp_pasv_accept_timeout: float = 30.0   # an unused passive listener closes after this
     ftp_pasv_per_ip: int = 2                # open passive listeners per source
-    llm_max_inflight: int = 4           # concurrent model calls from SQL/HTTP fallbacks
+    llm_max_inflight: int = 4           # concurrent model calls from SQL/HTTP/Redis fallbacks
     llm_timeout: float = 20.0
     llm_attempts: int = 2               # requests per model answer, 1 to 3 (see llm_json)
     llm_deadline: float = 12.0          # seconds for all attempts together, at most llm_timeout
@@ -155,6 +155,13 @@ class SlidingRate:
             return False
         q.append(now)
         return True
+
+    def remaining(self, key: str, now: Optional[float] = None) -> int:
+        """Events ``key`` may still have in the current 60 s window (nothing is used)."""
+        q = self._hits.get(ip_key(key))
+        now = time.monotonic() if now is None else now
+        used = sum(1 for t in q if now - t <= 60.0) if q else 0
+        return max(0, self.per_minute - used)
 
 
 class TokenBucket:

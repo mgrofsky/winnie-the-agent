@@ -709,17 +709,137 @@ def test_multipart_upload_stores_parts(server):
     assert error_code(exc.value) == "NoSuchUpload"
 
 
-def test_copy_and_bucket_level_writes_are_denied(server):
+def test_bucket_level_writes_are_denied(server):
     c = server.client()
-    for call in (lambda: c.copy_object(Bucket="nw-config-backup", Key="c",
-                                       CopySource="nw-config-backup/.env"),
-                 lambda: c.create_bucket(Bucket="new-bucket-here"),
+    for call in (lambda: c.create_bucket(Bucket="new-bucket-here"),
                  lambda: c.delete_bucket(Bucket="nw-config-backup")):
         with pytest.raises(ClientError) as exc:
             call()
         assert error_code(exc.value) == "AccessDenied"
     raw = server.raw(b"PATCH /nw-config-backup/x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     assert raw.startswith(b"HTTP/1.1 405") and b"MethodNotAllowed" in raw
+
+
+def test_copy_object_within_the_sources_own_objects(server):
+    c = server.client()
+    r = c.copy_object(Bucket="nw-config-backup", Key="copies/env.bak",
+                      CopySource="nw-config-backup/.env")
+    src = c.head_object(Bucket="nw-config-backup", Key=".env")
+    assert r["CopyObjectResult"]["ETag"] == src["ETag"]
+    body = c.get_object(Bucket="nw-config-backup", Key="copies/env.bak")["Body"].read()
+    assert body == c.get_object(Bucket="nw-config-backup", Key=".env")["Body"].read()
+    # A large filler object: the copy serves the same bytes as its source.
+    c.copy_object(Bucket="nw-config-backup", Key="rec.wav",
+                  CopySource={"Bucket": "nw-call-recordings", "Key": "exports/cdr.log"})
+    a = c.get_object(Bucket="nw-config-backup", Key="rec.wav", Range="bytes=1000-1999")
+    b = c.get_object(Bucket="nw-call-recordings", Key="exports/cdr.log", Range="bytes=1000-1999")
+    assert a["Body"].read() == b["Body"].read() and a["ContentType"] == "text/plain"
+    # An upload copied again, and a copy of a copy.
+    c.put_object(Bucket="nw-config-backup", Key="up.txt", Body=b"mine\n")
+    c.copy_object(Bucket="nw-config-backup", Key="up2.txt", CopySource="nw-config-backup/up.txt")
+    c.copy_object(Bucket="nw-config-backup", Key="up3.txt", CopySource="nw-config-backup/up2.txt")
+    assert c.get_object(Bucket="nw-config-backup", Key="up3.txt")["Body"].read() == b"mine\n"
+    keys = [o["Key"] for o in c.list_objects_v2(Bucket="nw-config-backup")["Contents"]]
+    assert {"copies/env.bak", "rec.wav", "up2.txt", "up3.txt"} <= set(keys)
+    for source, code in (("nw-config-backup/nope", "NoSuchKey"),
+                         ("no-such-bucket-x/a", "NoSuchBucket"),
+                         ("nw-config-backup/.env", "InvalidRequest")):
+        with pytest.raises(ClientError) as exc:
+            c.copy_object(Bucket="nw-config-backup",
+                          Key=".env" if code == "InvalidRequest" else "x", CopySource=source)
+        assert error_code(exc.value) == code
+    assert server.commands("CopyObject")[0]["data"]["copy_source"] == "nw-config-backup/.env"
+
+
+def test_copy_is_invisible_to_other_sources(server):
+    c = server.client()
+    c.copy_object(Bucket="nw-config-backup", Key="only-mine", CopySource="nw-config-backup/.env")
+    cat = s3.catalog(server.ctx)
+    assert "only-mine" in cat.listing_keys("nw-config-backup", "127.0.0.1")
+    assert "only-mine" not in cat.listing_keys("nw-config-backup", "198.51.100.7")
+
+
+def test_multipart_listings_and_parts(server):
+    c = server.client()
+    uid = c.create_multipart_upload(Bucket="nw-config-backup", Key="db/dump.sql")["UploadId"]
+    for n in (1, 2, 3):
+        c.upload_part(Bucket="nw-config-backup", Key="db/dump.sql", UploadId=uid,
+                      PartNumber=n, Body=bytes([64 + n]) * (100 * n))
+    ups = c.list_multipart_uploads(Bucket="nw-config-backup")
+    assert [(u["Key"], u["UploadId"]) for u in ups["Uploads"]] == [("db/dump.sql", uid)]
+    assert ups["Uploads"][0]["StorageClass"] == "STANDARD" and ups["IsTruncated"] is False
+    assert "Uploads" not in c.list_multipart_uploads(Bucket="nw-config-backup", Prefix="x/")
+    parts = c.list_parts(Bucket="nw-config-backup", Key="db/dump.sql", UploadId=uid)
+    assert [(p["PartNumber"], p["Size"]) for p in parts["Parts"]] == [(1, 100), (2, 200), (3, 300)]
+    assert parts["Parts"][0]["ETag"] == '"' + hashlib.md5(b"A" * 100).hexdigest() + '"'
+    page = c.list_parts(Bucket="nw-config-backup", Key="db/dump.sql", UploadId=uid, MaxParts=2)
+    assert page["IsTruncated"] is True and page["NextPartNumberMarker"] == 2
+    rest = c.list_parts(Bucket="nw-config-backup", Key="db/dump.sql", UploadId=uid,
+                        PartNumberMarker=2)
+    assert [p["PartNumber"] for p in rest["Parts"]] == [3]
+    with pytest.raises(ClientError) as exc:
+        c.list_parts(Bucket="nw-config-backup", Key="db/dump.sql", UploadId="nope")
+    assert error_code(exc.value) == "NoSuchUpload"
+    c.abort_multipart_upload(Bucket="nw-config-backup", Key="db/dump.sql", UploadId=uid)
+    assert "Uploads" not in c.list_multipart_uploads(Bucket="nw-config-backup")
+
+
+def test_object_tagging_versioning_and_bucket_tagging(server):
+    c = server.client()
+    assert c.get_object_tagging(Bucket="nw-config-backup", Key=".env")["TagSet"] == []
+    c.put_object_tagging(Bucket="nw-config-backup", Key=".env",
+                         Tagging={"TagSet": [{"Key": "owner", "Value": "ops & <dev>"},
+                                             {"Key": "class", "Value": "secret"}]})
+    tags = c.get_object_tagging(Bucket="nw-config-backup", Key=".env")["TagSet"]
+    assert tags == [{"Key": "owner", "Value": "ops & <dev>"}, {"Key": "class", "Value": "secret"}]
+    bad = [([{"Key": f"k{i}", "Value": "v"} for i in range(11)], "BadRequest"),
+           ([{"Key": "a", "Value": "1"}, {"Key": "a", "Value": "2"}], "InvalidTag"),
+           ([{"Key": "k" * 129, "Value": "v"}], "InvalidTag"),
+           ([{"Key": "k", "Value": "v" * 257}], "InvalidTag")]
+    for tag_set, code in bad:
+        with pytest.raises(ClientError) as exc:
+            c.put_object_tagging(Bucket="nw-config-backup", Key=".env",
+                                 Tagging={"TagSet": tag_set})
+        assert error_code(exc.value) == code
+    with pytest.raises(ClientError) as exc:
+        c.get_object_tagging(Bucket="nw-config-backup", Key="nope")
+    assert error_code(exc.value) == "NoSuchKey"
+    c.delete_object_tagging(Bucket="nw-config-backup", Key=".env")
+    assert c.get_object_tagging(Bucket="nw-config-backup", Key=".env")["TagSet"] == []
+    v = c.get_bucket_versioning(Bucket="nw-config-backup")
+    assert "Status" not in v and "MFADelete" not in v
+    with pytest.raises(ClientError) as exc:
+        c.get_bucket_tagging(Bucket="nw-config-backup")
+    assert error_code(exc.value) == "NoSuchTagSet"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    raw = server.raw(b"PUT /nw-config-backup/.env?tagging HTTP/1.1\r\nHost: x\r\n"
+                     b"Content-Length: 5\r\nConnection: close\r\n\r\nhello")
+    assert b"AccessDenied" in raw                            # anonymous
+
+
+def test_tag_parsing_is_linear_on_hostile_bodies():
+    for body in ("<Tagging><TagSet>" + "<Tag><Key>" * 12_000,
+                 "<Tagging><TagSet><Tag>" + "<Key>" * 12_000 + "</Tag>",
+                 "<Tag>" * 12_000 + "</Tag>" * 12_000):
+        started = time.perf_counter()
+        blocks = s3._xml_blocks(body, "Tag")
+        for b in blocks:
+            s3._xml_blocks(b, "Key")
+        assert time.perf_counter() - started < 0.2
+
+
+def test_per_source_tag_state_is_capped(server, monkeypatch):
+    monkeypatch.setattr(s3, "MAX_TAGGED_PER_SOURCE", 3)
+    c = server.client()
+    for i in range(5):
+        c.put_object(Bucket="nw-config-backup", Key=f"t{i}", Body=b"x")
+        c.put_object_tagging(Bucket="nw-config-backup", Key=f"t{i}",
+                             Tagging={"TagSet": [{"Key": "n", "Value": str(i)}]})
+    view = s3.catalog(server.ctx).source("127.0.0.1")
+    assert len(view.tags) == 3
+    assert c.get_object_tagging(Bucket="nw-config-backup", Key="t0")["TagSet"] == []
+    assert c.get_object_tagging(Bucket="nw-config-backup", Key="t4")["TagSet"] == [
+        {"Key": "n", "Value": "4"}]
 
 
 # ---- limits and hostile input -------------------------------------------------------------

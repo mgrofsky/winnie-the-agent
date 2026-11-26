@@ -8,6 +8,8 @@ from typing import Optional
 
 import pytest
 
+from agent_fakes import FakeJsonLLM
+from agents.budget import Budget
 from listeners import redis as redis_trap
 from listeners.base import Limits, ListenerContext, ServiceSettings
 from listeners.events import EventWriter
@@ -66,12 +68,14 @@ class Client:
 async def redis_server():
     servers = []
 
-    async def _start(accept="after_n", limits: Optional[Limits] = None, scenario=True):
+    async def _start(accept="after_n", limits: Optional[Limits] = None, scenario=True,
+                     json_llm=None, version="6.2.14"):
         writer = EventWriter(None)
         loaded = LoadedScenario(scenario=Scenario.model_validate(SCENARIO), seed="t") if scenario else None
         ctx = ListenerContext(writer, limits=limits, bind_host="127.0.0.1", seed="test",
-                              scenario=loaded)
-        settings = ServiceSettings(name="redis", enabled=True, port=0, version="6.2.14",
+                              scenario=loaded, budget=Budget() if json_llm else None,
+                              json_llm=json_llm)
+        settings = ServiceSettings(name="redis", enabled=True, port=0, version=version,
                                    policy=LoginPolicy(accept=accept, after_n_min=2, after_n_max=2))
         ctx.settings["redis"] = settings
         objs = await redis_trap.start(ctx, settings)
@@ -255,3 +259,202 @@ async def test_redis_http_probe_gets_arity_error_then_silent_close(redis_server)
     assert await c("GET", "session:9f1c") == '{"uid": 7}'
     cmds = [e["data"]["cmd"] for e in events(writer, "command")]
     assert "HOST:" in cmds and "POST" in cmds
+
+
+async def test_redis_string_commands_follow_the_keyspace(redis_server):
+    _, c, _ = await redis_server(accept="all")
+    assert await c("SET", "s", "v1", "GET") is None
+    assert await c("SET", "s", "v2", "GET") == "v1"
+    assert await c("SET", "s", "v3", "NX") is None and await c("GET", "s") == "v2"
+    assert await c("SET", "new", "x", "XX") is None and await c("EXISTS", "new") == 0
+    assert await c("SET", "s", "v3", "XX", "GET") == "v2" and await c("GET", "s") == "v3"
+    assert await c("SET", "s", "v", "NX", "XX") == "-ERR syntax error"
+    assert await c("SET", "user:7", "x", "GET") == \
+        "-WRONGTYPE Operation against a key holding the wrong kind of value"
+    assert await c("TYPE", "user:7") == "+hash"                   # nothing was written
+    assert await c("SET", "t", "1", "EX", "100") == "+OK"
+    assert await c("SET", "t", "2", "KEEPTTL") == "+OK" and 0 < await c("TTL", "t") <= 100
+    assert await c("SET", "t", "3") == "+OK" and await c("TTL", "t") == -1
+    assert await c("GETSET", "s", "g") == "v3" and await c("GETSET", "nope1", "a") is None
+    assert await c("GETDEL", "s") == "g" and await c("EXISTS", "s") == 0
+    assert await c("GETDEL", "s") is None
+    assert await c("APPEND", "ap", "hello") == 5 and await c("APPEND", "ap", " wörld") == 12
+    assert await c("STRLEN", "ap") == 12 and await c("STRLEN", "missing") == 0
+    assert await c("MSET", "m1", "a", "m2", "b") == "+OK"
+    assert await c("MGET", "m1", "jobs", "m2", "nope") == ["a", None, "b", None]
+    assert await c("MSET", "m1", "a", "m2") == "-ERR wrong number of arguments for 'mset' command"
+    assert await c("SETNX", "m1", "z") == 0 and await c("SETNX", "nx1", "z") == 1
+    assert await c("SETEX", "se", "50", "v") == "+OK" and 0 < await c("TTL", "se") <= 50
+    assert await c("SETEX", "se", "0", "v") == "-ERR invalid expire time in 'setex' command"
+    assert await c("INCRBY", "n", "10") == 10 and await c("DECR", "n") == 9
+    assert await c("DECRBY", "n", "4") == 5 and await c("INCRBY", "n", "x") == \
+        "-ERR value is not an integer or out of range"
+    assert await c("INCR", "m1") == "-ERR value is not an integer or out of range"
+    assert await c("DECRBY", "n", "-9223372036854775808") == "-ERR decrement would overflow"
+    assert await c("GETSET", "s") == "-ERR wrong number of arguments for 'getset' command"
+    assert await c("STRLEN", "a", "b") == "-ERR wrong number of arguments for 'strlen' command"
+
+
+async def test_redis_key_lifecycle_and_containers(redis_server):
+    _, c, _ = await redis_server(accept="all")
+    assert await c("SET", "k", "1", "EX", "100") == "+OK"
+    assert await c("RENAME", "k", "k2") == "+OK" and 0 < await c("TTL", "k2") <= 100
+    assert await c("RENAME", "k", "k3") == "-ERR no such key"
+    assert await c("RENAMENX", "k2", "jobs") == 0 and await c("RENAMENX", "k2", "k4") == 1
+    assert await c("PERSIST", "k4") == 1 and await c("TTL", "k4") == -1
+    assert await c("PERSIST", "k4") == 0 and await c("PERSIST", "nope") == 0
+    assert await c("SET", "d", "1", "EX", "100") == "+OK"
+    assert await c("DEL", "d") == 1
+    assert await c("LPUSH", "d", "x") == 1 and await c("TTL", "d") == -1     # no stale TTL
+    assert await c("HKEYS", "user:7") == ["name", "tier"] and await c("HLEN", "user:7") == 2
+    assert await c("HVALS", "user:7") == ["Avery Hartwell", "gold"]
+    assert await c("HDEL", "user:7", "name", "nope") == 1
+    assert await c("HDEL", "user:7", "tier") == 1 and await c("EXISTS", "user:7") == 0
+    assert await c("LLEN", "jobs") == 3 and await c("LPOP", "jobs") == "a"
+    assert await c("RPOP", "jobs", "5") == ["c", "b"] and await c("EXISTS", "jobs") == 0
+    assert await c("LPOP", "jobs") is None
+    assert await c("LPOP", "jobs", "-1") == "-ERR value is out of range, must be positive"
+    assert await c("SCARD", "admins") == 1 and await c("SISMEMBER", "admins", "ops") == 1
+    assert await c("SISMEMBER", "admins", "root") == 0
+    assert await c("SREM", "admins", "ops", "x") == 1 and await c("TYPE", "admins") == "+none"
+    assert await c("LLEN", "session:9f1c") == \
+        "-WRONGTYPE Operation against a key holding the wrong kind of value"
+    assert await c("TIME") and await c("ROLE") == ["master", 0, []]
+    assert await c("SELECT", "2") == "+OK" and await c("SET", "z", "1", "EX", "50") == "+OK"
+    info = await c("INFO", "keyspace")
+    assert "db2:keys=1,expires=1,avg_ttl=0" in info and "db0:keys=" in info
+    assert await c("FLUSHDB") == "+OK" and await c("DBSIZE") == 0
+    assert "db2:" not in await c("INFO", "keyspace")
+
+
+async def test_redis_key_cap_applies_to_every_creating_command(redis_server, monkeypatch):
+    monkeypatch.setattr(redis_trap, "MAX_KEYS", 6)
+    _, c, _ = await redis_server(accept="all")
+    assert await c("DBSIZE") == 4
+    assert await c("MSET", "a", "1", "b", "2", "c", "3") == \
+        "-OOM command not allowed when used memory > 'maxmemory'."
+    assert await c("DBSIZE") == 4                                # all or nothing
+    assert await c("SET", "a", "1") == "+OK" and await c("INCR", "b") == 1
+    for cmd in (("SETNX", "x", "1"), ("LPUSH", "x", "1"), ("SADD", "x", "1"),
+                ("HSET", "x", "f", "1"), ("APPEND", "x", "1"), ("INCRBY", "x", "1")):
+        assert (await c(*cmd)).startswith("-OOM"), cmd
+    assert await c("SET", "a", "2") == "+OK"                     # overwrite still allowed
+
+
+async def test_redis_save_moves_lastsave_and_info_persistence(redis_server):
+    import time as _time
+    _, c, _ = await redis_server(accept="all")
+    before = await c("LASTSAVE")
+    assert before < int(_time.time()) - 200
+    info = await c("INFO", "persistence")
+    assert f"rdb_last_save_time:{before}" in info and "rdb_changes_since_last_save:12" in info
+    assert await c("SET", "x", "1") == "+OK"
+    assert "rdb_changes_since_last_save:13" in await c("INFO", "persistence")
+    assert await c("CONFIG", "SET", "dir", "/var/spool/cron/crontabs") == "+OK"
+    assert await c("CONFIG", "SET", "dbfilename", "root") == "+OK"
+    assert await c("CONFIG", "GET", "dbfilename") == ["dbfilename", "root"]
+    assert await c("SAVE") == "+OK"
+    after = await c("LASTSAVE")
+    assert after >= int(_time.time()) - 1 and after > before
+    info = await c("INFO", "persistence")
+    assert f"rdb_last_save_time:{after}" in info and "rdb_changes_since_last_save:0" in info
+    assert "rdb_last_bgsave_status:ok" in info and "aof_enabled:0" in info
+    assert await c("BGSAVE") == "+Background saving started"
+    assert await c("BGSAVE", "SCHEDULE") == "+Background saving started"
+    assert await c("BGSAVE", "NOW") == "-ERR syntax error"
+
+
+async def test_redis_eval_literal_forms(redis_server):
+    _, c, _ = await redis_server(accept="all")
+    assert await c("EVAL", "return 1", "0") == 1
+    assert await c("EVAL", "return  -42 ;", "0") == -42
+    assert await c("EVAL", "return KEYS[1]", "1", "k1", "a1") == "k1"
+    assert await c("EVAL", "return ARGV[1]", "1", "k1", "a1") == "a1"
+    assert await c("EVAL", "return ARGV[2]", "1", "k1", "a1") is None
+    assert await c("EVAL", "return 'hi'", "0") == "hi"
+    assert await c("EVAL", "return redis.call('set', KEYS[1], ARGV[1])", "1", "ek", "ev") == "+OK"
+    assert await c("GET", "ek") == "ev"
+    assert await c("EVAL", "return redis.call('get', KEYS[1])", "1", "ek") == "ev"
+    assert await c("EVAL", 'return redis.call("GET", "session:9f1c")', "0") == '{"uid": 7}'
+    assert await c("EVAL", "redis.call('set', KEYS[1], 'quiet')", "1", "ek") is None
+    assert await c("GET", "ek") == "quiet"
+    assert await c("EVAL", "return redis.call('get', KEYS[1])", "1", "user:7") == (
+        "-ERR Error running script (call to f_4d5e4d9b8c1ff8c27bc3e5a7d1e7d4a3d73fd0e2): "
+        "@user_script:1: WRONGTYPE Operation against a key holding the wrong kind of value"
+    ).replace("4d5e4d9b8c1ff8c27bc3e5a7d1e7d4a3d73fd0e2", __import__("hashlib").sha1(
+        b"return redis.call('get', KEYS[1])").hexdigest())
+    assert await c("EVAL", "os.execute('id')", "0") is None
+    assert await c("EVAL", "return 1", "2", "a") == \
+        "-ERR Number of keys can't be greater than number of args"
+    assert await c("EVAL", "return 1", "-1") == "-ERR Number of keys can't be negative"
+    assert await c("EVAL", "return 1", "x") == "-ERR value is not an integer or out of range"
+    sha = await c("SCRIPT", "LOAD", "return ARGV[1]")
+    assert await c("SCRIPT", "EXISTS", sha, "0" * 40) == [1, 0]
+    assert await c("EVALSHA", sha, "0", "hello") == "hello"
+    assert await c("EVALSHA_RO", "0" * 40, "0") == "-NOSCRIPT No matching script. Please use EVAL."
+    assert await c("EVAL_RO", "return redis.call('set', KEYS[1], ARGV[1])", "1", "ro", "x") is None
+    assert await c("EXISTS", "ro") == 0
+    assert await c("EVAL", "return redis.call('get', KEYS[1]" + " " * 600 + ")", "1", "ek") is None
+
+
+async def test_redis_eval_script_error_format_on_redis_7(redis_server):
+    import hashlib as _hashlib
+    _, c, _ = await redis_server(accept="all", version="7.0.15")
+    script = "return redis.call('get', KEYS[1])"
+    sha = _hashlib.sha1(script.encode()).hexdigest()
+    assert await c("EVAL", script, "1", "jobs") == (
+        "-WRONGTYPE Operation against a key holding the wrong kind of value script: "
+        f"{sha}, on @user_script:1.")
+
+
+async def test_redis_model_answers_real_commands_the_trap_lacks(redis_server):
+    llm = FakeJsonLLM({"type": "integer", "integer": 1}, {"type": "array", "items": ["alice"]},
+                      {"type": "bulk", "text": "x\r\ny"}, {"type": "nil"},
+                      {"type": "error", "text": "NOAUTH\r\n+OK"}, {"type": "integer", "integer": "1"})
+    writer, c, _ = await redis_server(accept="all", json_llm=llm)
+    assert await c("ZADD", "board", "10", "alice") == 1
+    assert len(llm.calls) == 1
+    system, user, schema = llm.calls[0]
+    assert schema is redis_trap.LlmRedisReply and "UNTRUSTED" in user and "ZADD" in user
+    assert "session:9f1c (string)" in user and "session:9f1c" not in system
+    assert await c("ZRANGE", "board", "0", "-1") == ["alice"]
+    # Invalid answers are asked again with examples, then the real unknown-command error.
+    assert await c("OBJECT", "ENCODING", "x") is None                  # retry answered nil
+    assert redis_trap.REDIS_EXAMPLES in llm.calls[3][0]
+    assert redis_trap.REDIS_EXAMPLES not in llm.calls[2][0]
+    assert (await c("LINDEX", "jobs", "0")).startswith("-ERR unknown command 'LINDEX'")
+    calls = len(llm.calls)
+    # A name that is not a Redis command never reaches the model.
+    assert (await c("NOSUCH", "a")).startswith("-ERR unknown command 'NOSUCH'")
+    assert len(llm.calls) == calls
+    rungs = {e["data"]["cmd"]: e["data"].get("rung") for e in events(writer, "command")}
+    assert rungs["ZADD"] == "llm" and rungs["ZRANGE"] == "llm"
+    assert rungs["OBJECT"] == "llm_retry" and rungs["LINDEX"] == "fallback"
+    assert rungs["NOSUCH"] is None and rungs.get("GET") is None
+
+
+async def test_redis_model_not_called_before_auth_or_when_disabled(redis_server):
+    llm = FakeJsonLLM({"type": "integer", "integer": 1})
+    _, c, _ = await redis_server(json_llm=llm)
+    assert await c("ZADD", "board", "1", "a") == "-NOAUTH Authentication required."
+    assert llm.calls == []
+    _, c2, _ = await redis_server(accept="all")
+    assert (await c2("ZADD", "board", "1", "a")).startswith("-ERR unknown command 'ZADD'")
+
+
+def test_redis_model_schema_bounds():
+    from pydantic import ValidationError
+    good = [{"type": "status", "text": "OK"}, {"type": "error", "text": "ERR no such key"},
+            {"type": "integer", "integer": -5}, {"type": "bulk", "text": "a\nb"},
+            {"type": "nil"}, {"type": "array", "items": [1, None, "x"]}]
+    for g in good:
+        redis_trap.LlmRedisReply.model_validate(g)
+    bad = [{"type": "status", "text": "OK\r\n:1"}, {"type": "error", "text": "oops"},
+           {"type": "integer", "integer": 2**63}, {"type": "integer", "integer": "1"},
+           {"type": "bulk", "text": "x" * 5000}, {"type": "bulk", "text": "\x00"},
+           {"type": "nil", "text": "x"}, {"type": "array", "items": [[1]]},
+           {"type": "array", "items": list(range(65))}, {"type": "array", "items": ["y" * 513]},
+           {"type": "status", "text": "OK", "extra": 1}]
+    for b in bad:
+        with pytest.raises(ValidationError):
+            redis_trap.LlmRedisReply.model_validate(b)

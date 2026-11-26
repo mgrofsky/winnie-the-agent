@@ -10,14 +10,18 @@ first; the retry carrying Proxy-Authorization gets the 486/480.
 
 Safety:
 - never any SDP, never a call placed or bridged, never a packet to anyone but the source;
-- UDP: at most ONE response datagram per request (an INVITE over UDP gets only its final
-  486/480 after a short delay, no 100/180), every response gated by the per-source
-  response limiter ``ctx.udp_resp_rate`` and the global ``ctx.udp_global``, requests gated
-  by ``ctx.udp_rate``, datagrams larger than ``2 * max_line_bytes`` dropped;
-- UDP responses are never larger than the datagram that triggered them (compact header
-  names and dropped optional headers when needed; nothing is sent if it still does not
-  fit), requests with more than ``MAX_UDP_VIA`` Via hops are dropped, and SIP responses
-  are never answered. Together these keep the listener useless as a reflector;
+- UDP: at most ONE response datagram per request, with one exception: an INVITE that
+  passes auth from a source that has completed a nonce round trip (so its address is not
+  forged) gets ``100 Trying`` and ``180 Ringing`` before its final 486/480, and only when
+  all three together fit in the request's size (plus the operator's slack) and in the
+  source's remaining response allowance; otherwise it gets the final alone. Every response is gated by the per-source response limiter
+  ``ctx.udp_resp_rate`` and the global ``ctx.udp_global``, requests are gated by
+  ``ctx.udp_rate``, and datagrams larger than ``2 * max_line_bytes`` are dropped;
+- UDP responses are never larger than the datagram that triggered them, and the responses
+  to one request together never are either (compact header names and dropped optional
+  headers when needed; nothing is sent if it still does not fit), requests with more than
+  ``MAX_UDP_VIA`` Via hops are dropped, and SIP responses are never answered. Together
+  these keep the listener useless as a reflector;
 - malformed datagrams and limit events go through ``ctx.gate`` (first occurrence, then
   periodic counter lines).
 
@@ -57,6 +61,7 @@ MAX_USERS_PER_IP = 50
 MAX_TRACKED_DIALOGS = 20_000
 MAX_HEADERS = 64
 MAX_UDP_VIA = 5                   # more Via hops than this over UDP: dropped, never answered
+MAX_UDP_RESPONSES = 3             # 100 + 180 + final for a verified source's INVITE
 DEFAULT_SERVER = "Asterisk PBX 18.20.0"
 DEFAULT_REALM = "asterisk"
 DEFAULT_EXPIRES = 3600
@@ -385,9 +390,10 @@ class SipCore:
                max_response: Optional[int] = None) -> list[tuple[float, bytes]]:
         """Process one request; return [(delay_seconds, response_bytes), ...].
 
-        UDP always gets at most one element. ``max_response`` caps each response's size
-        (the UDP listener passes the request's size); a response that cannot be squeezed
-        under it is not sent.
+        UDP gets one element, or three (100, 180, final) for an answered INVITE from a
+        verified source. ``max_response`` caps the size of the responses to this request
+        together (the UDP listener passes the request's size); a final response that cannot
+        be squeezed under it is not sent.
         """
         ip = src[0]
         udp = transport == "udp"
@@ -455,7 +461,7 @@ class SipCore:
         if m == "REGISTER":
             return self.on_register(req, src, transport, emit, ua, common, respond)
         if m == "INVITE":
-            return self.on_invite(req, src, transport, emit, ua, common, respond)
+            return self.on_invite(req, src, transport, emit, ua, common, respond, limit)
         if m == "OPTIONS":
             emit("options", "SIP OPTIONS", client=ua, data=common)
             return respond(200, [Hdr("Accept", "application/sdp"),
@@ -472,7 +478,8 @@ class SipCore:
         return respond(405)
 
     def on_invite(self, req: SipRequest, src: tuple[str, int], transport: str, emit,
-                  ua: Optional[str], common: dict, respond) -> list[tuple[float, bytes]]:
+                  ua: Optional[str], common: dict, respond,
+                  limit: Optional[int] = None) -> list[tuple[float, bytes]]:
         ip = src[0]
         dialed = uri_user(req.uri)
         registered = self.is_registered(ip)
@@ -499,9 +506,25 @@ class SipCore:
             return respond(407, [self.challenge(ip, proxy=True)])
         code = 486 if hashlib.sha256(dialed.encode()).digest()[0] % 2 == 0 else 480
         if transport == "udp":
-            return respond(code, delay=INVITE_FINAL_DELAY)
+            return self.udp_invite_responses(req, src, code, respond, limit)
         return (respond(100, to_tag=False) + respond(180)
                 + respond(code, delay=INVITE_FINAL_DELAY))
+
+    def udp_invite_responses(self, req: SipRequest, src: tuple[str, int], code: int, respond,
+                             limit: Optional[int]) -> list[tuple[float, bytes]]:
+        """The final 486/480, preceded by 100 Trying and 180 Ringing only for a verified
+        source and only when all three together fit in ``limit`` bytes."""
+        final = respond(code, delay=INVITE_FINAL_DELAY)
+        if not final or limit is None or src[0] not in self.verified_sources:
+            return final
+        left = limit - len(final[0][1])
+        trying = self.response(req, 100, src, "udp", to_tag=False, limit=left)
+        if trying is None:
+            return final
+        ringing = self.response(req, 180, src, "udp", limit=left - len(trying))
+        if ringing is None:
+            return final
+        return [(0.0, trying), (0.0, ringing)] + final
 
     def on_register(self, req: SipRequest, src: tuple[str, int], transport: str, emit,
                     ua: Optional[str], common: dict, respond) -> list[tuple[float, bytes]]:
@@ -617,11 +640,16 @@ class SipUdpProtocol(asyncio.DatagramProtocol):
             if len(data) > ctx.limits.max_line_bytes * 2:
                 self.core.limit(src, self.dst, "udp", "packet_size")
                 return
-            # Hard rules: one response per request, never larger than the request (plus the
-            # operator's optional slack, capped at 512 bytes).
+            # Hard rules: the responses to one request together are never larger than the
+            # request (plus the operator's optional slack, capped at 512 bytes); one
+            # response per request, three only for a verified source's INVITE.
             slack = min(max(0, ctx.limits.sip_udp_slack_bytes), 512)
             responses = self.core.handle(data, src, self.dst, "udp",
-                                         max_response=len(data) + slack)[:1]
+                                         max_response=len(data) + slack)[:MAX_UDP_RESPONSES]
+            if len(responses) > 1 and ctx.udp_resp_rate.remaining(src[0]) < len(responses):
+                # Provisionals only while the source's response allowance covers all of
+                # them, so they never use up the final response's share.
+                responses = responses[-1:]
         except Exception as exc:  # noqa: BLE001 - malformed input never kills the listener
             self.core.log_gated(src, self.dst, "udp", "error", "Handler error",
                                 type(exc).__name__)

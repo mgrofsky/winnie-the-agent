@@ -3,6 +3,11 @@
 Messages accepted after DATA are logged (headers, recipients, size, sha256, first 2 KB of
 body) and discarded. No outbound socket is ever opened. Recipients outside the scenario
 domain are logged as relay attempts (``high_signal``); before auth they get 554.
+
+Postfix (3.6 replies) without TLS: STARTTLS is not advertised and answers 502; HELP and
+EXPN are not commands (502); ETRN is refused by ``smtpd_etrn_restrictions`` (554). The advertised SIZE is the limit
+DATA enforces, kept under the connection byte cap so a message within it is not cut off
+by that cap.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from typing import Optional
 from listeners.base import ConnClosed, Conn, ListenerContext, ServiceSettings, start_tcp
 
 MAX_MESSAGE_BYTES = 10_240_000
+SIZE_HEADROOM = 65_536            # connection bytes left for commands around one message
 HEADER_LOG_CAP = 4096
 BODY_LOG_CAP = 2048
 MAX_RCPTS = 100
@@ -25,6 +31,8 @@ SMTP_VERBS = frozenset({"HELO", "EHLO", "MAIL", "RCPT", "DATA", "RSET", "NOOP", 
 # Lines a client sends after the AUTH command for each mechanism (LOGIN: user, password).
 AUTH_CONTINUATIONS = {"PLAIN": 1, "LOGIN": 2}
 ADDR_RE = re.compile(r"<\s*([^<>\s]{0,320})\s*>|(\S{1,320})")
+SIZE_PARAM_RE = re.compile(r"(?:^|\s)SIZE=(\d{1,20})(?=\s|$)", re.IGNORECASE)
+DOMAIN_RE = re.compile(r"[A-Za-z0-9.-]{1,253}")
 
 
 def _identity(ctx: ListenerContext) -> tuple[str, str]:
@@ -39,6 +47,13 @@ def b64decode(text: str) -> Optional[str]:
             "utf-8", errors="replace")
     except (binascii.Error, ValueError, UnicodeEncodeError):
         return None
+
+
+def size_limit(ctx: ListenerContext) -> int:
+    """The message size DATA accepts and EHLO advertises: Postfix's default, or less so the
+    whole message fits in the connection byte cap (rounded down to whole KiB)."""
+    room = max(1024, ctx.limits.max_conn_bytes - SIZE_HEADROOM)
+    return min(MAX_MESSAGE_BYTES, room // 1024 * 1024)
 
 
 def parse_addr(arg: str, prefix: str) -> Optional[str]:
@@ -58,6 +73,7 @@ class SmtpSession:
         self.settings = settings
         self.host, self.domain = _identity(self.ctx)
         self.fqdn = f"{self.host}.{self.domain}"
+        self.size_limit = size_limit(self.ctx)
         self.helo: Optional[str] = None
         self.user: Optional[str] = None
         self.authed = False
@@ -114,7 +130,7 @@ class SmtpSession:
                 return True
             self.helo = arg[:255]
             self.reset()
-            caps = ["PIPELINING", "SIZE 10240000", "VRFY", "ETRN", "AUTH PLAIN LOGIN",
+            caps = ["PIPELINING", f"SIZE {self.size_limit}", "VRFY", "ETRN", "AUTH PLAIN LOGIN",
                     "ENHANCEDSTATUSCODES", "8BITMIME", "DSN", "SMTPUTF8"]
             await self.conn.write(f"250-{self.fqdn}\r\n" + "".join(f"250-{c}\r\n" for c in caps[:-1])
                                   + f"250 {caps[-1]}\r\n")
@@ -128,7 +144,14 @@ class SmtpSession:
             await self.reply(f"250 {self.fqdn}")
             return True
         if verb == "STARTTLS":
-            await self.reply("454 4.7.0 TLS not available due to local problem")
+            # Postfix with TLS off: the command exists but is not implemented.
+            if arg:
+                await self.reply("501 5.5.4 Syntax: STARTTLS")
+            else:
+                await self.reply("502 5.5.1 Error: command not implemented")
+            return True
+        if verb == "ETRN":
+            await self.etrn(arg)
             return True
         if verb in ("NOOP", "RSET"):
             if verb == "RSET":
@@ -217,6 +240,25 @@ class SmtpSession:
         else:
             await self.reply("535 5.7.8 Error: authentication failed: authentication failure")
 
+    async def etrn(self, arg: str) -> None:
+        """ETRN as Postfix's etrn_cmd answers it with ``smtpd_helo_required = yes`` and
+        ``smtpd_etrn_restrictions = reject``."""
+        if self.helo is None:
+            await self.reply("503 Error: send HELO/EHLO first")
+            return
+        if self.mail_from is not None:
+            await self.reply("503 Error: MAIL transaction in progress")
+            return
+        parts = arg.split()
+        if len(parts) != 1:
+            await self.reply("500 Syntax: ETRN domain")
+            return
+        domain = parts[0][1:] if parts[0][:1] in ("@", "#") else parts[0]
+        if not DOMAIN_RE.fullmatch(domain) or ".." in domain or domain.startswith((".", "-")):
+            await self.reply("501 Error: invalid parameter syntax")
+            return
+        await self.reply(f"554 5.7.1 <{domain}>: Etrn command rejected: Access denied")
+
     # ---- transaction ---------------------------------------------------------------------
 
     async def mail(self, arg: str) -> None:
@@ -229,6 +271,10 @@ class SmtpSession:
         addr = parse_addr(arg, "FROM:")
         if addr is None:
             await self.reply("501 5.5.4 Syntax: MAIL FROM:<address>")
+            return
+        m = SIZE_PARAM_RE.search(arg)
+        if m and int(m.group(1)) > self.size_limit:
+            await self.reply("552 5.3.4 Message size exceeds fixed limit")
             return
         self.mail_from = addr
         await self.reply("250 2.1.0 Ok")
@@ -262,7 +308,7 @@ class SmtpSession:
             await self.reply("503 5.5.1 Error: need RCPT command")
             return
         await self.reply("354 End data with <CR><LF>.<CR><LF>")
-        cap = min(MAX_MESSAGE_BYTES, self.ctx.limits.max_conn_bytes)
+        cap = self.size_limit
         lines: list[bytes] = []
         size = 0
         over = False

@@ -228,7 +228,11 @@ Protocol notes:
   with no live registration it is first challenged with 407. Over UDP there is at most one
   response per request, responses are never larger than the request (compact header names,
   optional headers dropped, otherwise no answer), more than 5 Via hops and SIP responses are
-  never answered, and per-source and global response rates are capped.
+  never answered, and per-source and global response rates are capped. An answered
+  `INVITE` from a verified source (see below) gets `100 Trying` and `180 Ringing` before
+  the final response when all three together fit in the request's size and in the
+  source's remaining response allowance; otherwise only the final response. Over TCP it
+  always gets all three.
   `[listeners] sip_udp_slack_bytes` (0 to 512, default 0) lets a response exceed its
   request by that many bytes, so that minimal REGISTERs from clients such as `sipsak` get
   their 401 challenge, at the cost of a small, rate-capped amplification factor. A UDP source
@@ -251,7 +255,10 @@ Protocol notes:
   inbound drop lines, per day, and the digest lists them under "Sensor limits".
 - **FTP**: passive mode only, on `ftp_pasv_ports`, advertising `ftp_pasv_address` (default:
   the control connection's local address). Data connections are accepted only from the
-  control connection's source. `PORT`/`EPRT` are refused. An unused passive listener
+  control connection's source. `PORT`/`EPRT` are refused with vsftpd's own replies
+  (`500 Illegal PORT command.`, `500 Illegal EPRT command.`, or the EPRT parse errors).
+  `HELP`, `STAT`, `ALLO`, `SITE` and `RMD` (550 on a
+  non-empty directory) answer as vsftpd, or as ProFTPD when the banner names it. An unused passive listener
   closes after `ftp_pasv_accept_timeout` seconds (default 30), and one source may hold at
   most `ftp_pasv_per_ip` open passive listeners (default 2). Uploads stream into the
   quarantine with caps enforced while reading; upload bytes are bounded by the quarantine
@@ -294,13 +301,24 @@ Protocol notes:
   `mysql.user` and `sys.sql_logins` stay refused. A model request carries this state and
   the connection's last 12 statements, each with its answer's kind and row count or error
   code (at most 2000 characters, inside the untrusted block).
-- **Redis**: RESP and inline protocol, fake per-connection keyspace. The takeover chain
-  (`CONFIG SET dir/dbfilename`, `SAVE`, `SLAVEOF`/`REPLICAOF`, `MODULE LOAD`, `EVAL`,
-  `FLUSHALL`) answers plausibly and is logged as high-signal; nothing touches disk or
-  connects out.
+- **Redis**: RESP and inline protocol, fake per-connection keyspace (strings, hashes, lists
+  and sets, with TTLs; at most 10,000 keys). The takeover chain (`CONFIG SET
+  dir/dbfilename`, `SAVE`, `SLAVEOF`/`REPLICAOF`, `MODULE LOAD`, `EVAL`, `FLUSHALL`)
+  answers plausibly and is logged as high-signal; nothing touches disk or connects out.
+  `SAVE` and `BGSAVE` move `LASTSAVE` and `INFO persistence` as a real save would. `EVAL`
+  never runs Lua: `return` of an integer, a string, `KEYS[n]` or `ARGV[n]`, and
+  `redis.call('get'|'set', ...)` are answered against the keyspace, anything else gets a
+  nil reply. A real Redis command the trap does not implement may go to the budgeted
+  model (when `[listeners] llm = true`) through a schema limited to RESP reply types,
+  with worked examples on a second request; a name that is not a Redis command, or no
+  answer, gets the real unknown-command error. The command's event has `rung` `llm`,
+  `llm_retry` or `fallback` when the model was asked.
 - **SMTP**: Postfix-like; captures `AUTH`; messages after `DATA` are logged (headers,
   recipients, size, SHA-256, first 2 KB) and discarded. Recipients outside the scenario
-  domain are relay attempts.
+  domain are relay attempts. As Postfix without TLS: `STARTTLS` is not advertised and
+  answers 502, `HELP` and `EXPN` answer 502, `ETRN` is refused with 554. The advertised
+  `SIZE` is the limit `DATA` enforces (Postfix's 10,240,000, or `max_conn_bytes` less
+  64 KiB when that is smaller), and `MAIL FROM` with a larger `SIZE=` gets 552.
 - **HTTP**: login form and Basic, Bearer and API-key capture; after login a small site and
   JSON API built from the scenario. Unknown routes under the API prefix may be answered by
   the budgeted model when the scenario enables `llm_unknown_api_routes`; otherwise 404.
@@ -311,13 +329,18 @@ Protocol notes:
   credential-shaped text, and is cached per path; the fallback is the server's 404. The
   event's `rung` is `llm`, `llm_retry` or `fallback`, with `cache_hit` on a cached answer.
 - **HL7 MLLP**: frames are logged and answered with an `AA` acknowledgement; nothing is
-  forwarded.
+  forwarded. A `QRY^A19` query gets `ADR^A19` and a `QBP^Q22` query gets `RSP^K22`, each
+  with `QAK` status `NF` (no data found) and the query segment echoed (sanitised and
+  bounded).
 - **S3**: enough of the S3 REST API (plain HTTP, path-style and virtual-hosted) for the AWS
   CLI, boto3, s3cmd and curl: ListBuckets, HeadBucket, GetBucketLocation, GetBucketAcl and
   GetBucketPolicy (canned), ListObjects V1 and V2 (prefix, delimiter, `max-keys` up to
   1,000, continuation, `encoding-type=url`), HeadObject, GetObject with `Range`, PutObject,
-  DeleteObject(s) and a minimal multipart upload; everything else is a correct S3 XML
-  error. Buckets and objects come from the scenario; object bodies are text, a scenario
+  DeleteObject(s), CopyObject between objects the source can see, multipart upload with
+  ListParts and ListMultipartUploads, Get/Put/DeleteObjectTagging (per source, at most
+  10 tags per object and 1,000 tagged objects per source), GetBucketVersioning (never
+  enabled) and GetBucketTagging (`NoSuchTagSet`); everything else, including CreateBucket
+  and DeleteBucket, is a correct S3 XML error. Buckets and objects come from the scenario; object bodies are text, a scenario
   table as CSV, or deterministic filler generated per byte range, never the size on paper.
   SigV4 (header and presigned) and SigV2 are parsed for the access key id, region and
   signed headers; access follows the login policy keyed on the access key id, a SigV4
@@ -671,7 +694,7 @@ model is not called: the attacker gets a canned error and the session closes, an
   system prompt, persona block and the session so far are read from the provider's cache
   on the next command. Other providers are unchanged. The budget still charges the full
   token count the provider reports.
-- Listener model calls (SQL and HTTP fallbacks) use the same budget, take a session slot,
+- Listener model calls (SQL, HTTP and Redis fallbacks) use the same budget, take a session slot,
   run at most `llm_max_inflight` at a time, and fail closed when no budget is initialised.
   One answer takes up to `[listeners] llm_attempts` requests (default 2, 1 to 3). When an
   answer fails the schema, the next request adds the caller's worked examples and one line

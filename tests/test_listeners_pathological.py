@@ -37,16 +37,25 @@ def _line(prefix: bytes, body: bytes, cap: int = 3900) -> bytes:
 CASES = {
     "ftp": dict(preamble=[b"USER a\r\n", b"PASS a\r\n"],
                 payloads=[_line(b"NLST ", b"*a" * 2000), _line(b"LIST ", b"[" * 4000),
-                          _line(b"CWD ", b"../" * 1300), _line(b"SIZE ", b"?" * 4000)]
+                          _line(b"CWD ", b"../" * 1300), _line(b"SIZE ", b"?" * 4000),
+                          _line(b"PORT ", b"1," * 1950), _line(b"EPRT ", b"|" * 3900),
+                          _line(b"EPRT |2|", b":" * 3900), _line(b"RMD ", b"/a" * 1950)]
                 + repeats("*?[]%\\", 70_000)),
     "smtp": dict(preamble=[b"EHLO a\r\n"],
                  payloads=[_line(b"AUTH PLAIN ", b"=" * 4000), _line(b"MAIL FROM:", b"<" * 4000),
-                           _line(b"RCPT TO:", b"@" * 4000)] + repeats("<>@.=:", 70_000)),
+                           _line(b"RCPT TO:", b"@" * 4000),
+                           _line(b"MAIL FROM:<a@b> ", b"SIZE=9 " * 550),
+                           _line(b"ETRN ", b"@#" * 1950)] + repeats("<>@.=:", 70_000)),
     "redis": dict(probe_request=b"PING\r\n",
                   payloads=[_line(b"KEYS ", b"a*" * 1950 + b"b"),
                             _line(b"SCAN 0 MATCH ", b"*a" * 1950 + b" COUNT 10"),
                             _line(b"CONFIG GET ", b"*?" * 1950),
-                            b"*3\r\n$4\r\nKEYS\r\n$60000\r\n" + b"a*" * 30000 + b"\r\n"]
+                            b"*3\r\n$4\r\nKEYS\r\n$60000\r\n" + b"a*" * 30000 + b"\r\n",
+                            b"*3\r\n$4\r\nEVAL\r\n$60000\r\n"
+                            + (b"return redis.call('get', KEYS[1]" * 2000)[:60000]
+                            + b"\r\n$1\r\n0\r\n",
+                            _line(b"EVAL \"", b"return KEYS[" * 300 + b"\" 0"),
+                            _line(b"ZADD k ", b"1 a " * 900)]
                   + repeats("*?[]\\\r", 70_000)),
     "telnet": dict(payloads=[b"\xff\xfb" * 35_000, b"\xff\xfa" * 35_000, b"\xff" * 70_000]),
     "http": dict(probe_request=b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -68,11 +77,19 @@ CASES = {
                          b"GET /?list-type=2&continuation-token=" + b"A" * 7000
                          + b" HTTP/1.1\r\n\r\n",
                          b"GET /bucket.name/k HTTP/1.1\r\nHost: " + b"a." * 3500 + b"\r\n\r\n",
-                         b"PUT /b/k HTTP/1.1\r\nContent-Length: 99999999999999\r\n\r\n"]
+                         b"PUT /b/k HTTP/1.1\r\nContent-Length: 99999999999999\r\n\r\n",
+                         b"PUT /b/k HTTP/1.1\r\nx-amz-copy-source: " + b"%2F" * 2000
+                         + b"\r\n\r\n",
+                         b"PUT /b/k?tagging HTTP/1.1\r\nContent-Length: 60000\r\n\r\n"
+                         + b"<Tag><Key>" * 6000]
                + repeats("%/?[]:;,&=\r", 70_000)),
     "mllp": dict(probe_request=b"\x0bMSH|^~\\&|A|B|C|D|20260101||ADT^A01|P1|P|2.5\r\x1c\r",
                  payloads=[b"\x0b" + b"|^~\\&" * 12_000 + b"\x1c\r", b"\x0b" * 60_000,
-                           b"\x0b" + b"\r" * 60_000]),
+                           b"\x0b" + b"\r" * 60_000,
+                           b"\x0bMSH|^~\\&|A|B|C|D|1||QBP^Q22^QBP_Q21|1|P|2.5\rQPD|"
+                           + b"~^|" * 20_000 + b"\x1c\r",
+                           b"\x0bMSH|^~\\&|A|B|C|D|1||QRY^A19|1|P|2.3\r"
+                           + b"QRD|" * 20_000 + b"\x1c\r"]),
     "postgres": dict(probe=False, payloads=repeats("\x00\xff'", 70_000)),
     "mysql": dict(payloads=repeats("\x00\xff'%", 70_000)),
     "mssql": dict(probe=False, payloads=repeats("\x00\x12\x10\xff", 70_000)),
