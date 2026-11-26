@@ -26,7 +26,9 @@ On top of that SSH honeypot this project adds:
 - **Triage**: one validated record per SSH session or per trap campaign, plus a daily digest.
 - **Where addresses are** (optional): country, city and network owner of each source,
   read from GeoLite2 or DB-IP Lite database files on disk (no network call), stored on
-  the triage record and shown in the console and the digest.
+  the triage record and shown in the console and the digest. Operators can keep
+  [pinned copies](docs/artifact-storage.md) in S3, GCS, Azure Blob Storage, or an
+  encrypted local or connected drive.
 - **What Shodan already knows** (optional, off by default): open ports, host names, tags
   and known CVEs that Shodan's public InternetDB holds for interesting sources, looked up
   by the agents (never a honeypot container), or delivered through the object store by a

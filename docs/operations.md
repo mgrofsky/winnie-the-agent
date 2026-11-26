@@ -806,6 +806,12 @@ Two free sources work, in MaxMind's `.mmdb` format. Use either, or one of each:
 Download on a machine with internet access, never from inside the sensor's containers,
 then copy the files to the sensor host.
 
+For reproducible copies of a specific monthly database, the optional
+[pinned artifact store](artifact-storage.md) supports S3, GCS, Azure Blob Storage,
+or an encrypted local or connected drive. An operator restores files from a
+reviewed SHA-256 manifest before mounting them; the sensor does not need storage
+credentials.
+
 ### Turning it on
 
 Put the files in a `geoip` directory next to `docker-compose.yml`, uncomment the
