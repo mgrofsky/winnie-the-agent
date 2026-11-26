@@ -233,7 +233,7 @@ def test_pipelines_over_our_own_output(line, expected):
 
 @pytest.mark.parametrize("line", [
     "cat /proc/cpuinfo > /etc/motd",       # redirection over a host file
-    "uname -a 2>/tmp/x/y",                 # into a directory we do not know
+    "uname -a 2>/var/x/y",                 # into a directory we do not know
     "echo $(id)",                          # substitution
     "echo `id`",
     "echo $HOME",                          # variables

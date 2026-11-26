@@ -637,6 +637,49 @@ def test_a_redirection_error_goes_where_fd_2_points_by_then():
     assert one("foo 2>/dev/null > /root") == ""
 
 
+# ---- a loader's writable-directory probe -------------------------------------------------------
+
+PROBE = ">{d}/.f && chmod 777 {d}/.f && {d}/.f && cd {d}/; "
+
+
+def test_the_probe_makes_its_file_in_a_system_directory():
+    session = shell.Session(cwd="/root")
+    assert run([PROBE.format(d="/var"), "ls -la /var/.f"], session=session) \
+        == ["", "-rwxrwxrwx 1 root root 0 Nov 18 11:06 /var/.f\n"]
+    assert session.cwd == "/var" and "/var/.f" in session.files
+    # the file does not stand in for a listing of /var, which this shell does not have
+    assert shell.answer(host(), "ls /var", now=NOW, session=session) is None
+    assert shell.answer(host(), "ls /var/.g", now=NOW, session=session) is None
+    # the kernel's file systems, /var/run (/run by another name) and plain host names stay
+    # with the model
+    for line in (">/proc/.f", ">/sys/.f", ">/var/run/.f", ">/var/cache", ">>/etc/crontab"):
+        assert shell.answer(host(), line, now=NOW) is None, line
+
+
+def test_a_redirection_into_a_missing_directory_fails_as_bash_says():
+    error = "-bash: /data/.f: No such file or directory\n"
+    assert one(">/data/.f") == error
+    assert one(">/data/.f || echo failed") == error + "failed\n"
+    session = shell.Session(cwd="/root")
+    assert run([PROBE.format(d="/data")], session=session) == [error]
+    assert session.cwd == "/root" and not session.files
+    assert one("echo hi > /nope/x") == "-bash: /nope/x: No such file or directory\n"
+    a = shell.answer(host(), ">/data/.f && echo no", now=NOW)
+    assert (a.output, a.status) == (error, 1)
+    a = shell.answer(host(), ">/data/.f", interactive=False, now=NOW)
+    assert a.output == "bash: line 1: /data/.f: No such file or directory\n"
+
+
+def test_the_probe_with_relative_paths_after_cd():
+    session = shell.Session(cwd="/root")
+    assert run(["cd /var", ">.f && chmod 777 .f && ./.f && echo ran", "ls -la /var/.f"],
+               session=session) == ["", "ran\n", "-rwxrwxrwx 1 root root 0 Nov 18 11:06 "
+                                                  "/var/.f\n"]
+    assert run(["cd /tmp", ">nope/.f && chmod 777 nope/.f"], session=session) \
+        == ["", "-bash: nope/.f: No such file or directory\n"]
+    assert "/tmp/nope/.f" not in session.files
+
+
 def test_a_line_that_cannot_be_parsed_keeps_its_stderr_redirections():
     assert one("foo $X") == "-bash: foo: command not found\n"
     assert one("foo $X 2>/dev/null") == ""
