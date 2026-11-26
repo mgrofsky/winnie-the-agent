@@ -103,6 +103,11 @@ SQL_STATEMENTS = [
     "SELECT '" + "'" * 30_000,
     "SELECT " + "\\" * 30_000,
     "SELECT 1 " + "-- x\n" * 10_000,
+    "CREATE USER " + "a," * 20_000 + "a",
+    "GRANT " + "SELECT," * 4_000 + "SELECT ON t TO " + "u," * 10_000 + "u",
+    "CREATE ROLE r; GRANT " + "r," * 20_000 + "r TO r",
+    "CREATE TABLE t (a int, b text); INSERT INTO t VALUES " + "(1,'a')," * 7_000 + "(1,'a')",
+    "CREATE TABLE t (a int); INSERT INTO t (a) VALUES (" + "(" * 20_000 + "1" + ")" * 20_000 + ")",
 ]
 
 
