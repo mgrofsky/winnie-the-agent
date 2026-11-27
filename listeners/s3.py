@@ -587,14 +587,15 @@ class BucketView:
                     time.time() - 3600)
         if obj.text is not None or obj.table is not None:
             body = self._body(key, obj)
-            return ObjMeta(self.name, key, len(body), hashlib.md5(body).hexdigest(), mtime,
+            etag = hashlib.md5(body, usedforsecurity=False).hexdigest()
+            return ObjMeta(self.name, key, len(body), etag, mtime,
                            obj.content_type, "text" if obj.text is not None else "table", seed)
         if obj.size is not None:
             size = obj.size if obj.count == 1 else int(
                 obj.size * (0.6 + 0.8 * _frac(seed, "s3size", self.name, key)))
         else:
             size = 512 + int(_frac(seed, "s3size", self.name, key) * 30_000)
-        etag = hashlib.md5(_h(seed, "s3etag", self.name, key)).hexdigest()
+        etag = hashlib.md5(_h(seed, "s3etag", self.name, key), usedforsecurity=False).hexdigest()
         return ObjMeta(self.name, key, size, etag, mtime, obj.content_type, "filler", seed)
 
     def body(self, meta: ObjMeta, start: int, end: int) -> Iterator[bytes]:
@@ -775,7 +776,8 @@ class Catalog:
         if key == AWS_CREDENTIALS_PATH.lstrip("/"):
             body = self.planted_for(ip, bucket.name)
             if body is not None:
-                return ObjMeta(bucket.name, key, len(body), hashlib.md5(body).hexdigest(),
+                etag = hashlib.md5(body, usedforsecurity=False).hexdigest()
+                return ObjMeta(bucket.name, key, len(body), etag,
                                DEFAULT_MTIME.timestamp(), "text/plain", "planted", self.seed)
         return bucket.meta(key)
 
@@ -1634,7 +1636,7 @@ class Exchange:
         if any(n not in mpu["parts"] for n in listed):
             raise S3Error("InvalidPart")
         md5s = b"".join(bytes.fromhex(mpu["parts"][n][1]) for n in listed)
-        etag = f"{hashlib.md5(md5s).hexdigest()}-{len(listed)}"
+        etag = f"{hashlib.md5(md5s, usedforsecurity=False).hexdigest()}-{len(listed)}"
         size = sum(mpu["parts"][n][0] for n in listed)
         self.cat.add_upload(self.ip, bucket.name, self.key, size, etag, mpu["content_type"],
                             None)
@@ -1779,7 +1781,7 @@ class Exchange:
         early = qw if isinstance(qw, QuarantineResult) else None
         sink = None if early is not None else qw
         cap = ctx.limits.quarantine_max_file_bytes
-        sha, md5 = hashlib.sha256(), hashlib.md5()
+        sha, md5 = hashlib.sha256(), hashlib.md5(usedforsecurity=False)
         keep: Optional[bytearray] = bytearray()
         state = {"size": 0, "truncated": False}
         checksums: dict[str, str] = {}

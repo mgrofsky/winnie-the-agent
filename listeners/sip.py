@@ -169,7 +169,7 @@ def uri_user(value: Optional[str]) -> str:
 def _hash(algorithm: str, text: str) -> str:
     if algorithm.startswith("SHA-256"):
         return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-    return hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest()
+    return hashlib.md5(text.encode("utf-8", errors="replace"), usedforsecurity=False).hexdigest()
 
 
 def digest_response(algorithm: str, username: str, realm: str, password: str, method: str,

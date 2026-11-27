@@ -147,8 +147,8 @@ def _take(buf: bytes, pos: int, n: int) -> tuple[bytes, int]:
 
 
 def md5_password_hash(password: str, user: str, salt: bytes) -> str:
-    inner = hashlib.md5((password + user).encode("utf-8")).hexdigest()
-    return "md5" + hashlib.md5(inner.encode("ascii") + salt).hexdigest()
+    inner = hashlib.md5((password + user).encode("utf-8"), usedforsecurity=False).hexdigest()
+    return "md5" + hashlib.md5(inner.encode("ascii") + salt, usedforsecurity=False).hexdigest()
 
 
 def recover_md5_password(response: str, user: str, salt: bytes,
