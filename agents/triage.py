@@ -20,12 +20,15 @@ import re
 import secrets
 import tempfile
 from collections import Counter
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Callable, Iterable, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from agents import analyses
+from agents.analyses import AnalysisStore, Keyed
 from agents.behaviours import BehaviourMatch, RuleSet
 from agents.indicators import IndicatorMatch, IndicatorSet
 from agents.llm import (
@@ -415,6 +418,11 @@ class TriageRecord(Strict):
     assessment: list[Item] = Field(default_factory=list, max_length=4)
     not_seen: list[NotSeenItem] = Field(default_factory=list, max_length=5)
     llm_used: bool = False
+    # The model's answer came from a stored analysis of the same command sequence
+    # (``agents.analyses``), with no model call for this record; analysis_key is the stored
+    # entry's id, also set when this record's own model answer was stored.
+    analysis_reused: bool = False
+    analysis_key: str = Field(default="", pattern=r"^([0-9a-f]{16})?$")
     high_signal: dict[str, int] = Field(default_factory=dict)
     honeytokens: list[str] = Field(default_factory=list)
     credentials: CredentialStats = Field(default_factory=CredentialStats)
@@ -627,13 +635,23 @@ def _request_sequence(requests: list[HttpRequest]) -> list[SeqEntry]:
             for r in kept]
 
 
-def _transcript_campaign(c: Campaign) -> str:
-    head = {"protocol": c.protocol, "src_ip": c.src_ip, "attempts": c.attempts,
+def _campaign_head(c: Campaign) -> dict:
+    """The header facts the model sees for a campaign, the source address aside."""
+    return {"protocol": c.protocol, "attempts": c.attempts,
             "successes": c.successes, "connections": c.connection_count(),
             "distinct_usernames": len(c.usernames), "distinct_passwords": len(c.passwords),
             "clients": _top(c.clients, 5), "dialed": _top(c.dialed, 10),
             "high_signal": dict(c.high_signal)}
-    lines = [json.dumps(head)]
+
+
+def _transcript_campaign(c: Campaign) -> str:
+    head = {"protocol": c.protocol, "src_ip": c.src_ip, **_campaign_head(c)}
+    return "\n".join([json.dumps(head)] + _campaign_lines(c))[:MAX_TRANSCRIPT_CHARS]
+
+
+def _campaign_lines(c: Campaign) -> list[str]:
+    """The request or command lines the model sees for a campaign."""
+    lines: list[str] = []
     if c.requests:
         # The request sequence with second offsets, so the model sees order and timing.
         for e in _request_sequence(c.requests):
@@ -648,7 +666,7 @@ def _transcript_campaign(c: Campaign) -> str:
     else:
         for cmd in (c.post_login or c.commands)[:200]:
             lines.append(json.dumps({"cmd": cmd}))
-    return "\n".join(lines)[:MAX_TRANSCRIPT_CHARS]
+    return lines
 
 
 SYSTEM_PROMPT = (
@@ -684,6 +702,73 @@ def _ask_model(llm: JsonLLM, label: str, transcript: str) -> Optional[TriageMode
             log.warning("triage model output dropped: wrong type")
             return None
     return out
+
+
+# The prompt and output schema are part of every stored-analysis key: a change to either
+# asks the model again.
+REUSE_PROMPT = SYSTEM_PROMPT + "\n" + json.dumps(TriageModelOutput.model_json_schema(),
+                                                 sort_keys=True)
+
+
+@dataclass(frozen=True)
+class Found:
+    """What the stored analyses hold for one item: its key (None when it has none) and the
+    stored answer filled with its tokens (None on a miss)."""
+    keyed: Optional[Keyed]
+    out: Optional[TriageModelOutput] = None
+
+
+def session_key(s: Session) -> Optional[Keyed]:
+    """A session's key: its commands as the model sees them. The honeypot's replies, the
+    source address, the username and the attempt count are left out."""
+    return analyses.make_key("session", "ssh", REUSE_PROMPT, {},
+                             [json.dumps({"cmd": c}) for c in s.commands])
+
+
+def campaign_key(c: Campaign) -> Optional[Keyed]:
+    return analyses.make_key("campaign", c.protocol, REUSE_PROMPT, _campaign_head(c),
+                             _campaign_lines(c))
+
+
+def _lookup(store: Optional[AnalysisStore], keyed: Optional[Keyed],
+            username: Optional[str] = None) -> Found:
+    if store is None or keyed is None:
+        return Found(keyed)
+    raw = store.lookup(keyed, username)
+    if raw is None:
+        return Found(keyed)
+    try:
+        return Found(keyed, TriageModelOutput.model_validate(raw))
+    except (ValidationError, TypeError, ValueError):
+        return Found(keyed)
+
+
+def session_analysis(store: Optional[AnalysisStore], s: Session) -> Found:
+    return _lookup(store, session_key(s) if store is not None else None, s.username)
+
+
+def campaign_analysis(store: Optional[AnalysisStore], c: Campaign) -> Found:
+    return _lookup(store, campaign_key(c) if store is not None else None)
+
+
+def _ioc_values(text: str) -> list[str]:
+    return [i.value for i in extract_iocs([text])]
+
+
+def _keep(store: Optional[AnalysisStore], keyed: Optional[Keyed], out: TriageModelOutput, *,
+          src_ips: Iterable[str], secrets: Iterable[str], username: Optional[str]) -> bool:
+    """Store a fresh model answer for reuse when it can be reused (``analyses.storable``).
+    Model-suggested IOCs are never stored."""
+    if store is None or keyed is None:
+        return False
+    value = analyses.storable(out.model_dump(mode="json", exclude={"extra_iocs"}), keyed,
+                              src_ips=src_ips, secrets=secrets, username=username,
+                              ioc_values=_ioc_values)
+    if value is None:
+        log.info("model answer for %s not stored: it names something specific to its source",
+                 keyed.short)
+        return False
+    return store.put(keyed, *value)
 
 
 def _honeytokens_in(texts: Iterable[str], values) -> list[str]:
@@ -1238,16 +1323,32 @@ def _session_floor(judgement: Judgement, stage: Stage, signals: dict[str, int],
 
 
 def triage_session(s: Session, llm: Optional[JsonLLM],
-                   honeytoken_values: dict[str, str]) -> Optional[TriageRecord]:
+                   honeytoken_values: dict[str, str], store: Optional[AnalysisStore] = None,
+                   found: Optional[Found] = None) -> Optional[TriageRecord]:
     """Triage of one SSH session. Deterministic signals and honeytoken use set a severity
     floor the model cannot lower. With no model configured (``llm`` is None) every session
     gets a deterministic record; when the model output is unusable, a deterministic record
-    is returned only if such signals exist."""
+    is returned only if such signals exist. With ``store``, a stored analysis of the same
+    command sequence (``found``, or looked up here when a model is configured) stands in
+    for the model call, and a fresh model answer is stored for later sessions."""
     commands = s.commands
     signals = session_signals(commands)
     tokens = _honeytokens_in(commands + [a.password for a in s.auth_attempts]
                              + [a.username for a in s.auth_attempts], honeytoken_values)
-    out = _ask_model(llm, "SSH session transcript", _transcript_session(s)) if llm else None
+    if found is None and store is not None and llm is not None:
+        found = session_analysis(store, s)
+    reused = found is not None and found.out is not None
+    kept = False
+    if reused:
+        out = found.out
+        store.served(found.keyed)
+    else:
+        out = _ask_model(llm, "SSH session transcript", _transcript_session(s)) if llm else None
+        if out is not None and found is not None:
+            kept = _keep(store, found.keyed, out, src_ips=[s.src_ip],
+                         secrets=[a.password for a in s.auth_attempts]
+                         + [a.username for a in s.auth_attempts if a.username != s.username],
+                         username=s.username)
     if out is None and llm is not None and not (signals or tokens):
         return None
     transcript = "\n".join(commands)
@@ -1286,7 +1387,10 @@ def triage_session(s: Session, llm: Optional[JsonLLM],
         auth_successes=sum(1 for a in s.auth_attempts if a.success),
         commands=len(commands), intent=intent, stage=stage, skill=skill,
         judgement=judgement, techniques=techniques, iocs=iocs[:200],
-        narrative=narrative[:600], llm_used=out is not None, high_signal=signals,
+        narrative=narrative[:600], llm_used=out is not None and not reused,
+        analysis_reused=reused,
+        analysis_key=found.keyed.short if (reused or kept) and found.keyed else "",
+        high_signal=signals,
         honeytokens=tokens, credentials=_session_cred_stats(s),
         command_sample=[c[:300] for c in commands[:50]], upstream_judgement=s.judgement,
         **parts,
@@ -1302,25 +1406,46 @@ def needs_llm(c: Campaign, tokens: list[str], behaviours: Iterable = ()) -> bool
 
 
 def triage_campaign(c: Campaign, llm: Optional[JsonLLM], honeytoken_values: dict[str, str],
-                    allow_llm: bool, behaviours: Iterable = ()) -> tuple[TriageRecord, bool]:
+                    allow_llm: bool, behaviours: Iterable = (),
+                    store: Optional[AnalysisStore] = None,
+                    found: Optional[Found] = None) -> tuple[TriageRecord, bool]:
     """Returns (record, used_llm). Falls back to the deterministic record on any failure.
 
     When a matched behaviour rule is the only reason to ask the model, the model writes
     the narrative and nothing else: judgement, stage, intent, skill, techniques and IOCs
-    stay the deterministic ones, so a behaviour match alone never raises severity."""
+    stay the deterministic ones, so a behaviour match alone never raises severity.
+
+    With ``store``, a stored analysis of the same campaign (``found``, or looked up here
+    when ``llm`` is given) stands in for the model call, whether or not a call is allowed,
+    and a fresh model answer is stored for later campaigns."""
     tokens = sorted(set(c.honeytokens) | set(_honeytokens_in(
         list(c.passwords) + list(c.usernames) + c.commands, honeytoken_values)))
     det = deterministic_campaign(c, tokens)
     worth_llm = needs_llm(c, tokens)
     narrative_only = not worth_llm and needs_llm(c, tokens, behaviours)
-    if not (allow_llm and (worth_llm or narrative_only) and llm is not None):
+    if not (worth_llm or narrative_only):
         return det, False
-    out = _ask_model(llm, f"{c.protocol} campaign summary", _transcript_campaign(c))
-    if out is None:
-        return det, True
+    if found is None and store is not None and llm is not None:
+        found = campaign_analysis(store, c)
+    reused = found is not None and found.out is not None
+    if not reused and not (allow_llm and llm is not None):
+        return det, False
+    kept = False
+    if reused:
+        out = found.out
+        store.served(found.keyed)
+    else:
+        out = _ask_model(llm, f"{c.protocol} campaign summary", _transcript_campaign(c))
+        if out is None:
+            return det, True
+        if found is not None:
+            kept = _keep(store, found.keyed, out, src_ips=[c.src_ip, *c.addresses],
+                         secrets=list(c.usernames) + list(c.passwords), username=None)
+    mark = {"llm_used": not reused, "analysis_reused": reused,
+            "analysis_key": found.keyed.short if (reused or kept) and found.keyed else ""}
     if narrative_only:
         return det.model_copy(update={"narrative": _model_narrative(out, det.narrative)[:600],
-                                      "llm_used": True, **model_parts(out)}), True
+                                      **mark, **model_parts(out)}), not reused
     transcript = "\n".join(c.post_login or c.commands)
     known = extract_iocs(c.post_login or c.commands)
     extra = verify_model_iocs(out.extra_iocs, transcript, known)
@@ -1329,9 +1454,9 @@ def triage_campaign(c: Campaign, llm: Optional[JsonLLM], honeytoken_values: dict
     stage = max(out.stage, det.stage, key=lambda s: STAGE_RANK[s])
     techniques = list({t.id: t for t in det.techniques + out.techniques}.values())[:12]
     rec = _campaign_record(c, out.intent, stage, out.skill, judgement, techniques,
-                           _model_narrative(out, det.narrative), True, tokens, extra,
+                           _model_narrative(out, det.narrative), not reused, tokens, extra,
                            parts=model_parts(out))
-    return rec, True
+    return rec.model_copy(update=mark), not reused
 
 
 # ---- writing ------------------------------------------------------------------------------
@@ -1536,7 +1661,8 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
                geo: Optional[GeoLookupFn] = None,
                shodan: Optional[ShodanLookupFn] = None,
                indicators: Optional[IndicatorSet] = None,
-               rules: Optional[RuleSet] = None) -> dict:
+               rules: Optional[RuleSet] = None,
+               analyses_store: Optional[AnalysisStore] = None) -> dict:
     """Triage what finished since the last run.
 
     The cursor is saved after every item, so a crash or provider outage loses nothing.
@@ -1548,7 +1674,10 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
     ``agents.enrich.GeoLookup``), each record stores where its source address was; with
     ``shodan`` (``agents.internetdb.InternetDbReader.info``), what InternetDB knew about it.
     With ``indicators`` and ``rules``, each campaign record lists the indicator entries
-    and behaviour rules it matched (``campaign_findings``).
+    and behaviour rules it matched (``campaign_findings``). With ``analyses_store`` and a
+    model, a session or campaign whose command sequence has a stored analysis gets it with
+    no model call, even when the call cap is reached or the model is unavailable; those
+    records count toward neither cap. The store is saved at the end (not on a dry run).
     """
     reports_dir = Path(reports_dir)
     state = Path(state_dir) if state_dir else reports_dir / "state"
@@ -1577,7 +1706,9 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
     ht_values = TokenIndex(load_honeytoken_values(reports_dir / "honeytokens.json"))
     ht_sources = load_honeytoken_sources(reports_dir / "honeytokens.json")
     calls = 0
+    reused = 0
     model_ok = llm is not None
+    store = analyses_store if llm is not None else None
     stop_reason: Optional[str] = None
     written: list[str] = []
     dropped: list[str] = []
@@ -1594,15 +1725,19 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
         if capped():
             deferred.append(s.session_id)
             continue
+        found = session_analysis(store, s) if store is not None else None
+        hit = found is not None and found.out is not None
         if llm is None:
             pass  # no model configured: deterministic record below, no call counted
+        elif hit:
+            pass  # a stored analysis answers: no call counted
         elif not model_ok or calls >= max_llm_calls:
             deferred.append(s.session_id)  # model temporarily unavailable or capped: retry later
             continue
         else:
             calls += 1
         try:
-            record = triage_session(s, llm, ht_values)
+            record = triage_session(s, llm, ht_values, store=store, found=found)
         except LLMUnavailable as exc:
             model_ok, stop_reason = False, str(exc)[:100]
             log.warning("model unavailable, deferring remaining model work: %s", stop_reason)
@@ -1623,6 +1758,7 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
             cursor.mark(s.session_id, s.last_offset)
             save()
         written.append(record.id)
+        reused += int(record.analysis_reused)
 
     for c, member_ids in fold_unverified(campaigns):
         add_campaign_signals(c)
@@ -1632,13 +1768,15 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
         tokens = sorted(set(c.honeytokens) | set(_honeytokens_in(
             list(c.passwords) + list(c.usernames) + c.commands, ht_values)))
         matched, found = campaign_findings(c, indicators, rules)
-        if needs_llm(c, tokens, found) and llm is not None and not model_ok:
+        worthy = needs_llm(c, tokens, found)
+        stored = campaign_analysis(store, c) if store is not None and worthy else None
+        if worthy and llm is not None and not model_ok and not (stored and stored.out):
             deferred.append(c.campaign_id)  # wait for the model rather than lose the look
             continue
         allow = model_ok and calls < max_llm_calls
         try:
             record, used = triage_campaign(c, llm if allow else None, ht_values, allow_llm=allow,
-                                           behaviours=found)
+                                           behaviours=found, store=store, found=stored)
         except LLMUnavailable as exc:
             model_ok, stop_reason = False, str(exc)[:100]
             calls += 1
@@ -1648,6 +1786,7 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
             log.error("triage of %s failed: %s", c.campaign_id, type(exc).__name__)
             record, used = deterministic_campaign(c, tokens), False
         calls += int(used)
+        reused += int(record.analysis_reused)
         record = with_findings(record, matched, found)
         if not dry_run:
             write_record(with_shodan(with_geo(_attribute(record, ht_sources), geo), shodan),
@@ -1668,7 +1807,10 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
         pending_bytes = max(0, parsed.end_offset - cursor.offset)
         removed = apply_record_retention(
             reports_dir, retention_days, now or datetime.datetime.now(datetime.timezone.utc))
+        if store is not None:
+            store.save()
     return {"written": written, "dropped": dropped, "deferred": deferred, "llm_calls": calls,
+            "analyses_reused": reused,
             "malformed_lines": parsed.malformed, "model_stopped": stop_reason,
             "bytes_read": parsed.end_offset - parsed.start_offset, "records_removed": removed,
             "pending_bytes": pending_bytes}
@@ -1769,7 +1911,9 @@ def digest(reports_dir: os.PathLike | str, day: Optional[str] = None, dry_run: b
     lines = [f"# Honeypot digest {day}", "",
              f"Records: {len(records)} ({sum(1 for r in records if r.kind == 'session')} SSH sessions, "
              f"{sum(1 for r in records if r.kind == 'campaign')} campaigns). "
-             f"LLM-triaged: {sum(1 for r in records if r.llm_used)}.", "",
+             f"LLM-triaged: {sum(1 for r in records if r.llm_used or r.analysis_reused)}.",
+             f"Analyses reused: {sum(1 for r in records if r.analysis_reused)} (a stored model "
+             "answer for a repeated command sequence, no model call).", "",
              "| Judgement | Count |", "|---|---|"]
     lines += [f"| {j} | {by_j.get(j, 0)} |" for j in ("MALICIOUS", "SUSPICIOUS", "BENIGN")]
     lines += ["", "| Protocol | Records |", "|---|---|"]

@@ -329,6 +329,16 @@ model = claude-haiku-5-5
 # Analyst model calls: shared by every stage of one run, and capped per UTC day.
 max_llm_calls_per_run = 20
 max_analyst_calls_per_day = 500
+# Stored analyses: a session or campaign whose command sequence matches one the model
+# already analysed (random-looking tokens aside) gets the stored answer, filled with its
+# own tokens, with no model call and nothing counted against the caps above. An entry is
+# asked again after analysis_reuse_days, or after analysis_reuse_max_uses serves (0: no
+# limit); at most analysis_reuse_max_entries are kept, least recently used dropped first.
+# python -m agents analyses --stats | --list | --forget ID | --clear manages them.
+analysis_reuse = true
+analysis_reuse_days = 30
+analysis_reuse_max_uses = 0
+analysis_reuse_max_entries = 5000
 max_tuner_changes_per_run = 3
 # Triage writes at most this many records per run (the rest wait for the next run), and
 # removes session and campaign records older than record_retention_days (0 keeps them).

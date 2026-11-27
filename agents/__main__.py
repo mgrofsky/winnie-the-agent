@@ -238,13 +238,68 @@ def _learned(args, cp: ConfigParser, base: Path, data_dir: Path, log_path: Optio
     return {"text": text, **summary}
 
 
+def _analyses(args, cp: ConfigParser, state: Path) -> dict:
+    """``analyses``: one action on the stored triage analyses. Returns a summary with the
+    plain text to print under ``text``."""
+    from agents import analyses
+
+    try:
+        reuse = analyses.settings(cp)
+    except ValueError as exc:
+        return {"error": str(exc)[:200]}
+    path = analyses.path_in(state)
+    store = analyses.AnalysisStore(path, reuse.days, reuse.max_uses, reuse.max_entries)
+    if args.forget is not None:
+        if not analyses.valid_short(args.forget):
+            return {"error": "an analysis id is 16 lowercase hex characters"}
+        removed = store.forget(args.forget)
+        if removed is None:
+            return {"error": f"cannot write {path}"}
+        return {"text": f"{args.forget}: {'forgotten' if removed else 'not found'}",
+                "forgotten": bool(removed)}
+    if args.clear:
+        count = store.clear()
+        if count is None:
+            return {"error": f"cannot write {path}"}
+        return {"text": f"cleared {count} entries", "cleared": count}
+    if args.list:
+        text, summary = analyses.list_text(store)
+    else:
+        text, summary = analyses.stats_text(store)
+    if store.read_error is not None:
+        text = f"cannot read {path} ({store.read_error[:100]}): triage starts it empty\n" + text
+        summary["read_error"] = store.read_error[:100]
+    if not reuse.enabled:
+        text = "[agents] analysis_reuse is off: the store is not used.\n" + text
+    return {"text": text, **summary}
+
+
+def _analyses_store(cp: ConfigParser, state: Path, llm):
+    """The stored-analyses store for a triage run, or None (reuse off, no model, or a bad
+    setting, which is logged)."""
+    if llm is None:
+        return None
+    from agents import analyses
+
+    try:
+        reuse = analyses.settings(cp)
+    except ValueError as exc:
+        log.warning("%s; stored analyses are not used this run", str(exc)[:200])
+        return None
+    if not reuse.enabled:
+        return None
+    return analyses.AnalysisStore(analyses.path_in(state), reuse.days, reuse.max_uses,
+                                  reuse.max_entries)
+
+
 def _run(argv=None, rotation: Optional[dict] = None) -> dict:
     """Parse args and run the requested agents. Returns a summary dict (also used by tests).
     ``rotation``, when given, is filled with what ``log_rotation_status`` needs."""
     parser = argparse.ArgumentParser(prog="python -m agents", description=__doc__)
     parser.add_argument("command", choices=["triage", "respond", "digest", "tune", "detect",
                                             "ship", "run-all", "queue", "approve", "reject", "unblock",
-                                            "enforce", "playbooks", "ui", "stix", "learned"])
+                                            "enforce", "playbooks", "ui", "stix", "learned",
+                                            "analyses"])
     parser.add_argument("target", nargs="?", help="approval id for approve / reject; address "
                                                   "or network for unblock; address for enforce")
     parser.add_argument("--log", help="honeypot JSON-lines log (default: [honeypot] log_file)")
@@ -280,13 +335,15 @@ def _run(argv=None, rotation: Optional[dict] = None) -> dict:
                         help="ui: also accept this HTTPS name, served by a reverse proxy on the "
                              "same host (default [ui] external_host, none)")
     parser.add_argument("--list", action="store_true",
-                        help="playbooks: list them; learned: list the entries")
+                        help="playbooks: list them; learned, analyses: list the entries")
     parser.add_argument("--stats", action="store_true",
-                        help="learned: entry counts and commands per reply step")
+                        help="learned: entry counts and commands per reply step; analyses: "
+                             "entry counts and model calls saved")
     parser.add_argument("--candidates", action="store_true",
                         help="learned: commands that reach the model most and are not served")
-    parser.add_argument("--forget", default=None, metavar="ID", help="learned: drop one entry")
-    parser.add_argument("--clear", action="store_true", help="learned: drop every entry")
+    parser.add_argument("--forget", default=None, metavar="ID",
+                        help="learned, analyses: drop one entry")
+    parser.add_argument("--clear", action="store_true", help="learned, analyses: drop every entry")
     parser.add_argument("--validate", action="store_true", help="playbooks: validate all files")
     parser.add_argument("--all", action="store_true", help="queue: include decided/expired items")
     parser.add_argument("--source-state", default=None, help="per-source state file "
@@ -343,6 +400,9 @@ def _run(argv=None, rotation: Optional[dict] = None) -> dict:
         return results
     if args.command == "learned":
         results["learned"] = _learned(args, cp, base, data_dir, log_path)
+        return results
+    if args.command == "analyses":
+        results["analyses"] = _analyses(args, cp, state)
         return results
     if args.command == "playbooks":
         from agents.playbooks import load_playbooks, tier_of
@@ -725,7 +785,8 @@ def _run(argv=None, rotation: Optional[dict] = None) -> dict:
                         retention_days=float(agents_cfg.get("record_retention_days",
                                                             RECORD_RETENTION_DAYS)),
                         geo=_geo(), shodan=_shodan(),
-                        indicators=indicators_from_config(cp), rules=rules_from_config(cp))
+                        indicators=indicators_from_config(cp), rules=rules_from_config(cp),
+                        analyses_store=_analyses_store(cp, state, llm))
 
                 stage("triage", _triage)
         if args.command in ("respond", "run-all") and \
@@ -831,9 +892,10 @@ def log_rotation_status(results: dict, *, log_path, state, readers, local=None,
 
 def main(argv=None) -> int:
     results = run(argv)
-    learned = results.get("learned")
-    if isinstance(learned, dict) and "text" in learned:
-        print(learned.pop("text"))
+    for name in ("learned", "analyses"):
+        item = results.get(name)
+        if isinstance(item, dict) and "text" in item:
+            print(item.pop("text"))
     print(json.dumps(results, indent=2, default=str), file=sys.stderr)
     failed = any(isinstance(v, dict) and "error" in v for v in results.values())
     return 2 if failed else 0
