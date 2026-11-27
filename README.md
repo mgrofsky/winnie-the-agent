@@ -23,6 +23,12 @@ On top of that SSH honeypot this project adds:
   per-source and daily token budgets, with concurrency limits, all enforced in code. They
   are estimates, not provider billing, and calls in flight can pass a limit by the
   estimate error.
+- **Learned replies**: the decoy shell answers a command from its deterministic shell
+  first, then from replies it has learned, and asks the model only for what it has not seen.
+  A model reply that came back the same in enough unrelated sessions is stored and served
+  from then on, a whole repeated script line by line, across restarts.
+  `python -m agents learned` shows the share of commands each step answered and what still
+  reaches the model.
 - **Triage**: one validated record per SSH session or per trap campaign, plus a daily digest.
 - **Where addresses are** (optional): country, city and network owner of each source,
   read from GeoLite2 or DB-IP Lite database files on disk (no network call), stored on
