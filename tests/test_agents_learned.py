@@ -130,7 +130,8 @@ def test_fill_substitutes_and_refuses_unknown_placeholders():
     ("timeout 5 /opt/tool/run", True), ("sudo /bin/cat /etc/issue", False),
     ("unlink /tmp/marker", True), ("env A=1 id", True), ("nice -n 5 uname -a", False),
     ("c\\d /tmp", True), ("c'd' /tmp", True), ('"r"m -f x', True), ("su\\do r\\m x", True),
-    ("ec'h'o hi", False),
+    ("ec'h'o hi", False), ('"/tmp/c\'at" x', True), ("/tmp/c\\at x", True),
+    ('cat "/etc/issue"', False),
 ])
 def test_may_change_state(line, changes):
     assert learned.may_change_state(line) is changes
