@@ -1064,7 +1064,12 @@ class Shell:
     # -- session files --
 
     def path(self, word: str) -> str:
-        return posixpath.normpath(posixpath.join(self.cwd, word))
+        """The file ``word`` names. ``/var/run`` is a link to ``/run``, so a name under it
+        is the same file under ``/run``."""
+        path = posixpath.normpath(posixpath.join(self.cwd, word))
+        if path == "/var/run" or path.startswith("/var/run/"):
+            path = "/run" + path[len("/var/run"):]
+        return path
 
     def directory(self, path: str) -> bool:
         """True for a directory this shell knows (the host's or one the session made)."""
@@ -2943,7 +2948,7 @@ _SYSTEM_DIRS = frozenset(("/etc", "/usr", "/var", "/proc", "/dev", "/run", "/var
 
 
 # System directories where a session may make a dot file without a listing: not the kernel's
-# own file systems, and not /var/run, which is /run under another name.
+# own file systems, and not /var/run, which ``Shell.path`` resolves to /run.
 _DOT_DIRS = _SYSTEM_DIRS - {"/proc", "/sys", "/var/run"}
 
 
@@ -3123,13 +3128,14 @@ def _cd(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         return _Result(err=f"{sh.prefix}: cd: too many arguments\n", status=1)
     target = sh.home if not args or args == ["~"] else \
         posixpath.normpath(posixpath.join(sh.cwd, args[0]))
-    if _denied(sh, target):
+    real = sh.path(target)                   # what the name resolves to; pwd keeps the name
+    if _denied(sh, real):
         return _Result(err=f"{sh.prefix}: cd: {args[0]}: Permission denied\n", status=1)
-    if target not in _dirs(sh) and target not in _SYSTEM_DIRS:
-        if target in sh.session.files or _below_file(sh, target):
+    if real not in _dirs(sh) and real not in _SYSTEM_DIRS:
+        if real in sh.session.files or _below_file(sh, real):
             reason = "Not a directory"
-        elif target in sh.session.removed or (".." not in args[0].split("/")
-                                              and _absent(sh, target)):
+        elif real in sh.session.removed or (".." not in args[0].split("/")
+                                            and _absent(sh, real)):
             reason = "No such file or directory"
         else:
             return None

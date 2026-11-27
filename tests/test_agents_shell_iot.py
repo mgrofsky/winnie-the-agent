@@ -650,10 +650,32 @@ def test_the_probe_makes_its_file_in_a_system_directory():
     # the file does not stand in for a listing of /var, which this shell does not have
     assert shell.answer(host(), "ls /var", now=NOW, session=session) is None
     assert shell.answer(host(), "ls /var/.g", now=NOW, session=session) is None
-    # the kernel's file systems, /var/run (/run by another name) and plain host names stay
-    # with the model
-    for line in (">/proc/.f", ">/sys/.f", ">/var/run/.f", ">/var/cache", ">>/etc/crontab"):
+    # the kernel's file systems and plain host names stay with the model
+    for line in (">/proc/.f", ">/sys/.f", ">/var/cache", ">>/etc/crontab"):
         assert shell.answer(host(), line, now=NOW) is None, line
+
+
+def test_a_file_made_under_var_run_is_the_same_file_under_run():
+    session = shell.Session(cwd="/root")
+    assert run([PROBE.format(d="/var/run"), "pwd", "ls -la /run/.f", "rm /run/.f", "cat .f"],
+               session=session) \
+        == ["", "/var/run\n", "-rwxrwxrwx 1 root root 0 Nov 18 11:06 /run/.f\n", "",
+            "cat: .f: No such file or directory\n"]
+
+
+def test_cd_enters_a_directory_made_under_var_run():
+    session = shell.Session(cwd="/root")
+    assert run(["cd /var/run", "mkdir .d", "cd .d", "pwd", ">x", "ls /run/.d"], session=session) \
+        == ["", "", "", "/var/run/.d\n", "", "x\n"]
+
+
+def test_a_whole_loader_probe_is_answered_without_the_model():
+    session = shell.Session(cwd="/root")
+    dirs = ("/var", "/var/tmp", "/var/run", "/dev", "/dev/shm", "/data", "/etc", "/mnt", "/usr",
+            "/boot", "/home", "/root")
+    replies = run([PROBE.format(d=d) for d in dirs], session=session)
+    assert replies == ["-bash: /data/.f: No such file or directory\n" if d == "/data" else ""
+                       for d in dirs]
 
 
 def test_a_redirection_into_a_missing_directory_fails_as_bash_says():
