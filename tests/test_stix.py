@@ -671,7 +671,10 @@ def test_cli_stix_and_run_all_write_the_file_and_open_no_socket(tmp_path, monkey
     from agents.triage import write_record
 
     reports = tmp_path / "reports"
-    for r in (rec(A), rec(B, auth_successes=0)):
+    # The CLI exports what was seen in the last lookback_days before the real clock, so the
+    # records are dated from it rather than from the fixed NOW.
+    seen = datetime.datetime.now(UTC).replace(microsecond=0) - datetime.timedelta(hours=1)
+    for r in (rec(A, seen=seen), rec(B, seen=seen, auth_successes=0)):
         write_record(r, reports)
     assert _cli(tmp_path, "stix", "")["stix"] == {"status": "disabled"}
     assert not (reports / "stix").exists()
