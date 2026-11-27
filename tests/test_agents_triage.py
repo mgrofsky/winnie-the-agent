@@ -715,3 +715,23 @@ def test_digest_lists_findings_as_like_a_framework_never_as_it(tmp_path):
     text = text if isinstance(text, str) else json.dumps(text)
     assert "ARTEX-like" in text and "agentic reconnaissance" in text
     assert "ARTEX activity" not in text
+
+
+@pytest.mark.usefixtures("public_test_net")
+def test_shipped_rules_reach_the_shipped_playbook_through_the_response_engine(tmp_path):
+    from agents.playbooks import load_playbooks
+    from agents.respond import list_queue, run_respond
+    from test_respond import SEED, FakeConnectors
+
+    _, reports = _run(tmp_path, _recon_events(), None, **_sets())
+    assert load_records(reports)[0].judgement.value == "BENIGN"
+    conn = FakeConnectors()
+    pbs, errors = load_playbooks()
+    out = run_respond(reports, tmp_path / "state", tmp_path / "det", tmp_path / "ss.json",
+                      connectors=conn, playbooks=pbs, seed=SEED, now=LATER, queue_enforce=True)
+    ran = {r["playbook"]: r for r in out["runs"]}
+    assert set(ran) == {"agentic_recon"}
+    steps = {s["action"]: s for s in ran["agentic_recon"]["steps"]}
+    assert set(steps) == {"tag_source", "capture_more", "notify"}
+    assert [c[0] for c in conn.calls] and {c[0] for c in conn.calls} == {"notify"}
+    assert list_queue(tmp_path / "state", now=LATER) == []

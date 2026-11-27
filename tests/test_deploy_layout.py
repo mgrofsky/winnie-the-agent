@@ -278,3 +278,10 @@ def test_ui_overrides_keep_it_on_loopback():
     isolated = _override("docker-compose.isolated.yml")
     assert "ui" not in isolated["services"]
     assert set(isolated["networks"]) == {"frontend"}
+
+
+def test_image_ships_the_indicator_and_behaviour_files():
+    # Their default path is under the repository's detections/, which the image does not
+    # otherwise copy (the runtime detections directory is a volume elsewhere).
+    sources = _copy_sources()
+    assert {"detections/indicators", "detections/behaviours"} <= set(sources)

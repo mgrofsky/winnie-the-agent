@@ -158,3 +158,15 @@ def test_thresholds_come_from_the_configured_file(tmp_path):
     off = ConfigParser()
     off.read_string("[behaviours]\nenabled = no\n")
     assert from_config(off) is None
+
+
+def test_every_rule_id_a_shipped_playbook_names_is_a_shipped_rule():
+    from agents.playbooks import load_playbooks
+
+    shipped = {r.id for r in load_rules().rules}
+    for pb in load_playbooks()[0]:
+        named = set(pb.when.behaviours_any)
+        for step in pb.steps:
+            if step.only_if is not None:
+                named |= set(step.only_if.behaviours_any)
+        assert named <= shipped, (pb.name, named - shipped)
