@@ -1120,6 +1120,13 @@ class Api:
         # Without a stored answer the record is served exactly as before.
         dumped = r.model_dump(mode="json", exclude={"src_shodan"} if r.src_shodan is None
                               else None)
+        if dumped.get("request_sequence"):
+            # Request text can carry a planted value in the path or query: masked, like the
+            # transcript and Activity views.
+            mask = self._masker()
+            for e in dumped["request_sequence"]:
+                for key in ("path", "query", "client"):
+                    e[key] = mask(e.get(key))
         out = {"record": dumped, "layout": record_layout(r),
                "approvals": approvals,
                "transcript_available": False, "transcript_withheld": None}

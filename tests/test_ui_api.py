@@ -675,7 +675,10 @@ def _recon_record(tree):
                                    lure="bundle", client="norma/0.4"),
                           SeqEntry(seq=2, at="2026-11-01T12:00:03+00:00", offset=3,
                                    method="GET", path="/api/admin/<b>x</b>", query="a=1",
-                                   status=403, discovered_via="bundle")],
+                                   status=403, discovered_via="bundle"),
+                          SeqEntry(seq=3, at="2026-11-01T12:00:04+00:00", offset=4,
+                                   method="GET", path="/api/backup",
+                                   query=f"key={ui_fixture.HONEYTOKEN_VALUE}", status=200)],
         indicator_matches=[IndicatorMatch(id="artex-ua-norma", framework="ARTEX",
                                           label="ARTEX default user agent", confidence="medium",
                                           count=2),
@@ -696,7 +699,8 @@ def test_record_carries_the_sequence_and_findings_with_provenance(tree):
     body = ok(Api(tree.api_paths(), cache_seconds=0, indicators=load_indicators()),
               f"/api/records/{rec.id}")
     seq = body["record"]["request_sequence"]
-    assert [e["path"] for e in seq] == ["/static/app.js", "/api/admin/<b>x</b>"]
+    assert [e["path"] for e in seq] == ["/static/app.js", "/api/admin/<b>x</b>", "/api/backup"]
+    assert ui_fixture.HONEYTOKEN_VALUE not in seq[2]["query"] and "......" in seq[2]["query"]
     assert seq[1]["discovered_via"] == "bundle" and seq[1]["offset"] == 3
     f = body["findings"]
     assert f["like"] == ["ARTEX"] and f["behaviours"][0]["id"] == "discovered-routes-used"
