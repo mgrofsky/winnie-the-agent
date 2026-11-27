@@ -17,6 +17,7 @@ expanded values. Fields marked ``credential`` (account passwords, columns with
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 from typing import Literal, NamedTuple, Optional, Union
 
@@ -36,6 +37,13 @@ PASSWORD_MAX = 64
 SCENARIO_NAME_RE = r"^[a-z][a-z0-9_]{1,40}$"
 IDENT_RE = r"^[A-Za-z_][A-Za-z0-9_]{0,63}$"
 HTTP_PATH_RE = r"^/[A-Za-z0-9._~/{}-]{0,200}$"
+HTTP_ASSET_PATH_RE = r"^/[A-Za-z0-9._~/-]{1,200}$"
+LURE_ID_RE = r"^[a-z0-9][a-z0-9_.-]{0,63}$"
+# A per-source marker in an HTTP asset body or route json_body: ``{marker:NAME}``. Single
+# braces, so the load-time ``{{...}}`` expansion leaves it alone; the listener fills it in for
+# each source.
+MARKER_RE = re.compile(r"\{marker:([a-z][a-z0-9_]{0,31})\}")
+MAX_MARKER_NAMES = 16
 
 
 def valid_password(value: str) -> bool:
@@ -280,16 +288,25 @@ class HttpPage(Strict):
     requires_login: bool = True
 
 
+HttpFlow = Literal["username_check", "recovery_request", "recovery_reset", "activation"]
+
+
 class HttpRoute(Strict):
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = "GET"
     path: str = Field(pattern=HTTP_PATH_RE)          # may contain {param}
     auth: Literal["none", "session", "basic", "bearer", "api_key", "any"] = "any"
     status: int = Field(default=200, ge=100, le=599)
-    json_body: Optional[Union[dict, list]] = None    # canned JSON; may use {param}
+    json_body: Optional[Union[dict, list]] = None    # canned JSON; may use {param}, {marker:NAME}
     list_from: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
     list_limit: int = Field(default=20, ge=1, le=200)
     item_from: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
     item_key: Optional[str] = Field(default=None, pattern=IDENT_RE)
+    # Web deception: the lure ID logged when this route answers, whether it is left out of
+    # the generated OpenAPI document (reachable only through an asset), and a fixed,
+    # local multi-step flow that answers in place of a body.
+    lure: Optional[str] = Field(default=None, pattern=LURE_ID_RE)
+    hidden: bool = False
+    flow: Optional[HttpFlow] = None
 
     @model_validator(mode="after")
     def _one_source(self) -> "HttpRoute":
@@ -299,6 +316,27 @@ class HttpRoute(Strict):
             raise ValueError(f"route {self.path}: choose one of json_body/list_from/item_from")
         if self.item_from and not self.item_key:
             raise ValueError(f"route {self.path}: item_from needs item_key")
+        if self.flow and any(sources):
+            raise ValueError(f"route {self.path}: a flow route has no json_body/list_from/"
+                             "item_from")
+        return self
+
+
+class HttpAsset(Strict):
+    """A decoy static file: a JavaScript bundle, its source map, a runtime config (JSON, or
+    ``window`` assignment when the path ends in ``.js``) or any other static file. Without
+    ``body`` the content is generated from the routes in ``advertises``."""
+
+    path: str = Field(pattern=HTTP_ASSET_PATH_RE)
+    kind: Literal["bundle", "source_map", "runtime_config", "static"]
+    lure: str = Field(pattern=LURE_ID_RE)
+    advertises: list[str] = Field(default_factory=list, max_length=50)
+    body: Optional[str] = Field(default=None, max_length=100_000)
+
+    @model_validator(mode="after")
+    def _content(self) -> "HttpAsset":
+        if self.kind == "static" and self.body is None:
+            raise ValueError(f"asset {self.path}: a static asset needs a body")
         return self
 
 
@@ -391,6 +429,61 @@ class HttpService(ServiceBase):
     # Unknown paths outside the API prefix may be answered by the model when
     # ``[listeners] llm`` is on.
     llm_unknown_paths: bool = True
+    # Web deception: decoy assets, extra paths serving the OpenAPI document, and which of
+    # its routes count as discovered by a source that fetched it (under ``openapi_lure``).
+    assets: list[HttpAsset] = Field(default_factory=list, max_length=30)
+    openapi_aliases: list[str] = Field(default_factory=list, max_length=10)
+    openapi_advertises: list[str] = Field(default_factory=list, max_length=100)
+    openapi_lure: str = Field(default="openapi", pattern=LURE_ID_RE)
+
+    @field_validator("openapi_aliases")
+    @classmethod
+    def _aliases(cls, v: list[str]) -> list[str]:
+        for p in v:
+            if not re.fullmatch(HTTP_ASSET_PATH_RE, p):
+                raise ValueError(f"bad openapi alias {p!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _deception(self) -> "HttpService":
+        route_paths = {r.path for r in self.routes}
+        taken = {self.login_path, "/", "/logout"} | {p.path for p in self.pages} | route_paths
+        if self.openapi_path:
+            taken.add(self.openapi_path)
+        if (self.openapi_aliases or self.openapi_advertises) and not self.openapi_path:
+            raise ValueError("openapi_aliases and openapi_advertises need openapi_path")
+        for alias in self.openapi_aliases:
+            if alias in taken:
+                raise ValueError(f"openapi alias {alias} is already a path on this site")
+            taken.add(alias)
+        for path in self.openapi_advertises:
+            if path not in route_paths:
+                raise ValueError(f"openapi_advertises {path}: not a route path")
+        markers: set[str] = set()
+        for asset in self.assets:
+            if asset.path in taken:
+                raise ValueError(f"asset {asset.path} is already a path on this site")
+            taken.add(asset.path)
+            for path in asset.advertises:
+                if path not in route_paths:
+                    raise ValueError(f"asset {asset.path} advertises {path}: not a route path")
+            markers.update(MARKER_RE.findall(asset.body or ""))
+        for route in self.routes:
+            if route.json_body is not None:
+                markers.update(MARKER_RE.findall(json.dumps(route.json_body)))
+        if len(markers) > MAX_MARKER_NAMES:
+            raise ValueError(f"at most {MAX_MARKER_NAMES} marker names per scenario")
+        return self
+
+    def marker_names(self) -> frozenset[str]:
+        """Every ``{marker:NAME}`` name used in an asset body or route json_body."""
+        found: set[str] = set()
+        for asset in self.assets:
+            found.update(MARKER_RE.findall(asset.body or ""))
+        for route in self.routes:
+            if route.json_body is not None:
+                found.update(MARKER_RE.findall(json.dumps(route.json_body)))
+        return frozenset(found)
 
 
 class MllpService(ServiceBase):
