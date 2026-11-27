@@ -68,7 +68,7 @@ from typing import Callable, Optional
 
 from pydantic import ValidationError
 
-from agents import triage
+from agents import analyses, triage
 from agents.budget import ip_key
 from agents.llm import DailyCallCounter
 from agents.playbooks import PLAYBOOKS_DIR, load_playbooks, tier_of
@@ -603,6 +603,7 @@ def _summary(r: TriageRecord) -> dict:
             "auth_attempts": r.auth_attempts, "auth_successes": r.auth_successes,
             "connections": r.connections, "honeytokens": list(r.honeytokens),
             "high_signal": sum(r.high_signal.values()), "llm_used": r.llm_used,
+            "analysis_reused": r.analysis_reused,
             "unverified_source": r.unverified_source, "narrative": r.narrative[:300],
             "layout": record_layout(r),
             **({"geo": geo_view(r.src_geo)} if r.src_geo is not None else {})}
@@ -1017,6 +1018,7 @@ class Api:
         stamps = [s for s in recs.stamps.values() if s is not None]
         counter = DailyCallCounter(p.state / "analyst_calls.json",
                                    self.limits.analyst_calls_per_day).peek()
+        counter["reused"] = analyses.reused_today(p.state, now.timestamp())
         today = now.date().isoformat()
         budget = _read_json(p.budget_state or p.data / "budget_state.json", {})
         tokens = budget.get("global_tokens") if budget.get("day") == today else 0

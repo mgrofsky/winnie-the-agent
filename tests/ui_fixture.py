@@ -246,6 +246,7 @@ def build_tree(root: Path | str) -> Tree:
         "notify": {"sent": {"webhook": 2}, "by_playbook": {}, "suppressed": {},
                    "last_notice": {}}})
     _write_json(tree.state / "analyst_calls.json", {"day": today, "calls": 7})
+    _write_json(tree.state / "triage_analyses_reused.json", {"day": today, "today": 3, "total": 9})
     _write_json(tree.data / "budget_state.json",
                 {"day": today, "global_tokens": 123456, "ip_tokens": {"198.51.100.7": 1000}})
     with open(tree.state / "ship_events.jsonl", "w", encoding="utf-8") as f:

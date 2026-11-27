@@ -178,7 +178,8 @@ def test_overview_health(api, tree):
     assert h["event_log"]["state"] == "ok" and h["event_log"]["bytes"] > 0
     assert h["event_log"]["index"]["sessions"] == 2
     assert h["records_total"] == 5 and h["newest_record"]
-    assert h["analyst_calls"] == {"day": tree.now.date().isoformat(), "calls": 7, "limit": 500}
+    assert h["analyst_calls"] == {"day": tree.now.date().isoformat(), "calls": 7, "limit": 500,
+                                  "reused": 3}
     assert h["frontend_tokens"]["tokens"] == 123456
     assert {(x["protocol"], x["count"]) for x in h["sensor_limits"]} == {("http", 5), ("sip", 12)}
     assert h["size_alarm"] is None
