@@ -13,7 +13,7 @@ from playwright.sync_api import expect  # noqa: E402
 
 from browser_support import (  # noqa: E402
     CANARIES, CANARY_ATTR, CANARY_SCRIPT, CANARY_SESSION, CANARY_SOURCE, CANARY_USER, watch)
-from ui_fixture import IMG, SCRIPT  # noqa: E402
+from ui_fixture import IMG, SCRIPT, _append, map_lines  # noqa: E402
 
 pytestmark = pytest.mark.browser
 
@@ -25,6 +25,7 @@ SECTIONS = {
     "#/decoy": "Decoy",
     "#/playbooks": "Playbooks",
     "#/activity": "Activity",
+    "#/map": "Map",
 }
 
 # True if any element carries an inline event handler attribute or a javascript: URL.
@@ -210,3 +211,107 @@ def test_hostile_hash_routes_render_as_text(signed_in, lab):
         page.wait_for_load_state("networkidle")
         assert_nothing_injected(page)
     assert all(not m.startswith("dialog") for m in seen.problems())
+
+
+# ---- map -----------------------------------------------------------------------------------
+
+# Distinct colours in the canvas, read once (the land, sea and dots differ from a blank one).
+CANVAS_COLOURS = """() => {
+    const c = document.querySelector('canvas.map-canvas');
+    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    const seen = new Set();
+    for (let i = 0; i < d.length; i += 4 * 97) seen.add(d[i] + ',' + d[i + 1] + ',' + d[i + 2] + ',' + d[i + 3]);
+    return seen.size;
+}"""
+
+
+def flying(page) -> int:
+    return int(page.locator(".map-counters .tile", has_text="In flight")
+               .locator(".tile-value").inner_text())
+
+
+def test_map_draws_the_world_lists_events_and_flies_them(signed_in, lab):
+    page, seen = signed_in
+    open_section(page, lab.base_url, "#/map")
+    feed = page.get_by_role("list", name="Events, newest first")
+    expect(feed.locator("li").first).to_be_visible()
+    expect(feed).to_contain_text("Amsterdam, Netherlands")
+    expect(feed).to_contain_text(re.compile(r"(ssh 22|http 8080|telnet 23|ftp 21|redis 6379)"))
+    page.wait_for_function("() => document.querySelector('canvas.map-canvas').width > 0")
+    assert page.evaluate(CANVAS_COLOURS) > 8
+    # The newest events replay on open, and events written after it arrive by the next poll.
+    _append(lab.tree.log, map_lines(lab.tree.now.now(lab.tree.now.tzinfo), 5, step=0.3, seed=21))
+    page.wait_for_function("""() => [...document.querySelectorAll('.map-counters .tile')]
+        .some((t) => t.textContent.startsWith('In flight') && !t.textContent.endsWith('0'))""",
+                           timeout=15000)
+    expect(page.get_by_role("group", name="Services shown").get_by_role("button")).not_to_have_count(0)
+    assert seen.problems() == []
+    assert_nothing_injected(page)
+
+
+def test_map_pause_stops_movement(signed_in, lab):
+    page, seen = signed_in
+    open_section(page, lab.base_url, "#/map")
+    page.wait_for_function("""() => [...document.querySelectorAll('.map-counters .tile')]
+        .some((t) => t.textContent.startsWith('In flight') && !t.textContent.endsWith('0'))""",
+                           timeout=15000)
+    page.get_by_role("button", name="Pause").click()
+    expect(page.get_by_role("button", name="Resume")).to_have_attribute("aria-pressed", "true")
+    canvas = page.locator("canvas.map-canvas")
+    page.wait_for_timeout(300)
+    first = canvas.screenshot()
+    page.wait_for_timeout(700)
+    assert canvas.screenshot() == first
+    page.get_by_role("button", name="Resume").click()
+    assert seen.problems() == []
+
+
+def test_map_with_reduced_motion_shows_dots_and_no_flights(browser, lab):
+    context = browser.new_context(reduced_motion="reduce")
+    page = context.new_page()
+    seen = watch(page)
+    try:
+        page.goto(lab.sign_in_url)
+        page.get_by_role("navigation", name="Sections").wait_for()
+        open_section(page, lab.base_url, "#/map")
+        _append(lab.tree.log, map_lines(lab.tree.now.now(lab.tree.now.tzinfo), 5, seed=22))
+        feed = page.get_by_role("list", name="Events, newest first")
+        before = feed.locator("li").count()
+        expect(feed.locator("li")).not_to_have_count(before, timeout=15000)
+        assert flying(page) == 0
+        assert seen.problems() == []
+    finally:
+        context.close()
+
+
+def test_map_shows_attacker_text_as_text(browser, lab):
+    context = browser.new_context(bypass_csp=True)
+    page = context.new_page()
+    seen = watch(page)
+    try:
+        page.goto(lab.sign_in_url)
+        page.get_by_role("navigation", name="Sections").wait_for()
+        open_section(page, lab.base_url, "#/map")
+        feed = page.get_by_role("list", name="Events, newest first")
+        # The canary source's place is a script tag, and its login and command are payloads.
+        expect(feed).to_contain_text(SCRIPT + ", Singapore")
+        expect(feed).to_contain_text(CANARY_SOURCE)
+        feed.get_by_text(SCRIPT + ", Singapore").first.hover()
+        page.get_by_text("Hide addresses").click()
+        expect(feed).not_to_contain_text(CANARY_SOURCE)
+        assert_nothing_injected(page)
+        assert seen.problems() == []
+    finally:
+        context.close()
+
+
+def test_a_feed_row_opens_activity_for_its_source(signed_in, lab):
+    page, seen = signed_in
+    open_section(page, lab.base_url, "#/map")
+    row = page.get_by_role("list", name="Events, newest first").locator("li",
+                                                                      has_text="Amsterdam").first
+    row.focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_role("heading", level=1).first).to_have_text("Activity")
+    assert "src=198.51.100.21" in page.url
+    assert seen.problems() == []
