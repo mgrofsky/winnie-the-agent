@@ -25,6 +25,10 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Cross-Origin-Opener-Policy": "same-origin",
     "Cross-Origin-Resource-Policy": "same-origin",
+    "Cross-Origin-Embedder-Policy": "require-corp",
+    "Permissions-Policy": (
+        "accelerometer=(), camera=(), display-capture=(), fullscreen=(), geolocation=(), "
+        "gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"),
     "Content-Security-Policy": (
         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
         "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"),
