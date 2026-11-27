@@ -126,7 +126,7 @@ window.__ENV__ = {
   "release": "{marker:build}",
   "oauthClientId": "{marker:client_id}",
   "publicApiKey": "{marker:public_api_key}",
-  "exportsPath": "/api/internal/export",
+  "exportsPath": "/internal/export",
   "features": { "bulkExport": true, "sso": false, "betaReports": false }
 };
 '''
