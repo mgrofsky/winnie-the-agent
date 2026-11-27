@@ -1035,7 +1035,10 @@
         level === "ok" ? "." : ". Triage may not be running."]]);
     }
 
-    rows.push(["Analyst calls", ...usage(obj(h.analyst_calls), "calls", "calls")]);
+    const calls = obj(h.analyst_calls);
+    const [callLevel, callText] = usage(calls, "calls");
+    rows.push(["Analyst calls", callLevel, typeof calls.reused === "number" && calls.reused > 0
+      ? callText + " " + num(calls.reused) + " reused today." : callText]);
     rows.push(["Front-end tokens", ...usage(obj(h.frontend_tokens), "tokens", "tokens")]);
 
     const limits = arr(h.sensor_limits);
@@ -1672,7 +1675,8 @@
       r.upstream_judgement ? el("span", { cls: "muted", text: "upstream: " + str(r.upstream_judgement) }) : null,
       el("span", { cls: "tag", text: str(r.protocol) }),
       el("span", { cls: "muted", text: str(r.kind) }),
-      el("span", { cls: "muted", text: r.llm_used === true ? "model-assisted triage" : "rule-based triage" })));
+      el("span", { cls: "muted", text: r.llm_used === true ? "model-assisted triage"
+        : r.analysis_reused === true ? "model-assisted triage (stored analysis)" : "rule-based triage" })));
 
     out.push(el("section", "section", el("div", "section-body", el("div", "facts",
       fact("Source", el("span", null, mono(r.src_ip),
