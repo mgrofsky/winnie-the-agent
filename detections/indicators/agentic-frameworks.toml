@@ -1,0 +1,134 @@
+# Indicators of agentic offensive frameworks, with where each fact comes from.
+#
+# User agents are trivially changed and some are shared with other tools, so no entry here
+# is more than medium confidence. A match is shown on the triage record and can be used in
+# a playbook condition; it never changes the record's judgement or reaches the blocklist.
+# Paths and queries are common reconnaissance targets that one report listed; they are
+# low confidence and not specific to any framework.
+
+[[indicators]]
+id = "artex-ua-enrich"
+type = "user_agent"
+match = "prefix"
+value = "artex-enrich/"
+framework = "ARTEX"
+label = "ARTEX default user agent (asset enrichment)"
+confidence = "medium"
+sources = ["https://www.microsoft.com/en-us/security/blog/2026/11/25/what-defenders-need-to-know-artex-agentic-ai-framework-threat-actors-abuse/"]
+reported = "2026-11-25"
+notes = "Microsoft lists artex-enrich/* as sent with a short GET to each newly discovered web asset, without following redirects. Microsoft also says operators can and do change the user agent."
+
+[[indicators]]
+id = "artex-ua-norma"
+type = "user_agent"
+match = "prefix"
+value = "norma/"
+framework = "ARTEX"
+label = "ARTEX default user agent (agent web fetch)"
+confidence = "medium"
+sources = [
+    "https://www.microsoft.com/en-us/security/blog/2026/11/25/what-defenders-need-to-know-artex-agentic-ai-framework-threat-actors-abuse/",
+    "https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors",
+]
+reported = "2026-11-25"
+notes = "Microsoft lists norma/* as sent by the agents' built-in web-fetch tool. Wiz lists norma/0.4 and notes that many user agents in its list are not unique to this actor. Operators can change it."
+
+[[indicators]]
+id = "artex-ua-reconprobe"
+type = "user_agent"
+match = "exact"
+value = "ReconProbe/1.0"
+framework = "ARTEX"
+label = "Self-describing scanner user agent seen with ARTEX activity"
+confidence = "low"
+sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
+reported = "2026-10-22"
+notes = "Wiz names ReconProbe/1.0 as a distinctive identifier in the activity, and says many user agents in its list are not unique to this actor and are noisy when hunted alone."
+
+[[indicators]]
+id = "recon-env-js"
+type = "path"
+match = "exact"
+value = "/env.js"
+label = "Runtime configuration fetch (common reconnaissance)"
+confidence = "low"
+sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
+reported = "2026-10-22"
+notes = "Listed by Wiz among requests made while harvesting runtime configuration. Common to many scanners."
+
+[[indicators]]
+id = "recon-assets-config-json"
+type = "path"
+match = "exact"
+value = "/assets/config.json"
+label = "Runtime configuration fetch (common reconnaissance)"
+confidence = "low"
+sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
+reported = "2026-10-22"
+notes = "Listed by Wiz among requests made while harvesting runtime configuration. Common to many scanners."
+
+[[indicators]]
+id = "recon-packs-js"
+type = "path"
+match = "prefix"
+value = "/packs/js/"
+label = "Bundle or source map fetch under /packs/js/ (common reconnaissance)"
+confidence = "low"
+sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
+reported = "2026-10-22"
+notes = "Wiz lists a .js.map source map fetched under /packs/js/; this entry matches any request under that directory. Wiz reports that internal route names the agent later called appeared only in those source maps."
+
+[[indicators]]
+id = "recon-swagger-openapi"
+type = "query"
+match = "exact"
+value = "/swagger/?format=openapi"
+label = "OpenAPI document fetch (common reconnaissance)"
+confidence = "low"
+sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
+reported = "2026-10-22"
+notes = "Listed by Wiz among requests for API documentation. Common to many scanners."
+
+[[indicators]]
+id = "recon-sso-jwt"
+type = "query"
+match = "prefix"
+value = "/sso?jwt="
+label = "Token passed to a single sign-on endpoint (common reconnaissance)"
+confidence = "low"
+sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
+reported = "2026-10-22"
+notes = "Wiz lists a request to /sso with an unsigned token in the jwt parameter while testing sign-in flows."
+
+[[indicators]]
+id = "recon-validate-username"
+type = "path"
+match = "exact"
+value = "/Account/ValidateUserName"
+label = "Username existence check (common reconnaissance)"
+confidence = "low"
+sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
+reported = "2026-10-22"
+notes = "Listed by Wiz among repeated username-recovery and password-reset requests."
+
+[[indicators]]
+id = "recon-password-reset-token"
+type = "path"
+match = "contains"
+value = "/GeneratePasswordResetToken"
+label = "Password reset token request (common reconnaissance)"
+confidence = "low"
+sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
+reported = "2026-10-22"
+notes = "Wiz lists a POST to this endpoint under a versioned users API path, among repeated username-recovery and password-reset requests. Matched anywhere in the path."
+
+[[indicators]]
+id = "recon-forgot-password"
+type = "path"
+match = "exact"
+value = "/forgot_password"
+label = "Password recovery request (common reconnaissance)"
+confidence = "low"
+sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
+reported = "2026-10-22"
+notes = "Listed by Wiz among repeated username-recovery and password-reset requests."

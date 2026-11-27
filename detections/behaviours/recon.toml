@@ -1,0 +1,49 @@
+# Behaviour rules over a source's HTTP request sequence. Thresholds are set here; edit them
+# or point [behaviours] path at your own files. A match is shown on the triage record, asks
+# the model for a narrative, and can be used in a playbook condition. It never changes the
+# record's judgement or reaches the blocklist.
+
+[[rules]]
+id = "discovered-routes-used"
+kind = "discovery_then_use"
+label = "agentic reconnaissance: called routes it found in a bundle, map or API document"
+confidence = "medium"
+description = "Two or more distinct routes requested within an hour of the asset or document that showed them to this source."
+min_routes = 2
+within_seconds = 3600
+
+[[rules]]
+id = "adaptive-retries"
+kind = "adaptive_retries"
+label = "agentic reconnaissance: retried with changes after errors"
+confidence = "low"
+description = "Within one minute, twenty or more requests, ten or more answered 4xx, and five or more errors followed by a changed path, query or method on the same host."
+min_requests = 20
+window_seconds = 60
+min_client_errors = 10
+min_changes = 5
+
+[[rules]]
+id = "object-enumeration"
+kind = "object_enumeration"
+label = "agentic reconnaissance: walked object ids on one route"
+confidence = "medium"
+description = "Ten or more distinct object ids asked of one item route."
+min_ids = 10
+
+[[rules]]
+id = "recovery-probing"
+kind = "recovery_probing"
+label = "agentic reconnaissance: probed account recovery flows"
+confidence = "medium"
+description = "Three or more requests across two or more username, recovery, reset or activation flows."
+min_steps = 3
+min_flows = 2
+
+[[rules]]
+id = "marker-reuse"
+kind = "marker_reuse"
+label = "agentic reconnaissance: presented a value it was served"
+confidence = "high"
+description = "A per-source marker from a served asset or response came back in a later request."
+min_hits = 1

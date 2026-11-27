@@ -25,6 +25,8 @@ COPY agents ./agents
 COPY listeners ./listeners
 COPY scenarios ./scenarios
 COPY playbooks ./playbooks
+COPY detections/indicators ./detections/indicators
+COPY detections/behaviours ./detections/behaviours
 # The AWS bootstrap (deploy/aws/sensor.yaml) copies these out of the image onto the host:
 # the config renderer, and with the tailnet option the egress rules and the tailscaled unit.
 COPY deploy/aws/render_config.py ./deploy/aws/render_config.py
