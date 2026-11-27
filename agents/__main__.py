@@ -115,6 +115,7 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     from agents.budget import BudgetConfig
     from agents.respond import RespondSettings
     from agents.ui.activity import DEFAULT_MAX_ENTRIES, MAX_ENTRIES, MIN_ENTRIES
+    from agents.indicators import from_config as indicators_from_config
     from agents.ui.api import Api, ApiLimits, ApiPaths
     from agents.ui.server import UiSettings, serve
 
@@ -181,7 +182,7 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
               respond_settings=lambda: runtime.respond_settings(cp),
               connectors=lambda: runtime.respond_connectors(cp, state),
               sensor=sensor_label(cp), sightings=sightings, geo=geo,
-              shodan=internetdb_reader(cp, state))
+              shodan=internetdb_reader(cp, state), indicators=indicators_from_config(cp))
     try:
         serve(settings, api)
     except (ValueError, OSError) as exc:
@@ -709,6 +710,8 @@ def _run(argv=None, rotation: Optional[dict] = None) -> dict:
                 results["triage"] = {"error": log_error}
                 log.error("%s", log_error)
             else:
+                from agents.behaviours import from_config as rules_from_config
+                from agents.indicators import from_config as indicators_from_config
                 from agents.triage import run_triage
 
                 from agents.triage import MAX_RECORDS_PER_RUN, RECORD_RETENTION_DAYS
@@ -721,7 +724,8 @@ def _run(argv=None, rotation: Optional[dict] = None) -> dict:
                                                                MAX_RECORDS_PER_RUN)),
                         retention_days=float(agents_cfg.get("record_retention_days",
                                                             RECORD_RETENTION_DAYS)),
-                        geo=_geo(), shodan=_shodan())
+                        geo=_geo(), shodan=_shodan(),
+                        indicators=indicators_from_config(cp), rules=rules_from_config(cp))
 
                 stage("triage", _triage)
         if args.command in ("respond", "run-all") and \

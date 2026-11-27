@@ -1725,6 +1725,11 @@
     commands.body.append(el("p", null, rawActivityLink(r, id)));
     out.push(el("div", "grid-2", creds.node, commands.node));
 
+    const findings = findingsSection(data.findings);
+    if (findings) out.push(findings);
+    const sequence = arr(r.request_sequence).map(obj);
+    if (sequence.length) out.push(requestSequence(r, id, sequence));
+
     const tokens = section("Honeytokens");
     const tokenSources = arr(r.honeytoken_sources);
     tokens.body.append(arr(r.honeytokens).length || tokenSources.length
@@ -1764,6 +1769,66 @@
 
   // From a record to its raw events: a session's own view, or a campaign's source and
   // service over its time span.
+  // A record's behaviour and indicator matches from the server's "findings" object, each
+  // with its confidence; an indicator match also shows where its fact comes from. Source
+  // URLs are shown as text, not links. Nothing when the record matched nothing.
+  function findingsSection(findings) {
+    const f = obj(findings);
+    const behaviours = arr(f.behaviours).map(obj);
+    const indicators = arr(f.indicators).map(obj);
+    if (!behaviours.length && !indicators.length) return null;
+    const like = arr(f.like).map(str).filter(Boolean);
+    const s = section("Behaviours and indicators");
+    s.body.append(el("p", { cls: "muted",
+      text: "Pattern and list matches: shown for context, never used for the judgement or the blocklist." }));
+    if (behaviours.length) {
+      s.body.append(el("ul", "nl-list", behaviours.map((b) => {
+        const span = typeof b.first_seq === "number" && typeof b.last_seq === "number"
+          ? ", requests #" + num(b.first_seq) + " to #" + num(b.last_seq) : "";
+        return el("li", null, el("strong", { text: str(b.label) }),
+          like.length ? el("span", { text: " (" + like.map((x) => x + "-like").join(", ") + ")" }) : null,
+          el("span", { cls: "muted", text: " · " + str(b.confidence) + " confidence · count " + num(b.count) + span }));
+      })));
+    }
+    if (indicators.length) {
+      s.body.append(el("ul", "nl-list", indicators.map((m) => {
+        const p = obj(m.provenance);
+        const reported = str(p.reported);
+        return el("li", null,
+          el("strong", { text: str(m.label) }),
+          el("span", { cls: "muted", text: " · " + str(m.confidence) + " confidence · " + num(m.count) + " hit" + (m.count === 1 ? "" : "s") }),
+          m.provenance ? el("div", { cls: "faint wrap",
+            text: "Reported " + (reported || "-") + " by " + arr(p.sources).map(str).join(", ") }) : null,
+          str(p.notes) ? el("div", { cls: "faint wrap", text: str(p.notes) }) : null);
+      })));
+    }
+    return s.node;
+  }
+
+  // An HTTP campaign's requests in order, with seconds since the first one. Every cell is
+  // attacker or scenario text, set as text.
+  function requestSequence(r, id, rows) {
+    const total = typeof r.commands === "number" ? r.commands : rows.length;
+    const s = section("Request sequence" + (total > rows.length ? " (first " + num(rows.length) + " of " + num(total) + ")" : ""), { flush: true });
+    const target = (e) => str(e.path) + (str(e.query) ? "?" + str(e.query) : "");
+    s.body.append(table([
+      { label: "#", num: true }, { label: "+s", num: true }, { label: "Request" },
+      { label: "Status", num: true }, { label: "Route" }, { label: "Found in" }, { label: "Flow" },
+      { label: "Marker" }, { label: "Client" }],
+    rows.map((e) => ({ cells: [
+      typeof e.seq === "number" ? num(e.seq) : "-",
+      typeof e.offset === "number" ? num(e.offset) : "-",
+      el("span", { cls: "mono wrap", text: str(e.method) + " " + target(e) }),
+      typeof e.status === "number" ? num(e.status) : "-",
+      mono(e.route || e.lure || "-"),
+      mono(e.discovered_via || "-"),
+      mono(e.flow ? str(e.flow) + (e.flow_step ? " / " + str(e.flow_step) : "") : "-"),
+      mono(e.marker ? str(e.marker) + (e.marker_src === true ? " (other source)" : "") : "-"),
+      clip(e.client || "-")] }))));
+    s.body.append(el("p", null, rawActivityLink(r, id)));
+    return s.node;
+  }
+
   function rawActivityLink(r, id) {
     if (r.kind === "session") {
       const href = sessionHref(id);

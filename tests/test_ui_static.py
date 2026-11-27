@@ -312,3 +312,16 @@ def test_decoy_screen_speaks_in_words_with_raw_detail_behind_an_expander():
     assert draw.count("empty(") >= 4
     assert "The tuner has not changed anything yet" in draw
     assert "No attacker has been singled out yet" in draw
+
+
+def test_request_sequence_and_findings_are_text_with_the_raw_activity_link():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    record = _function(text, "drawRecord")
+    assert "findingsSection(data.findings)" in record
+    assert "requestSequence(r, id, sequence)" in record
+    seq = _function(text, "requestSequence")
+    assert "rawActivityLink(r, id)" in seq and "link(" not in seq.replace("rawActivityLink(", "")
+    findings = _function(text, "findingsSection")
+    # Source URLs are shown as text, never as links.
+    assert "link(" not in findings and "href" not in findings
+    assert '"-like"' in findings and "never used for the judgement or the blocklist" in findings

@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from agent_fakes import GOOD_TRIAGE, T0, FakeJsonLLM, ssh_session, trap_event, write_log
 
 from agents.triage import (
+    Judgement,
     TriageRecord,
     digest,
     extract_iocs,
@@ -586,3 +587,131 @@ def test_telnet_campaign_carries_hardware_recon(tmp_path):
     assert camps["203.0.113.30"].high_signal == {"hardware_recon": 1}
     assert any(t.id == "T1082" for t in camps["203.0.113.30"].techniques)
     assert camps["203.0.113.31"].high_signal == {}
+
+
+# ---- request sequence, indicators and behaviours -------------------------------------------
+
+RECON_IP = "198.51.100.60"
+
+
+def _recon_events(n_items=10, client="norma/0.4", ip=RECON_IP):
+    """A source that reads a bundle, calls the routes it advertised and walks item ids."""
+    def ev(i, path, **data):
+        data.setdefault("status", 200)
+        return trap_event("http", "command", ip, "http-c1", i / 60, client=client,
+                          data={"method": "GET", "path": path, "seq": i + 1, **data})
+    out = [ev(0, "/env.js", lure_id="env"), ev(1, "/static/app.js", lure_id="bundle")]
+    out.append(ev(2, "/api/admin/export", discovered_via="bundle", discovered_age=60))
+    out.append(ev(3, "/api/admin/users", discovered_via="bundle", discovered_age=120))
+    for k in range(n_items):
+        out.append(ev(4 + k, f"/api/items/{k}", route="/api/items/{id}", object_id_count=k + 1))
+    return out
+
+
+def _sets():
+    from agents.behaviours import load_rules
+    from agents.indicators import load_indicators
+
+    return {"indicators": load_indicators(), "rules": load_rules()}
+
+
+def test_campaign_record_carries_the_sequence_in_order_with_offsets(tmp_path):
+    _, reports = _run(tmp_path, _recon_events(), None)
+    r = load_records(reports)[0]
+    seq = r.request_sequence
+    assert [e.path for e in seq[:4]] == ["/env.js", "/static/app.js", "/api/admin/export",
+                                        "/api/admin/users"]
+    assert [e.seq for e in seq] == list(range(1, 15))
+    assert seq[0].offset == 0 and seq[3].offset == 3 and seq[2].discovered_via == "bundle"
+    assert seq[0].at.startswith(T0.date().isoformat()) and seq[0].conn == "http-c1"
+    # Without the sets the record has no matches.
+    assert r.indicator_matches == [] and r.behaviours == []
+
+
+def test_sequence_is_bounded_on_the_record(tmp_path):
+    from agents.triage import SEQUENCE_KEPT
+
+    _, reports = _run(tmp_path, _recon_events(n_items=150), None)
+    r = load_records(reports)[0]
+    assert len(r.request_sequence) == SEQUENCE_KEPT and r.commands == 154
+
+
+def test_records_written_before_the_new_fields_still_load(tmp_path):
+    _, reports = _run(tmp_path, _recon_events(), None)
+    path = next((reports / "campaigns").glob("*.json"))
+    raw = json.loads(path.read_text())
+    for key in ("request_sequence", "indicator_matches", "behaviours"):
+        raw.pop(key)
+    path.write_text(json.dumps(raw))
+    r = load_records(reports)[0]
+    assert r.request_sequence == [] and r.behaviours == []
+
+
+@pytest.mark.usefixtures("public_test_net")
+def test_matches_are_recorded_and_change_nothing_else(tmp_path):
+    from agents.detect import blocklist_rows, record_reasons
+
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "found").mkdir()
+    _, plain_dir = _run(tmp_path / "plain", _recon_events(), None)
+    _, found_dir = _run(tmp_path / "found", _recon_events(), None, **_sets())
+    plain, found = load_records(plain_dir)[0], load_records(found_dir)[0]
+    assert {m.id for m in found.indicator_matches} == {"artex-ua-norma", "recon-env-js"}
+    norma = next(m for m in found.indicator_matches if m.id == "artex-ua-norma")
+    assert (norma.framework, norma.confidence, norma.count) == ("ARTEX", "medium", 14)
+    assert {b.id for b in found.behaviours} == {"discovered-routes-used", "object-enumeration"}
+    walk = next(b for b in found.behaviours if b.id == "object-enumeration")
+    assert (walk.count, walk.first_seq, walk.last_seq) == (10, 5, 14)
+    # Isolation: everything but the two new fields is identical.
+    strip = {"indicator_matches", "behaviours"}
+    assert found.model_dump(exclude=strip) == plain.model_dump(exclude=strip)
+    assert found.judgement.value == "BENIGN" and found.high_signal == {}
+    assert record_reasons(found) == record_reasons(plain)
+    now = LATER
+    assert blocklist_rows([found], now=now) == []
+    # Control: the same source judged SUSPICIOUS does produce a row.
+    assert [row["ip"] for row in blocklist_rows(
+        [found.model_copy(update={"judgement": Judgement.SUSPICIOUS})], now=now)] == [RECON_IP]
+
+
+def test_a_behaviour_alone_asks_the_model_for_the_narrative_only(tmp_path):
+    llm = FakeJsonLLM({**GOOD_TRIAGE, "judgement": "MALICIOUS", "intent": "DATA_THEFT",
+                       "narrative": "Walked the item routes it found in the bundle."})
+    out, reports = _run(tmp_path, _recon_events(), llm, **_sets())
+    assert out["llm_calls"] == 1 and len(llm.calls) == 1
+    transcript = llm.calls[0][1]
+    assert '"found_in": "bundle"' in transcript and '"t": 3' in transcript
+    assert "artex" not in transcript.lower() and "agentic" not in transcript.lower()
+    r = load_records(reports)[0]
+    assert r.llm_used and r.narrative.startswith("Walked the item routes")
+    assert r.judgement.value == "BENIGN" and r.intent.value == "RECONNAISSANCE"
+    assert r.techniques == [] and r.behaviours
+
+
+def test_without_a_behaviour_the_model_is_not_asked(tmp_path):
+    llm = FakeJsonLLM(GOOD_TRIAGE)
+    events = _recon_events(n_items=2, client="curl/8.0")
+    for e in events:
+        e["data"].pop("discovered_via", None)
+    out, _ = _run(tmp_path, events, llm, **_sets())
+    assert out["llm_calls"] == 0 and llm.calls == []
+
+
+def test_a_failing_rule_set_does_not_stop_triage(tmp_path):
+    class Broken:
+        def evaluate(self, requests):
+            raise RuntimeError("bug")
+
+        def match(self, *a):
+            raise RuntimeError("bug")
+
+    out, reports = _run(tmp_path, _recon_events(), None, indicators=Broken(), rules=Broken())
+    assert len(out["written"]) == 1 and load_records(reports)[0].behaviours == []
+
+
+def test_digest_lists_findings_as_like_a_framework_never_as_it(tmp_path):
+    _, reports = _run(tmp_path, _recon_events(), None, **_sets())
+    text = digest(reports, day=DAY, dry_run=True)
+    text = text if isinstance(text, str) else json.dumps(text)
+    assert "ARTEX-like" in text and "agentic reconnaissance" in text
+    assert "ARTEX activity" not in text

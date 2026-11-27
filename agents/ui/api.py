@@ -102,6 +102,7 @@ from agents.triage import (
     geo_view,
     rank,
     shodan_view,
+    findings_lines,
     record_layout,
     with_geo,
 )
@@ -737,6 +738,9 @@ class Api:
     # ``agents.internetdb.InternetDbReader`` (address -> ShodanInfo or None, never raises),
     # or None when ``[connector.internetdb]`` is off.
     shodan: Optional[Callable] = None
+    # ``agents.indicators.IndicatorSet`` for the provenance of a record's indicator
+    # matches (sources, report date, notes), or None when ``[indicators]`` is off.
+    indicators: Optional[object] = None
 
     def __post_init__(self) -> None:
         self._sightings = SightingsReader(self.sightings.file(self.paths.state), self.sightings)
@@ -1121,6 +1125,8 @@ class Api:
                "transcript_available": False, "transcript_withheld": None}
         if r.src_geo is not None:
             out.update(geo=geo_view(r.src_geo), geo_stored=stored)
+        if r.indicator_matches or r.behaviours:
+            out["findings"] = self._findings(r)
         if r.src_shodan is not None:
             out.update(shodan=shodan_view(r.src_shodan), shodan_stored=True)
         elif (known := self._known(r.src_ip)) is not None:
@@ -1141,6 +1147,23 @@ class Api:
         else:
             out["transcript_available"] = span is not None
         return 200, out
+
+    def _findings(self, r: TriageRecord) -> dict:
+        """The record's behaviour and indicator matches for display. Each indicator match
+        carries the entry's provenance from the loaded files (None when the entry is no
+        longer loaded); ``like`` names the frameworks of the record's indicator matches,
+        which a behaviour is described as resembling, never as attributed to."""
+        lookup = getattr(self.indicators, "provenance", None)
+        indicators = []
+        for m in r.indicator_matches:
+            try:
+                prov = lookup(m.id) if lookup is not None else None
+            except Exception:  # noqa: BLE001 - display only
+                prov = None
+            indicators.append({**m.model_dump(mode="json"), "provenance": prov})
+        return {"like": sorted({m.framework for m in r.indicator_matches if m.framework}),
+                "behaviours": [b.model_dump(mode="json") for b in r.behaviours],
+                "indicators": indicators, "lines": findings_lines(r)}
 
     def transcript(self, query: dict[str, str], rid: str) -> tuple[int, object]:
         r = self._record_id(rid)
