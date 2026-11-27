@@ -974,6 +974,10 @@ def _learn_advance(session_id: str, learn: Optional[_LearnTurn], text: str,
         # it left the session at is.
         state.script = learned.digest("opener", state.script, prompt)
         return
+    if (learn.volatile or getattr(result, "private_reply", False)) \
+            and learned.may_change_state(text):
+        state.script = None      # clock or address output kept in a file or a variable
+        return
     if learn.volatile or getattr(result, "private_reply", False):
         # Output that reads the clock or the source address differs in every session and
         # carries no state: the line and the prompt it left are chained, its output is not.

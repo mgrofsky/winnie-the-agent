@@ -351,6 +351,13 @@ _READERS = frozenset((
     "dmesg", "last", "lastlog", "netstat", "ss", "top", "env", "printenv", "locale",
     "busybox", "nvidia-smi", "pwd", "date",
 ))
+# Options that make a reading program write or run another: ``find -delete``, ``sort -o f``.
+_WRITING_OPTIONS = {
+    "find": ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0",
+             "-fprintf", "-fls"),
+    "sort": ("-o", "--output"),
+    "date": ("-s", "--set"),
+}
 _SEGMENTS = re.compile(r"\$\(|&&|\|\||[;&|\n(){}`]")
 _DEVNULL = re.compile(r"[0-9]*>>?\s*/dev/null|[0-9]*>&[0-9]|&>\s*/dev/null")
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -361,7 +368,8 @@ def may_change_state(text: str) -> bool:
     file (``/dev/null`` and descriptor copies aside), a variable assignment, a program in
     ``WRITERS`` in a command position (after any of ``sudo``, ``busybox``, ``xargs``,
     ``env``, ...), or a program run by path that is not a known reader (``./x``,
-    ``/tmp/x``). Errs on the side of True."""
+    ``/tmp/x``), or a reading program given an option that writes (``find -delete``,
+    ``sort -o``). Errs on the side of True."""
     if ">" in _DEVNULL.sub(" ", text):
         return True
     for segment in _SEGMENTS.split(text):
@@ -371,6 +379,10 @@ def may_change_state(text: str) -> bool:
         first = words[0]
         if _ASSIGN.match(first):
             return True
+        for word in words:
+            options = _WRITING_OPTIONS.get(word.rpartition("/")[2])
+            if options and any(w.startswith(options) for w in words):
+                return True
         name = first.rpartition("/")[2]
         if name in _WRAPPERS:
             # ``sudo -u root rm x``, ``busybox wget``: any later word may be the program.
