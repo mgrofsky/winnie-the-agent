@@ -834,6 +834,8 @@ installs `maxminddb` (the `geoip` extra in `pyproject.toml`); without Docker,
   hits, the records list (with a country filter), the record page (the Who line and the
   campaign's source addresses), approval cards, the blocklist and tracked list, the decoy
   screen's per-source state and the activity screen.
+- The console's Map places each source at its city's position from the City database
+  (rounded to a tenth of a degree, about 11 km). Positions are not stored on records.
 - The digest's Who line carries the same short form.
 - Exports and notifications do not change.
 
@@ -1262,6 +1264,7 @@ snippets run unchanged in bash and zsh. On another stack, replace `lab` with you
   what it means, not seen) on the record page, the overview and the queue, and the records
   table shows the headline; records written before the parts existed show their paragraph;
 - raw activity: every event in the log, any service, with filters and search;
+- a live map of where attacks come from and which service each one reached;
 - daily digests;
 - how the decoy is being adjusted (Decoy);
 - playbooks and detections.
@@ -1317,7 +1320,14 @@ port = 8480
 bind = 127.0.0.1
 actions = false
 operator = alice
+# Where the Map draws this sensor (latitude,longitude in degrees) and its label.
+map_home = 40.7,-74.0
+map_label = edge-1
 ```
+
+A `map_home` that is not two numbers in range stops the console at start with an error.
+Without it, the sensor is drawn at sea in the South Atlantic, labelled with
+`[honeypot] sensor_name`.
 
 The console refuses to bind anything but a loopback address unless given
 `--allow-non-loopback`. The Docker service uses it because the container binds 0.0.0.0
@@ -1554,6 +1564,37 @@ matched" rather than showing a reply that may belong to another command. A comma
 no reply logged says "no reply recorded". Campaign records keep their command sample as
 before: it gathers commands from many connections and has no single sequence to pair
 (Telnet sessions are campaigns, so their replies are read on the session view instead).
+
+### Map
+
+The Map screen (key `8`) draws the last 5 minutes, 15 minutes or hour of the event log on
+a world map. Each source is a dot at its city's position, sized by how many events it
+sent in the window and coloured by its newest triage judgement (grey until triage has
+written a record for it). The sensor is a honey pot ringed by one dock per service that
+received traffic, labelled with the service and its port, and each new event is a bee
+flying from its source to the dock of the service it reached. Beside the map, a feed
+lists the same events as text: time, service and port, event, outcome, place, source and
+a one-line summary. The tiles above count events, events per minute, the top countries
+and services, and the bees in flight.
+
+- Hover or focus a dot or a feed row to highlight the other; click either (or press Enter
+  on a row) to open Activity filtered to that source.
+- Pause freezes the map and holds new events until you resume. Hide addresses leaves only
+  places on screen, for screenshots. The service buttons under the map hide a service's
+  bees and feed rows.
+- The screen asks for new events every 5 seconds and releases them at their original
+  spacing, so motion stays continuous. At most 60 bees fly at once; beyond that, events
+  from the same source and service share a bee with a count. When more than 300 events
+  arrive between two polls, the map draws the newest 300 and the counts include the rest.
+- With reduced motion set in the operating system, sources light up in place instead of
+  sending bees, and the feed updates as usual.
+- Positions need a City database ([Where addresses are](#where-addresses-are)). Without
+  one, or for private, documentation and unverified addresses, sources arrive from the
+  "Unlocated" lane at the map's lower left and are still listed in the feed. Positions are
+  city level and approximate, and show the exit of any VPN or proxy.
+- When the event log is rotated, the map reloads from the current log.
+
+The land outline is from Natural Earth (public domain).
 
 ### Decoy
 
