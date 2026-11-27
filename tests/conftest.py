@@ -11,6 +11,13 @@ if str(SSH_DIR) not in sys.path:
 
 import ssh_server  # noqa: E402
 
+# The browser tests need the optional "browser" dependency group (pytest-playwright);
+# without it their folder is not collected at all.
+try:
+    import playwright  # noqa: F401
+except ImportError:
+    collect_ignore = ["browser"]
+
 
 @pytest.fixture(autouse=True)
 def isolated_data_dir(tmp_path_factory, monkeypatch):
