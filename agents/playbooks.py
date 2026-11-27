@@ -22,9 +22,18 @@ import tomllib
 from pathlib import Path
 from typing import Annotated, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from agents import REPO_ROOT
+from agents.indicators import CONFIDENCE_RANK, ID_PATTERN, Confidence
 from agents.source_state import MAX_TARPIT_MS, TAG_RE
 from agents.triage import (
     JUDGEMENT_RANK,
@@ -96,6 +105,23 @@ class Conditions(Strict):
     malware_indicators: Optional[bool] = None
     nothing_novel: Optional[bool] = None
     scenarios: list[str] = Field(default_factory=list, max_length=10)
+    # Behaviour rule ids (detections/behaviours) and an indicator confidence floor. They
+    # compare code- and operator-set ids and levels only, never attacker text.
+    behaviours_any: list[str] = Field(default_factory=list, max_length=20)
+    indicator_confidence_at_least: Optional[Confidence] = None
+
+    @field_validator("behaviours_any")
+    @classmethod
+    def _behaviours(cls, v: list[str]) -> list[str]:
+        for b in v:
+            if not re.fullmatch(ID_PATTERN, b):
+                raise ValueError(f"bad behaviour rule id {b!r}")
+        return v
+
+    def given(self) -> set[str]:
+        """Names of the conditions this block sets."""
+        return {name for name in type(self).model_fields
+                if getattr(self, name) not in (None, [])}
 
     @field_validator("scenarios")
     @classmethod
@@ -205,9 +231,30 @@ class Playbook(Strict):
             raise ValueError("bad playbook name")
         return v
 
+    @model_validator(mode="after")
+    def _enforce_needs_evidence(self) -> "Playbook":
+        # An enforce step must rest on more than behaviour or indicator matches: those are
+        # pattern and list matches, not proof. Scoping conditions (kinds, protocols,
+        # scenarios) do not count as evidence.
+        for i, step in enumerate(self.steps):
+            if tier_of(step) != "enforce":
+                continue
+            given = self.when.given() | (step.only_if.given() if step.only_if else set())
+            evidence = given - SCOPE_CONDITIONS
+            if evidence and evidence <= MATCH_CONDITIONS:
+                raise ValueError(
+                    f"step {i + 1} ({step.action}) is an enforce action whose only "
+                    f"conditions are {', '.join(sorted(evidence))}; add another condition")
+        return self
+
 
 def tier_of(step) -> ActionTier:
     return ACTION_TIERS[step.action]
+
+
+# Conditions on behaviour and indicator matches, and conditions that only scope a playbook.
+MATCH_CONDITIONS = frozenset({"behaviours_any", "indicator_confidence_at_least"})
+SCOPE_CONDITIONS = frozenset({"kinds", "protocols", "scenarios"})
 
 
 # ---- loading -----------------------------------------------------------------------------
@@ -301,5 +348,11 @@ def matches(cond: Conditions, record: TriageRecord, facts: dict) -> bool:
         if wanted is not None and bool(facts.get(name)) != wanted:
             return False
     if c.scenarios and facts.get("scenario") not in c.scenarios:
+        return False
+    if c.behaviours_any and not any(b.id in c.behaviours_any for b in record.behaviours):
+        return False
+    if c.indicator_confidence_at_least is not None and not any(
+            CONFIDENCE_RANK[m.confidence] >= CONFIDENCE_RANK[c.indicator_confidence_at_least]
+            for m in record.indicator_matches):
         return False
     return True

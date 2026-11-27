@@ -1,0 +1,22 @@
+name = "agentic_recon"
+description = "An HTTP source whose request sequence matched an agentic reconnaissance behaviour rule (routes found in a bundle or API document then called, object ids walked, recovery flows probed, a served marker sent back). Tag, capture more and notify; no enforcement, since a pattern match alone is not proof."
+enabled = true
+cooldown_minutes = 60
+max_runs_per_day = 200
+
+[when]
+kinds = ["campaign"]
+protocols = ["http"]
+behaviours_any = ["discovered-routes-used", "object-enumeration", "recovery-probing", "marker-reuse", "adaptive-retries"]
+
+[[steps]]
+action = "tag_source"
+tag = "agentic_recon"
+
+[[steps]]
+action = "capture_more"
+
+[[steps]]
+action = "notify"
+connectors = ["webhook", "siem_http", "email"]
+include = ["tags"]

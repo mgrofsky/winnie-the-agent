@@ -98,7 +98,7 @@ def test_schema_rejects_unknown_actions_conditions_and_tier_overrides(bad):
 
 def test_tiers_are_fixed_in_code_and_shipped_playbooks_validate():
     pbs, errors = load_playbooks()
-    assert errors == [] and len(pbs) == 7
+    assert errors == [] and len(pbs) == 8
     for p in pbs:
         for step in p.steps:
             assert tier_of(step) == ACTION_TIERS[step.action]
@@ -571,3 +571,70 @@ def test_s3_upload_triggers_malware_drop_and_planted_key_honeytoken_reuse(tmp_pa
                                                      "signals": ["s3_planted_key"]},
         "steps": [{"action": "tag_source", "tag": "s3_key"}]})
     assert planted.when.protocols == ["s3"]
+
+
+# ---- behaviour and indicator conditions ----------------------------------------------------
+
+def _matched(behaviours=(), indicators=(), **kw):
+    from agents.behaviours import BehaviourMatch
+    from agents.indicators import IndicatorMatch
+
+    r = rec(protocol="http", signals={}, judgement="BENIGN", **kw)
+    return r.model_copy(update={
+        "behaviours": [BehaviourMatch(id=b, label="agentic reconnaissance", confidence="medium",
+                                      count=2) for b in behaviours],
+        "indicator_matches": [IndicatorMatch(id=f"ind-{c}", label="x", confidence=c, count=1)
+                              for c in indicators]})
+
+
+@pytest.mark.parametrize("when,only_if", [
+    ({"behaviours_any": ["object-enumeration"]}, None),
+    ({"indicator_confidence_at_least": "medium"}, None),
+    ({"behaviours_any": ["object-enumeration"], "indicator_confidence_at_least": "low",
+      "protocols": ["http"], "kinds": ["campaign"], "scenarios": ["dev_portal"]}, None),
+    ({"protocols": ["http"]}, {"behaviours_any": ["marker-reuse"]}),
+])
+@pytest.mark.parametrize("action", ["export_blocklist", "publish_detection", "open_ticket",
+                                    "block_webhook"])
+def test_enforce_step_refused_on_match_only_conditions(when, only_if, action):
+    step = {"action": action, **({"only_if": only_if} if only_if else {})}
+    with pytest.raises(ValidationError, match="enforce action whose only conditions"):
+        pb(when=when, steps=[step])
+
+
+def test_enforce_step_allowed_with_other_evidence_and_local_steps_always_allowed():
+    pb(when={"behaviours_any": ["object-enumeration"], "judgement_at_least": "SUSPICIOUS"},
+       steps=[{"action": "export_blocklist"}])
+    pb(when={"behaviours_any": ["object-enumeration"]},
+       steps=[{"action": "export_blocklist", "only_if": {"honeytoken": True}}])
+    pb(when={"behaviours_any": ["object-enumeration"]},
+       steps=[{"action": "tag_source", "tag": "recon"}, {"action": "notify",
+                                                         "connectors": ["webhook"]}])
+
+
+def test_match_conditions_refuse_bad_values():
+    with pytest.raises(ValidationError):
+        pb(when={"behaviours_any": ["Not An Id"]})
+    with pytest.raises(ValidationError):
+        pb(when={"indicator_confidence_at_least": "certain"})
+
+
+def test_match_conditions_read_only_ids_and_levels():
+    from agents.playbooks import Conditions, derive_facts, matches
+
+    by_rule = Conditions(behaviours_any=["object-enumeration", "marker-reuse"])
+    by_level = Conditions(indicator_confidence_at_least="medium")
+    hit = _matched(behaviours=["object-enumeration"], indicators=["medium"])
+    miss = _matched(behaviours=["recovery-probing"], indicators=["low"])
+    for cond, want in ((by_rule, (True, False)), (by_level, (True, False))):
+        assert (matches(cond, hit, derive_facts(hit)), matches(cond, miss, derive_facts(miss))) \
+            == want
+    assert matches(by_level, _matched(indicators=["high"]), {})
+    assert not matches(by_rule, _matched(), {})
+
+
+def test_shipped_agentic_recon_playbook_never_enforces():
+    pbs, _ = load_playbooks()
+    recon = next(p for p in pbs if p.name == "agentic_recon")
+    assert {tier_of(s) for s in recon.steps} <= {"local", "notify"}
+    assert recon.when.behaviours_any and recon.when.judgement_at_least is None
