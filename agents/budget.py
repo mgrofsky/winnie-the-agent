@@ -19,7 +19,7 @@ is hit the caller does not call the model; it returns a canned response.
 - IPv6 sources are keyed on their /64.
 - Per session, at most ``max_model_commands_per_session`` commands are answered by the
   model; after that the deterministic shell answers (the session stays open). Answers
-  given without a model call (local, cached) do not count toward it.
+  given without a model call (local, cached, learned) do not count toward it.
 - Per-source mode from the response playbooks (``mode_provider``): ``shallow`` refuses all
   model calls for that source (canned replies); ``deep`` doubles its per-session and
   per-source limits. The global daily cap never changes.
@@ -308,6 +308,7 @@ class _SessionState:
     commands: int = 0
     answered_locally: int = 0   # commands counted without a model call (local, cached, capped)
     cached: int = 0             # of those, model replies served from the reply cache
+    learned: int = 0            # of those, replies served from the learned store
     model_cap_logged: bool = False
     tokens: int = 0
     history_chars: int = 0
@@ -391,16 +392,21 @@ class Budget:
             if state is not None and state.registered else None
 
     def model_answered(self, session_id: str) -> bool:
-        """Whether a model reply (fresh or from the reply cache) has answered a command in
-        this session, so the session's state may differ from the host profile."""
+        """Whether a model reply (fresh, from the reply cache or learned) has answered a
+        command in this session, so the session's state may differ from the host profile."""
         state = self._sessions.get(session_id)
         return state is not None and (state.commands > state.answered_locally
-                                      or state.cached > 0)
+                                      or state.cached > 0 or state.learned > 0)
 
     def cached_commands(self, session_id: str) -> int:
         """Commands answered from the reply cache in this session."""
         state = self._sessions.get(session_id)
         return state.cached if state is not None else 0
+
+    def learned_commands(self, session_id: str) -> int:
+        """Commands answered from the learned store in this session."""
+        state = self._sessions.get(session_id)
+        return state.learned if state is not None else 0
 
     def model_cap(self, session_id: str, ip: str) -> int:
         """The session's ``max_model_commands_per_session`` (doubled for a ``deep``
@@ -485,8 +491,10 @@ class Budget:
         state.tokens += est
         return None, Reservation(session_id, state.ip, est, counts_as_command)
 
-    def count_command(self, session_id: str, ip: str, cached: bool = False) -> Optional[str]:
-        """Count a command answered without a model call (canned, local or ``cached``).
+    def count_command(self, session_id: str, ip: str, cached: bool = False,
+                      learned: bool = False) -> Optional[str]:
+        """Count a command answered without a model call (canned, local, ``cached`` or
+        ``learned``).
         Only the per-session command cap and the source's mode apply; no tokens are
         charged, and it does not count toward the model cap."""
         state = self._session(session_id, ip)
@@ -499,6 +507,7 @@ class Budget:
         state.commands += 1
         state.answered_locally += 1
         state.cached += 1 if cached else 0
+        state.learned += 1 if learned else 0
         return None
 
     def add_history(self, session_id: str, ip: str, input_text: str, output_text: str) -> None:

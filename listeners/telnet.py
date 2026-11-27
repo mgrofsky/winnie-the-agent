@@ -143,14 +143,23 @@ def _logged(text: str) -> str:
     return printable(text[:RESPONSE_LOG_CAP])[:RESPONSE_LOG_CAP]
 
 
+def _step(resp) -> dict:
+    """The reply step (``agents.hooks.persona_invoke``) for the command event."""
+    step = getattr(resp, "reply_step", None)
+    return {"step": step[:16]} if isinstance(step, str) else {}
+
+
 def _note_cut(conn: Conn, user: str, resp) -> None:
     """One ``notice`` event when the persona reply was cut back to one round
     (``agents.onereply``): counts and a short sample of what the model invented, which is
     never an input of the client's. One ``notice`` event per persona retry, with its
-    reason."""
+    reason, and one when a learned reply answered (``agents.learned``)."""
     cut = getattr(resp, "reply_cut", None)
     if isinstance(cut, dict):
         conn.emit("notice", "Reply cut", username=user, data=cut)
+    learned = getattr(resp, "learned_reply", None)
+    if isinstance(learned, dict):
+        conn.emit("notice", "Learned reply", username=user, data=learned)
     retries = getattr(resp, "persona_retry", None)
     if isinstance(retries, list):
         for attempt, reason in enumerate(retries, 1):
@@ -191,7 +200,8 @@ async def _persona_session(conn: Conn, reader: TelnetReader, user: str) -> None:
             exceeded = bool(getattr(resp, "budget_exceeded", False))
             conn.emit("command", "Telnet input", username=user,
                       data={"input": line, "response": _logged(content),
-                            "persona": True, "budget_exceeded": exceeded})
+                            "persona": True, "budget_exceeded": exceeded,
+                            **_step(resp)})
             conn.capture("telnet_input", line)
             _note_cut(conn, user, resp)
             if content == END_OF_SESSION:

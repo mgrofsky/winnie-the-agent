@@ -142,7 +142,7 @@ session has done (`agents.shell.FIXED`, `SESSION`, `STATE`; a line takes the hig
   including `/etc/os-release` and the other release files, a file that does not exist, a
   program path that does not exist, such as `/usr/bin/xmr`, and a command the host does
   not have) are answered locally only
-  until a model reply (fresh or cached) has answered a command in the session; after that
+  until a model reply (fresh, cached or learned) has answered a command in the session; after that
   the model answers them, because it may have run `hostname x`, `useradd`, written a file
   or downloaded a program. The model's own session opener does not count.
 - Commands that change the session (`cd`, `export`, `unset`, `history`, `wget`, `curl`,
@@ -591,8 +591,9 @@ SSH `message` values include `SSH connection received`, `User attempting to auth
 `details`), `Session summary` (summary in `details`, `judgement` field: `BENIGN`,
 `SUSPICIOUS`, `MALICIOUS`, or `UNKNOWN` when no summary was made, for example without a
 model), `Budget exceeded`
-(with `reason`), `Model error`, `Persona retry`, `Persona break`, `Reply cut`, `Session timeout` and
-`SSH connection closed`.
+(with `reason`), `Model error`, `Persona retry`, `Persona break`, `Reply cut`, `Learned reply`
+(with `learned_id` and `learned_rule`), `Session timeout` and `SSH connection closed`. `LLM response` also
+carries `reply_step`, the step that answered (see "Reply path and learned replies").
 
 Listener events add:
 
@@ -745,3 +746,151 @@ model is not called: the attacker gets a canned error and the session closes, an
 
 SSH reads a whole line before the line cap applies (the SSH library buffers it), so a very
 long line without a newline still costs memory before it is truncated.
+
+### Reply path and learned replies
+
+A persona command (SSH or Telnet) is answered by the first of these steps that can:
+
+1. the deterministic shell, from the host profile (`local_shell_replies`, above);
+2. the reply cache, for a session whose history so far is identical to one already seen;
+3. a learned reply (`agents/learned.py`, `[llm] learned_replies`, on by default);
+4. the deterministic shell, once the session reached `max_model_commands_per_session`;
+5. the model.
+
+Learned replies are the model's own earlier answers, kept on disk so that over time the
+model is asked only for commands the sensor has not seen often enough. Every fresh model
+reply sent as the model wrote it (not cut back to one round, retried, replaced for
+breaking character or misprinting an `echo`, and not a fallback, budget or model-cap
+reply) is one observation of its command. An entry is served once its reply was observed
+in at least `learned_min_sessions` sessions (default 3), from at least two source
+networks (/24 for IPv4, /64 for IPv6), after at least two different sequences of earlier
+input lines, and never with any other reply. A session's first command (the opener is
+not a command) is also served when the observations made as first commands alone meet
+the session and network counts: those sessions all started in the same state, and an SSH
+exec session has no other command. An entry observed once with a different reply, or with
+a reply that cannot be stored (it moved the prompt, names the source address, or holds a
+trace of a token), is marked varying and is never served, which keeps commands whose
+output depends on the clock, on randomness or on what the session did with the model.
+
+A second rule serves replayed scripts, whose later lines always follow the same earlier
+lines. Each session keeps a script digest: a hash chained from the host fingerprint, the
+login user and interactive or exec, over every command line in order and the reply as
+sent. Random-looking tokens are numbered once per session and replaced by that number in
+both the line and the reply, so two runs of a script that differ only in their random
+markers share a digest. The output of a line that reads the clock or the source address
+(the volatile list above, or a local answer from `w`, `uptime` and the like) is left out
+of the chain; the line itself is kept. A command is served when this entry was observed
+with the identical reply under the session's current digest in at least
+`learned_min_sessions` sessions from at least two networks, and only when the line's
+tokens are bound the same way: each token in the line is the same earlier token of the
+session, or a new one, as in the teaching sessions, so `cat /tmp/B` after
+`echo A > /tmp/A` never gets the reply taught for `cat /tmp/A`. Such a session typed exactly
+what those sessions typed and was shown exactly what they were shown, so it is in their
+state, and this rule ignores the state-changing check below: a script that writes a file
+and reads it back is answered in full. The reply is stored whole, prompt included. A
+token that an earlier line wrote and a later line reads back appears in the stored reply
+as its session number, so a session is shown its own token, never one from the sessions
+that taught it; a reply that holds a token in any other form (a piece of it, another
+case, its base64 or hex decoding) cannot be stored and marks that history varying.
+Evidence and the varying mark are kept per digest, so a command that differs between
+scripts can still be served within each one: up to 64 digests per entry, of which at most
+16 hold reply text (the others keep a digest of their reply until they reach the
+threshold); past either cap the least recently seen digest of that kind goes, varying
+mark included. A line that computes over its text (the programs and forms listed below)
+in a session that has tokens is chained but neither served nor observed by this rule.
+The token lengths and classes are part of the digest, and when every teaching session
+used the same token values, the reply is served only to a session with those same values:
+a reply can depend on a value in ways a trace check cannot see (its length, a count), so
+other values need evidence from at least two different sets. The session opener is learned under
+this rule too, and is not part of the chain, since banners may differ. A session leaves
+this rule for good when a line cannot be made a template (more than 8 distinct tokens in
+the session, a control character, over 512 characters), when it is refused by the budget,
+or when its state was evicted. A served reply continues the chain, so after a restart a
+whole script that three sessions ran is answered line by line with no model request. Each
+`Learned reply` event carries `learned_rule`: `history` or `script`.
+
+- Templates. Random-looking tokens in a command (a UUID, a run of 16 or more hex digits,
+  a run of 20 or more base64 characters mixing upper case, lower case and digits) become
+  numbered placeholders, one number per distinct value, and the reply holds the same
+  placeholders wherever a value appears verbatim. A reply that holds a piece of a token,
+  a token in another case, a token's base64 or hex decoding, or a random-looking token
+  that is not in the command is not learned. Serving fills in the new command's values,
+  but a value the teaching sessions did not use is served only once their observations
+  span two or more different sets of values: a reply can depend on a value in ways no
+  trace check sees (its length, a count). Both rules apply this.
+- Token shape and computed output. Each token's length and character class (digits,
+  lower-case hex, upper-case hex, mixed-case hex, UUID, base64-like) is part of an
+  entry's key, so an answer seen for 20-character hex tokens never stands for a
+  30-character or an all-digit one. Placeholders also keep each token's position and
+  whether it repeats (`cp A A` and `cp A B` are different entries). A command that
+  computes over its text (`wc`, `printf`, `expr`, `awk`, `sed`, `cut`, `head`, `tail`,
+  `tr`, `base64`, `od`, checksums, `grep`, scripting languages, `$((...))`, `${...}`, and
+  the like; `learned.COMPUTERS`) is learned only for its exact text, never with
+  placeholders. A reply that holds two or more different tokens is not learned, because
+  their order can follow their values (`ls` sorts names).
+- Prompt. An interactive reply is stored without its final prompt and only when that
+  prompt is the one the session showed before the command; serving adds the session's
+  current prompt. An exec reply is stored whole.
+- Session state. A session teaches and gets learned replies only while none of its lines
+  so far could change what a later command prints: no redirect into a file (`/dev/null`
+  aside), no variable assignment, no program that writes, moves, downloads, changes
+  users, directory or environment, or runs other code (`cd`, `wget`, `chmod`, `sh`,
+  `sudo rm`, `./x`, `/tmp/x`, ...; `learned.WRITERS`). A learned reply was made on a
+  host in its starting state, so it is served only to a session still in that state. The
+  session opener does not count. A session whose state was evicted is out for good.
+- Not used: lines whose real output changes between runs (the reply cache's list:
+  `date`, `uptime`, `ps`, `/dev/urandom`, ...), replies that end the session or contain
+  the source address, sources with a planted token or a `deep` or `shallow` mode,
+  commands over 512 characters or with control characters, replies over 8 KB or with
+  control characters other than line endings and tabs.
+- Keys. An entry is keyed by the host fingerprint (hostname, kernel, sensor seed, the
+  persona block, the profile facts, the `[llm]` provider and model, and the system and
+  persona prompt text the front-end was started with), the login user, interactive or exec, and the command template. A changed
+  scenario, tuner overlay, model or prompt starts from nothing.
+- A learned reply counts toward `max_commands_per_session`, not the model cap, costs no
+  tokens, is added to the session history as a model reply would be, counts as a model
+  reply for the local-answer rule and for the session summary, and keeps the session in
+  or out of the reply cache as a cached reply does. `local_reply_delay_ms` applies.
+- Storage. `learned_replies.json` beside `[budget] state_file`, at most 64 MB written
+  (past that, entries that are not served go first), mode 0600, read and
+  written under an exclusive lock on `learned_replies.json.lock` and replaced atomically,
+  so the SSH server and the listeners (Telnet) share it. At most `learned_max_entries`
+  entries (default 2000, at most 3000); past that, entries that are not served go first,
+  least recently seen first. Each entry keeps at most 16 sessions' observations (the
+  first ones) and counts up to 16 source networks. Every entry read back is checked
+  again (lengths, printable text, placeholders) and dropped when it fails. A read, write
+  or lock failure sends the command to the model. With `learned_replies = false` no file
+  is read or written.
+- The file holds a version line, then one entry per line, so a reload decodes it in
+  small pieces; a write reuses the lines of entries that did not change, and a process
+  that wrote the file last does not read it back before its next write.
+- No session waits on the file. Recording an observation, writing the served counts and
+  reloading a file another process changed all run in one worker thread of the process,
+  fed by a queue of at most 256 jobs; the reply path only adds to the queue. When the
+  queue is full the observation is dropped and counted, with a warning at most once a
+  minute. Lookups read the in-memory copy; when the file's inode, size or modification
+  time changed they ask the worker for a reload (one at a time) and use the copy they
+  have until the new one replaces it whole. At start the worker reads the file once, and
+  at shutdown the SSH server and the listeners wait for the queue to drain.
+- Events. A served reply logs `Learned reply` (`learned_id`, `learned_rule`; Telnet: a
+  `notice` with the same `data`). Every SSH `LLM response` carries `reply_step` (`local`, `cached`,
+  `learned`, `capped`, `model`, `fallback`, `budget`, `offline`, or `opener`), and every
+  Telnet persona `Telnet input` carries `data.step`.
+
+`python -m agents learned` reads and edits the store (plain text on standard output, with
+stored text escaped; no run lock, no model):
+
+| Option | What it prints or does |
+|---|---|
+| `--stats` (default) | Entries, served entries, varying entries, times served, and the share of commands answered by each step in the event log. |
+| `--list` | Up to 200 entries, newest first: id, user, `tty` or `exec`, counts, state, command and reply templates. |
+| `--candidates` | The command templates that reach the model most often and are not served, with how often they were asked, the source networks that asked, and what each still needs. These are the commands worth a canned answer. |
+| `--forget ID` | Drops one entry (the 16-character id from `--list`). |
+| `--clear` | Drops every entry. |
+
+The running processes pick up a change to the file shortly after their next lookup. Reading needs no
+lock (the file is only ever replaced whole), so `--stats`, `--list` and `--candidates`
+work from a read-only mount such as the `agents` container's view of the `frontend`
+volume; `--forget` and `--clear` need write access, so run them where the store is
+writable (in Docker, a container that mounts the `frontend` volume read-write), and a
+failed read or write is reported as an error.

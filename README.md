@@ -363,7 +363,8 @@ On a remote host, reach it with `ssh -L 8480:127.0.0.1:8480 <host>`. Sign-in, ac
   answered by a deterministic shell without the model, a session gets at most 50 model
   answers (then the shell answers the rest), and a bot replaying a script another session
   already ran, with an identical history, gets the cached replies instead of new model
-  calls.
+  calls. A command whose model reply was the same in enough unrelated sessions is then
+  answered from the learned replies with no model call (`python -m agents learned`).
 - **The model cannot steer the system.** Models get no tools, files or network. Analyst
   output must validate against strict schemas; the tuner only picks from candidates the
   code generated; playbooks are matched and executed by code. Attacker text reaches
