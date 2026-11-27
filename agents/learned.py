@@ -362,6 +362,8 @@ _WRITING_OPTIONS = {
 _SEGMENTS = re.compile(r"\$\(|&&|\|\||[;&|\n(){}`]")
 _DEVNULL = re.compile(r"[0-9]*>>?\s*/dev/null|[0-9]*>&[0-9]|&>\s*/dev/null")
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Quoting the shell removes before it runs a word: ``c\\d`` and ``c'd'`` both run ``cd``.
+_QUOTING = str.maketrans("", "", "\"'\\")
 
 
 def may_change_state(text: str) -> bool:
@@ -374,7 +376,7 @@ def may_change_state(text: str) -> bool:
     if ">" in _DEVNULL.sub(" ", text):
         return True
     for segment in _SEGMENTS.split(text):
-        words = [w.strip("\"'\\") for w in segment.split()]
+        words = [w.translate(_QUOTING) for w in segment.split()]
         if not words:
             continue
         first = words[0]
