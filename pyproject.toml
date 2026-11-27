@@ -1,6 +1,6 @@
 [project]
 name = "winnie-the-agent"
-version = "0.4.0"
+version = "0.5.0"
 description = "LLM-driven SSH honeypot with multi-protocol login traps, scenario packs, triage, decoy tuning and response playbooks (based on DECEIVE)"
 readme = "README.md"
 license = "MIT"
