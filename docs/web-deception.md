@@ -17,8 +17,8 @@ The parts:
 - **Lures and discovery**: every asset and the OpenAPI document has a lure ID. A source
   that fetches one is recorded as shown its routes, and its later requests to those
   routes carry `discovered_via` (the lure ID) and `discovered_age` (seconds since).
-  A route marked `hidden` is reachable only through an asset or a scenario-written
-  document.
+  A route marked `hidden` is left out of the generated OpenAPI document, so a visitor
+  learns of it only from an asset or a document the scenario writes.
 - **Per-source markers**: `{marker:NAME}` in an asset or route body becomes a value
   derived for that source. When the value comes back in a later request, from the same
   source or another one, the event names the marker.
@@ -97,6 +97,7 @@ hidden = true
 dataset = "{dataset}"
 job_id = "{marker:export_job_id}"
 status = "queued"
+# ...
 
 [[services.http.assets]]
 path = "/static/js/main.{{hex:8:bundle}}.js"
@@ -104,8 +105,11 @@ kind = "bundle"
 lure = "main-bundle"
 advertises = [
     "/api/v1/projects",
+    "/api/v1/projects/{id}",
     "/api/v1/users/{id}",
+    "/api/v1/auth/username",
     "/api/v1/auth/forgot-password",
+    "/api/v1/auth/reset-password",
     "/api/internal/admin/settings",
     "/api/internal/export/{dataset}",
 ]
@@ -118,9 +122,12 @@ advertises = ["/api/v1/projects", "/api/internal/export/{dataset}"]
 body = '''
 window.__ENV__ = {
   "apiBase": "/api",
+  "environment": "production",
   "release": "{marker:build}",
   "oauthClientId": "{marker:client_id}",
-  "publicApiKey": "{marker:public_api_key}"
+  "publicApiKey": "{marker:public_api_key}",
+  "exportsPath": "/api/internal/export",
+  "features": { "bulkExport": true, "sso": false, "betaReports": false }
 };
 '''
 ```
@@ -145,9 +152,10 @@ then sends the API key `/env.js` gave it. One full line:
 {"timestamp": "2026-11-27T18:45:06.042+00:00", "level": "INFO", "task_name": "http-077db2c2-9ee2-4783-9e61-57593c610999", "src_ip": "198.51.100.77", "src_port": 52055, "dst_ip": "198.51.100.10", "dst_port": 52053, "message": "GET /static/js/main.366146e5.js", "sensor_name": "e2e", "sensor_protocol": "http", "event": "command", "transport": "tcp", "client": "norma/0.4", "data": {"method": "GET", "path": "/static/js/main.366146e5.js", "query": "", "status": 200, "host": "web01", "route": "asset", "seq": 2, "req": 1, "lure_id": "main-bundle", "resp_type": "application/javascript", "resp_bytes": 1002}}
 ```
 
-The rest, trimmed (connection and close lines and the keys `level`, `task_name`, ports,
+Then a selection, trimmed: connection and close lines and the requests with `seq` 1, 3, 6,
+8 to 17 and 20 are left out, and so are the keys `level`, `task_name`, ports,
 `dst_ip`, `message`, `sensor_name`, `sensor_protocol`, `transport`, `host`, `req`,
-`query`, `resp_type`, `resp_bytes`, `content_type` and `body_bytes` left out):
+`query`, `resp_type`, `resp_bytes`, `content_type` and `body_bytes`:
 
 ```json
 {"timestamp": "2026-11-27T18:45:06.043+00:00", "src_ip": "198.51.100.77", "event": "command", "client": "norma/0.4", "data": {"method": "GET", "path": "/api/openapi.json", "status": 200, "route": "openapi", "seq": 4, "lure_id": "openapi"}}
@@ -157,7 +165,7 @@ The rest, trimmed (connection and close lines and the keys `level`, `task_name`,
 {"timestamp": "2026-11-27T18:45:06.053+00:00", "src_ip": "198.51.100.77", "event": "command", "client": "norma/0.4", "data": {"method": "POST", "path": "/api/v1/auth/username", "status": 200, "route": "/api/v1/auth/username", "seq": 19, "lure_id": "username-check", "discovered_via": "main-bundle", "discovered_age": 0, "flow": "username_check", "flow_step": "exists", "body": "{\"username\": \"ops@dornbank-app.example\"}"}}
 {"timestamp": "2026-11-27T18:45:06.054+00:00", "src_ip": "198.51.100.77", "event": "command", "client": "norma/0.4", "data": {"method": "POST", "path": "/api/v1/auth/reset-password", "status": 400, "route": "/api/v1/auth/reset-password", "seq": 21, "lure_id": "recovery-reset", "discovered_via": "main-bundle", "discovered_age": 0, "flow": "recovery_reset", "flow_step": "token_rejected", "body": "{\"token\": \"stale-link\", \"password\": \"pw\"}"}}
 {"timestamp": "2026-11-27T18:45:06.055+00:00", "src_ip": "198.51.100.77", "event": "command", "client": "norma/0.4", "data": {"method": "GET", "path": "/api/v1/auth/activate/stale-link", "status": 400, "route": "/api/v1/auth/activate/{token}", "seq": 22, "lure_id": "activation", "flow": "activation", "flow_step": "token_rejected"}}
-{"timestamp": "2026-11-27T18:45:06.055+00:00", "src_ip": "198.51.100.77", "event": "auth_attempt", "username": "<api_key>", "password": "MJjdqR3s225DkWsivDDzz8Lse61MqBBY", "client": "norma/0.4", "data": {"method": "api_key", "path": "/api/v1/projects"}}
+{"timestamp": "2026-11-27T18:45:06.055+00:00", "src_ip": "198.51.100.77", "event": "auth_attempt", "username": "<api_key>", "password": "MJjdqR3s225DkWsivDDzz8Lse61MqBBY", "client": "norma/0.4", "success": false, "data": {"method": "api_key", "path": "/api/v1/projects"}}
 {"timestamp": "2026-11-27T18:45:06.055+00:00", "src_ip": "198.51.100.77", "event": "command", "client": "norma/0.4", "data": {"method": "GET", "path": "/api/v1/projects", "status": 401, "route": "/api/v1/projects", "seq": 23, "discovered_via": "main-bundle", "discovered_age": 0, "marker": "public_api_key", "api_key_header": "X-Api-Key"}}
 ```
 
@@ -285,7 +293,7 @@ The three user agents carry the framework ARTEX. User agents are trivially chang
 the reports say so: Microsoft says threat actors using ARTEX can and do vary them, and Wiz
 says many in its list are not unique to this actor. The paths and queries carry no
 framework, since any scanner may request them. No port, request rate or address ships as
-an indicator; the reports give no ports or rates for web probing, and addresses go stale.
+an indicator.
 
 To add your own entries, including addresses, put another `.toml` file beside the shipped
 one in `detections/indicators/`. `[indicators] path` in `config.ini` points at one directory
@@ -364,7 +372,7 @@ notification goes through whichever of those connectors are enabled.
 - Everything served is synthetic. Asset text, the OpenAPI document and route bodies come
   from the scenario and its seed, and generated asset text is checked with the rest of the
   scenario by `scenarios.check`.
-- Markers have no fixed shape. A value is derived from the sensor seed, the scenario, the
+- Markers have no fixed prefix or fragment. A value is derived from the sensor seed, the scenario, the
   source and the marker name, in the plain format its name suggests, and is recognised by
   lookup of what was issued, so the source code gives a reader nothing to search for.
 - Discovery, markers and ID counts are held in memory per source, for a day after the
