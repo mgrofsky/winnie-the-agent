@@ -285,7 +285,7 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
             process.stdout.write(f"{llm_response.content}")
             logger.info(
                 "LLM response",
-                extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8', 'surrogateescape')).decode('utf-8'), interactive=False)
+                extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8', 'surrogateescape')).decode('utf-8'), interactive=False, **agent_hooks.step_fields(llm_response))
             )
             await session_summary(process, llm_config, with_message_history, server, log_extra)
             process.exit(0)
@@ -296,7 +296,7 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
             process.stdout.write(f"{llm_response.content}")
             logger.info(
                 "LLM response",
-                extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8', 'surrogateescape')).decode('utf-8'), interactive=True)
+                extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8', 'surrogateescape')).decode('utf-8'), interactive=True, **agent_hooks.step_fields(llm_response))
             )
             if getattr(llm_response, "budget_exceeded", False):  # canned reply, then close
                 return
@@ -330,7 +330,7 @@ async def handle_client(process: asyncssh.SSHServerProcess, server: MySSHServer)
                     process.stdout.write(f"{llm_response.content}")
                     logger.info(
                         "LLM response",
-                        extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8', 'surrogateescape')).decode('utf-8'), interactive=True)
+                        extra=merge_log_extra(log_extra, details=b64encode(llm_response.content.encode('utf-8', 'surrogateescape')).decode('utf-8'), interactive=True, **agent_hooks.step_fields(llm_response))
                     )
                     if getattr(llm_response, "budget_exceeded", False):  # canned reply, close
                         return
@@ -802,6 +802,7 @@ def configure_runtime(args, message_history=None) -> None:
         with_message_history = OFFLINE_HISTORY
     else:
         prompts = get_prompts(args.prompt, args.prompt_file)
+        agent_hooks.note_persona_prompts(prompts["system_prompt"], prompts["user_prompt"])
         with_message_history = build_message_history(prompts["system_prompt"], prompts["user_prompt"])
 
 
@@ -818,6 +819,8 @@ def main(argv=None) -> int:
         print(f"Error: {e}", file=sys.stderr)
         traceback.print_exc()
         return 1
+    finally:
+        agent_hooks.close_learned()   # queued learned-reply writes reach the file
 
     return 0
 

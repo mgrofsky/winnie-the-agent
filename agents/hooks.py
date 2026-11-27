@@ -8,11 +8,13 @@ without it every model path fails closed with a canned reply.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
 import re
 from configparser import ConfigParser
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, MutableMapping, Optional
 
@@ -26,8 +28,9 @@ from agents.budget import (
     Budget,
     BudgetConfig,
 )
-from agents import onereply, runtime, shell
+from agents import learned, onereply, runtime, shell
 from agents.budget import ip_key
+from agents.learned import LearnedStore
 from agents.replycache import ReplyCache, conversation_key, session_root, volatile
 from agents.source_state import MAX_TARPIT_MS, SourceStateView, source_state_path, source_token
 
@@ -68,6 +71,10 @@ _offline_reason: Optional[str] = None   # set when the persona model cannot be u
 _local_replies = True   # answer host facts from the profile before asking the model
 MAX_PERSONA_RETRIES = 2
 _persona_retries = 1    # [llm] persona_retries
+_learned: Optional[LearnedStore] = None   # [llm] learned_replies
+_learn_model = ""       # digest of the [llm] provider, model and system prompt
+# Learned-reply state per session.
+_learn_sessions: dict[str, "_LearnState"] = {}   # ``_LearnState``, ``_learn_turn``
 
 # Providers whose client needs an API key from the environment; without it every call
 # would fail after network round trips, so the persona runs offline instead.
@@ -100,6 +107,8 @@ def init_runtime(config: ConfigParser, config_path: Optional[str], base_dir: str
     set_local_replies(local_replies_enabled(config))
     set_local_delay(local_delay_ms(config))
     set_persona_retries(persona_retries(config))
+    set_learned(learned_store(config, _budget.config.state_file),
+                model_fingerprint(config, base_dir))
     _config_path = os.path.abspath(config_path) if config_path else None
     _cli_accounts = dict(cli_accounts or {})
     _overlay_path = str(runtime.overlay_path(config, base_dir))
@@ -168,6 +177,79 @@ def set_persona_retries(count: int) -> None:
     """How many times a rejected persona reply is asked again (``persona_invoke``)."""
     global _persona_retries
     _persona_retries = max(0, min(int(count), MAX_PERSONA_RETRIES))
+
+
+def learned_settings(config: ConfigParser) -> tuple[bool, int, int]:
+    """``[llm] learned_replies`` (default on), ``learned_min_sessions`` (default 3, at
+    least 2) and ``learned_max_entries`` (default 2000, at most 20000)."""
+    if "llm" not in config:
+        return True, learned.DEFAULT_MIN_SESSIONS, learned.DEFAULT_MAX_ENTRIES
+    enabled = config["llm"].getboolean("learned_replies", fallback=True)
+    min_sessions = config["llm"].getint("learned_min_sessions",
+                                        fallback=learned.DEFAULT_MIN_SESSIONS)
+    max_entries = config["llm"].getint("learned_max_entries",
+                                       fallback=learned.DEFAULT_MAX_ENTRIES)
+    if min_sessions < 2:
+        raise ValueError("[llm] learned_min_sessions must be 2 or more")
+    if max_entries < 1:
+        raise ValueError("[llm] learned_max_entries must be 1 or more")
+    return enabled, min_sessions, min(max_entries, learned.MAX_ENTRIES_LIMIT)
+
+
+def learned_store(config: ConfigParser, state_file: Optional[str]) -> Optional[LearnedStore]:
+    """The learned-reply store, in ``learned_replies.json`` beside the budget state file
+    (in memory when the budget has no state file), or None when ``learned_replies`` is
+    off."""
+    enabled, min_sessions, max_entries = learned_settings(config)
+    if not enabled:
+        return None
+    store = LearnedStore(learned.path_beside(state_file), max_entries, min_sessions,
+                         background=True)
+    store.preload()
+    return store
+
+
+def model_fingerprint(config: ConfigParser, base_dir: str) -> str:
+    """A digest of the ``[llm]`` provider and model, part of every learned entry's key
+    (``note_persona_prompts`` adds the prompts the persona chain was built with)."""
+    if "llm" not in config:
+        return learned.digest("model")
+    provider = config["llm"].get("llm_provider", "")
+    model = config["llm"].get("model_name", "")
+    return learned.digest("model", provider, model)
+
+
+def note_persona_prompts(system_prompt: str, user_prompt: str) -> None:
+    """Add the system and user prompt the persona chain uses to the learned-entry key, so
+    a changed prompt never serves a reply made under the old one. Called by each entry
+    point once its chain is built (after ``set_learned``)."""
+    global _learn_model
+    _learn_model = learned.digest("prompts", _learn_model, system_prompt or "",
+                                  user_prompt or "")
+
+
+def set_learned(store: Optional[LearnedStore], model: str = "") -> None:
+    """Install the learned-reply store (None turns learned replies off) and the model
+    fingerprint its entries are keyed under."""
+    global _learned, _learn_model
+    if _learned is not None and _learned is not store:
+        close_learned()
+    _learned = store
+    _learn_model = model
+    _learn_sessions.clear()
+
+
+def close_learned() -> None:
+    """Write what the learned store still has queued and stop its worker (shutdown)."""
+    if _learned is not None:
+        try:
+            _learned.close()
+        except Exception as exc:  # noqa: BLE001 - shutdown goes on
+            log.warning("learned replies close failed: %s", type(exc).__name__)
+
+
+def learned_replies() -> Optional[LearnedStore]:
+    return _learned
 
 
 def _track(table: dict, session_id: str, value) -> None:
@@ -358,6 +440,7 @@ def reset() -> None:
     global _accounts_mtimes, _source_view, _seed, _offline_reason, _local_replies, _cache
     global _cuts_total
     _cache = None
+    set_learned(None)
     _session_keys.clear()
     _session_built.clear()
     _session_cuts.clear()
@@ -455,6 +538,7 @@ def session_close(session_id: str, history_store: Optional[MutableMapping] = Non
     _session_fragments.pop(session_id, None)
     _session_prompts.pop(session_id, None)
     _session_keys.pop(session_id, None)
+    _learn_sessions.pop(session_id, None)
     _session_built.pop(session_id, None)
     _session_cuts.pop(session_id, None)
     _shell_sessions.pop(session_id, None)
@@ -781,6 +865,169 @@ def _store(key: Optional[str], text: str, reply: str, src_ip: str) -> bool:
     return cache.put(key, reply)
 
 
+@dataclass
+class _LearnState:
+    history: str               # digest of the session's command lines so far
+    clean: bool                # no line so far could change state
+    script: Optional[str]      # script digest (``learned.script_step``), None once unusable
+    tokens: tuple[str, ...]    # the session's token values, numbered session-wide
+
+
+@dataclass(frozen=True)
+class _LearnTurn:
+    fingerprint: str     # host, persona block, seed and model the reply was made under
+    history: str         # digest of the session's command lines before this one
+    command: bool        # a counted, non-empty command: its model use is recorded
+    opener: bool         # the session opener: same-history rule only
+    eligible: bool       # may be observed and served by the different-histories rule
+    script: Optional[str]          # script digest before this line, for the same-history rule
+    values: tuple[str, ...]        # the session's token values including this line's
+    volatile: bool       # real output changes between runs: never observed or served
+
+
+def _learn_turn(session_id: str, src_ip: str, username: Optional[str], interactive: bool,
+                host: shell.Host, text: str, counts_as_command: bool) -> Optional[_LearnTurn]:
+    """This line's place in the learned store, and the session's state advanced past it
+    (the script digest advances in ``_learn_advance``, once the reply is known).
+
+    Different-histories rule: a session may observe and be served while none of its
+    earlier lines could change what a later command prints (``learned.may_change_state``):
+    such a learned reply was made on a host in its starting state.
+
+    Same-history rule: a session may observe and be served while its script digest is
+    known: the chain over every line so far (command and reply as sent, the session's
+    random tokens as session-wide placeholders) from a root of host fingerprint, user and
+    interactive or exec. Two sessions with one digest sent the same lines and saw the same
+    replies, so they are in the same state whatever those lines changed. A session leaves
+    this rule when a line cannot be templated (over ``learned.MAX_TOKENS`` token values in
+    the session, a control character, over 512 characters) or a reply ends it.
+
+    A session whose state was evicted after it had turns is out of both for good. Lines
+    whose real output changes between runs (``replycache.volatile``) are never observed or
+    served, and a source with a planted token or a ``deep`` or ``shallow`` mode never uses
+    the store. None when the store is off or the source is excluded."""
+    if _learned is None:
+        return None
+    fingerprint = learned.digest("host", _learn_model, host.hostname, host.kernel, _seed or "",
+                                 persona_fragment(session_id, src_ip), shell.persona_facts(host))
+    state = _learn_sessions.get(session_id)
+    if state is None:
+        fresh = _budget is None or not _budget.session_started(session_id)
+        state = _LearnState(learned.START, fresh,
+                            learned.script_root(fingerprint, username or "user", interactive)
+                            if fresh else None, ())
+        _track(_learn_sessions, session_id, state)
+    before = (state.history, state.clean, state.script)
+    values = state.tokens
+    if counts_as_command:
+        state.history = learned.digest("turn", state.history, text)
+        state.clean = state.clean and not learned.may_change_state(text)
+        template = learned.command_template(text) if text.strip() else learned.Template("", ())
+        if template is None:
+            state.script = None
+        else:
+            values = values + tuple(v for v in template.values if v not in values)
+            if len(values) > learned.MAX_TOKENS:
+                state.script, values = None, state.tokens
+            state.tokens = values
+    if not _cacheable_source(src_ip):
+        return None
+    command = counts_as_command and bool(text.strip())
+    opener = not counts_as_command and text == ""
+    vol = volatile(text)
+    return _LearnTurn(fingerprint, before[0], command, opener,
+                      command and before[1] and not vol,
+                      before[2] if (command or opener) and state.script is not None else None,
+                      values, vol)
+
+
+def _learn_advance(session_id: str, learn: Optional[_LearnTurn], text: str,
+                   result) -> None:
+    """Chain this line and its reply as sent into the session's script digest. For the
+    opener, and for output that reads the clock or the source address, only the prompt
+    the session was left at is chained, not the output; a budget refusal or the end of
+    the session takes the session out of the same-history rule."""
+    state = _learn_sessions.get(session_id)
+    if state is None or state.script is None:
+        return
+    if learn is None or (learn.command and learn.script is None):
+        state.script = None      # an excluded source, or a line that cannot be templated
+        return
+    if not (learn.opener or learn.command):
+        return
+    sent = str(getattr(result, "content", ""))
+    if getattr(result, "budget_exceeded", False) or sent == "YYY-END-OF-SESSION-YYY":
+        state.script = None
+        return
+    noted = _session_prompts.get(session_id)
+    prompt = noted[0] if noted else ""
+    if learn.opener:
+        # The banner may differ from session to session and is not chained; the prompt
+        # it left the session at is.
+        state.script = learned.digest("opener", state.script, prompt)
+        return
+    if learn.volatile or getattr(result, "private_reply", False):
+        # Output that reads the clock or the source address differs in every session and
+        # carries no state: the line and the prompt it left are chained, its output is not.
+        sent = "\x01" + str(getattr(result, "reply_step", "")) + "\x01" + prompt
+    state.script = learned.script_step(learn.script, text, sent, learn.values)
+
+
+def _learned_lookup(learn: Optional[_LearnTurn], username: Optional[str], interactive: bool,
+                    text: str):
+    if learn is None or _learned is None or learn.volatile \
+            or not (learn.eligible or learn.script is not None):
+        return None
+    try:
+        return _learned.lookup(learn.fingerprint, username or "user", interactive, text,
+                               history=learn.history, clean=learn.eligible,
+                               script=learn.script, values=learn.values)
+    except Exception as exc:  # noqa: BLE001 - a store failure leaves the line to the model
+        log.warning("learned reply lookup failed: %s", type(exc).__name__)
+        return None
+
+
+def _learn(learn: Optional[_LearnTurn], *, session_id: str, src_ip: str,
+           username: Optional[str], interactive: bool, host: shell.Host, text: str,
+           sent: Optional[str], shown_prompt: Optional[str]) -> None:
+    """Record that ``text`` reached the model and, when ``sent`` is the model's fresh reply
+    sent unchanged, observe it.
+
+    Different-histories rule (a clean session): an interactive reply is kept without its
+    final prompt, and only when that prompt is the one shown before the line (the line did
+    not move the session). Same-history rule: the reply is kept whole, prompt included,
+    since every session with that digest shows the same prompt. For both, a reply that
+    ends the session or contains the session's address cannot be stored, and an observed
+    reply that cannot be stored (or holds a trace of a token) counts as a different
+    reply: the entry, or that history, becomes varying."""
+    if learn is None or not (learn.command or learn.opener) or _learned is None:
+        return
+    shareable = sent is not None and sent != "YYY-END-OF-SESSION-YYY" \
+        and not (src_ip and (src_ip in sent or src_ip[:16] in sent))
+    observed = sent is not None and learn.eligible
+    body = None
+    if observed and shareable:
+        if interactive:
+            prompt = shown_prompt or shell_prompt(username, host.hostname)
+            body = sent[:-len(prompt)] if sent.endswith(prompt) else None
+        else:
+            body = sent
+    script = learn.script if sent is not None and not learn.volatile else None
+    try:
+        _learned.record(learn.fingerprint, username or "user", interactive, text, body,
+                        session=session_id, net=learned.network(src_ip),
+                        history=learn.history if observed else None, script=script,
+                        script_sent=sent if shareable else None, values=learn.values)
+    except Exception as exc:  # noqa: BLE001 - a store failure never reaches the session
+        log.warning("learned reply record failed: %s", type(exc).__name__)
+
+
+def step_fields(response) -> dict:
+    """``reply_step`` for the event logged with a persona reply, when it has one."""
+    step = getattr(response, "reply_step", None)
+    return {"reply_step": step} if isinstance(step, str) else {}
+
+
 async def _pause() -> None:
     """``local_reply_delay_ms`` before a reply made without a model call."""
     if _local_delay_ms > 0:
@@ -827,6 +1074,27 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
                          text: str, interactive: bool, llm_config: dict, logger=None,
                          log_extra: Optional[dict] = None, counts_as_command: bool = True,
                          scenario=None):
+    """The one path every persona model call takes (SSH and telnet); see
+    ``_persona_invoke``. The result carries ``reply_step``: the step that answered
+    (``local``, ``cached``, ``learned``, ``capped``, ``model``, ``fallback`` after a model
+    error, ``budget``, ``offline``), or ``opener`` for the session opener."""
+    learn = _learn_turn(session_id, src_ip, username, interactive, shell_host(scenario), text,
+                        counts_as_command) \
+        if _budget is not None and not _offline_reason else None
+    result = await _persona_invoke(
+        history, session_id=session_id, src_ip=src_ip, username=username, text=text,
+        interactive=interactive, llm_config=llm_config, logger=logger, log_extra=log_extra,
+        counts_as_command=counts_as_command, scenario=scenario, learn=learn)
+    _learn_advance(session_id, learn, text, result)
+    if not counts_as_command:
+        result.reply_step = "opener"
+    return result
+
+
+async def _persona_invoke(history, *, session_id: str, src_ip: str, username: Optional[str],
+                          text: str, interactive: bool, llm_config: dict, logger=None,
+                          log_extra: Optional[dict] = None, counts_as_command: bool = True,
+                          scenario=None, learn: Optional[_LearnTurn] = None):
     """The one path every persona model call takes (SSH and telnet).
 
     Reserves the estimated cost first. When a limit would be exceeded the model is not
@@ -846,6 +1114,13 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
       ``scenario`` overrides the active scenario (the telnet listener).
     - the reply cache: a model reply stored for a session whose history so far was the
       same (``agents.replycache``, ``_turn_key``). Consulted before the model cap.
+    - learned replies: a reply the model gave to the same command template in enough
+      unrelated sessions, with the session's current prompt, or in enough sessions whose
+      whole script so far matched this one, whole (``agents.learned``, ``_learn_turn``).
+      The session opener is looked up by the second rule only. Consulted before the model cap; logged as a "Learned reply" event (the
+      result carries ``learned_reply`` for a caller without a logger). It is added to the
+      history, counts as a model reply for the local-answer rule, and keeps the session
+      in or out of the reply cache as a cached reply does.
     - ``max_model_commands_per_session``: once the model has been asked that many
       commands (failed calls included), the deterministic shell answers the rest
       (``model_capped=True``; logged once).
@@ -868,6 +1143,10 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
     "Persona retry" event per retry; the result carries ``persona_retry`` (the reasons).
     When the last reply is still rejected, ``_model_reply`` replaces it, and an empty
     reply after a retry becomes ``in_character_reply`` (never stored in the reply cache).
+
+    Every command that reaches the model is recorded in the learned store, and a fresh
+    reply sent unchanged (not cut, retried or replaced; prompt tidying aside) is observed
+    there (``_learn``).
     """
     budget = _budget_or_none()
     host = shell_host(scenario)
@@ -878,7 +1157,7 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
     with_model = budget is not None and not _offline_reason
     key = _turn_key(session_id, src_ip, username, interactive, host, text) \
         if with_model else None
-    local = cached = None
+    local = cached = found = None
     capped = False
     owned = None
     if with_model:
@@ -908,12 +1187,16 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         cache = reply_cache()
         if local is None and key is not None and cache is not None:
             cached = cache.get(key)
-        capped = local is None and cached is None and counts_as_command and \
-            budget.model_cap_reached(session_id, src_ip)
+        if local is None and cached is None:
+            found = _learned_lookup(learn, username, interactive, text)
+        capped = local is None and cached is None and found is None and counts_as_command \
+            and budget.model_cap_reached(session_id, src_ip)
     if budget is None:
         reason, reservation = "budget_not_initialised", None
-    elif _offline_reason or local is not None or cached is not None or capped:
-        reason = budget.count_command(session_id, src_ip, cached=cached is not None) \
+    elif _offline_reason or local is not None or cached is not None or found is not None \
+            or capped:
+        reason = budget.count_command(session_id, src_ip, cached=cached is not None,
+                                      learned=found is not None) \
             if counts_as_command else None
         reservation = None
     else:
@@ -921,11 +1204,12 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
     if reason is not None:
         _log(logger, "Budget exceeded", log_extra, reason=reason)
         canned = CANNED_INTERACTIVE if interactive else CANNED_NON_INTERACTIVE
-        return SimpleNamespace(content=canned, budget_exceeded=True)
+        return SimpleNamespace(content=canned, budget_exceeded=True, reply_step="budget")
     if _offline_reason:
         await _tarpit(src_ip)
         return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip,
-                                                      session_id=session_id))
+                                                      session_id=session_id),
+                               reply_step="offline")
     if local is not None:
         await _tarpit(src_ip)
         await _pause()
@@ -943,7 +1227,8 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
             _advance(session_id, key, kept)
         else:
             _leave(session_id)
-        return SimpleNamespace(content=shown(local.output), local_reply=True)
+        return SimpleNamespace(content=shown(local.output), local_reply=True, reply_step="local",
+                               private_reply=not local.shareable)
     if cached is not None:
         await _tarpit(src_ip)
         await _pause()
@@ -952,7 +1237,24 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         if interactive:
             _note_prompt(session_id, cached, username)
         _advance(session_id, key, cached)
-        return SimpleNamespace(content=cached, cached_reply=True)
+        return SimpleNamespace(content=cached, cached_reply=True, reply_step="cached")
+    if found is not None:
+        await _tarpit(src_ip)
+        await _pause()
+        sent = found.reply if found.whole or not interactive else \
+            found.reply + (shown_prompt or shell_prompt(username, host.hostname))
+        if _remember(history, session_id, text, sent) is not None:
+            budget.add_history(session_id, src_ip, text, sent)
+        if interactive:
+            _note_prompt(session_id, sent, username)
+        _advance(session_id, key, sent)
+        with contextlib.suppress(Exception):
+            _learned.served(found.entry)   # type: ignore[union-attr]
+        _log(logger, "Learned reply", log_extra, learned_id=found.entry,
+             learned_rule=found.rule)
+        return SimpleNamespace(content=sent, reply_step="learned",
+                               learned_reply={"learned_id": found.entry,
+                                              "learned_rule": found.rule})
     if capped:
         if budget.note_model_cap(session_id):
             _log(logger, "Model cap reached", log_extra,
@@ -966,7 +1268,7 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
             stored = _remember(history, session_id, text, _clip_local(shell.printable(sent)))
             if stored is not None:
                 budget.add_history(session_id, src_ip, text, stored)
-        return SimpleNamespace(content=sent, model_capped=True)
+        return SimpleNamespace(content=sent, model_capped=True, reply_step="capped")
     try:
         response = await history.ainvoke(
             {
@@ -984,7 +1286,8 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
         _leave(session_id)
         await _tarpit(src_ip)
         return SimpleNamespace(content=fallback_reply(text, interactive, username, host, src_ip,
-                                                      shown_prompt, session_id))
+                                                      shown_prompt, session_id),
+                               reply_step="fallback")
     budget.commit(reservation, text, _content(response), usage_tokens=_usage_tokens(response))
     await _tarpit(src_ip)
     # First, before the reply is sent, kept, cached, logged or read for the prompt: cut it
@@ -1018,14 +1321,20 @@ async def persona_invoke(history, *, session_id: str, src_ip: str, username: Opt
                                                               shown_prompt),
                                    usage_metadata=getattr(response, "usage_metadata", None))
         _replace_in_history(history, session_id, response.content)
+    fresh = _content(response)
     result = _model_reply(history, response, session_id=session_id, key=reply_key, text=text,
                           interactive=interactive, username=username,
                           shown_prompt=shown_prompt, src_ip=src_ip, logger=logger,
                           log_extra=log_extra)
-    if cut is not None or retries:
-        if not isinstance(result, SimpleNamespace):
-            result = SimpleNamespace(content=result.content,
-                                     usage_metadata=getattr(result, "usage_metadata", None))
+    if not isinstance(result, SimpleNamespace):
+        result = SimpleNamespace(content=result.content,
+                                 usage_metadata=getattr(result, "usage_metadata", None))
+    unchanged = cut is None and not retries and not getattr(result, "persona_break", False) \
+        and result.content == (_tidy_prompt(fresh) if interactive else fresh)
+    _learn(learn, session_id=session_id, src_ip=src_ip, username=username,
+           interactive=interactive, host=host, text=text,
+           sent=result.content if unchanged else None, shown_prompt=shown_prompt)
+    result.reply_step = "model"
     if cut is not None:
         result.reply_cut = {k: v for k, v in cut.items() if k != "kept"}
     if retries:
@@ -1188,8 +1497,8 @@ async def summary_invoke(history, *, session_id: str, src_ip: str, username: Opt
                          prompt: str, llm_config: dict, logger=None, log_extra=None):
     """Session summary call, under the same session, per-source and daily caps.
 
-    Skipped (no model call) when no model reply answered a command in the session (fresh
-    or cached), so a source reconnecting in a loop cannot spend the day on summaries of
+    Skipped (no model call) when no model reply answered a command in the session (fresh,
+    cached or learned), so a source reconnecting in a loop cannot spend the day on summaries of
     nothing. A session that replayed a cached conversation gets the cached summary.
     """
     budget = _budget_or_none()
@@ -1199,7 +1508,8 @@ async def summary_invoke(history, *, session_id: str, src_ip: str, username: Opt
         return SimpleNamespace(content=SUMMARY_SKIPPED, budget_exceeded=True)
     if _offline_reason:
         return SimpleNamespace(content=SUMMARY_SKIPPED, budget_exceeded=True)
-    if budget.model_commands(session_id) == 0 and budget.cached_commands(session_id) == 0:
+    if budget.model_commands(session_id) == 0 and budget.cached_commands(session_id) == 0 \
+            and budget.learned_commands(session_id) == 0:
         _log(logger, "Summary skipped", log_extra, reason="no_model_commands")
         return SimpleNamespace(content=SUMMARY_SKIPPED, budget_exceeded=True)
     state = _session_keys.get(session_id)

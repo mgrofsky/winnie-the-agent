@@ -51,6 +51,9 @@ def _telnet_persona(config: ConfigParser, base: Path):
         # get_prompts would exit the whole process; the caller falls back to the static shell.
         raise FileNotFoundError("[llm] prompt_file not found")
     prompts = ssh_server.get_prompts(None, prompt_file)
+    from agents import hooks
+
+    hooks.note_persona_prompts(prompts["system_prompt"], prompts["user_prompt"])
     chain = ssh_server.build_message_history(prompts["system_prompt"], prompts["user_prompt"])
     return chain, ssh_server.llm_sessions
 
@@ -115,6 +118,8 @@ def build_context(config: ConfigParser, base: Path, scenario_name: Optional[str]
     hooks.set_local_replies(hooks.local_replies_enabled(config))
     hooks.set_local_delay(hooks.local_delay_ms(config))
     hooks.set_persona_retries(hooks.persona_retries(config))
+    hooks.set_learned(hooks.learned_store(config, budget.config.state_file),
+                      hooks.model_fingerprint(config, str(base)))
     ctx.overlay_path = overlay  # type: ignore[attr-defined]
     ctx.ftp_pasv_ports = parse_port_range(section.get("ftp_pasv_ports", ""))
     ctx.ftp_pasv_address = (section.get("ftp_pasv_address", "") or "").strip() or None
@@ -188,6 +193,9 @@ async def serve(ctx: ListenerContext, config: ConfigParser) -> None:
     finally:
         reloader.cancel()
         reporter.cancel()
+        from agents import hooks
+
+        hooks.close_learned()   # queued learned-reply writes reach the file
 
 
 def _describe_seed(config: ConfigParser, base: Path, args) -> tuple[str, str]:

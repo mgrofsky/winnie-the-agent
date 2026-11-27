@@ -112,6 +112,23 @@ local_reply_delay_ms = 0
 # command with the first. 0 replaces the reply at once.
 persona_retries = 1
 
+# Learned replies: keep the model's reply to a command once the same reply was seen in
+# learned_min_sessions sessions (2 or more), from two or more source networks (/24, /64),
+# after two or more different earlier input lines, and never a different reply. Later
+# sessions get that reply with no model call, until the host profile, scenario, model or
+# system prompt changes. Random-looking tokens (UUIDs, long hex or base64 runs) in the
+# command are placeholders. Sessions that typed a line able to change what later commands
+# print (cd, a redirect, a download, a write) neither teach nor get learned replies by that
+# rule. A second rule serves a line whose whole session so far (every line and reply) matched
+# learned_min_sessions earlier sessions from two or more networks, so a replayed script is
+# answered in full, writes included.
+# Stored in learned_replies.json beside [budget] state_file (mode 0600), at most
+# learned_max_entries entries (up to 3000). Off reads and writes no file.
+# python -m agents learned --stats | --list | --candidates | --forget ID | --clear
+learned_replies = true
+learned_min_sessions = 3
+learned_max_entries = 2000
+
 # Mark the persona prompt for the provider's prompt cache. Default: on for anthropic; off
 # for aws, because not every Claude or Nova model on Bedrock accepts cache points. Set to
 # true to use it on aws (Claude and Nova model ids only). If the first request with a

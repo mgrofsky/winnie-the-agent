@@ -1,8 +1,9 @@
 """CLI: python -m agents {triage,respond,digest,tune,detect,ship,run-all,queue,approve,reject,unblock,
-enforce,playbooks,ui}.
+enforce,playbooks,ui,stix,learned}.
 
 Directories:
-- ``--data-dir``: the front-ends' data directory (log, sensor seed). Only read here.
+- ``--data-dir``: the front-ends' data directory (log, sensor seed). Only read here, except
+  by ``learned --forget`` and ``learned --clear``, which change the learned-reply store.
 - ``--reports-dir``: triage records, digests, tuner records, honeytoken registry.
 - ``--state-dir``: cursor, tuner snapshots and state, analyst call counter
   (default ``<reports-dir>/state``).
@@ -26,6 +27,12 @@ track_before_enforce``).
 ``--actions``, ``--by``, ``--external-host``). It reads the same directories, takes no run
 lock and never calls a model. The sign-in token comes from ``WINNIE_UI_TOKEN`` or is
 generated at start.
+
+``learned`` shows and edits the persona's learned replies (``agents.learned``, the file
+beside the budget state file): ``--stats`` (entries, and commands per reply step from the
+event log), ``--list``, ``--candidates`` (commands that reach the model most often and are
+not served), ``--forget <id>`` and ``--clear``. It prints plain text with attacker text
+escaped, takes no run lock and never calls a model.
 
 ``stix`` writes the STIX 2.1 bundle (``[stix]``, off by default) to a local file;
 ``run-all`` does too when it is enabled. Nothing is sent anywhere (agents/stix.py).
@@ -188,13 +195,55 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     return {"status": "stopped"}
 
 
+def _learned(args, cp: ConfigParser, base: Path, data_dir: Path, log_path: Optional[str]) -> dict:
+    """``learned``: one action on the learned-reply store. Returns a summary with the plain
+    text to print under ``text``."""
+    from agents import learned
+    from agents.budget import BudgetConfig
+    from agents.hooks import learned_settings
+
+    try:
+        enabled, min_sessions, max_entries = learned_settings(cp)
+        state_file = BudgetConfig.from_config(cp, str(base), str(data_dir)).state_file
+    except ValueError as exc:
+        return {"error": str(exc)[:200]}
+    path = learned.path_beside(state_file)
+    if path is None:
+        return {"error": "[budget] state_file is empty: learned replies are kept in memory"}
+    store = learned.LearnedStore(path, max_entries, min_sessions)
+    if args.forget is not None:
+        if not learned.valid_id(args.forget):
+            return {"error": "an entry id is 16 lowercase hex characters"}
+        removed = store.forget(args.forget)
+        if removed is None:
+            return {"error": f"cannot write {path}"}
+        return {"text": f"{args.forget}: {'forgotten' if removed else 'not found'}",
+                "forgotten": removed}
+    if args.clear:
+        count = store.clear()
+        if count is None:
+            return {"error": f"cannot write {path}"}
+        return {"text": f"cleared {count} entries", "cleared": count}
+    if args.list:
+        text, summary = learned.list_text(store)
+    elif args.candidates:
+        text, summary = learned.candidates_text(store)
+    else:
+        text, summary = learned.stats_text(store, log_path)
+    if store.read_error is not None:
+        return {"error": f"cannot read {path}: {store.read_error[:100]}"}
+    if not enabled:
+        text = "[llm] learned_replies is off: the store is not used.\n" + text
+    return {"text": text, **summary}
+
+
 def _run(argv=None, rotation: Optional[dict] = None) -> dict:
     """Parse args and run the requested agents. Returns a summary dict (also used by tests).
     ``rotation``, when given, is filled with what ``log_rotation_status`` needs."""
     parser = argparse.ArgumentParser(prog="python -m agents", description=__doc__)
     parser.add_argument("command", choices=["triage", "respond", "digest", "tune", "detect",
                                             "ship", "run-all", "queue", "approve", "reject", "unblock",
-                                            "enforce", "playbooks", "ui", "stix"])
+                                            "enforce", "playbooks", "ui", "stix", "learned"])
     parser.add_argument("target", nargs="?", help="approval id for approve / reject; address "
                                                   "or network for unblock; address for enforce")
     parser.add_argument("--log", help="honeypot JSON-lines log (default: [honeypot] log_file)")
@@ -229,7 +278,14 @@ def _run(argv=None, rotation: Optional[dict] = None) -> dict:
     parser.add_argument("--external-host", default=None, metavar="NAME",
                         help="ui: also accept this HTTPS name, served by a reverse proxy on the "
                              "same host (default [ui] external_host, none)")
-    parser.add_argument("--list", action="store_true", help="playbooks: list them")
+    parser.add_argument("--list", action="store_true",
+                        help="playbooks: list them; learned: list the entries")
+    parser.add_argument("--stats", action="store_true",
+                        help="learned: entry counts and commands per reply step")
+    parser.add_argument("--candidates", action="store_true",
+                        help="learned: commands that reach the model most and are not served")
+    parser.add_argument("--forget", default=None, metavar="ID", help="learned: drop one entry")
+    parser.add_argument("--clear", action="store_true", help="learned: drop every entry")
     parser.add_argument("--validate", action="store_true", help="playbooks: validate all files")
     parser.add_argument("--all", action="store_true", help="queue: include decided/expired items")
     parser.add_argument("--source-state", default=None, help="per-source state file "
@@ -283,6 +339,9 @@ def _run(argv=None, rotation: Optional[dict] = None) -> dict:
                             detections=detections, overlay=overlay,
                             source_state=source_state_path(args.source_state),
                             log_path=log_path)
+        return results
+    if args.command == "learned":
+        results["learned"] = _learned(args, cp, base, data_dir, log_path)
         return results
     if args.command == "playbooks":
         from agents.playbooks import load_playbooks, tier_of
@@ -768,6 +827,9 @@ def log_rotation_status(results: dict, *, log_path, state, readers, local=None,
 
 def main(argv=None) -> int:
     results = run(argv)
+    learned = results.get("learned")
+    if isinstance(learned, dict) and "text" in learned:
+        print(learned.pop("text"))
     print(json.dumps(results, indent=2, default=str), file=sys.stderr)
     failed = any(isinstance(v, dict) and "error" in v for v in results.values())
     return 2 if failed else 0

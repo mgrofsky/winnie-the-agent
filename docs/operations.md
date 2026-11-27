@@ -53,7 +53,7 @@ Volumes:
 
 | Volume | Written by | Mounted read-only by | Contents |
 |---|---|---|---|
-| `frontend` | `ssh`, `listeners` | `agents`, `ui` | event log, quarantine, budget state, sensor seed |
+| `frontend` | `ssh`, `listeners` | `agents`, `ui` | event log, quarantine, budget state, learned replies, sensor seed |
 | `overlay` | `agents` | `ssh`, `listeners`, `ui` | tuner overlay, per-source state |
 | `agentdata` | `agents` (and `ui` with actions on) | `ui` | triage records, digests, response runs, approvals, tuner snapshots, honeytoken registry, detection drafts, blocklist |
 
@@ -234,6 +234,7 @@ Everything runs without any model configured:
 |---|---|---|
 | Event log | `frontend`: `/data/ssh_log.log` | no |
 | Quarantine | `frontend` | no, but capped per file, per source and in total |
+| Learned replies (attacker command text and model replies) | `frontend`: `/data/learned_replies.json` | capped at `[llm] learned_max_entries`; `python -m agents learned --clear` empties it |
 | Triage session and campaign records | `agentdata`: `/agents/reports/sessions/`, `/agents/reports/campaigns/` | yes, after `[agents] record_retention_days` (90) |
 | Digests | `agentdata`: `/agents/reports/daily/` | no |
 | Response run records, decided approvals | `agentdata` | yes, after `[respond] retention_days` (30) |
@@ -387,7 +388,7 @@ owner, group and mode, before any writer runs.
    `groupadd winnie-log-readers; usermod -aG winnie-log-readers REVIEWER`).
 2. Keep the log in a directory of its own, owned by the service user, group
    `winnie-log-readers`, mode 0750. Do not grant the group the data directory itself: it
-   also holds the quarantine, the sensor seed and the budget state. Moving the log means
+   also holds the quarantine, the sensor seed, the budget state and the learned replies. Moving the log means
    every process must use the new path: `[honeypot] log_file` or `--log-file` for both
    writers, `--log` for the agents, the exporter and the console, and a volume mount of the
    new directory in each container (read-only for the readers). The stock compose files and
