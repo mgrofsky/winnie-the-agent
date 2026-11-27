@@ -132,6 +132,17 @@ TUNER_RECORDS = 20
 MAX_TUNER_FILE = 1024 * 1024
 MAX_JSON_FILE = 16 * 1024 * 1024
 WINDOWS = {"24h": datetime.timedelta(hours=24), "7d": datetime.timedelta(days=7)}
+# The map screen (``Api.map``): its windows, the events and sources one answer carries, and
+# how far past the window start the backward scan reads (lines are not strictly in time
+# order across services).
+MAP_WINDOWS = {"5m": 300, "15m": 900, "1h": 3600}
+MAP_ITEMS = 300
+MAP_SOURCES = 200
+MAP_LOOKUPS = 2_000
+MAP_SLACK_SECONDS = 300
+MAP_LABEL_MAX = 64
+# Where the sensor is drawn without ``[ui] map_home``: open sea in the South Atlantic.
+MAP_HOME_DEFAULT = (-10.0, -25.0)
 # Size caps of the response boundary: a hostile file cannot make any route's body unbounded.
 LIST_CAP = 2_000
 DICT_CAP = 500
@@ -677,6 +688,22 @@ def _merge(first: list[dict], second: list[dict], second_first) -> list[dict]:
     return out + first[i:] + second[j:]
 
 
+def parse_map_home(text: object) -> Optional[tuple[float, float]]:
+    """``[ui] map_home`` (``<latitude>,<longitude>`` in degrees) as a pair, or None when it is
+    empty. Raises ValueError for anything else, without echoing the value."""
+    if text is None or not str(text).strip():
+        return None
+    parts = str(text).split(",")
+    if len(parts) != 2 or any(not re.fullmatch(r"\s*-?\d{1,3}(\.\d{1,6})?\s*", p)
+                              for p in parts):
+        raise ValueError("[ui] map_home must be <latitude>,<longitude> in degrees")
+    lat, lon = (float(p) for p in parts)
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError("[ui] map_home is out of range (latitude -90 to 90, "
+                         "longitude -180 to 180)")
+    return (lat, lon)
+
+
 def _iso_ts(value: Optional[float]) -> Optional[str]:
     if value is None:
         return None
@@ -742,6 +769,10 @@ class Api:
     # ``agents.indicators.IndicatorSet`` for the provenance of a record's indicator
     # matches (sources, report date, notes), or None when ``[indicators]`` is off.
     indicators: Optional[object] = None
+    # ``[ui] map_home`` (latitude, longitude) and ``map_label``: where and how the map draws
+    # the sensor. Without a position it is drawn at ``MAP_HOME_DEFAULT``.
+    map_home: Optional[tuple[float, float]] = None
+    map_label: str = ""
 
     def __post_init__(self) -> None:
         self._sightings = SightingsReader(self.sightings.file(self.paths.state), self.sightings)
@@ -761,6 +792,7 @@ class Api:
         self._facets: tuple[object, dict] = (None, {})
         self._alarm_lock = threading.Lock()
         self._alarm: tuple[float, object] = (float("-inf"), None)
+        self._judged: tuple[object, dict] = (None, {})
         self._routes: list[tuple[re.Pattern, Callable]] = [
             (re.compile(r"overview"), self.overview),
             (re.compile(r"records"), self.records),
@@ -769,6 +801,7 @@ class Api:
             (re.compile(r"records/([^/]+)/replies"), self.replies),
             (re.compile(r"activity"), self.activity),
             (re.compile(r"activity/session/([^/]+)"), self.activity_session),
+            (re.compile(r"map"), self.map),
             (re.compile(r"queue"), self.queue),
             (re.compile(r"blocklist"), self.blocklist),
             (re.compile(r"digests"), self.digests),
@@ -1402,6 +1435,166 @@ class Api:
             out["search"] = {"complete": not exhausted, "budget_bytes": activity.READ_BUDGET,
                              "searched_back_to": _iso_ts(reached)}
         return 200, out
+
+    # -- map --
+
+    def map(self, query: dict[str, str]) -> tuple[int, object]:
+        """The live map: recent events with where each came from, the sensor, and counts.
+
+        Without a cursor: the newest ``MAP_ITEMS`` events of the window (``5m``, ``15m`` or
+        ``1h``), oldest first. With ``after`` and ``log_id`` (as ``activity`` hands them out):
+        only the window's events past that offset, the newest ``MAP_ITEMS`` of them, with
+        ``skipped`` counting the rest. ``sources`` and ``totals`` always cover the whole
+        window. A source is placed only when masking leaves its address as it is."""
+        win = query.get("window") or "15m"
+        if win not in MAP_WINDOWS:
+            raise _BadQuery
+        after = self._offset_param(query, "after")
+        entries, info = self.events.snapshot()
+        log_id = info["log_id"]
+        if after is not None and query.get("log_id") != log_id:
+            return 409, {"error": "the event log changed since this map was loaded",
+                         "log_id": log_id}
+        now = self.now().timestamp()
+        since = now - MAP_WINDOWS[win]
+        window: list[tuple] = []
+        for i in range(len(entries) - 1, -1, -1):
+            ts = entries[i][activity.TS]
+            if ts is None:
+                continue
+            if ts >= since:
+                window.append(entries[i])
+            elif ts < since - MAP_SLACK_SECONDS:
+                break
+        window.reverse()
+        fresh = window if after is None else [e for e in window if e[activity.OFF] > after]
+        shown = fresh[-MAP_ITEMS:]
+        mask = self._masker()
+        judged = self._judgements()
+        places: dict[str, tuple] = {}
+
+        def where(src: Optional[str]) -> tuple:
+            """(point, place, country code) of a raw source, looked up once per answer."""
+            if src not in places:
+                if src is None or len(places) >= MAP_LOOKUPS or mask(src) != src:
+                    places[src] = (None, None, None)
+                else:
+                    places[src] = self._map_place(src)
+            return places[src]
+
+        items = []
+        budget = activity.READ_BUDGET
+        f = activity.open_log(self.paths.log)
+        try:
+            for e in shown:
+                rec = None
+                if f is not None and budget > 0:
+                    budget -= activity.read_cost(e)
+                    rec = activity.read_line(f, e)
+                items.append(self._map_item(e, rec, mask, where(e[activity.SRC]), judged))
+        finally:
+            if f is not None:
+                f.close()
+        newest = entries[-1][activity.OFF] if entries else None
+        return 200, {"items": items, "skipped": len(fresh) - len(shown), "newest": newest,
+                     "log_id": log_id, "window": win,
+                     "located": bool(getattr(self.geo, "enabled", self.geo is not None)),
+                     "sources": self._map_sources(window, mask, where, judged),
+                     "totals": self._map_totals(window, mask, where, since, now),
+                     "sensor": {"name": self.sensor, "label": self.map_label or self.sensor,
+                                "point": list(self.map_home or MAP_HOME_DEFAULT),
+                                "placed": self.map_home is not None}}
+
+    def _map_place(self, src: str) -> tuple:
+        point = getattr(self.geo, "point", None) if self.geo is not None else None
+        try:
+            at = point(src) if point is not None else None
+        except Exception:  # noqa: BLE001 - display only
+            at = None
+        g = None
+        if self.geo is not None:
+            try:
+                g = self.geo(src)
+            except Exception:  # noqa: BLE001 - display only
+                g = None
+        place = None
+        if g is not None and not g.empty:
+            place = ", ".join(p for p in (g.city, g.country) if p) or g.note or None
+        return (list(at) if at is not None else None, place,
+                g.country_code if g is not None and g.country_code else None)
+
+    def _judgements(self) -> dict:
+        """{(source, service): judgement} and {source: judgement} of the newest triage record
+        for each, built once per records load."""
+        recs = self._records.get()
+        key, value = self._judged
+        if key is recs:
+            return value
+        value = {}
+        for r in recs.newest:
+            for src in (r.src_ip, *r.src_addresses):
+                value.setdefault((src, r.protocol), r.judgement.value)
+                value.setdefault(src, r.judgement.value)
+        self._judged = (recs, value)
+        return value
+
+    def _map_item(self, e: tuple, rec: Optional[dict], mask, place: tuple,
+                  judged: dict) -> dict:
+        outcome = None if e[activity.OK] is None else \
+            "success" if e[activity.OK] else "failure"
+        user = mask(e[activity.USER])
+        item = {"offset": e[activity.OFF], "time": _iso_ts(e[activity.TS]),
+                "src": mask(e[activity.SRC]), "service": mask(e[activity.SERVICE]),
+                "kind": e[activity.KIND], "outcome": outcome, "username": user,
+                "point": place[0], "place": place[1],
+                "dst_port": None, "summary": e[activity.KIND]}
+        j = judged.get((e[activity.SRC], e[activity.SERVICE]))
+        if j is not None:
+            item["judgement"] = j
+        if rec is not None:
+            port = rec.get("dst_port")
+            if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
+                item["dst_port"] = port
+            d = activity.describe(rec, e[activity.SERVICE], e[activity.KIND], TEXT_CAP, mask)
+            item["summary"] = activity.summary(e[activity.KIND], user, e[activity.OK], d)
+        return item
+
+    def _map_sources(self, window: list, mask, where, judged: dict) -> list[dict]:
+        counts = activity.TopCounter()
+        last: dict[str, tuple] = {}
+        for e in window:
+            if e[activity.SRC] is not None:
+                counts.add(e[activity.SRC])
+                last[e[activity.SRC]] = e
+        out = []
+        for src, n in counts.top(MAP_SOURCES):
+            point, place, country = where(src)
+            e = last.get(src)
+            item = {"src": mask(src), "events": n, "point": point, "place": place,
+                    "country": country,
+                    "service": mask(e[activity.SERVICE]) if e is not None else None,
+                    "last": _iso_ts(e[activity.TS]) if e is not None else None}
+            if src in judged:
+                item["judgement"] = judged[src]
+            out.append(item)
+        return out
+
+    def _map_totals(self, window: list, mask, where, since: float, now: float) -> dict:
+        services, countries = activity.TopCounter(), activity.TopCounter()
+        minutes: dict[int, int] = {}
+        start = int(since // 60)
+        for e in window:
+            services.add(e[activity.SERVICE])
+            country = where(e[activity.SRC])[2]
+            countries.add(country or "unknown")
+            m = int(e[activity.TS] // 60)
+            if m >= start:
+                minutes[m] = minutes.get(m, 0) + 1
+        return {"events": len(window),
+                "services": {mask(k): n for k, n in services.top(activity.TOP_SERVICES)},
+                "countries": dict(countries.top(activity.TOP_SOURCES)),
+                "per_minute": [{"minute": _iso_ts(m * 60), "events": minutes.get(m, 0)}
+                               for m in range(start, int(now // 60) + 1)]}
 
     @staticmethod
     def _offset_param(query: dict[str, str], name: str) -> Optional[int]:

@@ -68,6 +68,24 @@
   --bar-track: #e6e9ee;
   --bar-fill: #5c88c4;
 
+  /* map: sea, land, sensor and one colour per service (bees, docks, feed) */
+  --map-water: #e8eef5;
+  --map-land: #fbfcfd;
+  --map-coast: #a9b4c2;
+  --map-grid: #dbe3ec;
+  --map-pot: #e3a72f;
+  --map-pot-ink: #5e3d05;
+  --map-wing: #ffffff;
+  --map-bee-ink: #1d1a14;
+  --map-svc-0: #d4871a;
+  --map-svc-1: #2a6fd1;
+  --map-svc-2: #2f9a6a;
+  --map-svc-3: #8a56c9;
+  --map-svc-4: #d14b4b;
+  --map-svc-5: #1d9bb0;
+  --map-svc-6: #c2569b;
+  --map-svc-7: #6f7d2a;
+
   color-scheme: light;
 }
 
@@ -103,6 +121,23 @@
 
     --bar-track: #222a34;
     --bar-fill: #4f7fb8;
+
+    --map-water: #0b1016;
+    --map-land: #1a2129;
+    --map-coast: #34404d;
+    --map-grid: #141b23;
+    --map-pot: #f0b440;
+    --map-pot-ink: #3b2603;
+    --map-wing: #e9f1fb;
+    --map-bee-ink: #120f0a;
+    --map-svc-0: #f2a93b;
+    --map-svc-1: #5a9cf2;
+    --map-svc-2: #4cc492;
+    --map-svc-3: #b18af0;
+    --map-svc-4: #f27b7b;
+    --map-svc-5: #4ec6da;
+    --map-svc-6: #ee86c6;
+    --map-svc-7: #b5c45a;
 
     color-scheme: dark;
   }
@@ -1407,6 +1442,224 @@ tr.row-detail > td {
   color: var(--term-input);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* ---- map ------------------------------------------------------------------------------ */
+
+.map-counters {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: var(--s4);
+  margin-bottom: var(--s4);
+}
+
+.map-counters .tile-value {
+  font-size: var(--fs-xl);
+}
+
+.map-top {
+  font-size: var(--fs-m);
+  font-weight: 600;
+  line-height: 1.9;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.map-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  margin: 0 var(--s4);
+  color: var(--text-muted);
+  font-size: var(--fs-s);
+  white-space: nowrap;
+}
+
+.map-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: var(--s4);
+  align-items: start;
+}
+
+.map-stage {
+  min-width: 0;
+}
+
+/* The canvas fills a box whose shape CSS fixes (the map's 360 by 142 degrees), so the
+   drawing never feeds back into the layout. */
+.map-wrap {
+  position: relative;
+  aspect-ratio: 360 / 142;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  background: var(--map-water);
+  overflow: hidden;
+}
+
+.map-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.map-canvas-hot {
+  cursor: pointer;
+}
+
+.map-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+  margin-top: var(--s3);
+}
+
+.map-key::before,
+.map-svc::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: var(--s2);
+  border-radius: 50%;
+  background: var(--svc);
+}
+
+.map-key[aria-pressed="false"] {
+  color: var(--text-faint);
+  background: transparent;
+  text-decoration: line-through;
+}
+
+.map-key[aria-pressed="false"]::before {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--svc);
+}
+
+.map-key[aria-pressed="true"] {
+  background: var(--surface);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.svc-0 { --svc: var(--map-svc-0); }
+.svc-1 { --svc: var(--map-svc-1); }
+.svc-2 { --svc: var(--map-svc-2); }
+.svc-3 { --svc: var(--map-svc-3); }
+.svc-4 { --svc: var(--map-svc-4); }
+.svc-5 { --svc: var(--map-svc-5); }
+.svc-6 { --svc: var(--map-svc-6); }
+.svc-7 { --svc: var(--map-svc-7); }
+
+.map-feed {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  background: var(--surface);
+  min-width: 0;
+}
+
+.map-feed-note {
+  padding: var(--s2) var(--s4);
+  font-size: var(--fs-s);
+}
+
+.map-feed-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 560px;
+  overflow-y: auto;
+}
+
+.map-row {
+  padding: var(--s3) var(--s4);
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+  font-size: var(--fs-s);
+}
+
+.map-row:first-child {
+  border-top: 0;
+}
+
+.map-row:hover,
+.map-row:focus,
+.map-row-hot {
+  background: var(--surface-hover);
+}
+
+.map-row:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+.map-row-head,
+.map-row-where {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 var(--s3);
+}
+
+.map-svc {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.map-kind {
+  color: var(--text-muted);
+}
+
+.map-row-where {
+  overflow-wrap: anywhere;
+}
+
+.map-row-what {
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 1100px) {
+  .map-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .map-counters {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .map-feed-list {
+    max-height: 420px;
+  }
+}
+
+@media (max-width: 600px) {
+  .map-counters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--s3);
+  }
+
+  .map-counters .tile {
+    padding: var(--s2) var(--s3);
+  }
+
+  .map-counters .tile-value {
+    font-size: var(--fs-l);
+  }
+
+  .map-top {
+    line-height: 1.6;
+  }
+
+  .map-check {
+    margin: 0 var(--s2);
+  }
 }
 
 /* ---- narrow screens ------------------------------------------------------------------ */

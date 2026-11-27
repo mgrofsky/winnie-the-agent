@@ -116,7 +116,8 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     from agents.respond import RespondSettings
     from agents.ui.activity import DEFAULT_MAX_ENTRIES, MAX_ENTRIES, MIN_ENTRIES
     from agents.indicators import from_config as indicators_from_config
-    from agents.ui.api import Api, ApiLimits, ApiPaths
+    from agents.triage import clean_text
+    from agents.ui.api import MAP_LABEL_MAX, Api, ApiLimits, ApiPaths, parse_map_home
     from agents.ui.server import UiSettings, serve
 
     ui_cfg = cp["ui"] if "ui" in cp else {}
@@ -140,6 +141,11 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
     except ValueError:
         return {"error": "[ui] port or activity_entries, or [agents] "
                          "max_analyst_calls_per_day, is not a number"}
+    try:
+        map_home = parse_map_home(ui_cfg.get("map_home", ""))
+    except ValueError as exc:
+        return {"error": str(exc)}
+    map_label = clean_text(str(ui_cfg.get("map_label", "")), MAP_LABEL_MAX).strip()
     try:
         respond_settings = runtime.respond_settings(cp)
     except ValueError as exc:
@@ -182,7 +188,8 @@ def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, st
               respond_settings=lambda: runtime.respond_settings(cp),
               connectors=lambda: runtime.respond_connectors(cp, state),
               sensor=sensor_label(cp), sightings=sightings, geo=geo,
-              shodan=internetdb_reader(cp, state), indicators=indicators_from_config(cp))
+              shodan=internetdb_reader(cp, state), indicators=indicators_from_config(cp),
+              map_home=map_home, map_label=map_label)
     try:
         serve(settings, api)
     except (ValueError, OSError) as exc:

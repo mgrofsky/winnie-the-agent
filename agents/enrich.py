@@ -21,6 +21,9 @@ ASN; their field names differ slightly and both shapes are read (``_location``,
   files by renaming a new copy into place (an in-place overwrite of a memory-mapped file
   can give garbled answers until the next check).
 
+``point(address)`` gives the City record's latitude and longitude, rounded to one decimal
+(city level), for the console's map. It is not stored on triage records.
+
 Reverse DNS (a PTR name) needs a live query and is not done here; ``GeoInfo.rdns`` is left
 for it.
 """
@@ -165,6 +168,21 @@ def _location(rec: object) -> dict:
             "region": region, "city": _name(rec.get("city"))}
 
 
+def _point(rec: object) -> Optional[tuple[float, float]]:
+    """``location.latitude`` and ``location.longitude`` of a City record (both shapes), rounded
+    to one decimal (city level, about 11 km), or None when either is missing or out of
+    range."""
+    loc = rec.get("location") if isinstance(rec, dict) else None
+    if not isinstance(loc, dict):
+        return None
+    lat, lon = loc.get("latitude"), loc.get("longitude")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (lat, lon)):
+        return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):   # also refuses NaN
+        return None
+    return (round(float(lat), 1), round(float(lon), 1))
+
+
 def _asn(value: object) -> Optional[int]:
     if isinstance(value, str):
         text = value.strip().upper()
@@ -281,6 +299,7 @@ class GeoLookup:
         self.attribution = self.settings.attribution
         self._lock = threading.Lock()
         self._cache: OrderedDict[str, Optional[GeoInfo]] = OrderedDict()
+        self._points: OrderedDict[str, Optional[tuple[float, float]]] = OrderedDict()
         self._cache_size = max(1, cache_size)
         self._recheck = recheck_seconds
         self._clock = clock
@@ -323,6 +342,7 @@ class GeoLookup:
         self._checked = now
         if any([db.refresh() for db in self._dbs]):
             self._cache.clear()
+            self._points.clear()
 
     def close(self) -> None:
         with self._lock:
@@ -331,6 +351,7 @@ class GeoLookup:
                     _close(db.reader)
                     db.reader = None
             self._cache.clear()
+            self._points.clear()
 
     # -- lookups --
 
@@ -361,6 +382,36 @@ class GeoLookup:
                 return found
         except Exception:  # noqa: BLE001 - never raise into a caller
             log.debug("IP lookup failed", exc_info=True)
+            return None
+
+    def point(self, address: object) -> Optional[tuple[float, float]]:
+        """``(latitude, longitude)`` of ``address`` from the location database, rounded to one
+        decimal, or None when the lookup is off, the address is not global, or the file has
+        no position for it. Cached like ``lookup``; never raises."""
+        if not self._dbs:
+            return None
+        try:
+            ip = parse_target(address)
+            if ip is None or non_global_label(ip) is not None:
+                return None
+            key = str(ip)
+            with self._lock:
+                self._refresh()
+                if not self.enabled:
+                    return None
+                if key in self._points:
+                    self._points.move_to_end(key)
+                    return self._points[key]
+                found = None
+                for db in self._dbs:
+                    if db.role == "location" and db.reader is not None:
+                        found = _point(db.get(key))
+                self._points[key] = found
+                if len(self._points) > self._cache_size:
+                    self._points.popitem(last=False)
+                return found
+        except Exception:  # noqa: BLE001 - never raise into a caller
+            log.debug("IP position lookup failed", exc_info=True)
             return None
 
     def _find(self, ip) -> Optional[GeoInfo]:

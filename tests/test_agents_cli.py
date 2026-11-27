@@ -1124,3 +1124,25 @@ def test_ui_activity_entries_are_clamped_to_the_documented_range(tmp_path, monke
     seen = _capture_serve(monkeypatch)
     cli.run(["ui", *args])
     assert seen["routes"].events.max_entries == expected
+
+
+def test_ui_passes_the_map_home_and_label(tmp_path, monkeypatch):
+    args = _ui_setup(tmp_path, monkeypatch,
+                     "[ui]\nmap_home = 51.5, -0.1\nmap_label = Lab \x1b[31msensor\n")
+    seen = _capture_serve(monkeypatch)
+    cli.run(["ui", *args])
+    assert seen["routes"].map_home == (51.5, -0.1)
+    assert seen["routes"].map_label == "Lab [31msensor"
+    args = _ui_setup(tmp_path, monkeypatch)
+    cli.run(["ui", *args])
+    assert seen["routes"].map_home is None and seen["routes"].map_label == ""
+
+
+@pytest.mark.parametrize("value", ["51.5", "91,0", "0,181", "nan,0", "inf,0", "a,b", "1,2,3",
+                                   "1e2,0"])
+def test_ui_refuses_to_start_on_a_bad_map_home(tmp_path, monkeypatch, value):
+    args = _ui_setup(tmp_path, monkeypatch, f"[ui]\nmap_home = {value}\n")
+    seen = _capture_serve(monkeypatch)
+    result = cli.run(["ui", *args])
+    assert "map_home" in result["ui"]["error"] and value not in result["ui"]["error"]
+    assert "routes" not in seen

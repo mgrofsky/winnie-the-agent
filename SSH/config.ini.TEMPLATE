@@ -454,6 +454,10 @@ actions = false
 # dropped first; 1000 to 500000). Worst case about 115 MiB at the default and 275 MiB at
 # 500000; see docs/operations.md, "The indexed window".
 #activity_entries = 200000
+# Where the Map screen draws this sensor, as latitude,longitude in degrees, and the label
+# under it (default: [honeypot] sensor_name). Without map_home it is drawn at sea.
+#map_home = 40.7,-74.0
+#map_label = edge-1
 
 # Outbound connectors. All disabled by default. Destinations must be https and public
 # (allow_private = true to permit internal ones). Secrets are environment variable NAMES.

@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from console_lab import Lab
-from ui_fixture import _append, ssh_lines
+from ui_fixture import SCRIPT, _append, map_lines, ssh_lines
 
 # Payloads whose only effect, if the console ever inserted them as markup, is to set a
 # global the tests read back. Pages built with bypass_csp run them if they get in, so the
@@ -26,6 +26,16 @@ def plant_canaries(lab: Lab) -> None:
     start_at = lab.tree.now - datetime.timedelta(minutes=30)
     _append(lab.tree.log, ssh_lines(CANARY_SESSION, CANARY_SOURCE, start_at,
                                     [(CANARY_USER, CANARY_ATTR, True)], list(CANARIES)))
+
+
+def plant_map_events(lab: Lab, now: datetime.datetime | None = None) -> None:
+    """Append located events from the last two minutes for the map, then one canary login
+    and command from the source whose place is a script tag."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    _append(lab.tree.log, map_lines(now - datetime.timedelta(seconds=110), 40, step=2.5))
+    _append(lab.tree.log, ssh_lines(f"session-{uuid.UUID(int=0xCA8).hex}", CANARY_SOURCE,
+                                    now - datetime.timedelta(seconds=8),
+                                    [(CANARY_USER, CANARY_ATTR, False)], [SCRIPT]))
 
 
 

@@ -343,7 +343,8 @@ type (`connection`, `auth_attempt`, `command`, `register`, `invite`, ...).
 ## Operator console
 
 A local web console for the operator: pipeline health, the approval queue, triage records
-with SSH transcript replay, digests, tuner state, playbooks and detections. It is
+with SSH transcript replay, raw activity, a live map of where attacks come from and which
+service each one reached, digests, tuner state, playbooks and detections. It is
 read-only by default, listens on 127.0.0.1:8480 only, and never calls a model.
 
 ![The console's overview screen, shown with test data](docs/console.png)

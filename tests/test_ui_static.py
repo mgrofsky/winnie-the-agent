@@ -53,6 +53,7 @@ API_LITERALS = {
     "/api/honeytokens",
     "/api/activity",
     "/api/activity/session/",
+    "/api/map",
 }
 # Suffixes appended after an id: GET /api/records/{id}/transcript|replies and
 # POST /api/queue/{id}/approve|reject.
@@ -283,7 +284,7 @@ def test_every_section_has_a_number_key():
     text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
     sections = re.findall(r'\{ key: "([a-z]+)", label: "[A-Za-z ]+", hash: "#/', text)
     n = len(sections)
-    assert "activity" in sections
+    assert "activity" in sections and "map" in sections and n == 8
     assert f"/^[1-{n}]$/.test(ev.key)" in text and f"Keys: 1-{n} switch sections" in text
 
 
@@ -325,3 +326,33 @@ def test_request_sequence_and_findings_are_text_with_the_raw_activity_link():
     # Source URLs are shown as text, never as links.
     assert "link(" not in findings and "href" not in findings
     assert '"-like"' in findings and "never used for the judgement or the blocklist" in findings
+
+
+def test_map_keeps_attacker_text_out_of_attributes_and_reloads_on_a_new_log():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    start = text.index("  // ---- screen: map")
+    end = text.index("  // ---- screen: not found")
+    view = text[start:end]
+    # Event and source values reach the page as text nodes or canvas text only.
+    for attrs in re.findall(r"attrs:\s*\{[^}]*\}", view):
+        assert not re.search(r"\b(it|s|o|src|d)\.", attrs), attrs
+    for label in re.findall(r'setAttribute\("aria-label", ([^;]*)\);', view):
+        assert not re.search(r"\b(it|o|src|d)\.|\.src\b|\.place\b|\.label\b", label), label
+    # The delta poll carries the log id and starts over when the server says the log changed.
+    poll = _function(text, "pollMap")
+    assert "after: m.cursor, log_id: m.logId" in poll and "err.status === 409" in poll
+    assert "loadMap(m)" in poll
+    # Timers stop when the screen changes.
+    assert "state.view.stop()" in _function(text, "render")
+    assert "m.gen === state.gen" in _function(text, "alive")
+
+
+def test_map_drops_answers_to_superseded_requests_and_rebuilds_sources():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    load = _function(text, "loadMap")
+    assert "const req = ++m.req" in load and "req !== m.req" in load
+    poll = _function(text, "pollMap")
+    assert "const req = ++m.req" in poll and poll.count("req !== m.req") == 2
+    assert "m.loading" in poll
+    ingest = _function(text, "ingest")
+    assert "m.sources = new Map()" in ingest and "busy.has(key)" in ingest

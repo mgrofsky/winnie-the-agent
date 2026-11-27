@@ -106,7 +106,7 @@ def zap_started(zap, target):
              "/api/records/" + ids["session_a"] + "/replies", "/api/activity?src=198.51.100.7",
              "/api/activity/session/" + session, "/api/queue?all=1", "/api/blocklist",
              "/api/digests", "/api/decoy", "/api/playbooks", "/api/detections",
-             "/api/honeytokens"]
+             "/api/honeytokens", "/api/map?window=1h"]
     for path in paths:
         zap.core.access_url(url=base + path, followredirects="false")
     body = json.dumps({"view_hash": _view_hash(zap, base, ids["pending"])})
