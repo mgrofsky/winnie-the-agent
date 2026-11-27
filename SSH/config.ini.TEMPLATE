@@ -346,6 +346,22 @@ blocklist_access_expiry_days = 30
 # a log that reader has not finished: log_readers = triage, ship
 #log_readers =
 
+# Indicator lists (TOML files with provenance; see detections/README.md). Triage lists the
+# entries a campaign matched (user agent, path, query or address) on its record. A match is
+# shown and usable in playbook conditions; it never changes the judgement or the blocklist.
+# path: a directory of *.toml files or one file, relative to the repository; empty means
+# the shipped detections/indicators.
+[indicators]
+enabled = true
+#path = detections/indicators
+
+# Behaviour rules over an HTTP source's request sequence (thresholds are in the rule files;
+# see detections/README.md). A match is listed on the record and asks the model for a
+# narrative within the call caps; it never changes the judgement or the blocklist.
+[behaviours]
+enabled = true
+#path = detections/behaviours
+
 # Response playbooks (playbooks/*.toml; python -m agents respond / queue / approve / reject).
 # Local steps (tarpit, deepen, shallow, plant_token, tag_source, capture_more) change only
 # this honeypot and run automatically. Notify steps run only through connectors enabled

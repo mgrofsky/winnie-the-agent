@@ -26,6 +26,8 @@ from typing import Annotated, Callable, Iterable, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from agents.behaviours import BehaviourMatch, RuleSet
+from agents.indicators import IndicatorMatch, IndicatorSet
 from agents.llm import (
     JsonLLM,
     LLMOutputError,
@@ -37,6 +39,7 @@ from agents.sessions import (
     UNVERIFIED_SOURCE,
     Campaign,
     Cursor,
+    HttpRequest,
     Session,
     merge_campaign,
     parse_log,
@@ -361,6 +364,32 @@ class CredentialStats(Strict):
     dialed_numbers: list[tuple[str, int]] = Field(default_factory=list)
 
 
+SEQUENCE_KEPT = 100              # requests a record keeps of its campaign's sequence
+
+
+class SeqEntry(Strict):
+    """One HTTP request of a campaign record's sequence. ``at`` and ``seq`` find the raw
+    event line; ``offset`` is seconds since the first request kept. Strings are attacker
+    text except ``lure``, ``discovered_via``, ``flow``, ``flow_step`` and ``marker``, which
+    the listener sets from the scenario."""
+    seq: Optional[int] = Field(default=None, ge=0)
+    at: str = Field(max_length=40)
+    offset: int = Field(ge=0)
+    conn: str = Field(default="", max_length=128)
+    method: str = Field(default="", max_length=16)
+    path: str = Field(default="", max_length=300)
+    query: str = Field(default="", max_length=200)
+    status: Optional[int] = Field(default=None, ge=0)
+    route: str = Field(default="", max_length=64)
+    client: str = Field(default="", max_length=CLIENT_MAX)
+    lure: str = Field(default="", max_length=64)
+    discovered_via: str = Field(default="", max_length=64)
+    flow: str = Field(default="", max_length=32)
+    flow_step: str = Field(default="", max_length=32)
+    marker: str = Field(default="", max_length=64)
+    marker_src: bool = False
+
+
 class TriageRecord(Strict):
     kind: str = Field(pattern=r"^(session|campaign)$")
     id: str = Field(max_length=200)
@@ -409,6 +438,13 @@ class TriageRecord(Strict):
     # What Shodan InternetDB knew about src_ip when the record was written (``ShodanInfo``);
     # absent with the lookup off, before it existed, or when the address was not looked up.
     src_shodan: Optional[ShodanInfo] = None
+    # HTTP campaigns: the first SEQUENCE_KEPT requests in order (``SeqEntry``).
+    request_sequence: list[SeqEntry] = Field(default_factory=list, max_length=SEQUENCE_KEPT)
+    # Indicator entries and behaviour rules the campaign matched (``agents.indicators``,
+    # ``agents.behaviours``). Shown and usable in playbook conditions; they never feed
+    # judgement, high_signal, blocklist reasons or exports.
+    indicator_matches: list[IndicatorMatch] = Field(default_factory=list, max_length=20)
+    behaviours: list[BehaviourMatch] = Field(default_factory=list, max_length=100)
 
     @property
     def structured(self) -> bool:
@@ -573,6 +609,24 @@ def _transcript_session(s: Session) -> str:
     return text[:MAX_TRANSCRIPT_CHARS]
 
 
+def _clip(value: str, cap: int) -> str:
+    return value[:cap]
+
+
+def _request_sequence(requests: list[HttpRequest]) -> list[SeqEntry]:
+    kept = requests[:SEQUENCE_KEPT]
+    if not kept:
+        return []
+    start = min(r.ts for r in kept)
+    return [SeqEntry(seq=r.seq, at=r.ts.isoformat(timespec="seconds"),
+                     offset=int((r.ts - start).total_seconds()), conn=r.conn[:128],
+                     method=r.method, path=_clip(r.path, 300), query=_clip(r.query, 200),
+                     status=r.status, route=r.route, client=_clip(r.client, CLIENT_MAX),
+                     lure=r.lure, discovered_via=r.discovered_via, flow=r.flow,
+                     flow_step=r.flow_step, marker=r.marker, marker_src=r.marker_src)
+            for r in kept]
+
+
 def _transcript_campaign(c: Campaign) -> str:
     head = {"protocol": c.protocol, "src_ip": c.src_ip, "attempts": c.attempts,
             "successes": c.successes, "connections": c.connection_count(),
@@ -580,8 +634,20 @@ def _transcript_campaign(c: Campaign) -> str:
             "clients": _top(c.clients, 5), "dialed": _top(c.dialed, 10),
             "high_signal": dict(c.high_signal)}
     lines = [json.dumps(head)]
-    for cmd in (c.post_login or c.commands)[:200]:
-        lines.append(json.dumps({"cmd": cmd}))
+    if c.requests:
+        # The request sequence with second offsets, so the model sees order and timing.
+        for e in _request_sequence(c.requests):
+            item = {"t": e.offset, "req": f"{e.method} {e.path}" + (f"?{e.query}" if e.query
+                                                                     else ""),
+                    "status": e.status}
+            if e.discovered_via:
+                item["found_in"] = e.discovered_via
+            if e.flow:
+                item["flow"] = e.flow
+            lines.append(json.dumps(item))
+    else:
+        for cmd in (c.post_login or c.commands)[:200]:
+            lines.append(json.dumps({"cmd": cmd}))
     return "\n".join(lines)[:MAX_TRANSCRIPT_CHARS]
 
 
@@ -933,6 +999,7 @@ def _campaign_record(c: Campaign, intent, stage, skill, judgement, techniques, n
         src_address_count=len(c.addresses) + c.extra_addresses,
         clients=clean_list([k for k, _ in c.clients.most_common(CLIENTS_MAX * 4)],
                            CLIENTS_MAX, CLIENT_MAX),
+        request_sequence=_request_sequence(c.requests),
         **(parts or {}),
     )
 
@@ -1226,24 +1293,34 @@ def triage_session(s: Session, llm: Optional[JsonLLM],
     )
 
 
-def needs_llm(c: Campaign, tokens: list[str]) -> bool:
+def needs_llm(c: Campaign, tokens: list[str], behaviours: Iterable = ()) -> bool:
+    """Whether the campaign is worth a model call: a login with commands after it, a
+    high-signal event, a planted token, or a matched behaviour rule."""
     if c.unverified_source:
         return False
-    return bool((c.successes and c.post_login) or c.high_signal or tokens)
+    return bool((c.successes and c.post_login) or c.high_signal or tokens or list(behaviours))
 
 
 def triage_campaign(c: Campaign, llm: Optional[JsonLLM], honeytoken_values: dict[str, str],
-                    allow_llm: bool) -> tuple[TriageRecord, bool]:
-    """Returns (record, used_llm). Falls back to the deterministic record on any failure."""
+                    allow_llm: bool, behaviours: Iterable = ()) -> tuple[TriageRecord, bool]:
+    """Returns (record, used_llm). Falls back to the deterministic record on any failure.
+
+    When a matched behaviour rule is the only reason to ask the model, the model writes
+    the narrative and nothing else: judgement, stage, intent, skill, techniques and IOCs
+    stay the deterministic ones, so a behaviour match alone never raises severity."""
     tokens = sorted(set(c.honeytokens) | set(_honeytokens_in(
         list(c.passwords) + list(c.usernames) + c.commands, honeytoken_values)))
     det = deterministic_campaign(c, tokens)
     worth_llm = needs_llm(c, tokens)
-    if not (allow_llm and worth_llm and llm is not None):
+    narrative_only = not worth_llm and needs_llm(c, tokens, behaviours)
+    if not (allow_llm and (worth_llm or narrative_only) and llm is not None):
         return det, False
     out = _ask_model(llm, f"{c.protocol} campaign summary", _transcript_campaign(c))
     if out is None:
         return det, True
+    if narrative_only:
+        return det.model_copy(update={"narrative": _model_narrative(out, det.narrative)[:600],
+                                      "llm_used": True, **model_parts(out)}), True
     transcript = "\n".join(c.post_login or c.commands)
     known = extract_iocs(c.post_login or c.commands)
     extra = verify_model_iocs(out.extra_iocs, transcript, known)
@@ -1361,6 +1438,47 @@ def with_shodan(record: TriageRecord, shodan: Optional[ShodanLookupFn]) -> Triag
     return record.model_copy(update={"src_shodan": found})
 
 
+def with_findings(record: TriageRecord, indicators: list[IndicatorMatch],
+                  behaviours: list[BehaviourMatch]) -> TriageRecord:
+    """``record`` with its indicator and behaviour matches. Only these two fields change."""
+    if not indicators and not behaviours:
+        return record
+    return record.model_copy(update={"indicator_matches": list(indicators)[:20],
+                                     "behaviours": list(behaviours)[:100]})
+
+
+def campaign_findings(c: Campaign, indicators: Optional[IndicatorSet],
+                      rules: Optional[RuleSet]) -> tuple[list[IndicatorMatch],
+                                                        list[BehaviourMatch]]:
+    """The indicator matches (full client counter, every kept request, each address) and
+    behaviour matches of a campaign. Never raises: a failure is logged and matches nothing."""
+    matched: list[IndicatorMatch] = []
+    found: list[BehaviourMatch] = []
+    if c.unverified_source:
+        return matched, found
+    try:
+        if indicators is not None:
+            matched = indicators.match(c.clients, c.requests, c.addresses)
+        if rules is not None:
+            found = rules.evaluate(c.requests)
+    except Exception as exc:  # noqa: BLE001 - a rule bug must not stop triage
+        log.error("findings for %s failed: %s", c.campaign_id, type(exc).__name__)
+    return matched, found
+
+
+def findings_lines(r: TriageRecord) -> list[str]:
+    """Short lines for the record's behaviour and indicator matches. A behaviour on a
+    record that also matched an indicator naming a framework is described as like that
+    framework, never as attributed to it."""
+    frameworks = sorted({m.framework for m in r.indicator_matches if m.framework})
+    like = ", ".join(f"{f}-like" for f in frameworks)
+    out = [f"{b.label}{f' ({like})' if like else ''}: {b.confidence} confidence, "
+           f"count {b.count}" for b in r.behaviours]
+    out += [f"indicator {m.label}: {m.confidence} confidence, {_plural(m.count, 'hit')}"
+            for m in r.indicator_matches]
+    return out
+
+
 def fold_unverified(campaigns: list[Campaign]) -> list[tuple[Campaign, list[str]]]:
     """(campaign, ids it covers), oldest first. Campaigns of unverified UDP sources (their
     addresses may be forged) are merged into one aggregate per protocol and window, so a
@@ -1416,7 +1534,9 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
                max_records_per_run: int = MAX_RECORDS_PER_RUN,
                retention_days: float = RECORD_RETENTION_DAYS,
                geo: Optional[GeoLookupFn] = None,
-               shodan: Optional[ShodanLookupFn] = None) -> dict:
+               shodan: Optional[ShodanLookupFn] = None,
+               indicators: Optional[IndicatorSet] = None,
+               rules: Optional[RuleSet] = None) -> dict:
     """Triage what finished since the last run.
 
     The cursor is saved after every item, so a crash or provider outage loses nothing.
@@ -1427,6 +1547,8 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
     older than ``retention_days`` are removed at the end of the run. With ``geo`` (an
     ``agents.enrich.GeoLookup``), each record stores where its source address was; with
     ``shodan`` (``agents.internetdb.InternetDbReader.info``), what InternetDB knew about it.
+    With ``indicators`` and ``rules``, each campaign record lists the indicator entries
+    and behaviour rules it matched (``campaign_findings``).
     """
     reports_dir = Path(reports_dir)
     state = Path(state_dir) if state_dir else reports_dir / "state"
@@ -1509,12 +1631,14 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
             continue
         tokens = sorted(set(c.honeytokens) | set(_honeytokens_in(
             list(c.passwords) + list(c.usernames) + c.commands, ht_values)))
-        if needs_llm(c, tokens) and llm is not None and not model_ok:
+        matched, found = campaign_findings(c, indicators, rules)
+        if needs_llm(c, tokens, found) and llm is not None and not model_ok:
             deferred.append(c.campaign_id)  # wait for the model rather than lose the look
             continue
         allow = model_ok and calls < max_llm_calls
         try:
-            record, used = triage_campaign(c, llm if allow else None, ht_values, allow_llm=allow)
+            record, used = triage_campaign(c, llm if allow else None, ht_values, allow_llm=allow,
+                                           behaviours=found)
         except LLMUnavailable as exc:
             model_ok, stop_reason = False, str(exc)[:100]
             calls += 1
@@ -1524,6 +1648,7 @@ def run_triage(log_path: os.PathLike | str, reports_dir: os.PathLike | str, llm:
             log.error("triage of %s failed: %s", c.campaign_id, type(exc).__name__)
             record, used = deterministic_campaign(c, tokens), False
         calls += int(used)
+        record = with_findings(record, matched, found)
         if not dry_run:
             write_record(with_shodan(with_geo(_attribute(record, ht_sources), geo), shodan),
                          reports_dir)
@@ -1588,6 +1713,7 @@ def _md_layout(r: TriageRecord) -> list[str]:
             out += [f"     - {_md(v, ITEM_MAX)}" for v in items]
     if r.not_seen:
         out.append("   - Not seen: " + ", ".join(_md(v, NOT_SEEN_ITEM_MAX) for v in r.not_seen))
+    out += [f"   - Finding: {_md(v, 240)}" for v in findings_lines(r)]
     return out
 
 

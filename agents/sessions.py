@@ -38,6 +38,7 @@ MAX_FIELD = 512
 MAX_COMMAND = 4096
 MAX_COMMANDS_KEPT = 500
 MAX_POST_LOGIN_KEPT = 200
+MAX_REQUESTS_KEPT = 300           # HTTP requests kept per campaign, in log order
 MAX_DISTINCT = 1_000              # distinct keys per campaign counter (usernames, dialed, ...)
 MAX_CONNECTIONS_KEPT = 10_000     # connection ids kept per campaign; the rest are only counted
 MAX_ADDRESSES_KEPT = 20           # individual source addresses kept per campaign (IPv6 /64)
@@ -55,6 +56,61 @@ TRAP_PROTOCOLS = {"sip", "ftp", "telnet", "postgres", "mysql", "mssql", "redis",
 def _cap(value, limit: int = MAX_FIELD) -> str:
     text = "" if value is None else str(value)
     return text[:limit]
+
+
+def _text(value, limit: int) -> str:
+    """A string field from the event, capped; anything that is not a string is empty."""
+    return value[:limit] if isinstance(value, str) else ""
+
+
+def _count(value) -> Optional[int]:
+    """A non-negative integer field from the event (a bool is not one), clamped."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return min(value, 1_000_000_000)
+
+
+@dataclass(frozen=True)
+class HttpRequest:
+    """One HTTP request of a campaign, as the listener logged it. Every field is optional
+    in the event: a field the line does not carry (older events) is empty or None."""
+    ts: datetime.datetime
+    conn: str
+    method: str = ""
+    path: str = ""
+    query: str = ""
+    status: Optional[int] = None
+    host: str = ""
+    route: str = ""
+    client: str = ""
+    seq: Optional[int] = None
+    req: Optional[int] = None
+    lure: str = ""
+    discovered_via: str = ""
+    discovered_age: Optional[int] = None
+    flow: str = ""
+    flow_step: str = ""
+    object_id_count: Optional[int] = None
+    marker: str = ""
+    marker_src: bool = False
+
+    @property
+    def target(self) -> str:
+        return f"{self.path}?{self.query}" if self.query else self.path
+
+
+def http_request(ts: datetime.datetime, conn: str, client, data: dict) -> HttpRequest:
+    """The request an HTTP ``command`` event describes, each field type-checked and capped."""
+    return HttpRequest(
+        ts=ts, conn=conn, method=_text(data.get("method"), 16), path=_text(data.get("path"), 500),
+        query=_text(data.get("query"), 500), status=_count(data.get("status")),
+        host=_text(data.get("host"), 200), route=_text(data.get("route"), 64),
+        client=_text(client, 200), seq=_count(data.get("seq")), req=_count(data.get("req")),
+        lure=_text(data.get("lure_id"), 64), discovered_via=_text(data.get("discovered_via"), 64),
+        discovered_age=_count(data.get("discovered_age")), flow=_text(data.get("flow"), 32),
+        flow_step=_text(data.get("flow_step"), 32),
+        object_id_count=_count(data.get("object_id_count")),
+        marker=_text(data.get("marker"), 64), marker_src=data.get("marker_src") is True)
 
 
 def _ts(value) -> Optional[datetime.datetime]:
@@ -148,6 +204,8 @@ class Campaign:
     dialed: Counter = field(default_factory=Counter)
     commands: list[str] = field(default_factory=list)
     post_login: list[str] = field(default_factory=list)
+    # HTTP campaigns: each request in log order (at most MAX_REQUESTS_KEPT).
+    requests: list[HttpRequest] = field(default_factory=list)
     high_signal: Counter = field(default_factory=Counter)
     honeytokens: set = field(default_factory=set)
     events: int = 0
@@ -278,6 +336,7 @@ def merge_campaign(into: Campaign, other: Campaign) -> None:
             _bump(mine, key, n)
     into.commands.extend(other.commands[:max(0, MAX_COMMANDS_KEPT - len(into.commands))])
     into.post_login.extend(other.post_login[:max(0, MAX_POST_LOGIN_KEPT - len(into.post_login))])
+    into.requests.extend(other.requests[:max(0, MAX_REQUESTS_KEPT - len(into.requests))])
     into.honeytokens |= other.honeytokens
     for address in other.addresses:
         into.add_address(address)
@@ -492,6 +551,8 @@ def parse_log(path: os.PathLike | str, window_minutes: int = 60,
                         or rec.get("message"), MAX_COMMAND)
             if len(camp.commands) < MAX_COMMANDS_KEPT:
                 camp.commands.append(text)
+            if protocol == "http" and len(camp.requests) < MAX_REQUESTS_KEPT:
+                camp.requests.append(http_request(ts, task, client, data))
             if task in conn_success and len(camp.post_login) < MAX_POST_LOGIN_KEPT:
                 camp.post_login.append(text)
 

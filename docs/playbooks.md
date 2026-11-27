@@ -62,6 +62,8 @@ All conditions given in `[when]` must hold. List values mean "any of".
 | `malware_indicators` | bool | an FTP or S3 upload, or a URL or file hash among the IOCs |
 | `nothing_novel` | bool | a campaign with no high-signal event, no honeytoken and no commands |
 | `scenarios` | scenario names | the sensor's active scenario is listed |
+| `behaviours_any` | behaviour rule ids | the record matched any listed behaviour rule (see [detections/README.md](../detections/README.md#behaviour-rules)) |
+| `indicator_confidence_at_least` | `low`, `medium`, `high` | the record matched an indicator entry of at least this confidence (see [detections/README.md](../detections/README.md#indicator-lists)) |
 
 Signals: `redis_takeover`, `sql_exec_attempt`, `sql_cred_dump`, `smtp_relay_attempt`,
 `sip_dialed_number`, `quarantine_quota`, `http_proxy_attempt`, `ftp_upload`, `s3_upload`,
@@ -82,6 +84,14 @@ successful login.
 
 There are no expressions and no free-text matching. Conditions read only enum and numeric
 fields of a validated triage record, plus the facts above, which code computes from it.
+`behaviours_any` and `indicator_confidence_at_least` compare rule ids and confidence levels
+set by the operator's files, never attacker text.
+
+Behaviour and indicator matches are pattern and list matches, not proof. A playbook is
+refused when an enforce step's only conditions, in `[when]` and the step's `only_if`
+together, are `behaviours_any` and `indicator_confidence_at_least`; `kinds`, `protocols`
+and `scenarios` only scope a playbook and do not count. Add a condition such as
+`judgement_at_least` or `honeytoken` to such a step.
 
 ## Actions and tiers
 
@@ -372,6 +382,7 @@ changes are snapshotted under `<state dir>/source-state-snapshots/`.
 | `sensitive_data_access` (priority) | patient or financial data touched on the `healthcare` or `bank` scenario | tag, plant token, deepen, notify |
 | `malware_drop` | FTP upload or download-and-execute in SSH | tag, capture more, notify, publish detection |
 | `miner_recon` | `hardware_recon`: GPU or CPU sizing after a login (SSH or Telnet) | tag, capture more, notify |
+| `agentic_recon` | an HTTP campaign matched an agentic reconnaissance behaviour rule | tag, capture more, notify |
 | `toll_fraud` | SIP dialing to international or premium-rate numbers | tag, tarpit 2 s, notify, export blocklist |
 | `noisy_brute_force` | campaign with 50+ attempts and nothing novel | shallow for 48 h; export blocklist only above 5,000 attempts |
 

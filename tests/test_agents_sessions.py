@@ -223,3 +223,61 @@ def test_a_cursor_file_from_an_older_version_still_resumes(tmp_path):
     assert old.tail is None and old.start_offset(log) == old.offset > 0
     (tmp_path / "cursor.json").write_text(json.dumps({**legacy, "tail": 5}))
     assert Cursor(tmp_path / "cursor.json").tail is None  # a malformed field is ignored
+
+
+# ---- HTTP request sequence -----------------------------------------------------------------
+
+def _http(i, ip="198.51.100.40", task="http-1", minutes=None, client="norma/0.4", **data):
+    data.setdefault("method", "GET")
+    data.setdefault("path", f"/api/items/{i}")
+    data.setdefault("status", 200)
+    return trap_event("http", "command", ip, task, i / 60 if minutes is None else minutes,
+                      client=client, data=data)
+
+
+def test_http_requests_are_kept_in_order_with_their_evidence(tmp_path):
+    records = [
+        _http(0, path="/static/app.js", seq=1, req=1, lure_id="bundle", resp_type="text/javascript"),
+        _http(1, path="/api/admin/export", query="all=1", seq=2, req=2,
+              discovered_via="bundle", discovered_age=1, status=403),
+        _http(2, path="/api/recover", seq=3, flow="recovery_request", flow_step="start",
+              marker="build", marker_src=True, object_id_count=4, task="http-2"),
+    ]
+    camp = next(iter(parse_log(write_log(tmp_path / "l", records)).campaigns.values()))
+    assert [r.path for r in camp.requests] == ["/static/app.js", "/api/admin/export",
+                                               "/api/recover"]
+    first, second, third = camp.requests
+    assert (first.seq, first.req, first.lure, first.client) == (1, 1, "bundle", "norma/0.4")
+    assert (second.query, second.status, second.discovered_via, second.discovered_age) == \
+        ("all=1", 403, "bundle", 1)
+    assert (third.flow, third.flow_step, third.marker, third.marker_src, third.object_id_count,
+            third.conn) == ("recovery_request", "start", "build", True, 4, "http-2")
+    assert camp.commands == ["/static/app.js", "/api/admin/export", "/api/recover"]
+
+
+def test_http_request_fields_are_type_checked_and_capped(tmp_path):
+    records = [_http(0, path="/" + "a" * 2000, query=["x"], status="200", seq=True, req=-1,
+                     discovered_age=1.5, marker_src="yes", flow={"k": 1}, client=7),
+               trap_event("http", "command", "198.51.100.40", "http-1", 0.5, data={})]
+    camp = next(iter(parse_log(write_log(tmp_path / "l", records)).campaigns.values()))
+    bad, empty = camp.requests
+    assert len(bad.path) == 500 and bad.query == "" and bad.status is None
+    assert bad.seq is None and bad.req is None and bad.discovered_age is None
+    assert bad.marker_src is False and bad.flow == "" and bad.client == ""
+    assert (empty.method, empty.path, empty.status) == ("", "", None)
+
+
+def test_http_requests_are_bounded_and_other_protocols_keep_none(tmp_path):
+    from agents.sessions import MAX_REQUESTS_KEPT, merge_campaign
+
+    records = [_http(i, minutes=i / 1000) for i in range(MAX_REQUESTS_KEPT + 20)]
+    records.append(trap_event("ftp", "command", "198.51.100.41", "ftp-1", 1,
+                              data={"command": "LIST"}))
+    camps = parse_log(write_log(tmp_path / "l", records)).campaigns.values()
+    http = next(c for c in camps if c.protocol == "http")
+    ftp = next(c for c in camps if c.protocol == "ftp")
+    assert len(http.requests) == MAX_REQUESTS_KEPT and ftp.requests == []
+    merge_campaign(ftp, http)
+    assert len(ftp.requests) == MAX_REQUESTS_KEPT
+    merge_campaign(ftp, http)
+    assert len(ftp.requests) == MAX_REQUESTS_KEPT

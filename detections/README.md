@@ -42,6 +42,52 @@ Nothing here is deployed, sent, or enforced automatically.
   Read [Using the intelligence outside the sensor](../docs/operations.md#using-the-intelligence-outside-the-sensor)
   before feeding this file to anything that blocks or pages.
 
+## Indicator lists
+
+`detections/indicators/*.toml` hold indicator entries that triage matches against each
+campaign; `[indicators] enabled` and `path` in `config.ini` turn them off or point at other
+files. Each `[[indicators]]` entry has:
+
+| Key | Values |
+|---|---|
+| `id` | lower-case letters, digits, `.`, `_`, `-`; unique across files |
+| `type` | `user_agent`, `path`, `query` (path and query joined by `?`), `ipv4`, `ipv6` |
+| `match` | `exact`, `prefix` or `contains` (addresses: `exact` only); user agents compare without case |
+| `value` | up to 200 characters |
+| `framework`, `label` | what the entry stands for |
+| `confidence` | `low`, `medium` or `high` |
+| `sources`, `reported`, `notes` | the https pages that state the fact, the report date, and each source's own qualification |
+
+Matching is plain string comparison; no regular expression is built from these files. A
+file that does not validate is left out whole and logged. `agentic-frameworks.toml` ships
+the ARTEX user agents `artex-enrich/` and `norma/` (medium) and `ReconProbe/1.0` (low), and
+low-confidence paths and queries one report listed from the same activity. Those carry no
+framework, since any scanner may request them. User agents are trivially changed. Add your
+own entries, including addresses, in another file.
+
+## Behaviour rules
+
+`detections/behaviours/*.toml` hold rules over a campaign's HTTP request sequence;
+`[behaviours] enabled` and `path` turn them off or point at other files. Each `[[rules]]`
+entry has `id`, `kind`, `label`, `confidence`, `description`, optional `enabled`, and the
+kind's thresholds:
+
+| Kind | Thresholds | Matches when |
+|---|---|---|
+| `discovery_then_use` | `min_routes`, `within_seconds` | that many distinct paths were requested within that long of the asset or document that showed them to the source |
+| `adaptive_retries` | `min_requests`, `window_seconds`, `min_client_errors`, `min_changes` | within the window: that many requests, that many 4xx answers, and that many errors followed by a changed path, query or method on the same host |
+| `object_enumeration` | `min_ids` | that many distinct object ids were asked of one item route |
+| `recovery_probing` | `min_steps`, `min_flows` | that many username, recovery, reset or activation flow requests across that many flow kinds |
+| `marker_reuse` | `min_hits`, `other_source_only` | a per-source marker served to a source came back in a request (with `other_source_only`, from a different source) |
+
+`recon.toml` ships one rule of each kind, labelled "agentic reconnaissance". Indicator and
+behaviour matches appear on the triage record, in the digest and in the console, and
+playbooks can use them (`behaviours_any`, `indicator_confidence_at_least`; see
+[docs/playbooks.md](../docs/playbooks.md#conditions)). They never change a record's
+judgement and never put a source in `blocklist-candidates.csv`.
+
+## Promoting a draft
+
 Before promoting a draft:
 1. Check the indicator is not shared infrastructure (CDN, cloud NAT, a scanner you rely on).
 2. Test the Sigma rule against a day of normal logs for false positives.

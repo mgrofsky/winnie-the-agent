@@ -660,3 +660,60 @@ def test_pending_item_expires_in_the_view_without_a_file_change(tree):
     closed = {i["approval"]["id"]: i for i in ok(api, "/api/queue", all=1)["items"]}
     assert closed[tree.ids["pending"]]["approval"]["status"] == "expired"
     assert closed[tree.ids["pending"]]["view_hash"] is None
+
+
+def _recon_record(tree):
+    from agents.behaviours import BehaviourMatch
+    from agents.indicators import IndicatorMatch
+    from agents.triage import SeqEntry
+
+    rec = ui_fixture._record(
+        "campaign-http-198_51_100_77-20261101T1200", "campaign", "http", "198.51.100.77",
+        tree.now, "BENIGN", commands=3,
+        request_sequence=[SeqEntry(seq=1, at="2026-11-01T12:00:00+00:00", offset=0,
+                                   method="GET", path="/static/app.js", status=200,
+                                   lure="bundle", client="norma/0.4"),
+                          SeqEntry(seq=2, at="2026-11-01T12:00:03+00:00", offset=3,
+                                   method="GET", path="/api/admin/<b>x</b>", query="a=1",
+                                   status=403, discovered_via="bundle"),
+                          SeqEntry(seq=3, at="2026-11-01T12:00:04+00:00", offset=4,
+                                   method="GET", path="/api/backup",
+                                   query=f"key={ui_fixture.HONEYTOKEN_VALUE}", status=200)],
+        indicator_matches=[IndicatorMatch(id="artex-ua-norma", framework="ARTEX",
+                                          label="ARTEX default user agent", confidence="medium",
+                                          count=2),
+                           IndicatorMatch(id="gone-entry", label="removed", confidence="low",
+                                          count=1)],
+        behaviours=[BehaviourMatch(id="discovered-routes-used", label="agentic reconnaissance",
+                                   confidence="medium", count=2, first_seq=2, last_seq=2)])
+    path = tree.reports / "campaigns" / f"{rec.id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(rec.model_dump_json())
+    return rec
+
+
+def test_record_carries_the_sequence_and_findings_with_provenance(tree):
+    from agents.indicators import load_indicators
+
+    rec = _recon_record(tree)
+    body = ok(Api(tree.api_paths(), cache_seconds=0, indicators=load_indicators()),
+              f"/api/records/{rec.id}")
+    seq = body["record"]["request_sequence"]
+    assert [e["path"] for e in seq] == ["/static/app.js", "/api/admin/<b>x</b>", "/api/backup"]
+    assert ui_fixture.HONEYTOKEN_VALUE not in seq[2]["query"] and "......" in seq[2]["query"]
+    assert seq[1]["discovered_via"] == "bundle" and seq[1]["offset"] == 3
+    f = body["findings"]
+    assert f["like"] == ["ARTEX"] and f["behaviours"][0]["id"] == "discovered-routes-used"
+    norma, gone = f["indicators"]
+    assert norma["provenance"]["sources"][0].startswith("https://www.microsoft.com/")
+    assert norma["provenance"]["reported"] == "2026-11-25"
+    assert gone["provenance"] is None
+    assert any("ARTEX-like" in line for line in f["lines"])
+    # Without the indicator files the matches are still shown, with no provenance.
+    bare = ok(Api(tree.api_paths(), cache_seconds=0), f"/api/records/{rec.id}")
+    assert [m["provenance"] for m in bare["findings"]["indicators"]] == [None, None]
+
+
+def test_record_without_findings_has_no_findings_key(api, tree):
+    body = ok(api, f"/api/records/{tree.ids['redis']}")
+    assert "findings" not in body and body["record"]["request_sequence"] == []

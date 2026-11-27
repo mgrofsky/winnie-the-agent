@@ -468,11 +468,32 @@ Deterministic rules set floors the model cannot lower:
   keys, cloud and tool credential files). Each one, and any honeytoken use, makes the
   judgement `MALICIOUS` and raises the stage.
 - Campaigns get a model look only when there was a fake login followed by activity, a
-  high-signal event or honeytoken use, and the source is verified. Failed-only brute force
+  high-signal event, honeytoken use or a matched behaviour rule, and the source is
+  verified. Failed-only brute force
   is always handled by code.
 
 Model-suggested IOCs are kept only if they appear verbatim in the transcript and match their
 type's format.
+
+HTTP campaigns also carry their request sequence and what it matched:
+
+| Field | What it holds | Cap |
+|---|---|---|
+| `request_sequence` | the campaign's first requests in log order: `seq` (the listener's per-source request number) and `at` (the event time) to find the raw line, `offset` (seconds since the first), connection, method, path, query, status, route, user agent, and the listener's `lure`, `discovered_via`, `flow`, `flow_step`, `marker` and `marker_src` | 100 entries; path 300 and query 200 characters |
+| `indicator_matches` | indicator entries matched over every user agent, kept request and source address: `id`, `framework`, `label`, `confidence`, `count` | 20 |
+| `behaviours` | behaviour rules matched over the kept requests (up to 300 per campaign): `id`, `label`, `confidence`, `count`, `first_seq`, `last_seq` | 100 |
+
+Indicator entries and behaviour rules are data files (`[indicators]`, `[behaviours]`; see
+[detections/README.md](../detections/README.md)). Their matches are shown on the record,
+in the digest and in the console, and playbooks can use them as conditions. They never
+feed `judgement`, `high_signal`, blocklist reasons, OTX or STIX. A matched behaviour asks
+the model for a narrative within the usual call caps; when it is the only reason for the
+call, the model writes the narrative parts only and the judgement, stage, intent, skill,
+techniques and IOCs stay the rule-based ones. The model sees the request sequence with
+second offsets, not the match labels. A behaviour on a record that also matched an
+indicator naming a framework is described as like that framework (for example
+"ARTEX-like"), never as attributed to it. Records written before these fields existed load
+with them empty.
 
 Without any model configured (no Anthropic credentials, or `--no-llm`), every SSH session
 and campaign gets a deterministic record. When a model is configured but temporarily
