@@ -2,7 +2,8 @@
 
 ``start(root)`` builds the tree from ``ui_fixture.build_tree`` under ``root`` and serves the
 console on 127.0.0.1 with actions on, in a background thread. The TEST-NET-2 range the
-fixture uses counts as public while it runs, so approvals can be decided. Run it as a
+fixture uses counts as public while it runs, so approvals can be decided, and
+``ui_fixture.FakeGeo`` places the fixture's documentation addresses for the map. Run it as a
 process for a scanner::
 
     WINNIE_UI_TOKEN=<24+ characters> python tests/console_lab.py <dir> --port 8480
@@ -30,7 +31,7 @@ for entry in (ROOT, TESTS):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-from ui_fixture import Tree, build_tree  # noqa: E402
+from ui_fixture import FakeGeo, Tree, build_tree  # noqa: E402
 
 from agents.addresses import public_for_tests  # noqa: E402
 from agents.ui.api import Api  # noqa: E402
@@ -68,7 +69,8 @@ def start(root: Path | str, port: int = 0, token: str = "") -> Lab:
     try:
         tree = build_tree(root)
         token = token or secrets.token_urlsafe(32)
-        api = Api(tree.api_paths(), cache_seconds=0, operator=OPERATOR)
+        api = Api(tree.api_paths(), cache_seconds=0, operator=OPERATOR, geo=FakeGeo(),
+                  sensor="fixture", map_home=(40.7, -74.0), map_label="Lab sensor")
         server = build_server(UiSettings(bind="127.0.0.1", port=port, token=token,
                                          actions=True, operator=OPERATOR), api)
     except BaseException:

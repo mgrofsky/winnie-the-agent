@@ -53,6 +53,7 @@ API_LITERALS = {
     "/api/honeytokens",
     "/api/activity",
     "/api/activity/session/",
+    "/api/map",
 }
 # Suffixes appended after an id: GET /api/records/{id}/transcript|replies and
 # POST /api/queue/{id}/approve|reject.
@@ -283,7 +284,7 @@ def test_every_section_has_a_number_key():
     text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
     sections = re.findall(r'\{ key: "([a-z]+)", label: "[A-Za-z ]+", hash: "#/', text)
     n = len(sections)
-    assert "activity" in sections
+    assert "activity" in sections and "map" in sections and n == 8
     assert f"/^[1-{n}]$/.test(ev.key)" in text and f"Keys: 1-{n} switch sections" in text
 
 

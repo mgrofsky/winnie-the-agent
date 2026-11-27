@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from browser_support import plant_canaries, watch
+from browser_support import plant_canaries, plant_map_events, watch
 from console_lab import start
 
 
@@ -14,6 +14,7 @@ def lab(tmp_path):
     """A console of its own for each test, so a decision in one test changes no other."""
     console = start(tmp_path / "tree")
     plant_canaries(console)
+    plant_map_events(console)
     yield console
     console.stop()
 
