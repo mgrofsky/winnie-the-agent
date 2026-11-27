@@ -1493,3 +1493,13 @@ async def test_each_family_end_to_end_through_the_telnet_listener():
         response = e["data"]["response"]
         assert all(c.isprintable() or c in "\r\n\t" for c in response)
         json.dumps(e).encode("utf-8")
+
+
+def test_a_group_that_reads_the_file_it_writes_is_left_to_the_model():
+    assert shell.answer(host(), "(echo a; wc -c f) >f; cat f", now=NOW) is None
+    assert shell.answer(host(), "(echo a; (cat /tmp/f)) >/tmp/f", now=NOW) is None
+    assert one("(echo a; echo b) >/tmp/f; cat /tmp/f") == "a\nb\n"
+
+
+def test_a_nested_group_keeps_every_byte_on_its_way_to_a_file():
+    assert one("( (echo -ne '\\x00\\x01a') ) >/tmp/f; wc -c /tmp/f") == "3 /tmp/f\n"

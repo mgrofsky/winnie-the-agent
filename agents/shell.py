@@ -701,6 +701,20 @@ class _Simple:
 _LOOP = ("while", "read", None, ";", "do", "echo", "$", ";", "done")
 
 
+def _group_words(items: list) -> set:
+    """The last path component of every word and redirection target in a group's list,
+    nested groups included, URLs aside."""
+    out: set = set()
+    for _joiner, pipeline in items:
+        for cmd in pipeline:
+            for word in list(cmd.argv) + [target for _op, _fd, target in cmd.redirs]:
+                if isinstance(word, str) and "://" not in word:   # a URL names no local file
+                    out.add(posixpath.basename(word.rstrip("/")))
+            if cmd.group is not None:
+                out |= _group_words(cmd.group)
+    return out
+
+
 def _loop_at(tokens: list, i: int) -> Optional[tuple[int, bool]]:
     """(index after ``done``, raw) when ``while read [-r] NAME; do echo $NAME; done`` starts
     at ``tokens[i]``, else None."""
@@ -1101,14 +1115,22 @@ class Shell:
         the group is unsupported."""
         if stdin is not None or self.depth + 1 >= MAX_DEPTH:
             raise _Unsupported
+        targets = {posixpath.basename(fd[1]) for fd in (fds[1], fds[2]) if fd[0] == "file"}
         saved = (self.cwd, self.stage, self.stage_fds, self.stage_errs, self.captured)
         self.depth += 1
-        self.captured = fds[1][0] == "file" or (piped and fds[1][0] == "out")
+        # Output that still leaves through an enclosing group's file or pipe keeps every byte.
+        self.captured = fds[1][0] == "file" or ((piped or self.captured) and fds[1][0] == "out")
         parts, status, scope = [], 0, FIXED
         try:
             for joiner, pipeline in items:
                 if (joiner == "&&" and status != 0) or (joiner == "||" and status == 0):
                     continue
+                # What earlier parts wrote reaches the file when the group ends: a part that
+                # names that file would not see it.
+                if targets & _group_words([(joiner, pipeline)]) and any(
+                        (fds[1][0] == "file" and r.out) or (fds[2][0] == "file" and (r.err or r.late))
+                        for r in parts):
+                    raise _Unsupported
                 try:
                     result = self._pipeline(pipeline)
                 except _OverBudget:
