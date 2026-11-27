@@ -454,12 +454,17 @@ seen and what is still unproven. In short:
 ```bash
 uv sync
 uv run pytest                        # skips the slow timing and scale tests
-uv run pytest -m "slow or not slow"  # everything, as CI runs it
+uv run pytest -m "(slow or not slow) and not browser"  # everything but the browser tests, as CI runs it
 ```
 
 No test touches the network beyond loopback, and none calls a real model. The SSH
 integration tests start the real server on a random local port and use a deterministic fake
 model. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+The security workflow adds Playwright tests of the operator console in Chromium, an OWASP
+ZAP baseline and active scan of the console on loopback, Ruff's security rules and a
+pip-audit of `uv.lock`; [CONTRIBUTING.md](CONTRIBUTING.md#security-checks) shows how to run
+each locally.
 
 ## Security
 
