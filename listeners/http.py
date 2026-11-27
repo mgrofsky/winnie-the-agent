@@ -971,7 +971,7 @@ class Exchange:
             try:    # a key tried as "-u key:" arrives base64 encoded
                 texts.append(base64.b64decode(cred.strip()[:4096], validate=False)
                              .decode("utf-8", "replace"))
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 - not Basic credentials; nothing to scan
                 pass
         hit = self.state.find_marker(texts)
         if hit is not None:
