@@ -1,0 +1,391 @@
+# An invented project-workspace web app with a single-page frontend and a JSON API. The
+# frontend bundle, its source map, /env.js and an OpenAPI document show the API's routes,
+# including internal admin and export routes. The organisation, hosts, networks, people and
+# credentials are {{...}} templates expanded from each sensor's seed, and {marker:...} values
+# are filled in per source when served (see docs/scenarios.md).
+
+name = "dev_portal"
+title = "{{org.short}} workspace web app"
+description = """
+An invented project-workspace web app. A Node API behind nginx serves a single-page
+frontend (a webpack bundle with its source map and a runtime /env.js), a JSON API under
+/api with an OpenAPI document, account sign-in, username checks, password recovery and
+account activation. Project and user records come from PostgreSQL. Honeytokens sit in the
+internal admin settings route, the users table and an OpenAPI example.
+"""
+
+[bait]
+org_suffixes = ["Labs", "Software", "Inc", "Cloud", "HQ"]
+domain_words = ["app", "dev", "work"]
+
+[identity]
+org_name = "{{org.name}}"
+hostname = "{{host:web}}"
+domain = "{{org.domain}}"
+internal_ips = ["{{net:web}}.31", "{{net:data}}.31"]
+os_pretty_name = "Ubuntu 24.04.1 LTS"
+kernel = "Linux {{host:web}} 6.8.0-45-generic #45-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug 30 12:02:04 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux"
+timezone = "UTC"
+lures = [
+    "/srv/{{org.slug}}/api/.env",
+    "/srv/{{org.slug}}/web/build/env.js",
+    "/etc/nginx/sites-enabled/{{org.slug}}.conf",
+    "/var/log/{{org.slug}}/api.log",
+]
+
+[[identity.users]]
+name = "deploy"
+uid = 1000
+gecos = "Deploy user"
+home = "/home/deploy"
+
+[[identity.users]]
+name = "{{org.slug}}"
+uid = 1100
+gecos = "{{org.short}} API"
+home = "/srv/{{org.slug}}"
+shell = "/usr/sbin/nologin"
+
+[ssh]
+persona_prompt = """
+This is {{host:web}}, the production web node for {{org.short}}, an invented project-workspace
+web app. nginx serves the single-page frontend from /srv/{{org.slug}}/web/build and proxies
+/api to a Node 20 service (systemd unit {{org.slug}}-api, port 3000) in /srv/{{org.slug}}/api,
+whose settings are in /srv/{{org.slug}}/api/.env. PostgreSQL 16 runs on {{host:db}}
+({{net:data}}.40, database workspace). Deploys arrive as tarballs from CI under
+/srv/{{org.slug}}/releases. Users: deploy (sudo) and {{org.slug}} (service). Keep every answer
+consistent with this host.
+"""
+
+[[ssh.accounts]]
+username = "deploy"
+password = "{{password:deploy:user}}"
+
+[[ssh.accounts]]
+username = "admin"
+password = "{{password:ssh_admin:weak}}"
+
+# ---- PostgreSQL: workspace data ---------------------------------------------------------
+
+[services.postgres]
+enabled = true
+port = 5432
+version = "16.4"
+
+[services.postgres.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 5
+
+[[services.postgres.accounts]]
+username = "workspace"
+password = "{{ht:workspace_db_password}}"
+
+[[services.postgres.databases]]
+name = "workspace"
+
+[[services.postgres.databases.tables]]
+name = "users"
+columns = [
+    { name = "id", type = "int" },
+    { name = "email", type = "varchar" },
+    { name = "full_name", type = "varchar" },
+    { name = "role", type = "varchar" },
+    { name = "status", type = "varchar" },
+]
+seed_rows = [
+    [1, "ops@{{org.domain}}", "{{person:1.full_name}}", "owner", "active"],
+    [2, "qa@{{org.domain}}", "{{org.short}} QA", "admin", "active"],
+]
+
+[services.postgres.databases.tables.generator]
+count = 120
+[services.postgres.databases.tables.generator.fields]
+id = { kind = "seq", min = 3 }
+email = { kind = "email" }
+full_name = { kind = "full_name" }
+role = { kind = "choice", choices = ["member", "member", "member", "admin", "guest"] }
+status = { kind = "choice", choices = ["active", "active", "active", "invited", "disabled"] }
+
+[[services.postgres.databases.tables]]
+name = "projects"
+columns = [
+    { name = "id", type = "int" },
+    { name = "name", type = "varchar" },
+    { name = "owner_id", type = "int" },
+    { name = "visibility", type = "varchar" },
+    { name = "open_issues", type = "int" },
+]
+
+[services.postgres.databases.tables.generator]
+count = 80
+[services.postgres.databases.tables.generator.fields]
+id = { kind = "seq", min = 2001 }
+name = { kind = "sentence" }
+owner_id = { kind = "int", min = 1, max = 120 }
+visibility = { kind = "choice", choices = ["private", "private", "internal", "public"] }
+open_issues = { kind = "int", min = 0, max = 90 }
+
+# ---- HTTP: frontend, API, assets and flows ----------------------------------------------
+
+[services.http]
+enabled = true
+port = 8080
+server_header = "nginx/1.24.0 (Ubuntu)"
+login_path = "/signin"
+login_title = "Sign in to {{org.short}}"
+branding = "{{org.name}} workspace"
+api_prefix = "/api"
+api_key_header = "X-Api-Key"
+openapi_path = "/api/openapi.json"
+openapi_aliases = ["/swagger.json", "/v3/api-docs"]
+openapi_lure = "openapi"
+openapi_advertises = [
+    "/api/v1/projects",
+    "/api/v1/projects/{id}",
+    "/api/v1/auth/username",
+    "/api/v1/auth/forgot-password",
+    "/api/internal/admin/settings",
+    "/api/internal/export/{dataset}",
+]
+
+[services.http.policy]
+accept = "after_n"
+after_n_min = 2
+after_n_max = 6
+
+[[services.http.accounts]]
+username = "ops@{{org.domain}}"
+password = "{{password:ops:user}}"
+
+[[services.http.accounts]]
+username = "qa@{{org.domain}}"
+password = "{{password:qa}}"
+
+[[services.http.pages]]
+path = "/app"
+title = "Workspace"
+requires_login = false
+body_html = '''
+<div id="root">Loading workspace...</div>
+<noscript>You need to enable JavaScript to run this app.</noscript>
+<p><a href="/signin">Sign in</a></p>
+<p>API reference: <a href="/api/openapi.json">/api/openapi.json</a></p>
+<!-- runtime config: /env.js, bundle: /static/js/main.{{hex:8:bundle}}.js -->
+'''
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/health"
+auth = "none"
+[services.http.routes.json_body]
+status = "ok"
+service = "workspace-api"
+build = "{marker:build}"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/projects"
+auth = "any"
+list_from = "workspace.projects"
+list_limit = 25
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/projects/{id}"
+auth = "none"
+item_from = "workspace.projects"
+item_key = "id"
+lure = "project-item"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/users/{id}"
+auth = "none"
+item_from = "workspace.users"
+item_key = "id"
+lure = "user-item"
+hidden = true
+
+[[services.http.routes]]
+method = "POST"
+path = "/api/v1/auth/username"
+auth = "none"
+flow = "username_check"
+lure = "username-check"
+
+[[services.http.routes]]
+method = "POST"
+path = "/api/v1/auth/forgot-password"
+auth = "none"
+status = 202
+flow = "recovery_request"
+lure = "recovery"
+
+[[services.http.routes]]
+method = "POST"
+path = "/api/v1/auth/reset-password"
+auth = "none"
+flow = "recovery_reset"
+lure = "recovery-reset"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/v1/auth/activate/{token}"
+auth = "none"
+flow = "activation"
+lure = "activation"
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/internal/admin/settings"
+auth = "bearer"
+lure = "admin-settings"
+hidden = true
+[services.http.routes.json_body]
+environment = "production"
+signup_mode = "invite_only"
+mail_relay = "{{host:mail}}.{{org.domain}}:587"
+storage = { bucket = "{{org.slug}}-exports", region = "us-east-2", access_key_id = "{{ht:export_aws_key}}" }
+
+[[services.http.routes]]
+method = "GET"
+path = "/api/internal/export/{dataset}"
+auth = "none"
+lure = "export"
+hidden = true
+[services.http.routes.json_body]
+dataset = "{dataset}"
+job_id = "{marker:export_job_id}"
+status = "queued"
+download_path = "/api/internal/export/jobs/{marker:export_job_id}"
+
+# ---- decoy assets -----------------------------------------------------------------------
+
+[[services.http.assets]]
+path = "/static/js/main.{{hex:8:bundle}}.js"
+kind = "bundle"
+lure = "main-bundle"
+advertises = [
+    "/api/v1/projects",
+    "/api/v1/projects/{id}",
+    "/api/v1/users/{id}",
+    "/api/v1/auth/username",
+    "/api/v1/auth/forgot-password",
+    "/api/v1/auth/reset-password",
+    "/api/internal/admin/settings",
+    "/api/internal/export/{dataset}",
+]
+
+[[services.http.assets]]
+path = "/static/js/main.{{hex:8:bundle}}.js.map"
+kind = "source_map"
+lure = "main-sourcemap"
+advertises = [
+    "/api/v1/projects",
+    "/api/v1/projects/{id}",
+    "/api/v1/users/{id}",
+    "/api/v1/auth/username",
+    "/api/v1/auth/forgot-password",
+    "/api/v1/auth/reset-password",
+    "/api/v1/auth/activate/{token}",
+    "/api/internal/admin/settings",
+    "/api/internal/export/{dataset}",
+]
+
+[[services.http.assets]]
+path = "/env.js"
+kind = "runtime_config"
+lure = "env-js"
+advertises = ["/api/v1/projects", "/api/internal/export/{dataset}"]
+body = '''
+window.__ENV__ = {
+  "apiBase": "/api",
+  "environment": "production",
+  "release": "{marker:build}",
+  "oauthClientId": "{marker:client_id}",
+  "publicApiKey": "{marker:public_api_key}",
+  "exportsPath": "/api/internal/export",
+  "features": { "bulkExport": true, "sso": false, "betaReports": false }
+};
+'''
+
+[[services.http.assets]]
+path = "/assets/config.json"
+kind = "runtime_config"
+lure = "assets-config"
+advertises = ["/api/v1/projects", "/api/v1/projects/{id}"]
+
+# ---- OpenAPI document -------------------------------------------------------------------
+
+[services.http.openapi]
+openapi = "3.0.3"
+
+[services.http.openapi.info]
+title = "{{org.short}} Workspace API"
+version = "3.8.2"
+description = "Projects, users and account management for the {{org.short}} workspace."
+
+[[services.http.openapi.servers]]
+url = "https://app.{{org.domain}}/api"
+description = "Production"
+
+[services.http.openapi.components.securitySchemes.ApiKeyAuth]
+type = "apiKey"
+in = "header"
+name = "X-Api-Key"
+description = "Sandbox example key for the QA account: {{ht:qa_api_key}}"
+
+[services.http.openapi.components.securitySchemes.AdminBearer]
+type = "http"
+scheme = "bearer"
+description = "Internal admin token (ops only)"
+
+[[services.http.openapi.security]]
+ApiKeyAuth = []
+
+[services.http.openapi.paths."/api/v1/projects".get]
+summary = "List projects visible to the caller"
+responses = { "200" = { description = "Projects" } }
+
+[services.http.openapi.paths."/api/v1/projects/{id}".get]
+summary = "Get a project"
+parameters = [ { name = "id", in = "path", required = true, schema = { type = "integer" } } ]
+responses = { "200" = { description = "Project" }, "404" = { description = "Not found" } }
+
+[services.http.openapi.paths."/api/v1/auth/username".post]
+summary = "Check whether a username is taken"
+security = []
+responses = { "200" = { description = "Result" } }
+
+[services.http.openapi.paths."/api/v1/auth/forgot-password".post]
+summary = "Request a password reset email"
+security = []
+responses = { "202" = { description = "Accepted" } }
+
+[services.http.openapi.paths."/api/internal/admin/settings".get]
+summary = "Instance settings (internal)"
+security = [ { AdminBearer = [] } ]
+responses = { "200" = { description = "Settings" }, "401" = { description = "Unauthorized" } }
+
+[services.http.openapi.paths."/api/internal/export/{dataset}".get]
+summary = "Start a dataset export (internal)"
+parameters = [ { name = "dataset", in = "path", required = true, schema = { type = "string", enum = ["users", "projects", "audit"] } } ]
+responses = { "200" = { description = "Export job" } }
+
+# ---- honeytokens ---------------------------------------------------------------------------
+
+[[honeytokens]]
+name = "qa_api_key"
+kind = "api_key"
+planted_in = ["OpenAPI /api/openapi.json components.securitySchemes.ApiKeyAuth description"]
+
+[[honeytokens]]
+name = "export_aws_key"
+kind = "aws_access_key"
+planted_in = ["HTTP /api/internal/admin/settings (storage.access_key_id)"]
+
+[[honeytokens]]
+name = "workspace_db_password"
+kind = "db_password"
+planted_in = ["PostgreSQL account workspace"]

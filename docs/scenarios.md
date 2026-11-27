@@ -42,6 +42,7 @@ leaves out FTP file contents and HTTP bodies, which may embed honeytokens.
 | `healthcare` | HL7 MLLP, PostgreSQL, FTP, HTTP | Regional health system integration host: patient portal and EHR admin console, FHIR R4-style API (Patient, Observation, Encounter), inbound ADT/ORU feeds over MLLP, clinical database, lab and imaging FTP share. |
 | `saas` | PostgreSQL, Redis, SMTP, S3, HTTP | Multi-tenant work-tracking SaaS: customer web app, admin console, bearer-token API, tenants and tokens in PostgreSQL, sessions and job queues in Redis, a notification mail relay, S3 uploads and database exports plus a public assets bucket that also holds a deploy `.env`. |
 | `api_platform` | PostgreSQL, Redis, HTTP | B2B data API gateway: versioned REST endpoints with API-key auth, an OpenAPI document, consumer and key records in PostgreSQL, rate-limit counters in Redis. Unknown API routes may be answered by the budgeted model. |
+| `dev_portal` | PostgreSQL, HTTP | Project-workspace web app: a single-page frontend with a JavaScript bundle, its source map and a runtime `/env.js`, a JSON API with an OpenAPI document that lists internal admin and export routes, item routes over generated projects and users, username checks, password recovery and activation flows. |
 
 The SSH honeypot runs alongside any scenario and takes the scenario's host profile.
 
@@ -250,6 +251,32 @@ Service-specific keys:
   are served only when they can hold the scenario's honeytokens or the source's planted
   pair; everything else is the server's own 404 (or 403 for `/server-status` and
   `/cgi-bin/` behind an Apache `server_header`).
+- **`http` web deception** (all optional): `[[...assets]]`, `openapi_aliases`,
+  `openapi_advertises`, `openapi_lure`, and on a route `lure`, `hidden` and `flow`.
+  - An asset has `path`, `kind` (`bundle`, `source_map`, `runtime_config`, `static`),
+    `lure` (its lure ID), `advertises` (route paths) and an optional `body`. Without a
+    `body` the content is generated from the advertised routes: a minified webpack chunk
+    with an API client table, a source map whose `sourcesContent` holds that client, or a
+    config object with `apiBase`, feature flags and an endpoint table (a
+    `window.__ENV__` assignment when the path ends in `.js`). A `static` asset needs a
+    `body`. Assets answer GET and HEAD with their own content type, `ETag`,
+    `Last-Modified` and cache headers.
+  - A source that fetches an asset, or the OpenAPI document (at `openapi_path` or an
+    `openapi_aliases` path) when `openapi_advertises` is set, is recorded as shown those
+    routes. Its later requests to them carry `discovered_via` and `discovered_age`.
+  - `{marker:NAME}` in an asset `body` or a route `json_body` is replaced per source by a
+    value derived from the sensor seed, the source and the name (a short hex hash for a
+    build or commit name, a UUID for an `*_id` name, a 32-character key for a key or
+    token name). A marker presented back in the target, body, `Authorization`, the
+    API-key header or `Cookie` is logged as `marker`, with `marker_src` when it was
+    issued to another source. Up to 16 marker names per scenario.
+  - `hidden = true` leaves a route out of the generated OpenAPI document and the model's
+    prompt; it still answers.
+  - `flow` answers a route with a fixed local reply: `username_check` (`exists` true only
+    for the service's accounts), `recovery_request` (the same message for every address),
+    `recovery_reset` and `activation` (every token is invalid or expired). A flow route
+    has no other content source.
+  - Item routes with a `lure` log `object_id_count`, the distinct IDs this source asked.
 - **`mllp`**: `sending_facility`.
 - **`s3`**: `server_header`, `region`, `owner_name`, `get_max_bytes` (bytes one download
   sends, at most 16 MB) and `[[services.s3.buckets]]` with `name`, `region`, `created`,

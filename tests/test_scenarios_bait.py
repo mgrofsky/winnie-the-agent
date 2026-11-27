@@ -32,7 +32,7 @@ from scenarios.schema import (
     valid_password,
 )
 
-SHIPPED = ["sip_provider", "contact_center", "bank", "healthcare", "saas", "api_platform"]
+SHIPPED = ["sip_provider", "contact_center", "bank", "healthcare", "saas", "api_platform", "dev_portal"]
 
 
 def _bait(seed="sensor-a", scenario="t_pack", **pins) -> Bait:
@@ -374,7 +374,8 @@ _ASSIGN_RE = re.compile(r"(?i)(?<![A-Za-z])(" + _SECRET_NAME + r")[A-Za-z_]*['\"
 _URL_CRED_RE = re.compile(r"://[^/\s:@]+:([^@\s/]+)@")
 _SECRET_KEY_RE = re.compile(r"(?i)^(?:.*_)?(password|passwd|pwd|secret|client_secret|token|"
                             r"api_key|apikey|access_key|secret_key|session_id|sid)$")
-_HARMLESS = re.compile(r"^(\{\{.*|\*+.*|[0-9]{1,5}|true|false|yes|no|none|null|required|"
+# A {marker:NAME} value is filled in per source when served, like a template per sensor.
+_HARMLESS = re.compile(r"^(\{\{.*|\{marker:.*|\*+.*|[0-9]{1,5}|true|false|yes|no|none|null|required|"
                        r"hidden|optional|bearer|basic|header|query|string|apiKey|http)$", re.I)
 
 

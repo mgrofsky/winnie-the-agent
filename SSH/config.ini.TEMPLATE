@@ -221,7 +221,7 @@ reply_cache_max_age = 21600
 state_file = budget_state.json
 
 # One scenario pack makes the whole sensor look like one coherent target.
-# Names: sip_provider, contact_center, bank, saas, api_platform, healthcare
+# Names: sip_provider, contact_center, bank, saas, api_platform, healthcare, dev_portal
 # (python -m listeners --list-scenarios). Changing it needs a restart.
 [scenario]
 active = sip_provider

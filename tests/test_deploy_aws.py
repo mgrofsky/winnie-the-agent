@@ -838,14 +838,19 @@ def test_names_and_account_ids_are_parameters_only(sensor, bucket):
 
 # ---- consistency with the rest of the repository ------------------------------------------
 
+# Packs the sensor template does not offer, with the reason.
+NOT_IN_TEMPLATE = {"dev_portal": "the template body is at CloudFormation's 51,200-byte limit"}
+
+
 def test_scenario_mapping_matches_the_scenarios(sensor):
     from listeners.base import SERVICES
     from scenarios.loader import list_scenarios, load_scenario
 
+    names = [n for n in list_scenarios() if n not in NOT_IN_TEMPLATE]
     mapping = sensor["Mappings"]["ScenarioServices"]
-    assert sorted(mapping) == sorted(n.replace("_", "-") for n in list_scenarios())
+    assert sorted(mapping) == sorted(n.replace("_", "-") for n in names)
     assert sorted(sensor["Parameters"]["Scenario"]["AllowedValues"]) == sorted(mapping)
-    for name in list_scenarios():
+    for name in names:
         services = load_scenario(name, "seed").scenario.services
         flags = mapping[name.replace("_", "-")]
         for svc in SERVICES:

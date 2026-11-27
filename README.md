@@ -18,7 +18,7 @@ On top of that SSH honeypot this project adds:
   credentials and intent, then fakes a working service after a fake login.
 - **Scenarios**: one TOML file describes the whole fake target (organisation, host, users,
   services, banners, accounts, fake data, HTTP pages and APIs, honeytokens), so every
-  protocol on a sensor tells the same story. Six scenarios ship with the project.
+  protocol on a sensor tells the same story. Seven scenarios ship with the project.
 - **Budgets**: every model call first reserves its estimated tokens against per-session,
   per-source and daily token budgets, with concurrency limits, all enforced in code. They
   are estimates, not provider billing, and calls in flight can pass a limit by the
@@ -276,6 +276,7 @@ or go into detail:
 | `healthcare` | Regional health system EHR integration host: HL7 MLLP, FHIR-style REST API, PostgreSQL clinical database, FTP lab and imaging share. |
 | `saas` | Multi-tenant SaaS app server: PostgreSQL, Redis, SMTP relay, S3 uploads, database exports and a misconfigured public bucket, web app and bearer-token API. |
 | `api_platform` | B2B data API gateway: versioned REST API with API keys, OpenAPI document, PostgreSQL, Redis. |
+| `dev_portal` | Project-workspace web app: JavaScript bundle, source map, runtime config and OpenAPI document that show its API, recovery and activation flows, PostgreSQL. |
 
 Every organisation, person, phone number, card number and domain in them is invented, and a
 checker enforces that (`uv run python -m scenarios.check`). The SSH honeypot is available
