@@ -9,12 +9,20 @@ fallback is a plain 404. Other unknown paths get a canned answer for the most-pr
 (``CANNED_404``, lure files holding only issued tokens, the stack's own 403s), then for a
 plain GET the budgeted model (``llm_unknown_paths``) with its answer cached per path, then
 the stack's 404 page. Nothing here makes an outbound connection.
+
+Web deception (all optional, configured by the scenario): decoy assets (bundles, source
+maps, runtime config) served with their own type and cache headers, a per-source record of
+which routes an asset or the OpenAPI document showed (``listeners.http_state``), per-source
+``{marker:NAME}`` values recognised when presented back, and fixed local flows for username
+checks, account recovery and activation. No flow makes a credential valid or issues a
+session. Each request event carries the evidence keys listed in ``docs/architecture.md``.
 """
 
 from __future__ import annotations
 
 import base64
 import email.utils
+import hashlib
 import html
 import json
 import os
@@ -28,10 +36,14 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agents.budget import ip_key
 from agents.llm import untrusted_block
 from listeners.base import Conn, ConnClosed, ListenerContext, ServiceSettings, start_tcp
 from listeners.ftp import AWS_CREDENTIALS_PATH, aws_profile
+from listeners.http_state import http_state
 from listeners.sqlfake import wire_text
+from scenarios.schema import MARKER_RE
+from scenarios.web_assets import app_name, asset_text
 
 MAX_REQUEST_LINE = 8192
 MAX_HEADERS = 50
@@ -51,6 +63,16 @@ REASONS = {200: "OK", 201: "Created", 204: "No Content", 301: "Moved Permanently
            501: "Not Implemented", 505: "HTTP Version Not Supported"}
 
 USER_FIELDS = ("username", "user", "login", "email", "j_username", "userid", "user_name")
+FLOW_TOKEN_FIELDS = ("token", "code", "reset_token", "activation_token", "key", "t")
+# Evidence keys, in the order they are written (ahead of optional header and body fields,
+# so the 32-key event cap never drops them).
+EVIDENCE_KEYS = ("lure_id", "discovered_via", "discovered_age", "marker", "marker_src", "flow",
+                 "flow_step", "object_id_count")
+ASSET_TYPES = {"css": "text/css", "html": "text/html", "htm": "text/html", "txt": "text/plain",
+               "json": "application/json", "js": "application/javascript",
+               "mjs": "application/javascript", "map": "application/json",
+               "svg": "image/svg+xml", "xml": "text/xml", "webmanifest": "application/manifest+json"}
+ASSET_MTIME_BASE = 1_788_000_000    # asset Last-Modified times fall in the months after this
 PASS_FIELDS = ("password", "pass", "pwd", "passwd", "j_password", "secret")
 
 _SESSIONS: "weakref.WeakKeyDictionary[ListenerContext, OrderedDict[str, dict]]" = \
@@ -168,6 +190,12 @@ class HttpCfg:
     openapi: Optional[dict] = None
     llm_unknown: bool = False
     llm_unknown_paths: bool = True
+    assets: dict = field(default_factory=dict)          # path -> (HttpAsset, text)
+    openapi_aliases: tuple = ()
+    openapi_advertises: tuple = ()
+    openapi_lure: str = "openapi"
+    markers: frozenset = frozenset()                    # marker names used by the scenario
+    accounts: frozenset = frozenset()                   # lowercased account names
 
 
 DEFAULT_PAGES = [SimpleNamespace(path="/dashboard", title="Dashboard", requires_login=True,
@@ -195,9 +223,16 @@ def build_cfg(ctx: ListenerContext, settings: ServiceSettings) -> HttpCfg:
         cfg.openapi = svc.openapi
         cfg.llm_unknown = svc.llm_unknown_api_routes
         cfg.llm_unknown_paths = svc.llm_unknown_paths
+        app = app_name(cfg.domain)
+        cfg.assets = {a.path: (a, asset_text(a, svc, app)) for a in svc.assets}
+        cfg.openapi_aliases = tuple(svc.openapi_aliases)
+        cfg.openapi_advertises = tuple(svc.openapi_advertises)
+        cfg.openapi_lure = svc.openapi_lure
+        cfg.markers = svc.marker_names()
     else:
         cfg.server = settings.banner or "nginx"
         cfg.pages = list(DEFAULT_PAGES)
+    cfg.accounts = frozenset(u.lower() for u, _ in settings.accounts)
     return cfg
 
 
@@ -300,6 +335,20 @@ def model_may_answer(method: str, path: str) -> bool:
     if last.lower().split(".", 1)[0] in NO_MODEL_NAMES:
         return False
     return not ("." in last and last.rsplit(".", 1)[1].lower() in NO_MODEL_EXT)
+
+
+def asset_type(asset) -> str:
+    """The Content-Type a static file server sends for the asset."""
+    if asset.kind == "bundle":
+        return "application/javascript"
+    if asset.kind == "source_map":
+        return "application/json"
+    ext = asset.path.rsplit("/", 1)[-1].rsplit(".", 1)
+    ctype = ASSET_TYPES.get(ext[1].lower(), "application/octet-stream") if len(ext) == 2 else \
+        "application/octet-stream"
+    if asset.kind == "runtime_config" and ctype == "application/octet-stream":
+        return "application/json"
+    return ctype
 
 
 def parse_cookies(value: Optional[str]) -> dict[str, str]:
@@ -410,6 +459,11 @@ async def read_head(conn: Conn) -> Optional[Request]:
 
 # ---- the handler --------------------------------------------------------------------------
 
+def source_key(conn: Conn) -> str:
+    """The per-source state key: the address, IPv6 sources grouped per /64."""
+    return ip_key(conn.src_ip)
+
+
 class Exchange:
     """One request/response, with logging fields accumulated along the way."""
 
@@ -424,6 +478,10 @@ class Exchange:
         self.schemes: set[str] = set()
         self.set_cookie: Optional[str] = None
         self.close = False
+        self.state = http_state(self.ctx)
+        self.key = source_key(conn)
+        self.seq = self.state.next_seq(self.key)
+        self.ev: dict = {}          # evidence keys (EVIDENCE_KEYS) for this request
 
     # ---- auth ---------------------------------------------------------------------------
 
@@ -560,6 +618,7 @@ class Exchange:
             self.close = True
             return 400, error_page(400, cfg.server), "text/html", []
         self.authenticate()
+        self.recognise_marker()
         path = req.path
         method = "GET" if req.method == "HEAD" else req.method
 
@@ -578,8 +637,13 @@ class Exchange:
             return 302, b"", "text/html", [
                 ("Location", cfg.login_path),
                 ("Set-Cookie", f"{COOKIE_NAME}=deleted; Path=/; Max-Age=0; HttpOnly")]
-        if cfg.openapi_path and path == cfg.openapi_path and method == "GET":
+        if cfg.openapi_path and (path == cfg.openapi_path or path in cfg.openapi_aliases) \
+                and method == "GET":
             self.log["route"] = "openapi"
+            if cfg.openapi_advertises:
+                self.ev["lure_id"] = cfg.openapi_lure
+                if req.method == "GET":
+                    self.state.show(self.key, cfg.openapi_advertises, cfg.openapi_lure)
             return 200, json_bytes(cfg.openapi or self.generated_openapi()), "application/json", []
         for page in cfg.pages:
             if page.path == path and method == "GET":
@@ -596,12 +660,19 @@ class Exchange:
             if route.method != method:
                 continue
             self.log["route"] = route.path
+            params = {k: wire_text(v, 200) for k, v in m.groupdict().items()}
+            self.route_evidence(route, params)
             if not self.allowed(route.auth):
                 return self.unauthorized_api()
-            return self.serve_route(route, {k: wire_text(v, 200) for k, v in m.groupdict().items()})
+            if route.flow:
+                return self.run_flow(route, params)
+            return self.serve_route(route, params)
         if matched_path:
             self.log["route"] = "method_not_allowed"
             return 405, json_bytes({"error": "method not allowed"}), "application/json", []
+        asset = cfg.assets.get(path)
+        if asset is not None:
+            return self.serve_asset(*asset)
         if path == "/":
             self.log["route"] = "root"
             target = self.first_page() if self.schemes else cfg.login_path
@@ -711,7 +782,7 @@ class Exchange:
         the site treats it as a directory and not as a missing file."""
         cfg, prefix = self.cfg, path.rstrip("/") + "/"
         known = [p.path for p in cfg.pages] + [r.path for r in cfg.routes] + \
-            [cfg.login_path, cfg.api_prefix or ""]
+            [cfg.login_path, cfg.api_prefix or ""] + list(cfg.assets) + list(cfg.openapi_aliases)
         return any(k.startswith(prefix) for k in known)
 
     def scenario_tokens(self, kinds) -> list:
@@ -774,19 +845,7 @@ class Exchange:
         return host in local
 
     def form_login(self) -> tuple[int, bytes, str, list]:
-        ctype = (self.req.header("content-type") or "").lower()
-        fields: dict[str, str] = {}
-        try:
-            text = self.req.body.decode("utf-8", "replace")
-            if "json" in ctype:
-                obj = json.loads(text)
-                if isinstance(obj, dict):
-                    fields = {str(k)[:64]: str(v)[:256] for k, v in list(obj.items())[:50]}
-            else:
-                qs = parse_qs(text, keep_blank_values=True, max_num_fields=50)
-                fields = {k[:64]: v[0][:256] for k, v in qs.items() if v}
-        except (ValueError, RecursionError):
-            fields = {}
+        fields = self.body_fields()
         self.log["form_keys"] = ",".join(sorted(fields))[:200]
         lower = {k.lower(): v for k, v in fields.items()}
         user = next((lower[k] for k in USER_FIELDS if k in lower), None)
@@ -870,13 +929,136 @@ class Exchange:
                                 "application/json", []
             return 404, json_bytes({"error": "not found"}), "application/json", []
         if route.json_body is not None:
-            return route.status, json_bytes(substitute(route.json_body, params)), \
-                "application/json", []
+            # Markers first, from the scenario's own text, so a path parameter never names one.
+            body = self.fill_markers(route.json_body) if self.cfg.markers else route.json_body
+            return route.status, json_bytes(substitute(body, params)), "application/json", []
         return route.status, json_bytes({"status": "ok"}), "application/json", []
+
+    # ---- web deception ------------------------------------------------------------------
+
+    def fill_markers(self, obj: Any) -> Any:
+        """``obj`` with each ``{marker:NAME}`` in its strings replaced by this source's value."""
+        if isinstance(obj, str):
+            if "{marker:" not in obj:
+                return obj
+            return MARKER_RE.sub(lambda m: self.state.marker(self.key, m.group(1))
+                                 if m.group(1) in self.cfg.markers else m.group(0), obj)
+        if isinstance(obj, list):
+            return [self.fill_markers(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: self.fill_markers(v) for k, v in obj.items()}
+        return obj
+
+    def recognise_marker(self) -> None:
+        """Note a marker issued by this listener in the target, body, Authorization, API-key
+        header or Cookie, and whether it was issued to another source."""
+        if not self.cfg.markers:
+            return
+        req = self.req
+        texts = (req.target, req.body[:MAX_BODY].decode("utf-8", "replace") if req.body else None,
+                 req.header("authorization"), req.header(self.cfg.api_key_header),
+                 req.header("cookie"))
+        hit = self.state.find_marker(texts)
+        if hit is not None:
+            self.ev["marker"] = hit[0]
+            if hit[1] != self.key:
+                self.ev["marker_src"] = True
+
+    def route_evidence(self, route, params: dict[str, str]) -> None:
+        """Lure, discovery and object-ID evidence for a matched route."""
+        if route.lure:
+            self.ev["lure_id"] = route.lure
+        found = self.state.discovery(self.key, route.path)
+        if found is not None:
+            self.ev["discovered_via"], self.ev["discovered_age"] = found
+        if route.lure and route.item_from:
+            value = params.get(route.item_key) if route.item_key in params else (
+                list(params.values())[-1] if params else None)
+            if value is not None:
+                self.ev["object_id_count"] = self.state.count_id(self.key, route.path, value)
+
+    def serve_asset(self, asset, text: str) -> tuple[int, bytes, str, list]:
+        """A decoy asset with its own type, ETag, Last-Modified and cache headers, like the
+        server's static file handler. A GET records the routes it advertises as shown."""
+        self.log["route"] = "asset"
+        self.ev["lure_id"] = asset.lure
+        if self.req.method not in ("GET", "HEAD"):
+            return 405, error_page(405, self.cfg.server), "text/html", []
+        if self.cfg.markers and "{marker:" in text:
+            text = self.fill_markers(text)
+        body = text.encode("utf-8")
+        if self.req.method == "GET" and asset.advertises:
+            self.state.show(self.key, asset.advertises, asset.lure)
+        digest = hashlib.sha256(f"{self.cfg.hostname}|{asset.path}".encode()).digest()
+        mtime = ASSET_MTIME_BASE + int.from_bytes(digest[:4], "big") % 7_000_000
+        headers = [("Last-Modified", email.utils.formatdate(mtime, usegmt=True)),
+                   ("ETag", f'"{mtime:x}-{len(body):x}"'),
+                   ("Cache-Control", "no-cache" if asset.kind == "runtime_config"
+                    else "public, max-age=31536000, immutable"),
+                   ("Accept-Ranges", "bytes")]
+        return 200, body, asset_type(asset), headers
+
+    def request_fields(self) -> dict[str, str]:
+        """Query and body fields (form or JSON object), keys lowercased, values capped."""
+        fields: dict[str, str] = {}
+        try:
+            qs = parse_qs(self.req.query, keep_blank_values=True, max_num_fields=50)
+            fields.update({k[:64].lower(): v[0][:256] for k, v in qs.items() if v})
+        except ValueError:
+            pass
+        fields.update({k.lower(): v for k, v in self.body_fields().items()})
+        return fields
+
+    def body_fields(self) -> dict[str, str]:
+        ctype = (self.req.header("content-type") or "").lower()
+        fields: dict[str, str] = {}
+        try:
+            text = self.req.body.decode("utf-8", "replace")
+            if "json" in ctype:
+                obj = json.loads(text)
+                if isinstance(obj, dict):
+                    fields = {str(k)[:64]: str(v)[:256] for k, v in list(obj.items())[:50]}
+            else:
+                qs = parse_qs(text, keep_blank_values=True, max_num_fields=50)
+                fields = {k[:64]: v[0][:256] for k, v in qs.items() if v}
+        except (ValueError, RecursionError):
+            fields = {}
+        return fields
+
+    def run_flow(self, route, params: dict[str, str]) -> tuple[int, bytes, str, list]:
+        """The fixed local reply of a multi-step flow. Nothing is sent anywhere, no
+        credential becomes valid and no session is issued."""
+        flow = route.flow
+        self.ev["flow"] = flow
+        fields = self.request_fields()
+        fields.update({k.lower(): v for k, v in params.items()})
+        if flow == "username_check":
+            name = next((fields[k] for k in USER_FIELDS if fields.get(k)), None)
+            if name is None:
+                self.ev["flow_step"] = "missing"
+                return 400, json_bytes({"error": "username is required"}), "application/json", []
+            exists = name.strip().lower() in self.cfg.accounts
+            self.ev["flow_step"] = "exists" if exists else "unknown"
+            return route.status, json_bytes({"exists": exists}), "application/json", []
+        if flow == "recovery_request":
+            self.ev["flow_step"] = "requested"
+            return route.status, json_bytes({
+                "message": "If an account exists for that address, you will receive an email "
+                           "with a link to reset your password."}), "application/json", []
+        what = "password reset" if flow == "recovery_reset" else "activation"
+        if not any(fields.get(k) for k in FLOW_TOKEN_FIELDS):
+            self.ev["flow_step"] = "missing"
+            return 400, json_bytes({"error": "token is required"}), "application/json", []
+        self.ev["flow_step"] = "token_rejected"
+        return 400, json_bytes({"error": "invalid_token",
+                                "message": f"This {what} link is invalid or has expired."}), \
+            "application/json", []
 
     def generated_openapi(self) -> dict:
         paths: dict = {}
         for r in self.cfg.routes:
+            if r.hidden:
+                continue
             entry = paths.setdefault(r.path, {})
             params = [{"name": n, "in": "path", "required": True, "schema": {"type": "string"}}
                       for n in re.findall(r"\{([A-Za-z_]\w*)\}", r.path)]
@@ -910,7 +1092,7 @@ class Exchange:
             payload = f"{req.method if req.method != 'HEAD' else 'GET'} {req.path[:MAX_MODEL_PATH]}"
             schema, examples = LlmPageAnswer, PAGE_EXAMPLES
         else:
-            known = ", ".join(f"{r.method} {r.path}" for r in cfg.routes)[:2000]
+            known = ", ".join(f"{r.method} {r.path}" for r in cfg.routes if not r.hidden)[:2000]
             system = ("You emulate the JSON REST API of a decoy web application"
                       f"{' for ' + cfg.org if cfg.org else ''}. Known routes: {known}. Answer the "
                       "HTTP request in the untrusted block as that API would, as JSON "
@@ -1002,8 +1184,25 @@ async def handle(conn: Conn) -> None:
             headers.append(("Set-Cookie", ex.set_cookie))
         await conn.write(build_response(status, cfg.server, body, ctype, headers, keep_alive=keep,
                                         head=req.method == "HEAD"))
+        nreq = conn.state["http_req"] = conn.state.get("http_req", 0) + 1
+        # Order matters: the event keeps its first 32 keys, so the request line, route and
+        # evidence come before optional headers and body fields.
         data = {"method": req.method, "path": req.path[:500], "query": req.query[:500],
                 "status": status, "host": req.header("host") or ""}
+        for k in ("route", "rung"):
+            if k in ex.log:
+                data[k] = ex.log[k]
+        data["seq"], data["req"] = ex.seq, nreq
+        for k in EVIDENCE_KEYS:
+            if k in ex.ev:
+                data[k] = ex.ev[k]
+        data["resp_type"] = ctype if body or status not in (204, 302, 301) else ""
+        data["resp_bytes"] = 0 if req.method == "HEAD" else len(body)
+        token = conn.ctx.honeytoken_in(req.target, req.body[:MAX_BODY].decode("utf-8", "replace"))
+        if token:
+            data["honeytoken"] = token
+            data["high_signal"] = True
+        data.update(ex.log)
         for k in ("referer", "x-forwarded-for", "content-type", "origin"):
             v = req.header(k)
             if v:
@@ -1015,11 +1214,6 @@ async def handle(conn: Conn) -> None:
             data["absolute_uri"] = req.target[:500]
         if ".." in req.path or "%2e%2e" in req.target.lower():
             data["path_traversal"] = True
-        token = conn.ctx.honeytoken_in(req.target, req.body[:MAX_BODY].decode("utf-8", "replace"))
-        if token:
-            data["honeytoken"] = token
-            data["high_signal"] = True
-        data.update(ex.log)
         conn.emit("command", f"{req.method} {req.path[:200]}", client=ex.ua, username=ex.user,
                   data=data)
         if req.body:

@@ -3,6 +3,8 @@
 import asyncio
 import base64
 import json
+import re
+import types
 
 import pytest
 
@@ -739,3 +741,435 @@ async def test_post_body_to_a_known_route_is_logged():
         await stop(servers)
     data = unknown_events(ctx, "/api/v1/notes")[0]
     assert data["body"] == '{"note": "hello"}' and data["body_bytes"] == 17
+
+
+# ---- web deception: assets, discovery, markers, flows, evidence ----------------------------
+
+EVIDENCE = {"lure_id", "discovered_via", "discovered_age", "marker", "marker_src", "flow",
+            "flow_step", "object_id_count"}
+ALWAYS = {"seq", "req", "resp_type", "resp_bytes"}
+
+
+async def start_pack(name="dev_portal", seed="t", **limits):
+    from listeners.base import Limits
+    from scenarios.loader import load_scenario
+
+    scen = load_scenario(name, seed=seed)
+    ctx = ListenerContext(EventWriter(None), scenario=scen, bind_host="127.0.0.1", seed=seed,
+                          honeytokens=scen.recognised_tokens(),
+                          limits=Limits(rate_per_ip_per_minute=10_000, **limits))
+    svc = scen.scenario.services.http
+    settings = ServiceSettings(name="http", enabled=True, port=0, policy=svc.policy,
+                               accounts=scen.accounts_for("http"))
+    ctx.settings["http"] = settings
+    servers = await http.start(ctx, settings)
+    return ctx, servers, servers[0].sockets[0].getsockname()[1]
+
+
+def assets_of(ctx) -> dict:
+    return {a.kind if a.kind != "runtime_config" else a.path: a.path
+            for a in ctx.scenario.scenario.services.http.assets}
+
+
+def cmd(ctx, path, method=None) -> list:
+    return [e["data"] for e in events(ctx, "command") if e["data"]["path"] == path
+            and (method is None or e["data"]["method"] == method)]
+
+
+def as_source(monkeypatch, holder: dict):
+    """Requests are attributed to ``holder['key']`` instead of the loopback address."""
+    monkeypatch.setattr(http, "source_key", lambda conn: holder["key"])
+
+
+async def test_assets_are_served_with_their_type_and_cache_headers():
+    ctx, servers, port = await start_pack()
+    paths = assets_of(ctx)
+    try:
+        status, h, body = await req(port, "GET", paths["bundle"])
+        assert status == 200 and h["content-type"] == "application/javascript"
+        assert h["cache-control"] == "public, max-age=31536000, immutable"
+        assert h["etag"].startswith('"') and h["etag"].endswith(f'-{len(body):x}"')
+        assert "last-modified" in h
+        assert body.rstrip().endswith(
+            ("sourceMappingURL=" + paths["source_map"].rsplit("/", 1)[1]).encode())
+        status, h, body = await req(port, "GET", paths["source_map"])
+        assert status == 200 and h["content-type"] == "application/json"
+        json.loads(body)
+        status, h, body = await req(port, "GET", "/env.js")
+        assert status == 200 and h["content-type"] == "application/javascript"
+        assert h["cache-control"] == "no-cache" and body.startswith(b"window.__ENV__ = {")
+        status, h, body = await req(port, "GET", "/assets/config.json")
+        assert status == 200 and h["content-type"] == "application/json"
+        status, h, body = await req(port, "HEAD", "/env.js")
+        assert status == 200 and body == b"" and int(h["content-length"]) > 0
+        status, _, _ = await req(port, "POST", "/env.js", body=b"x=1")
+        assert status == 405
+        await settle()
+        data = cmd(ctx, paths["bundle"])[0]
+        assert data["route"] == "asset" and data["lure_id"] == "main-bundle"
+        assert data["resp_type"] == "application/javascript" and data["resp_bytes"] > 0
+        head = cmd(ctx, "/env.js", "HEAD")[0]
+        assert head["resp_bytes"] == 0 and "lure_id" in head
+    finally:
+        await stop(servers)
+
+
+async def test_generated_bundle_map_and_config_name_the_advertised_routes():
+    ctx, servers, port = await start_pack()
+    paths = assets_of(ctx)
+    try:
+        _, _, bundle = await req(port, "GET", paths["bundle"])
+        _, _, smap = await req(port, "GET", paths["source_map"])
+        _, _, config = await req(port, "GET", "/assets/config.json")
+    finally:
+        await stop(servers)
+    for path in ("/api/v1/projects", "/api/v1/auth/forgot-password",
+                 "/api/internal/admin/settings"):
+        assert f'"{path}"'.encode() in bundle
+    assert b'"/api/v1/users/"+encodeURIComponent(e)' in bundle
+    assert b'"/api/internal/export/"+encodeURIComponent(e)' in bundle
+    doc = json.loads(smap)
+    assert doc["version"] == 3 and doc["file"] == paths["bundle"].rsplit("/", 1)[1]
+    source = "".join(doc["sourcesContent"])
+    assert "`/api/v1/users/${encodeURIComponent(id)}`" in source
+    assert "`/api/v1/auth/activate/${encodeURIComponent(token)}`" in source
+    assert set(json.loads(config)["endpoints"].values()) == {"/api/v1/projects",
+                                                             "/api/v1/projects/{id}"}
+
+
+async def test_hidden_route_is_answered_but_left_out_of_the_generated_openapi():
+    routes = [{"path": "/api/v1/status", "auth": "none", "json_body": {"ok": True}},
+              {"path": "/api/v1/admin/export", "auth": "none", "hidden": True,
+               "json_body": {"queued": True}}]
+    ctx, servers, port = await start_server(routes=routes)
+    try:
+        _, _, body = await req(port, "GET", "/api/openapi.json")
+        paths = json.loads(body)["paths"]
+        assert "/api/v1/status" in paths and "/api/v1/admin/export" not in paths
+        status, _, body = await req(port, "GET", "/api/v1/admin/export")
+        assert status == 200 and json.loads(body) == {"queued": True}
+    finally:
+        await stop(servers)
+
+
+async def test_hidden_route_is_not_named_to_the_model():
+    seen = {}
+
+    class Spy:
+        def complete_json(self, system, user, schema):
+            seen["system"] = system
+            return {"status": 404, "content_type": "application/json", "body": "{}"}
+
+    routes = [{"path": "/api/v1/status", "auth": "none", "json_body": {"ok": True}},
+              {"path": "/api/v1/admin/export", "auth": "none", "hidden": True}]
+    ctx, servers, port = await start_server(json_llm=Spy(), routes=routes)
+    try:
+        await req(port, "GET", "/api/v1/unknown", basic("apiuser", "s3cret"))
+        await req(port, "GET", "/api/v1/unknown", basic("apiuser", "s3cret"))
+    finally:
+        await stop(servers)
+    assert "/api/v1/status" in seen["system"] and "/api/v1/admin/export" not in seen["system"]
+
+
+async def test_discovery_is_stamped_only_for_the_source_that_fetched_the_asset(monkeypatch):
+    who = {"key": "198.51.100.7"}
+    as_source(monkeypatch, who)
+    ctx, servers, port = await start_pack()
+    paths = assets_of(ctx)
+    try:
+        await req(port, "GET", "/api/v1/users/5")                 # before any asset
+        await req(port, "GET", paths["bundle"])
+        await req(port, "GET", "/api/v1/users/5")
+        await req(port, "GET", "/swagger.json")                   # export route shown again
+        await req(port, "GET", "/api/internal/export/users")
+        who["key"] = "203.0.113.9"                                # never fetched anything
+        await req(port, "GET", "/api/v1/users/5")
+        await settle()
+    finally:
+        await stop(servers)
+    before, after, other = cmd(ctx, "/api/v1/users/5")
+    assert "discovered_via" not in before and before["lure_id"] == "user-item"
+    assert after["discovered_via"] == "main-bundle" and isinstance(after["discovered_age"], int)
+    assert "discovered_via" not in other
+    export = cmd(ctx, "/api/internal/export/users")[0]
+    assert export["discovered_via"] == "main-bundle"             # the first showing stays
+    swagger = cmd(ctx, "/swagger.json")[0]
+    assert swagger["route"] == "openapi" and swagger["lure_id"] == "openapi"
+
+
+async def test_openapi_discovery_counts_only_the_advertised_paths(monkeypatch):
+    who = {"key": "198.51.100.8"}
+    as_source(monkeypatch, who)
+    ctx, servers, port = await start_pack()
+    try:
+        await req(port, "GET", "/v3/api-docs")
+        await req(port, "GET", "/api/internal/export/audit")
+        await req(port, "GET", "/api/v1/users/7")                  # not in openapi_advertises
+        await settle()
+    finally:
+        await stop(servers)
+    assert cmd(ctx, "/api/internal/export/audit")[0]["discovered_via"] == "openapi"
+    assert "discovered_via" not in cmd(ctx, "/api/v1/users/7")[0]
+
+
+def env_values(body: bytes) -> dict:
+    text = body.decode().strip()
+    return json.loads(text[text.index("{"):text.rindex("}") + 1])
+
+
+async def test_markers_differ_per_source_and_are_recognised_where_presented(monkeypatch):
+    who = {"key": "198.51.100.20"}
+    as_source(monkeypatch, who)
+    ctx, servers, port = await start_pack()
+    try:
+        _, _, body_a = await req(port, "GET", "/env.js")
+        _, _, again_a = await req(port, "GET", "/env.js")
+        a = env_values(body_a)
+        who["key"] = "203.0.113.30"
+        _, _, body_b = await req(port, "GET", "/env.js")
+        b = env_values(body_b)
+        assert body_a == again_a
+        for name in ("release", "oauthClientId", "publicApiKey"):
+            assert a[name] != b[name] and "{marker" not in a[name]
+        assert re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                            a["oauthClientId"])
+        # B presents its own values, then A's, in each place a client can carry one.
+        await req(port, "GET", f"/api/v1/projects?client_id={b['oauthClientId']}")
+        await req(port, "GET", "/api/v1/health", {"Authorization": f"Bearer {a['publicApiKey']}"})
+        await req(port, "GET", "/api/v1/health", {"X-Api-Key": a["publicApiKey"]})
+        await req(port, "GET", "/api/v1/health", {"Cookie": f"rel={a['release']}"})
+        await req(port, "POST", "/api/v1/auth/username",
+                  {"Content-Type": "application/json"},
+                  json.dumps({"username": "x", "client": a["oauthClientId"]}).encode())
+        await settle()
+    finally:
+        await stop(servers)
+    own = cmd(ctx, "/api/v1/projects")[0]
+    assert own["marker"] == "client_id" and "marker_src" not in own
+    health = cmd(ctx, "/api/v1/health")
+    assert [(d["marker"], d["marker_src"]) for d in health] == [
+        ("public_api_key", True), ("public_api_key", True), ("build", True)]
+    posted = cmd(ctx, "/api/v1/auth/username")[0]
+    assert posted["marker"] == "client_id" and posted["marker_src"] is True
+    for d in health + [own, posted]:
+        assert "honeytoken" not in d and "high_signal" not in d
+
+
+async def test_marker_in_route_json_body_is_per_source_and_never_from_a_parameter(monkeypatch):
+    who = {"key": "198.51.100.21"}
+    as_source(monkeypatch, who)
+    ctx, servers, port = await start_pack()
+    try:
+        _, _, one = await req(port, "GET", "/api/internal/export/users")
+        _, _, minted = await req(port, "GET", "/api/internal/export/%7Bmarker:client_id%7D")
+        who["key"] = "203.0.113.31"
+        _, _, two = await req(port, "GET", "/api/internal/export/users")
+    finally:
+        await stop(servers)
+    one, two, minted = json.loads(one), json.loads(two), json.loads(minted)
+    assert one["job_id"] != two["job_id"] and one["download_path"].endswith(one["job_id"])
+    assert minted["dataset"] == "{marker:client_id}"
+
+
+async def test_flows_give_fixed_local_replies():
+    ctx, servers, port = await start_pack()
+    domain = ctx.scenario.scenario.identity.domain
+    js = {"Content-Type": "application/json"}
+    try:
+        s1, _, b1 = await req(port, "POST", "/api/v1/auth/username", js,
+                              json.dumps({"username": f"OPS@{domain}"}).encode())
+        s2, _, b2 = await req(port, "POST", "/api/v1/auth/username", js,
+                              json.dumps({"email": f"nobody@{domain}"}).encode())
+        s3, _, _ = await req(port, "POST", "/api/v1/auth/username", js, b"{}")
+        r1 = await req(port, "POST", "/api/v1/auth/forgot-password", js,
+                       json.dumps({"email": f"ops@{domain}"}).encode())
+        r2 = await req(port, "POST", "/api/v1/auth/forgot-password", js,
+                       json.dumps({"email": "nobody@example.com"}).encode())
+        s4, _, b4 = await req(port, "POST", "/api/v1/auth/reset-password",
+                              {"Content-Type": "application/x-www-form-urlencoded"},
+                              b"token=stale-link&password=pw")
+        s5, _, b5 = await req(port, "GET", "/api/v1/auth/activate/stale-link")
+        await settle()
+    finally:
+        await stop(servers)
+    assert (s1, json.loads(b1)) == (200, {"exists": True})
+    assert (s2, json.loads(b2)) == (200, {"exists": False})
+    assert s3 == 400
+    assert r1[0] == r2[0] == 202 and r1[2] == r2[2]
+    assert s4 == 400 and json.loads(b4)["error"] == "invalid_token"
+    assert s5 == 400 and "activation" in json.loads(b5)["message"]
+    steps = [(d["flow"], d["flow_step"]) for d in (e["data"] for e in events(ctx, "command"))
+             if "flow" in d]
+    assert steps == [("username_check", "exists"), ("username_check", "unknown"),
+                     ("username_check", "missing"), ("recovery_request", "requested"),
+                     ("recovery_request", "requested"), ("recovery_reset", "token_rejected"),
+                     ("activation", "token_rejected")]
+
+
+async def test_no_flow_makes_a_login_succeed_or_issues_a_session():
+    async def run(with_flows: bool):
+        ctx, servers, port = await start_pack()
+        domain = ctx.scenario.scenario.identity.domain
+        user = f"ops@{domain}"
+        cookies = []
+        try:
+            if with_flows:
+                for path, body in (("/api/v1/auth/forgot-password", {"email": user}),
+                                   ("/api/v1/auth/reset-password",
+                                    {"token": "stale-link", "password": "pw-chosen"}),
+                                   ("/api/v1/auth/username", {"username": user})):
+                    _, h, _ = await req(port, "POST", path, {"Content-Type": "application/json"},
+                                        json.dumps(body).encode())
+                    cookies.append(h.get("set-cookie"))
+                _, h, _ = await req(port, "GET", "/api/v1/auth/activate/stale-link")
+                cookies.append(h.get("set-cookie"))
+                assert not events(ctx, "auth_attempt") and not http.sessions(ctx)
+            results = []
+            for pw in ("pw-chosen", "pw-chosen"):
+                status, h, _ = await req(port, "POST", "/signin",
+                                         {"Content-Type": "application/x-www-form-urlencoded"},
+                                         f"username={user}&password={pw}".encode())
+                results.append((status, "set-cookie" in h))
+            await settle()
+            return results, cookies
+        finally:
+            await stop(servers)
+
+    plain, _ = await run(False)
+    after_flows, cookies = await run(True)
+    assert cookies == [None] * 4
+    assert after_flows == plain
+
+
+async def test_object_ids_are_counted_per_source_on_lured_item_routes_only(monkeypatch):
+    who = {"key": "198.51.100.40"}
+    as_source(monkeypatch, who)
+    ctx, servers, port = await start_pack()
+    try:
+        for i in (2001, 2002, 2002, 9999999):                  # a 404 is still an ID asked
+            await req(port, "GET", f"/api/v1/projects/{i}")
+        who["key"] = "203.0.113.41"
+        await req(port, "GET", "/api/v1/projects/2003")
+        await settle()
+    finally:
+        await stop(servers)
+    counts = [d["object_id_count"] for d in (e["data"] for e in events(ctx, "command"))
+              if d["path"].startswith("/api/v1/projects/")]
+    assert counts == [1, 2, 2, 3, 1]
+    ctx, servers, port = await start_server()
+    try:
+        await req(port, "GET", "/api/v1/patients/1", basic("apiuser", "s3cret"))
+        await settle()
+    finally:
+        await stop(servers)
+    assert not EVIDENCE & set(cmd(ctx, "/api/v1/patients/1")[0])
+
+
+async def test_runtime_config_asset_never_gets_the_planted_key_pair(monkeypatch):
+    ctx, servers, port = await start_pack()
+    monkeypatch.setattr(ctx, "source", lambda ip: types.SimpleNamespace(
+        plant_token=True, tarpit_ms=0, capture_more=False, budget_mode=None))
+    try:
+        _, _, config = await req(port, "GET", "/assets/config.json")
+        _, _, env = await req(port, "GET", "/env.js")
+        _, _, settings = await req(port, "GET", "/api/internal/admin/settings")
+    finally:
+        await stop(servers)
+    key_id = ctx.source_token("127.0.0.1")[0]
+    assert key_id.encode() not in config and key_id.encode() not in env
+    assert b"aws_access_key_id" not in config
+
+
+async def test_evidence_keys_survive_the_event_key_cap(monkeypatch):
+    who = {"key": "198.51.100.50"}
+    as_source(monkeypatch, who)
+    # Twenty more log fields than any request sets today, so the cap really drops keys.
+    plain_auth = http.Exchange.authenticate
+
+    def padded(self):
+        plain_auth(self)
+        self.log.update({f"pad_{i:02d}": i for i in range(20)})
+
+    monkeypatch.setattr(http.Exchange, "authenticate", padded)
+    ctx, servers, port = await start_pack()
+    paths = assets_of(ctx)
+    try:
+        _, _, env = await req(port, "GET", "/env.js")
+        await req(port, "GET", paths["bundle"])
+        await req(port, "GET", "/api/v1/projects/2001")
+        marker = env_values(env)["publicApiKey"]
+        # Every optional field at once, a marker from another source, a discovered,
+        # lured item route.
+        who["key"] = "203.0.113.51"
+        await req(port, "GET", paths["bundle"])
+        body = json.dumps({"q": marker, "pad": "x" * 100}).encode()
+        target = f"http://localhost/api/v1/projects/2002/?k={marker}&p=..%2e%2e"
+        await req(port, "GET", target, {
+            "Referer": "http://web01/app", "X-Forwarded-For": "192.0.2.4",
+            "Content-Type": "application/json", "Origin": "http://web01",
+            "Authorization": "Digest x", "X-Api-Key": marker, "Cookie": "session_id=stale",
+            "X-Extra": "1"}, body)
+        await settle()
+    finally:
+        await stop(servers)
+    data = events(ctx, "command")[-1]["data"]
+    assert len(data) == 32 and "referer" not in data and "body" not in data
+    must = {"method", "path", "query", "status", "host", "route", "lure_id", "discovered_via",
+            "discovered_age", "marker", "marker_src", "object_id_count"} | ALWAYS
+    assert must <= set(data), must - set(data)
+
+
+async def test_shipped_pack_worst_case_request_keeps_every_key():
+    ctx, servers, port = await start_pack("api_platform")
+    try:
+        await req(port, "POST", "http://localhost/v1/consumers/..%2e%2e?a=1", {
+            "Referer": "http://web01/x", "X-Forwarded-For": "192.0.2.4",
+            "Content-Type": "application/json", "Origin": "http://web01",
+            "Authorization": "Digest x", "Cookie": "session_id=stale",
+            ctx.scenario.scenario.services.http.api_key_header: "abcdefgh1234"},
+            b'{"password": "x"}')
+        await settle()
+    finally:
+        await stop(servers)
+    data = events(ctx, "command")[-1]["data"]
+    assert len(data) < 32
+    assert {"referer", "x_forwarded_for", "content_type", "origin", "body", "body_bytes",
+            "absolute_uri", "path_traversal", "auth_scheme", "auth_raw", "api_key_header",
+            "stale_cookie", "route"} | ALWAYS <= set(data)
+
+
+@pytest.mark.parametrize("name", ["api_platform", "bank", "contact_center", "healthcare", "saas",
+                                  "sip_provider"])
+async def test_shipped_packs_gain_only_the_always_present_keys(name):
+    ctx, servers, port = await start_pack(name)
+    svc = ctx.scenario.scenario.services.http
+    paths = ["/", "/env.js", "/swagger.json", "/static/js/main.js", "/app.js.map"]
+    if svc is not None:
+        paths += [svc.login_path] + [re.sub(r"\{[^}]+\}", "1", r.path) for r in svc.routes]
+        paths += [svc.openapi_path] if svc.openapi_path else []
+    try:
+        for p in paths:
+            await req(port, "GET", p)
+        await settle()
+    finally:
+        await stop(servers)
+    commands = events(ctx, "command")
+    assert len(commands) == len(paths)
+    for i, e in enumerate(commands, 1):
+        assert not EVIDENCE & set(e["data"]), (e["data"]["path"], EVIDENCE & set(e["data"]))
+        assert ALWAYS <= set(e["data"]) and e["data"]["seq"] == i and e["data"]["req"] == 1
+
+
+async def test_req_counts_requests_on_one_connection_and_seq_across_them():
+    ctx, servers, port = await start_server()
+    try:
+        one = b"GET /status HTTP/1.1\r\nHost: web01\r\n\r\n"
+        await raw(port, one + one + one.replace(b"\r\n\r\n", b"\r\nConnection: close\r\n\r\n"))
+        await req(port, "GET", "/status")
+        await settle()
+    finally:
+        await stop(servers)
+    got = [(e["data"]["seq"], e["data"]["req"]) for e in events(ctx, "command")]
+    assert got == [(1, 1), (2, 2), (3, 3), (4, 1)]
+    redirect = [e["data"] for e in events(ctx, "command")]
+    assert all(isinstance(d["resp_type"], str) for d in redirect)

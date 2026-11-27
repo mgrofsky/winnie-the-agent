@@ -383,3 +383,60 @@ def test_sql_wire_parsers_reject_every_truncation_cleanly():
                                                                    ("sp_execute", 2, True)]
     assert [p.literal for p in mssql.parse_rpc(rpc_body)[1]] == ["N'SELECT @a'", "N'@a int'",
                                                                  "3", "N'ab'"]
+
+
+
+# ---- HTTP with a web-deception scenario: assets, markers and flows ------------------------
+
+async def test_http_deception_scenario_survives_pathological_input(tmp_path):
+    from listeners import http
+    from scenarios.loader import load_scenario
+
+    scen = load_scenario("dev_portal", seed="fuzz")
+    ctx = ListenerContext(EventWriter(None), bind_host="127.0.0.1", scenario=scen, seed="fuzz",
+                          honeytokens=scen.recognised_tokens(),
+                          limits=Limits(rate_per_ip_per_minute=10_000, max_connections_per_ip=64,
+                                        max_connections_per_ip_per_service=64,
+                                        pre_login_timeout=2, read_timeout=2))
+    settings = ServiceSettings("http", True, 0, policy=LoginPolicy(accept="all"),
+                               accounts=scen.accounts_for("http"))
+    ctx.settings["http"] = settings
+    servers = await http.start(ctx, settings)
+    port = servers[0].sockets[0].getsockname()[1]
+    r, w = await asyncio.open_connection("127.0.0.1", port)       # issue this source's markers
+    w.write(b"GET /env.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    env = await asyncio.wait_for(r.read(), 5)
+    w.close()
+    issued = [v for v in http.http_state(ctx)._issued]
+    assert issued and all(v.encode() in env for v in issued)
+    near = issued[0][:-1]                                          # a probe hit, never a match
+    body = (near * 8000)[:60_000].encode()
+
+    def post(path: str, data: bytes, ctype: str = "application/json") -> bytes:
+        return (f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: {ctype}\r\n"
+                f"Content-Length: {len(data)}\r\n\r\n").encode() + data
+
+    payloads = [
+        post("/api/v1/auth/username", body),
+        post("/api/v1/auth/reset-password", b"token=" + b"&token=" * 9000,
+             "application/x-www-form-urlencoded"),
+        post("/api/v1/auth/username", b"{" + b'"a":1,' * 9000 + b'"username":"x"}'),
+        post("/api/v1/auth/forgot-password", b"[" * 30_000 + b"]" * 30_000),
+        _line(b"GET /api/v1/projects/1?q=", (near * 900)[:3800].encode() + b" HTTP/1.1"),
+        b"GET /env.js HTTP/1.1\r\nCookie: " + (near * 900)[:7000].encode() + b"\r\n"
+        + b"Authorization: Bearer " + (near * 900)[:7000].encode() + b"\r\n\r\n",
+        _line(b"GET /api/v1/users/", b"%7Bmarker:client_id%7D" * 170 + b" HTTP/1.1"),
+        _line(b"GET /static/js/", b"a." * 1950 + b" HTTP/1.1"),
+    ] + [_line(b"GET /api/v1/projects/", str(i).encode() + b" HTTP/1.1") for i in range(10)]
+    try:
+        result = await hammer(port, payloads, probe_request=b"GET /env.js HTTP/1.1\r\nHost: x\r\n\r\n")
+    finally:
+        for s in servers:
+            s.close()
+    assert result.worst_payload_seconds < PAYLOAD_BOUND, result
+    assert result.worst_probe_seconds < PROBE_BOUND, result
+    assert not any(e["event"] == "error" and e["data"].get("reason") == "RecursionError"
+                   for e in ctx.writer.events)
+    # Only the Bearer header logs a login attempt; no flow request does.
+    assert {e["data"]["method"] for e in ctx.writer.events if e["event"] == "auth_attempt"} \
+        <= {"bearer"}
