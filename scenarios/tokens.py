@@ -12,6 +12,7 @@ prefix of the input.
                                                             issued; for recognition only
     source_pair(seed, key) -> (access_key_id, secret)       per-source AWS-style pair
     legacy_source_pair(seed, key)                           earlier per-source pair
+    marker_value(seed, scenario, key, name) -> str          per-source HTTP marker
     TokenIndex(values).find(text) -> Optional[name]
 
 AWS-style access key ids use the real shape, ``AKIA`` and 16 characters of A-Z2-7. Nothing
@@ -107,6 +108,27 @@ def legacy_source_pair(seed: str, key: str) -> tuple[str, str]:
     digest = hmac.new(seed.encode(), f"plant|{key}".encode(), hashlib.sha256).digest()
     access = "AKIA" + "FAKE" + "".join(BASE32[b % 32] for b in digest[:12])
     return access, _source_secret(seed, key, digest)
+
+
+HEX = "0123456789abcdef"
+LOWER_ALNUM = string.ascii_lowercase + string.digits
+
+
+def marker_value(seed: str, scenario: str, key: str, name: str) -> str:
+    """The value of ``{marker:NAME}`` served to one source. Its shape follows the name: a
+    build or commit name gets a short hex hash, a ``client_id`` or other ``*_id`` a UUID, a
+    key or token name a 32-character key, anything else 20 lowercase letters and digits.
+    No fixed fragment; recognised by lookup of what was issued."""
+    digest = hmac.new(seed.encode(), f"marker|{scenario}|{key}|{name}".encode(),
+                      hashlib.sha256).digest()
+    if any(w in name for w in ("build", "commit", "release", "sha")):
+        return digest[:6].hex()
+    if name.endswith("_id") or name == "id":
+        h = digest[:16].hex()
+        return f"{h[:8]}-{h[8:12]}-4{h[13:16]}-{'89ab'[digest[8] % 4]}{h[17:20]}-{h[20:32]}"
+    if "key" in name or "token" in name:
+        return "".join(ALNUM[b % 62] for b in digest[:32])
+    return "".join(LOWER_ALNUM[b % 36] for b in digest[:20])
 
 
 # ---- recognition --------------------------------------------------------------------------

@@ -27,7 +27,7 @@ from scenarios.tokens import (
     source_pair,
 )
 
-SHIPPED = ["sip_provider", "contact_center", "bank", "healthcare", "saas", "api_platform"]
+SHIPPED = ["sip_provider", "contact_center", "bank", "healthcare", "saas", "api_platform", "dev_portal"]
 SEEDS = [f"seed-{i}" for i in range(300)]
 
 # The real formats each kind imitates: length and alphabet, and only the real prefix.

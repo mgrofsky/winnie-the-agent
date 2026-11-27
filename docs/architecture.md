@@ -632,6 +632,30 @@ Every attacker-supplied value is length-capped (512 characters) and has control 
 escaped before it is written. Listener writes use `O_APPEND`, so lines from the SSH and
 listener processes never interleave.
 
+### HTTP request evidence
+
+Every HTTP `command` event carries `method`, `path`, `query`, `status`, `host` and `route`,
+and the top-level `client` is the User-Agent. These keys come next, ahead of optional
+header and body fields, so the 32-key cap never drops them:
+
+| Key | On | Meaning |
+|---|---|---|
+| `seq` | every request | This source's request number on this listener. |
+| `req` | every request | Request number on the connection; `task_name` is the connection ID. |
+| `resp_type` | every request | Response `Content-Type`; empty when none is sent (a redirect). |
+| `resp_bytes` | every request | Response body bytes sent (0 for HEAD). |
+| `lure_id` | an asset, a route with a `lure`, or the OpenAPI document when `openapi_advertises` is set | The lure ID answered. |
+| `discovered_via` | a route this source was shown | Lure ID of the asset or document that first showed it the route. |
+| `discovered_age` | with `discovered_via` | Seconds since that showing. |
+| `marker`, `marker_src` | a request presenting a per-source marker | The marker name; `marker_src` is `true` when it was issued to another source. |
+| `flow`, `flow_step` | a flow route | `username_check`, `recovery_request`, `recovery_reset` or `activation`, and the step (`exists`, `unknown`, `requested`, `token_rejected`, `missing`). |
+| `object_id_count` | an item route with a `lure` | Distinct IDs this source has asked of the route. |
+
+Discovery, markers and ID counts are held per source in memory, for a day after the
+source's last request: request counters for up to 65,536 sources, the rest for up to 8,192
+sources that fetched an asset, were issued a marker or asked an ID (200 IDs per route,
+400,000 in all). A listener restart starts them over.
+
 ### Source proof
 
 A UDP datagram's source address is whatever the sender wrote, so a SIP event over UDP may

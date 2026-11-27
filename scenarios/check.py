@@ -21,7 +21,7 @@ Rules (see ``check_text``):
 - no well-known real bank / hospital / carrier / vendor customer names;
 - IPv4 addresses must be private, loopback, link-local, reserved, unspecified or in the
   documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24).
-IPv6 literals are not checked.
+IPv6 literals are not checked. Generated HTTP decoy asset content is scanned like the rest.
 """
 
 from __future__ import annotations
@@ -235,6 +235,10 @@ def check_scenario(loaded) -> list[str]:
 
     for path, text in _walk(sc.model_dump(mode="json"), "scenario"):
         scan(path, text)
+
+    from .web_assets import scenario_asset_texts
+    for asset_path, text in scenario_asset_texts(loaded):
+        scan(f"http asset {asset_path}", text)
 
     for svc_name in ("postgres", "mysql", "mssql"):
         svc = getattr(sc.services, svc_name)

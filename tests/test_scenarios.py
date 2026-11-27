@@ -11,7 +11,8 @@ from scenarios.describe import describe, list_text
 from scenarios.loader import list_scenarios, load_scenario
 from scenarios.schema import Scenario
 
-SHIPPED = ["api_platform", "bank", "contact_center", "healthcare", "saas", "sip_provider"]
+SHIPPED = ["api_platform", "bank", "contact_center", "healthcare", "saas", "sip_provider",
+           "dev_portal"]
 
 
 def test_all_expected_scenarios_ship():
@@ -179,3 +180,55 @@ def test_tables_generate_deterministically(name):
                         differs = True
     assert generated >= 1
     assert differs
+
+
+# ---- HTTP web-deception keys ----------------------------------------------------------------
+
+def _http(**over):
+    from scenarios.schema import HttpService
+
+    base = {"enabled": True, "port": 8080, "api_prefix": "/api",
+            "openapi_path": "/api/openapi.json",
+            "routes": [{"path": "/api/v1/items/{id}", "item_from": "db.items", "item_key": "id"},
+                       {"method": "POST", "path": "/api/v1/forgot", "auth": "none",
+                        "flow": "recovery_request"}]}
+    base.update(over)
+    return HttpService.model_validate(base)
+
+
+def test_http_deception_keys_validate():
+    svc = _http(assets=[{"path": "/static/app.js", "kind": "bundle", "lure": "app-js",
+                         "advertises": ["/api/v1/items/{id}"]},
+                        {"path": "/env.js", "kind": "runtime_config", "lure": "env",
+                         "body": 'window.__ENV__ = {"k": "{marker:client_id}"};'}],
+                openapi_aliases=["/swagger.json"], openapi_advertises=["/api/v1/forgot"])
+    assert svc.marker_names() == {"client_id"}
+
+
+@pytest.mark.parametrize("over,needle", [
+    ({"assets": [{"path": "/api/openapi.json", "kind": "bundle", "lure": "x"}]}, "already"),
+    ({"assets": [{"path": "/a.js", "kind": "bundle", "lure": "x", "advertises": ["/nope"]}]},
+     "not a route"),
+    ({"assets": [{"path": "/a/{id}.js", "kind": "bundle", "lure": "x"}]}, "pattern"),
+    ({"assets": [{"path": "/a.css", "kind": "static", "lure": "x"}]}, "needs a body"),
+    ({"assets": [{"path": "/a.js", "kind": "bundle", "lure": "Bad Lure"}]}, "pattern"),
+    ({"openapi_advertises": ["/api/v1/other"]}, "not a route"),
+    ({"openapi_aliases": ["/api/v1/forgot"]}, "already"),
+    ({"openapi_path": None, "openapi_aliases": ["/swagger.json"]}, "need openapi_path"),
+    ({"routes": [{"path": "/r", "flow": "activation", "json_body": {"a": 1}}]}, "flow route"),
+    ({"routes": [{"path": "/r", "flow": "login"}]}, "flow"),
+    ({"assets": [{"path": "/e.js", "kind": "runtime_config", "lure": "e",
+                  "body": " ".join(f"{{marker:m{i}}}" for i in range(17))}]}, "marker names"),
+])
+def test_http_deception_keys_refused(over, needle):
+    with pytest.raises(ValueError, match=needle):
+        _http(**over)
+
+
+def test_dev_portal_assets_are_checked_and_clean():
+    from scenarios.web_assets import scenario_asset_texts
+
+    loaded = load_scenario("dev_portal", seed="sensor-a")
+    texts = dict(scenario_asset_texts(loaded))
+    assert len(texts) == 4 and all(texts.values())
+    assert check_scenario(loaded) == []
