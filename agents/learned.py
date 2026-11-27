@@ -17,7 +17,12 @@ numbered placeholder, one number per distinct value. Where a token's value appea
 verbatim in the reply it becomes the same placeholder. A reply that holds any other trace
 of a token (an 8-character piece of it in any case, its base64 or hex decoding) or a
 random-looking token that is not from the command is not learned: it may be computed
-from the input. An interactive reply is stored without its final prompt, and only when
+from the input. Each token's length and character class (``shape``) is part of the key,
+and placeholders keep each token's position and whether it repeats. A command that
+computes over its text or matches patterns (``computes``) keeps its tokens literal: it is
+learned only for its exact text. A reply that holds two or more different tokens, or a
+token in the output of a program that sorts names (``sorts``), is not learned: the order
+may follow the values. An interactive reply is stored without its final prompt, and only when
 that prompt is the one the session showed before the command (the command did not move
 the session); the session's current prompt is added when it is served.
 
@@ -32,13 +37,15 @@ different reply, or with a reply that could not be stored, is marked varying and
 never served: that keeps commands whose output
 depends on the clock, on randomness or on session state with the model.
 
-Same-history rule. An entry is also served to a session whose script digest
-(``script_step``: every line and reply so far, the session's tokens numbered
-session-wide) equals one under which it was observed with the identical reply in at least
-``min_sessions`` sessions from two networks. Such a session is in the state those
+Same-history rule. An entry is also served to a session whose same-history key
+(``script_key``: the script digest of every line and reply so far from ``script_step``,
+plus how this line's tokens bind to the session's tokens and their shapes) equals one
+under which it was observed with the identical reply in at least ``min_sessions``
+sessions from two networks. A line that computes over its text in a session with tokens
+is not looked up or observed by this rule. Such a session is in the state those
 sessions were in, whatever its lines changed. The reply is stored whole (prompt
 included), with session-wide placeholders, so a token read back is the session's own.
-Evidence and the varying mark are kept per digest (``MAX_HISTORIES`` per entry).
+Evidence and the varying mark are kept per key (``MAX_HISTORIES`` per entry).
 
 Storage. One JSON file beside the budget state, written under an exclusive lock on
 ``<file>.lock`` and replaced atomically (mode 0600), so the SSH process and the listeners
@@ -89,7 +96,7 @@ MAX_ENTRIES_LIMIT = 3000
 DEFAULT_MIN_SESSIONS = 3
 FLUSH_SERVES = 32
 FLUSH_SECONDS = 60.0
-FILE_VERSION = 2
+FILE_VERSION = 3        # 3: token shapes and binding keys; older files read as empty
 MAX_QUEUE = 256                # store jobs waiting for the worker; past it they are dropped
 FRAGMENT = 8                   # a token piece this long left in a reply blocks learning
 _ID = re.compile(r"^[0-9a-f]{16}$")
@@ -160,8 +167,65 @@ def command_template(command: str) -> Optional[Template]:
 
 
 def _template(command: str) -> Optional[Template]:
-    """``command_template``, with the session opener (an empty line) as its own entry."""
-    return Template("", ()) if command == "" else command_template(command)
+    """The key template of ``command``: ``command_template``, with the session opener (an
+    empty line) as its own entry, and the command kept literal (no placeholders) when it
+    computes over its text (``computes``): its reply may depend on a token's value in
+    ways only that exact value can show."""
+    if command == "":
+        return Template("", ())
+    template = command_template(command)
+    if template is not None and template.values and computes(command):
+        return Template(command, ())
+    return template
+
+
+# Programs and shell forms whose output can be computed from their input text (a count, a
+# length, a conversion, a slice) without holding it verbatim.
+COMPUTERS = frozenset((
+    "wc", "expr", "bc", "dc", "awk", "gawk", "mawk", "od", "xxd", "hexdump", "cksum", "sum",
+    "md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum",
+    "base64", "base32", "basenc", "cut", "head", "tail", "tr", "rev", "sort", "uniq",
+    "printf", "factor", "seq", "numfmt", "let", "fold", "strings", "grep", "egrep", "fgrep",
+    "sed", "perl", "python", "python2", "python3", "ruby", "php", "node", "lua", "openssl",
+    "gzip", "bzip2", "xz", "zcat", "iconv", "nl", "comm", "join", "paste", "split", "dd",
+    "test", "[", "[[", "case", "expr", "if",
+))
+# Programs whose output orders names by their values (a token sorts among other names).
+SORTERS = frozenset(("ls", "dir", "vdir", "sort", "tree", "du", "find", "locate"))
+_COMPUTE_FORMS = ("$((", "$[", "${", "((", "[[", "=~", "*", "?", "[")
+
+
+def computes(text: str) -> bool:
+    """True when ``text`` runs a program in ``COMPUTERS`` (any word, by any path), uses
+    shell arithmetic or parameter expansion (``$((``, ``${#x}``, ``${x:1}``), or matches
+    a pattern (``case``, ``[[``, ``=~``, a glob with ``*``, ``?`` or ``[``)."""
+    if any(form in text for form in _COMPUTE_FORMS):
+        return True
+    return any(w.rpartition("/")[2] in COMPUTERS for w in _WORDS.split(text) if w)
+
+
+_WORDS = re.compile(r"""[\s"'`;|&(){}<>=]+""")
+
+
+def _token_class(value: str) -> str:
+    """One letter for a token's character class: ``d`` digits, ``x`` lower-case hex,
+    ``y`` upper-case hex, ``h`` mixed-case hex, ``u`` UUID, ``b`` base64-like."""
+    if _UUID.fullmatch(value):
+        return "u"
+    if value.isdigit():
+        return "d"
+    if _HEX.fullmatch(value):
+        return "x" if value == value.lower() else "y" if value == value.upper() else "h"
+    return "b"
+
+
+def shape(values: tuple[str, ...]) -> str:
+    """Each token's length and class, in placeholder order (``20x,36u``): part of every
+    key, so an answer seen for tokens of one length or class never stands for another."""
+    return ",".join(f"{len(v)}{_token_class(v)}" for v in values)
+
+
+_SHAPE = re.compile(r"(?:[0-9]{1,3}[a-z](?:,[0-9]{1,3}[a-z]){0,7})?")
 
 
 @dataclass(frozen=True)
@@ -188,10 +252,18 @@ def _decodings(value: str) -> Iterable[str]:
             yield text
 
 
-def reply_template(reply: str, values: tuple[str, ...]) -> Optional[str]:
+def sorts(text: str) -> bool:
+    """True when ``text`` runs a program in ``SORTERS``."""
+    return any(w.rpartition("/")[2] in SORTERS for w in _WORDS.split(text) if w)
+
+
+def reply_template(reply: str, values: tuple[str, ...], command: str = "") -> Optional[str]:
     """The reply with each token value replaced by its placeholder, or None when the reply
-    cannot be learned: it holds the marker or other control characters, is too large, or
-    holds a trace of a token that is not its verbatim value."""
+    cannot be learned: it holds the marker or other control characters, is too large,
+    holds a trace of a token that is not its verbatim value, holds two or more different
+    tokens (their order may follow their values), or holds a token in the output of a
+    ``command`` that sorts names (``ls /tmp``: where the token falls among the other names
+    follows its value)."""
     if MARK in reply or not _clean(reply) or len(reply.encode("utf-8")) > MAX_REPLY_BYTES:
         return None
     if not values:
@@ -211,6 +283,12 @@ def reply_template(reply: str, values: tuple[str, ...]) -> Optional[str]:
             if decoded.lower() in lowered:
                 return None
     if tokens(rest):
+        return None
+    if _PLACEHOLDER.search(templated) and sorts(command):
+        return None
+    if len(set(_PLACEHOLDER.findall(templated))) > 1:
+        # The order of two tokens in output can follow their values (``ls`` sorts names),
+        # which no key carries: such a reply is not learned.
         return None
     if len(templated.encode("utf-8")) > MAX_REPLY_BYTES:
         return None
@@ -349,10 +427,18 @@ def session_template(text: str, values: tuple[str, ...]) -> str:
 def script_step(script: str, command: str, reply: str, values: tuple[str, ...]) -> str:
     """The script digest after one more line: the command and the reply as sent, each
     with the session's token values as placeholders, so two sessions of one script that
-    differ only in their random tokens keep one digest. The token lengths are part of it:
-    tokens of different lengths never share a digest."""
-    return digest("step", script, ",".join(str(len(v)) for v in values),
+    differ only in their random tokens keep one digest. The tokens' lengths and classes
+    (``shape``) are part of it."""
+    return digest("step", script, shape(values),
                   session_template(command, values), session_template(reply, values))
+
+
+def script_key(script: str, command: str, values: tuple[str, ...]) -> str:
+    """The same-history key of ``command`` after ``script``: the command with every token
+    as its session-wide number (which earlier token it is, or a new one) and the shape of
+    the session's tokens. Two lines share a key only when their tokens are bound the same
+    way: ``cat /tmp/T`` after ``echo T > /tmp/T`` is not ``cat /tmp/B``."""
+    return digest("bind", script, shape(values), session_template(command, values))
 
 
 def value_set(values: tuple[str, ...]) -> str:
@@ -360,8 +446,10 @@ def value_set(values: tuple[str, ...]) -> str:
     return digest("values", *values)
 
 
-def entry_id(fingerprint: str, user: str, interactive: bool, command: str) -> str:
-    return digest("learned", fingerprint, user, "i" if interactive else "x", command)
+def entry_id(fingerprint: str, user: str, interactive: bool, command: str,
+             token_shape: str = "") -> str:
+    return digest("learned", fingerprint, user, "i" if interactive else "x", command,
+                  token_shape)
 
 
 # ---- the store ---------------------------------------------------------------------------
@@ -413,11 +501,19 @@ def _valid_entry(raw) -> Optional[dict]:
     if hist is None or not isinstance(vals, list) or not all(
             isinstance(v, str) and _DIGEST.fullmatch(v) for v in vals[:MAX_VALUE_SETS]):
         return None
-    eid = entry_id(fp, user, interactive, command)
+    token_shape = raw.get("shape", "")
+    if not isinstance(token_shape, str):
+        return None
+    if not (_SHAPE.fullmatch(token_shape)
+            and len(token_shape.split(",")) == len(set(cmd_ids)) if token_shape
+            else not cmd_ids):
+        return None
+    eid = entry_id(fp, user, interactive, command, token_shape)
     return {"id": eid, "fp": fp, "user": user, "interactive": interactive,
             "command": command, "reply": reply, "varying": varying, "obs": clean_obs,
             "nets": clean_nets, "asked": asked, "served": served, "first": first,
-            "last": last, "hist": hist, "vals": list(vals[:MAX_VALUE_SETS])}
+            "last": last, "hist": hist, "vals": list(vals[:MAX_VALUE_SETS]),
+            "shape": token_shape}
 
 
 def _valid_hist(raw) -> Optional[dict]:
@@ -825,14 +921,15 @@ class LearnedStore:
                script: Optional[str] = None,
                values: tuple[str, ...] = ()) -> Optional["Found"]:
         """The served reply for ``command``, else None. ``clean`` says the session may use
-        the different-histories rule (``history`` is its input history); ``script`` and
-        ``values`` (the session's script digest and token values) select the
-        same-history rule, which is tried second."""
+        the different-histories rule (``history`` is its input history); ``script`` (the
+        line's same-history key, ``script_key``) and ``values`` (the session's token
+        values) select the same-history rule, which is tried second."""
         template = _template(command)
         if template is None:
             return None
         self._reload_if_changed()
-        eid = entry_id(fingerprint, user[:MAX_USER_CHARS], interactive, template.text)
+        eid = entry_id(fingerprint, user[:MAX_USER_CHARS], interactive, template.text,
+                       shape(template.values))
         with self._lock:
             entry = self._entries.get(eid)
             if entry is None:
@@ -881,8 +978,8 @@ class LearnedStore:
         queued = self._submit(lambda: self._record(
             fingerprint, user, interactive, command, reply, session=session, net=net,
             history=history, script=script, script_sent=script_sent, values=values))
-        return entry_id(fingerprint, user[:MAX_USER_CHARS], interactive, template.text) \
-            if queued else None
+        return entry_id(fingerprint, user[:MAX_USER_CHARS], interactive, template.text,
+                        shape(template.values)) if queued else None
 
     def _record(self, fingerprint: str, user: str, interactive: bool, command: str,
                 reply: Optional[str], *, session: str, net: str,
@@ -892,8 +989,9 @@ class LearnedStore:
         """Record that ``command`` reached the model. With ``history`` (a clean session's
         fresh reply, sent unchanged) it is also an observation for the different-histories
         rule: of ``reply``, or, when ``reply`` is None or cannot be a template, of a reply
-        that cannot be stored, which marks the entry varying. With ``script`` it is an
-        observation for the same-history rule under that script digest: of ``script_sent``
+        that cannot be stored, which marks the entry varying. With ``script`` (the line's
+        same-history key, ``script_key``) it is an observation for the same-history rule
+        under that key: of ``script_sent``
         (the whole reply as sent) templated with the session's token ``values``; a reply
         that cannot be templated marks that history varying. Returns the entry id, or None
         when the command cannot be a template or the write failed."""
@@ -901,11 +999,11 @@ class LearnedStore:
         if template is None:
             return None
         user = user[:MAX_USER_CHARS]
-        stored = reply_template(reply, template.values) if reply is not None else None
+        stored = reply_template(reply, template.values, command) if reply is not None else None
         observe = history is not None
-        script_stored = reply_template(script_sent, values) \
+        script_stored = reply_template(script_sent, values, command) \
             if script is not None and script_sent is not None else None
-        eid = entry_id(fingerprint, user, interactive, template.text)
+        eid = entry_id(fingerprint, user, interactive, template.text, shape(template.values))
         now = int(self._clock())
         sess = digest("session", session)
 
@@ -916,7 +1014,7 @@ class LearnedStore:
                          "interactive": interactive, "command": template.text,
                          "reply": None, "varying": False, "obs": [], "nets": [],
                          "asked": 0, "served": 0, "first": now, "last": now, "hist": {},
-                         "vals": []}
+                         "vals": [], "shape": shape(template.values)}
                 entries[eid] = entry
             entry["asked"] += 1
             entry["last"] = max(entry["last"], now)

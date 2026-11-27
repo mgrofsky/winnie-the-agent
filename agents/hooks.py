@@ -883,6 +883,7 @@ class _LearnTurn:
     script: Optional[str]          # script digest before this line, for the same-history rule
     values: tuple[str, ...]        # the session's token values including this line's
     volatile: bool       # real output changes between runs: never observed or served
+    key: Optional[str] = None      # same-history key: the script and this line's bindings
 
 
 def _learn_turn(session_id: str, src_ip: str, username: Optional[str], interactive: bool,
@@ -900,7 +901,11 @@ def _learn_turn(session_id: str, src_ip: str, username: Optional[str], interacti
     interactive or exec. Two sessions with one digest sent the same lines and saw the same
     replies, so they are in the same state whatever those lines changed. A session leaves
     this rule when a line cannot be templated (over ``learned.MAX_TOKENS`` token values in
-    the session, a control character, over 512 characters) or a reply ends it.
+    the session, a control character, over 512 characters) or a reply ends it. A line is
+    looked up and observed under ``learned.script_key``: the script digest plus how its
+    tokens bind to the session's (which earlier token each one is, or a new one) and
+    their lengths and classes. A line that computes over its text (``learned.computes``)
+    while the session has tokens is chained but not served or observed by this rule.
 
     A session whose state was evicted after it had turns is out of both for good. Lines
     whose real output changes between runs (``replycache.volatile``) are never observed or
@@ -935,10 +940,13 @@ def _learn_turn(session_id: str, src_ip: str, username: Optional[str], interacti
     command = counts_as_command and bool(text.strip())
     opener = not counts_as_command and text == ""
     vol = volatile(text)
+    script = before[2] if (command or opener) and state.script is not None else None
+    # A line that computes over its text (a count, a slice, a conversion) in a session
+    # that has tokens may depend on a token in ways no key can carry: not by this rule.
+    key = learned.script_key(script, text, values) \
+        if script is not None and not (values and learned.computes(text)) else None
     return _LearnTurn(fingerprint, before[0], command, opener,
-                      command and before[1] and not vol,
-                      before[2] if (command or opener) and state.script is not None else None,
-                      values, vol)
+                      command and before[1] and not vol, script, values, vol, key)
 
 
 def _learn_advance(session_id: str, learn: Optional[_LearnTurn], text: str,
@@ -976,12 +984,12 @@ def _learn_advance(session_id: str, learn: Optional[_LearnTurn], text: str,
 def _learned_lookup(learn: Optional[_LearnTurn], username: Optional[str], interactive: bool,
                     text: str):
     if learn is None or _learned is None or learn.volatile \
-            or not (learn.eligible or learn.script is not None):
+            or not (learn.eligible or learn.key is not None):
         return None
     try:
         return _learned.lookup(learn.fingerprint, username or "user", interactive, text,
                                history=learn.history, clean=learn.eligible,
-                               script=learn.script, values=learn.values)
+                               script=learn.key, values=learn.values)
     except Exception as exc:  # noqa: BLE001 - a store failure leaves the line to the model
         log.warning("learned reply lookup failed: %s", type(exc).__name__)
         return None
@@ -1012,7 +1020,7 @@ def _learn(learn: Optional[_LearnTurn], *, session_id: str, src_ip: str,
             body = sent[:-len(prompt)] if sent.endswith(prompt) else None
         else:
             body = sent
-    script = learn.script if sent is not None and not learn.volatile else None
+    script = learn.key if sent is not None and not learn.volatile else None
     try:
         _learned.record(learn.fingerprint, username or "user", interactive, text, body,
                         session=session_id, net=learned.network(src_ip),

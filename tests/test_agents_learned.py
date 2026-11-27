@@ -190,9 +190,9 @@ def test_placeholders_are_filled_with_the_new_values(store):
 
 def test_teachers_with_one_token_value_serve_only_that_value_by_either_rule(store):
     h1 = hexrun(14)
-    promote(store, f"wc -c /tmp/{h1}", f"0 /tmp/{h1}\r\n")     # every teacher used h1
-    assert store.lookup(FP, "root", True, f"wc -c /tmp/{hexrun(15)}") is None
-    assert store.lookup(FP, "root", True, f"wc -c /tmp/{h1}").reply == f"0 /tmp/{h1}\r\n"
+    promote(store, f"file /tmp/{h1}", f"/tmp/{h1}\r\n")     # every teacher used h1
+    assert store.lookup(FP, "root", True, f"file /tmp/{hexrun(15)}") is None
+    assert store.lookup(FP, "root", True, f"file /tmp/{h1}").reply == f"/tmp/{h1}\r\n"
 
 
 def test_a_changed_host_fingerprint_never_serves_the_old_answer(store):
@@ -263,7 +263,8 @@ def test_malformed_or_tampered_entries_are_dropped_on_read(tmp_path):
     bad = [dict(entry, reply="ok\x1b[2J"), dict(entry, reply="x \x003\x00"),
            dict(entry, command="y" * 2000), dict(entry, fp="nothex"),
            dict(entry, obs=[["zz", "n", "q"]]), dict(entry, asked=-1),
-           dict(entry, vals=["nothex"])]
+           dict(entry, vals=["nothex"]), dict(entry, shape=None), dict(entry, shape=0),
+           dict(entry, shape="20x")]
     path.write_text("\n".join([head, *(json.dumps(b) for b in bad), "{broken",
                                json.dumps(entry)]) + "\n")
     entries = LearnedStore(str(path)).entries()
@@ -332,18 +333,20 @@ def test_too_many_tokens_and_many_placeholders_do_not_collide(store):
     values = [hexrun(30 + i) for i in range(learned.MAX_TOKENS + 1)]
     assert learned.command_template("x " + " ".join(values)) is None
     ten = learned.command_template("x " + " ".join(values[:learned.MAX_TOKENS]))
-    reply = learned.reply_template(values[1] + values[0], ten.values)
-    assert learned.fill(reply, ten.values) == values[1] + values[0]
+    assert learned.reply_template(values[7] + "\r\n", ten.values) == "\x007\x00\r\n"
+    assert learned.fill("\x007\x00 \x001\x00", ten.values) == values[7] + " " + values[1]
+    # Two different tokens in one reply: their order may follow their values (``ls``).
+    assert learned.reply_template(values[1] + " " + values[0], ten.values) is None
 
 
 def test_a_command_built_to_share_another_template_gets_only_its_own_values(store):
     h1, h2 = hexrun(40), hexrun(41)
-    promote_values(store, "ls /tmp/{t}", "/tmp/{t}\r\n", (40, 42, 43))
+    promote_values(store, "file /tmp/{t}", "/tmp/{t}\r\n", (40, 42, 43))
     # Same template, a different random marker: the reply names the new marker only.
-    reply = store.lookup(FP, "root", True, f"ls /tmp/{h2}").reply
+    reply = store.lookup(FP, "root", True, f"file /tmp/{h2}").reply
     assert reply == f"/tmp/{h2}\r\n"
     # A different command whose text spells the first template's tokens is its own entry.
-    assert store.lookup(FP, "root", True, f"ls /tmp/{h1} extra") is None
+    assert store.lookup(FP, "root", True, f"file /tmp/{h1} extra") is None
 
 
 # ---- reply path ---------------------------------------------------------------------------
@@ -700,7 +703,8 @@ async def test_teachers_with_one_token_value_serve_only_that_value(wired):
     assert out[1].reply_step == "model"
     out, _, _ = await _session(wired, "k5", "198.51.100.10", [f"echo {same} > /tmp/f",
                                                               "cat /tmp/f | wc -c"])
-    assert out[1].reply_step == "learned"
+    # ``wc`` computes over what it reads, in a session with tokens: never by this rule.
+    assert out[1].reply_step == "model"
     longer = hexrun(62, 30)
     script = learned.script_root(learned.digest("x"), "root", True)
     assert learned.script_step(script, f"echo {same}", "", (same,)) != \
@@ -866,9 +870,125 @@ def test_served_counts_queue_one_flush_at_a_time(tmp_path, monkeypatch):
 def test_value_sets_are_kept_past_the_observation_cap(store):
     h1 = hexrun(80)
     for i in range(learned.MAX_OBSERVATIONS):
-        observe(store, f"wc -c /tmp/{h1}", f"0 /tmp/{h1}\r\n", session=f"s{i}",
+        observe(store, f"file /tmp/{h1}", f"/tmp/{h1}\r\n", session=f"s{i}",
                 net=f"192.0.{i % 2}.0/24" if i % 2 else "198.51.100.0/24", history=f"{i:016x}")
     h2 = hexrun(81)
-    observe(store, f"wc -c /tmp/{h2}", f"0 /tmp/{h2}\r\n", session="late",
+    observe(store, f"file /tmp/{h2}", f"/tmp/{h2}\r\n", session="late",
             net="192.0.2.0/24", history="f" * 16)
-    assert store.lookup(FP, "root", True, f"wc -c /tmp/{hexrun(82)}") is not None
+    assert store.lookup(FP, "root", True, f"file /tmp/{hexrun(82)}") is not None
+
+
+# ---- follow-up 3: token bindings and token shapes ---------------------------------------------
+
+class _FileHistory(_History):
+    """A host with files: ``echo X > /tmp/Y`` writes, ``cat /tmp/Y`` reads, from the
+    session's own history (served lines included)."""
+
+    async def ainvoke(self, payload, config=None):
+        text = payload["messages"][-1].content
+        sid = config["configurable"]["session_id"]
+        files = {}
+        for m in self.get_session_history(sid).messages:
+            words = str(m.content).split()
+            if len(words) == 4 and words[0] == "echo" and words[2] == ">":
+                files[words[3]] = words[1]
+        if text.startswith("cat "):
+            name = text.split()[1]
+            self.replies[text] = (files[name] if name in files else
+                                  f"cat: {name}: No such file or directory") + "\r\n" + PROMPT
+        return await super().ainvoke(payload, config)
+
+
+async def test_a_script_reply_needs_the_same_token_bindings(wired):
+    wired.history = _FileHistory({"": PROMPT})
+    for n, (sid, ip) in enumerate([("b1", "192.0.2.1"), ("b2", "198.51.100.2"),
+                                   ("b3", "192.0.2.3")]):
+        t = hexrun(90 + n)
+        await _session(wired, sid, ip, [f"echo {t} > /tmp/{t}", f"cat /tmp/{t}"])
+    a, b = hexrun(95), hexrun(96)
+    out, _, _ = await _session(wired, "b4", "198.51.100.9", [f"echo {a} > /tmp/{a}",
+                                                             f"cat /tmp/{b}"])
+    assert a not in out[1].content
+    assert out[1].content == f"cat: /tmp/{b}: No such file or directory\r\n" + PROMPT
+    out, _, _ = await _session(wired, "b5", "198.51.100.10", [f"echo {a} > /tmp/{a}",
+                                                              f"cat /tmp/{a}"])
+    assert out[1].reply_step == "learned" and out[1].content == f"{a}\r\n" + PROMPT
+
+
+def test_a_reply_for_one_token_length_never_stands_for_another(store):
+    for n, (net, hist) in enumerate([("192.0.2.0/24", learned.START),
+                                     ("198.51.100.0/24", learned.START),
+                                     ("192.0.2.0/24", learned.START)]):
+        observe(store, f"printf %s {hexrun(100 + n)} | wc -c", "20\r\n", session=f"w{n}",
+                net=net, history=hist)
+        observe(store, f"ls -d /tmp/{hexrun(110 + n)}", "x\r\n", session=f"w{n}", net=net,
+                history=hist)
+    longer = hexrun(120, 30)
+    assert store.lookup(FP, "root", True, f"printf %s {longer} | wc -c",
+                        history=learned.START) is None
+    assert store.lookup(FP, "root", True, f"ls -d /tmp/{longer}", history=learned.START) is None
+    assert store.lookup(FP, "root", True, f"ls -d /tmp/{hexrun(121)}",
+                        history=learned.START) is not None
+
+
+def test_computing_commands_are_learned_only_for_their_exact_text(store):
+    h = hexrun(130)
+    assert learned.computes(f"printf %s {h} | wc -c") and learned.computes("echo ${#x}")
+    assert not learned.computes(f"ls -d /tmp/{h}") and not learned.computes("cat /etc/issue")
+    promote_values(store, "echo {t} | base64", "x\r\n", (131, 132, 133))
+    assert store.lookup(FP, "root", True, f"echo {hexrun(134)} | base64") is None
+
+
+def test_token_shape_is_part_of_the_key():
+    assert learned.shape(("ab12" * 5, "1" * 16, "AB12" * 5, "aB12" * 5,
+                          "123e4567-e89b-42d3-a456-4266141740ab")) == "20x,16d,20y,20h,36u"
+    h20, h30 = hexrun(140), hexrun(141, 30)
+    assert learned.entry_id(FP, "root", True, "x \x000\x00", learned.shape((h20,))) != \
+        learned.entry_id(FP, "root", True, "x \x000\x00", learned.shape((h30,)))
+    digits = "1234567890123456"
+    assert learned.shape((digits,)) != learned.shape((hexrun(142, 16),))
+
+
+def test_a_repeated_token_and_two_tokens_are_different_keys():
+    a, b = hexrun(150), hexrun(151)
+    one = learned.command_template(f"cp {a} {a}")
+    two = learned.command_template(f"cp {a} {b}")
+    assert one.text != two.text
+    root = learned.digest("root")
+    assert learned.script_key(root, f"cat /tmp/{a}", (a,)) != \
+        learned.script_key(root, f"cat /tmp/{b}", (a, b))
+
+
+async def test_a_script_reply_for_one_token_length_never_stands_for_another(wired):
+    wired.history = _FileHistory({"": PROMPT})
+    for n, (sid, ip) in enumerate([("L1", "192.0.2.1"), ("L2", "198.51.100.2"),
+                                   ("L3", "192.0.2.3")]):
+        t = hexrun(160 + n)
+        await _session(wired, sid, ip, [f"echo {t} > /tmp/{t}", f"cat /tmp/{t}"])
+    longer = hexrun(170, 30)
+    out, _, _ = await _session(wired, "L4", "198.51.100.9", [f"echo {longer} > /tmp/{longer}",
+                                                             f"cat /tmp/{longer}"])
+    assert out[1].reply_step == "model"
+
+
+async def test_a_token_listed_among_other_names_is_never_served(wired):
+    """Where a token sorts among fixed names follows its value: refused."""
+    wired.history.replies.update({"": PROMPT})
+    for n, (sid, ip) in enumerate([("S1", "192.0.2.1"), ("S2", "198.51.100.2"),
+                                   ("S3", "192.0.2.3")]):
+        t = "0" + hexrun(180 + n)[1:]           # every teacher's token sorts first
+        wired.history.replies[f"touch /tmp/{t}"] = PROMPT
+        wired.history.replies["ls /tmp"] = f"{t}  zzfixed\r\n" + PROMPT
+        await _session(wired, sid, ip, [f"touch /tmp/{t}", "ls /tmp"])
+    late = "f" + hexrun(190)[1:]                 # sorts after the fixed name
+    wired.history.replies[f"touch /tmp/{late}"] = PROMPT
+    out, _, _ = await _session(wired, "S4", "198.51.100.9", [f"touch /tmp/{late}", "ls /tmp"])
+    assert out[1].reply_step == "model"
+    entry = next(e for e in wired.store.entries() if e["command"] == "ls /tmp")
+    assert all(h["varying"] for h in entry["hist"].values())
+
+
+def test_pattern_matching_commands_compute():
+    for line in ["case x in [0-9]*) echo n;; esac", "[[ $x =~ ^a ]] && echo y",
+                 "ls /tmp/*", "echo ?"]:
+        assert learned.computes(line)

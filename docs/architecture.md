@@ -781,7 +781,10 @@ markers share a digest. The output of a line that reads the clock or the source 
 (the volatile list above, or a local answer from `w`, `uptime` and the like) is left out
 of the chain; the line itself is kept. A command is served when this entry was observed
 with the identical reply under the session's current digest in at least
-`learned_min_sessions` sessions from at least two networks. Such a session typed exactly
+`learned_min_sessions` sessions from at least two networks, and only when the line's
+tokens are bound the same way: each token in the line is the same earlier token of the
+session, or a new one, as in the teaching sessions, so `cat /tmp/B` after
+`echo A > /tmp/A` never gets the reply taught for `cat /tmp/A`. Such a session typed exactly
 what those sessions typed and was shown exactly what they were shown, so it is in their
 state, and this rule ignores the state-changing check below: a script that writes a file
 and reads it back is answered in full. The reply is stored whole, prompt included. A
@@ -793,7 +796,9 @@ Evidence and the varying mark are kept per digest, so a command that differs bet
 scripts can still be served within each one: up to 64 digests per entry, of which at most
 16 hold reply text (the others keep a digest of their reply until they reach the
 threshold); past either cap the least recently seen digest of that kind goes, varying
-mark included. The token lengths are part of the digest, and when every teaching session
+mark included. A line that computes over its text (the programs and forms listed below)
+in a session that has tokens is chained but neither served nor observed by this rule.
+The token lengths and classes are part of the digest, and when every teaching session
 used the same token values, the reply is served only to a session with those same values:
 a reply can depend on a value in ways a trace check cannot see (its length, a count), so
 other values need evidence from at least two different sets. The session opener is learned under
@@ -813,6 +818,16 @@ whole script that three sessions ran is answered line by line with no model requ
   but a value the teaching sessions did not use is served only once their observations
   span two or more different sets of values: a reply can depend on a value in ways no
   trace check sees (its length, a count). Both rules apply this.
+- Token shape and computed output. Each token's length and character class (digits,
+  lower-case hex, upper-case hex, mixed-case hex, UUID, base64-like) is part of an
+  entry's key, so an answer seen for 20-character hex tokens never stands for a
+  30-character or an all-digit one. Placeholders also keep each token's position and
+  whether it repeats (`cp A A` and `cp A B` are different entries). A command that
+  computes over its text (`wc`, `printf`, `expr`, `awk`, `sed`, `cut`, `head`, `tail`,
+  `tr`, `base64`, `od`, checksums, `grep`, scripting languages, `$((...))`, `${...}`, and
+  the like; `learned.COMPUTERS`) is learned only for its exact text, never with
+  placeholders. A reply that holds two or more different tokens is not learned, because
+  their order can follow their values (`ls` sorts names).
 - Prompt. An interactive reply is stored without its final prompt and only when that
   prompt is the one the session showed before the command; serving adds the session's
   current prompt. An exec reply is stored whole.
