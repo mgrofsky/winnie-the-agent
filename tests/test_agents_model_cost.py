@@ -260,7 +260,7 @@ async def test_replies_that_must_not_be_shared_are_not_cached():
                                        "root@srv01:~# ",
         "cat /var/log/btmp.txt": f"root ssh:notty {IP6[:16]}\r\nroot@srv01:~# ",
         "logout now": "YYY-END-OF-SESSION-YYY",
-        "explain": "As an AI language model I cannot\r\nroot@srv01:~# ",
+        "man explain": "As an AI language model I cannot\r\nroot@srv01:~# ",
         "date": "Thu Nov 19 10:00:00 UTC 2026\r\nroot@srv01:~# ",
         "head -c 8 /dev/urandom | base64": "q83+Vf0n1aQ=\r\nroot@srv01:~# ",
     })
@@ -341,8 +341,9 @@ async def test_summary_of_a_replayed_session_comes_from_the_cache():
 async def test_persona_block_gives_the_exact_not_found_line():
     hooks.set_budget(Budget(BudgetConfig()))
     history = History(default="x\n")
-    await ask(history, "frobnicate", interactive=True)
-    await ask(history, "frobnicate", sid="s2", interactive=False)
+    # a line left to the model (a variable): the persona block tells it bash's wording
+    await ask(history, "frobnicate $X", interactive=True)
+    await ask(history, "frobnicate $X", sid="s2", interactive=False)
     assert "`-bash: NAME: command not found`" in history.profiles[0]
     assert "followed by the prompt" in history.profiles[0]
     # SSH exec runs bash -c; the default host's bash 5.1 adds "line 1"

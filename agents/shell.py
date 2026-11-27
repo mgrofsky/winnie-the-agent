@@ -13,10 +13,12 @@ whole cost is bounded: see ``MAX_WORK``, ``MAX_STAGE_OUTPUT`` and ``MAX_FILES``.
 
 ``answer`` takes one input line: a simple command, a pipeline of our own output through
 ``grep``, ``head``, ``tail``, ``cut``, ``wc`` and ``awk '{print ...}'``, or a ``;`` / ``&&``
-/ ``||`` list of those. Redirections (``>``, ``>>``, ``<``, ``2>&1``) and the loop IoT
-loaders use to read a binary (``while read i; do echo $i; done < FILE``) are understood.
-Anything it cannot evaluate exactly (substitution, globbing, other variables, an unknown
-command, file or option) returns None, and the caller answers as it did before. ``reply``
+/ ``||`` list of those, with ``( list )`` subshells. Redirections (``>``, ``>>``, ``<``,
+``2>&1``), the loop IoT loaders use to read a binary (``while read i; do echo $i; done <
+FILE``) and short ``sh -c`` scripts (``_Script``) are understood. A word that names no
+command on the host is ``command not found``. Anything it cannot evaluate exactly
+(substitution, globbing, other variables, a command, file or option it does not model)
+returns None, and the caller answers as it did before. ``reply``
 goes further for the canned shell: a list is answered part by part, each part it cannot
 evaluate getting what ``Shell.unhandled`` gives a whole line.
 
@@ -53,6 +55,7 @@ MAX_WORD = 1024
 MAX_WORDS = 64             # per command
 MAX_STAGES = 8             # commands in one pipeline
 MAX_LIST = 32              # pipelines in one ; && || list (loader lines run to ~20)
+MAX_DEPTH = 4              # ( ) groups and sh -c scripts inside one another
 MAX_PATTERN = 256          # grep pattern length
 MAX_FILES = 8              # file operands one command reads
 MAX_STAGE_OUTPUT = 128 * 1024  # characters one command may produce (a 64-CPU cpuinfo is 72k)
@@ -79,9 +82,27 @@ SHELL_KEYWORDS = frozenset(("while", "until", "for", "if", "case", "select", "fu
                             "time", "{", "[[", "!", "do", "done", "then", "fi", "esac"))
 BIN_DIRS = frozenset(("/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin",
                       "/usr/local/sbin"))
-# Words IoT bots send first because a device CLI knows them. bash does not, so they are
-# "command not found" (``enable`` is a bash builtin and ``sh`` starts a nested shell).
-NOT_COMMANDS = frozenset(("system", "shell", "linuxshell"))
+# A word that names no builtin, alias or program on the host is "command not found"
+# (``Shell.unknown``): ``system``, ``shell`` and the other words IoT bots send first because
+# a device CLI knows them (``enable`` is a bash builtin and ``sh`` starts a nested shell).
+# Aliases a login shell may have (/etc/skel's .bashrc on Debian and Ubuntu, colorls.sh on
+# RHEL): a word that may name one is never "command not found" here.
+_ALIASES = frozenset(("ll", "la", "l", "l."))
+# Programs a working server very often has beyond the minimal image: left to the model.
+_COMMON_PROGRAMS = frozenset((
+    "ss", "journalctl", "less", "vi", "vim", "view", "nano", "emacs", "ifconfig", "route",
+    "arp", "netstat", "lsof", "killall", "pkill", "pgrep", "watch", "lsb_release", "git",
+    "gcc", "cc", "g++", "c++", "clang", "make", "screen", "tmux", "ncat", "netcat", "socat",
+    "telnet", "ftp", "sftp", "rsync", "ssh-keygen", "docker", "docker-compose", "podman",
+    "kubectl", "htop", "nft", "ufw", "firewall-cmd", "iptables-save", "ip6tables", "python",
+    "python2", "pip", "pip3", "php", "ruby", "node", "npm", "java", "go", "tcpdump", "nmap",
+    "strace", "gdb", "dig", "nslookup", "host", "traceroute", "tracepath", "mtr", "ethtool",
+    "lsmod", "modprobe", "dmidecode", "lsusb", "at", "atq", "atrm", "service", "mysql",
+    "mysqldump", "psql", "pg_dump", "redis-cli", "redis-server", "sqlite3", "nginx",
+    "apache2", "httpd", "zip", "unzip", "bzip2", "xz",
+))
+# bash's other reserved words: alone on a line each is a syntax error, not a command.
+_RESERVED = SHELL_KEYWORDS | {"else", "elif", "in", "}", "]]", "coproc"}
 DEFAULT_KERNEL = ("Linux srv01 5.15.0-105-generic #115-Ubuntu SMP Mon Apr 15 09:52:04 UTC "
                   "2024 x86_64 x86_64 x86_64 GNU/Linux")
 MACHINES = frozenset(("x86_64", "aarch64", "i686", "armv7l"))
@@ -516,13 +537,27 @@ class _Unsupported(Exception):
     """The line needs a real shell; the caller answers as before."""
 
 
-_UNQUOTED_SPECIAL = set("$`\\<>(){}*?[]~#!\"'")
+def _dq_backslash(text: str, i: int) -> tuple[int, str]:
+    """A backslash at ``text[i]`` inside double quotes, by the POSIX rule: before ``$``,
+    `````, ``"``, ``\\`` or a newline it quotes that character (a newline is removed);
+    before any other character both stay. (index after it, its text)."""
+    nxt = text[i + 1:i + 2]
+    if not nxt:
+        raise _Unsupported
+    if nxt in "$`\"\\":
+        return i + 2, nxt
+    if nxt == "\n":
+        return i + 2, ""
+    return i + 1, "\\"
+
+
+_UNQUOTED_SPECIAL = set("$`\\<>{}*?[]~#!\"'")
 
 
 def _tokenize(line: str) -> list:
-    """Words, the operators ``|``, ``;``, ``&&``, ``||``, redirections (``_Redir``) and a
-    bare ``$NAME`` (``_Var``, only the loop in ``_parse`` uses one). Quotes are honoured;
-    anything else a shell would expand raises ``_Unsupported``."""
+    """Words, the operators ``|``, ``;``, ``&&``, ``||``, ``(`` and ``)``, redirections
+    (``_Redir``) and a bare ``$NAME`` (``_Var``, only the loop in ``_parse`` uses one). Quotes
+    are honoured; anything else a shell would expand raises ``_Unsupported``."""
     if len(line) > MAX_LINE or any(not c.isprintable() and c != "\t" for c in line):
         raise _Unsupported
     tokens: list = []
@@ -545,15 +580,30 @@ def _tokenize(line: str) -> list:
             i = end + 1
             continue
         if c == '"':
-            end = line.find('"', i + 1)
-            if end < 0:
-                raise _Unsupported
-            inner = line[i + 1:end]
-            if any(ch in inner for ch in "$`\\!"):
-                raise _Unsupported
             word = word if word is not None else []
-            word.append(inner)
-            i = end + 1
+            i += 1
+            while True:
+                if i >= n or line[i] in "$`!":
+                    raise _Unsupported       # unclosed, an expansion, or history
+                if line[i] == '"':
+                    i += 1
+                    break
+                if line[i] == "\\":
+                    i, text = _dq_backslash(line, i)
+                    word.append(text)
+                    continue
+                stop = i
+                while stop < n and line[stop] not in '"$`!\\':
+                    stop += 1
+                word.append(line[i:stop])
+                i = stop
+            continue
+        if c == "\\":
+            if i + 1 >= n:
+                raise _Unsupported           # a line continuation
+            word = word if word is not None else []
+            word.append(line[i + 1])         # the next character, quoted
+            i += 2
             continue
         if c in "<>" or (c.isdigit() and word is None and line[i + 1:i + 2] == ">"):
             fd = int(c) if c.isdigit() else (0 if c == "<" else 1)
@@ -580,6 +630,15 @@ def _tokenize(line: str) -> list:
                 raise _Unsupported
             tokens.append(_Var(name))
             i += 1 + len(name)
+            continue
+        if c in "()":
+            if line[i:i + 2] == "((":
+                raise _Unsupported           # bash's arithmetic command
+            if word is not None:
+                tokens.append("".join(word))
+                word = None
+            tokens.append(_Op(c))
+            i += 1
             continue
         if c in "|;&":
             if word is not None:
@@ -628,13 +687,32 @@ class _Var:
 @dataclass
 class _Simple:
     """One command of a pipeline: its words, its redirections in order (op, fd, target),
-    and for ``while read NAME; do echo $NAME; done`` the loop's read options."""
+    for ``while read NAME; do echo $NAME; done`` the loop's read options, and for a subshell
+    ``( list )`` the list it runs."""
     argv: list
     redirs: list = field(default_factory=list)
     loop: Optional[tuple] = None     # (raw: bool,) for the read loop
+    group: Optional[list] = None     # [(operator before it, pipeline)] for ( list )
+
+    def empty(self) -> bool:
+        return not self.argv and not self.redirs and self.loop is None and self.group is None
 
 
 _LOOP = ("while", "read", None, ";", "do", "echo", "$", ";", "done")
+
+
+def _group_words(items: list) -> set:
+    """The last path component of every word and redirection target in a group's list,
+    nested groups included, URLs aside."""
+    out: set = set()
+    for _joiner, pipeline in items:
+        for cmd in pipeline:
+            for word in list(cmd.argv) + [target for _op, _fd, target in cmd.redirs]:
+                if isinstance(word, str) and "://" not in word:   # a URL names no local file
+                    out.add(posixpath.basename(word.rstrip("/")))
+            if cmd.group is not None:
+                out |= _group_words(cmd.group)
+    return out
 
 
 def _loop_at(tokens: list, i: int) -> Optional[tuple[int, bool]]:
@@ -661,14 +739,34 @@ def _loop_at(tokens: list, i: int) -> Optional[tuple[int, bool]]:
 
 def _parse(line: str) -> list[tuple[str, list[_Simple]]]:
     """[(operator before it, pipeline)], a pipeline being a list of ``_Simple``."""
+    tokens = _tokenize(line)
+    items, i = _parse_list(tokens, 0, 0)
+    if i != len(tokens):
+        raise _Unsupported                   # a ) with no ( before it
+    return items
+
+
+def _parse_list(tokens: list, i: int, depth: int) -> tuple[list, int]:
+    """The list starting at ``tokens[i]`` and the index where it ends: the end of the line,
+    or the ``)`` closing a group ``depth`` levels down."""
     items: list[tuple[str, list[_Simple]]] = []
     joiner, pipeline, cmd = ";", [], _Simple([])
-    tokens = _tokenize(line)
-    i = 0
     while i < len(tokens):
         tok = tokens[i]
+        if tok == _Op(")"):
+            if not depth:
+                raise _Unsupported
+            break
+        if tok == _Op("("):
+            if not cmd.empty() or depth + 1 >= MAX_DEPTH:
+                raise _Unsupported           # ``x (`` and ``>f (`` are syntax errors
+            cmd.group, i = _parse_list(tokens, i + 1, depth + 1)
+            if i >= len(tokens):
+                raise _Unsupported           # no closing )
+            i += 1
+            continue
         if isinstance(tok, _Op):
-            if not cmd.argv and not cmd.redirs and cmd.loop is None:
+            if cmd.empty():
                 raise _Unsupported
             pipeline.append(cmd)
             cmd = _Simple([])
@@ -689,18 +787,19 @@ def _parse(line: str) -> list[tuple[str, list[_Simple]]]:
             cmd.redirs.append((tok.op, tok.fd, target))
             i += 2
             continue
-        if tok == "while" and not cmd.argv and cmd.loop is None:
+        if tok == "while" and not cmd.argv and cmd.loop is None and cmd.group is None:
             found = _loop_at(tokens, i)
             if found is None:
                 raise _Unsupported
             i, raw = found
             cmd.loop = (raw,)
             continue
-        if isinstance(tok, _Var) or cmd.loop is not None or len(tok) > MAX_WORD:
+        if isinstance(tok, _Var) or cmd.loop is not None or cmd.group is not None \
+                or len(tok) > MAX_WORD:
             raise _Unsupported
         cmd.argv.append(tok)
         i += 1
-    if cmd.argv or cmd.redirs or cmd.loop is not None:
+    if not cmd.empty():
         pipeline.append(cmd)
         items.append((joiner, pipeline))
     elif pipeline or joiner != ";":
@@ -708,7 +807,7 @@ def _parse(line: str) -> list[tuple[str, list[_Simple]]]:
     if not items or len(items) > MAX_LIST or any(len(p) > MAX_STAGES for _, p in items) \
             or any(len(c.argv) + len(c.redirs) > MAX_WORDS for _, p in items for c in p):
         raise _Unsupported
-    return items
+    return items, i
 
 
 # ---- evaluation ---------------------------------------------------------------------------
@@ -775,6 +874,7 @@ class Session:
     removed: set = field(default_factory=set)      # its own files it removed again
     version: int = 0       # bumped whenever an entry is made or removed (listing caches)
     modes: dict = field(default_factory=dict)      # its directories' modes, other than 755
+    spawned: int = 0       # shells it started that showed their pid (``_child_pid``)
 
     def size(self) -> int:
         return sum(len(f.data) for f in self.files.values())
@@ -782,7 +882,8 @@ class Session:
     def copy(self) -> "Session":
         """An independent copy: a line may run on it and be kept only if its answer is."""
         return Session(self.cwd, {p: replace(f) for p, f in self.files.items()},
-                       dict(self.dirs), set(self.removed), self.version, dict(self.modes))
+                       dict(self.dirs), set(self.removed), self.version, dict(self.modes),
+                       self.spawned)
 
 
 # Where a non-root login may create files.
@@ -813,6 +914,10 @@ class Shell:
         self.stage_errs: list[str] = []     # what the stages before it wrote to stderr
         self._files: dict[str, Optional[str]] = {}
         self.memo: dict = {}                # seeded values reused within the line
+        self.argv: list[str] = []           # the running command's words as typed
+        self.partial = False                # ``run``'s ``partial``: groups fall back part by part
+        self.depth = 0                      # groups and ``sh -c`` scripts being evaluated
+        self.captured = False               # a group's stdout goes to a file or a pipe
 
     @property
     def now(self) -> float:
@@ -849,6 +954,10 @@ class Shell:
     def run(self, line: str, partial: bool = False) -> Optional[Answer]:
         """The answer to a line, or None when it needs a real shell. With ``partial`` a
         list part this shell cannot evaluate gets ``_fallback`` and the rest still runs."""
+        if not line:
+            self.session.cwd = self.cwd
+            return Answer("", 0, FIXED)      # an empty line: bash shows the prompt again
+        self.partial = partial
         try:
             self.charge(len(line) * STEP)
             items = _parse(line)
@@ -979,16 +1088,18 @@ class Shell:
 
     def _simple(self, cmd: _Simple, stdin: Optional[str], piped: bool = False) -> _Result:
         """One command with its redirections, applied in order as bash applies them."""
-        self.exe = "bash"                   # the shell opens the redirections
+        self.exe, self.argv = "bash", []    # the shell opens the redirections
         opened = self._redirect(cmd, stdin)
         if isinstance(opened, _Result):
             return opened
         fds, stdin, scope = opened
         self.stage_fds = fds
-        self.raw = fds[1][0] == "file" or (piped and fds[1][0] == "out")
+        self.raw = fds[1][0] == "file" or ((piped or self.captured) and fds[1][0] == "out")
         try:
             if cmd.loop is not None:
                 result = _read_loop(self, cmd.loop[0], stdin)
+            elif cmd.group is not None:
+                result = self._group(cmd.group, stdin, fds, piped)
             elif not cmd.argv:
                 result = _Result()
             else:
@@ -996,6 +1107,49 @@ class Shell:
         finally:
             self.raw = False
         return self._route(fds, result, scope)
+
+    def _group(self, items: list, stdin: Optional[str], fds: dict, piped: bool) -> _Result:
+        """``( list )``: a subshell running ``items`` as ``run`` runs a line, a ``cd`` in it
+        moving nobody outside. What its parts write leaves through the group's descriptors
+        ``fds``; where stdout and stderr end in one place, their order there is kept, else
+        the group is unsupported."""
+        if stdin is not None or self.depth + 1 >= MAX_DEPTH:
+            raise _Unsupported
+        targets = {posixpath.basename(fd[1]) for fd in (fds[1], fds[2]) if fd[0] == "file"}
+        saved = (self.cwd, self.stage, self.stage_fds, self.stage_errs, self.captured)
+        self.depth += 1
+        # Output that still leaves through an enclosing group's file or pipe keeps every byte.
+        self.captured = fds[1][0] == "file" or ((piped or self.captured) and fds[1][0] == "out")
+        parts, status, scope = [], 0, FIXED
+        try:
+            for joiner, pipeline in items:
+                if (joiner == "&&" and status != 0) or (joiner == "||" and status == 0):
+                    continue
+                # What earlier parts wrote reaches the file when the group ends: a part that
+                # names that file would not see it.
+                if targets & _group_words([(joiner, pipeline)]) and any(
+                        (fds[1][0] == "file" and r.out) or (fds[2][0] == "file" and (r.err or r.late))
+                        for r in parts):
+                    raise _Unsupported
+                try:
+                    result = self._pipeline(pipeline)
+                except _OverBudget:
+                    raise
+                except _Unsupported:
+                    if not self.partial:
+                        raise
+                    result = self._fallback(pipeline)
+                parts.append(result)
+                status, scope = result.status, max(scope, result.scope)
+        finally:
+            self.depth -= 1
+            self.cwd, self.stage, self.stage_fds, self.stage_errs, self.captured = saved
+        out, err, late = ("".join(getattr(r, k) for r in parts) for k in ("out", "err", "late"))
+        apart = "null" in (fds[1][0], fds[2][0]) or (fds[1] != fds[2] and "file" in
+                                                     (fds[1][0], fds[2][0]))
+        if not apart and "".join(r.err + r.out + r.late for r in parts) != err + out + late:
+            raise _Unsupported               # its parts' stdout and stderr interleave
+        return _Result(out, err, status, scope, late)
 
     def _redirect(self, cmd: _Simple, stdin: Optional[str], lenient: bool = False):
         """Open ``cmd``'s redirections in order: (fds, stdin, scope), or the result of one
@@ -1095,10 +1249,12 @@ class Shell:
             # /bin and /sbin are /usr/bin and /usr/sbin under another name: a file made in
             # one would be missing from the other's listing. Left to the model.
             raise _Unsupported
-        # A dot name in a system directory ``ls`` does not list (``/var/.f``): the host's
-        # own entries there are plain names, so a new one is made without listing the rest.
-        hidden = parent in _DOT_DIRS and posixpath.basename(path).startswith(".")
-        if (parent not in _dirs(self) and parent not in self.session.dirs and not hidden) \
+        # A dot name or a one-character name in a system directory ``ls`` does not list
+        # (``/var/.f``, ``/var/d``): the host's own entries there are plain names of two
+        # characters or more, so a new one is made without listing the rest.
+        name = posixpath.basename(path)
+        new = parent in _DOT_DIRS and (name.startswith(".") or len(name) == 1)
+        if (parent not in _dirs(self) and parent not in self.session.dirs and not new) \
                 or path in _FILES or self.program(path) \
                 or path in {posixpath.normpath(p) for p in self.host.lures}:
             raise _Unsupported               # a host file, or a directory we cannot list
@@ -1213,7 +1369,27 @@ class Shell:
             or self.program("/usr/bin/" + name) is not None \
             or self.program("/usr/sbin/" + name) is not None
 
-    def _command(self, argv: list[str], stdin: Optional[str]) -> _Result:
+    def unknown(self, name: str) -> bool:
+        """True when bash finds no command ``name`` (a word without a slash): no builtin,
+        reserved word, alias or assignment, no program a server very often has
+        (``_COMMON_PROGRAMS``), no program the host's ``ps`` shows running, and
+        no program of that name in a directory of the PATH, as the host's listings and the
+        session's own files show them."""
+        if name in ("nvidia-smi", "busybox"):
+            return not self.installed(name)
+        if name in SHELL_BUILTINS or name in _RESERVED or name in _BASH_BUILTINS \
+                or name in _ALIASES or name in _COMMON_PROGRAMS or "=" in name or not name \
+                or self.installed(name) \
+                or name in _ps_names(self):
+            return False
+        lures = {posixpath.normpath(p) for p in self.host.lures}
+        return not any(posixpath.join(d, name) in self.session.files
+                       or posixpath.join(d, name) in lures for d in BIN_DIRS)
+
+    def _command(self, argv: list[str], stdin: Optional[str],
+                 typed: Optional[list[str]] = None) -> _Result:
+        """Run ``argv``; ``typed`` is what the process sees as its arguments when that
+        differs (a session copy of a program run by its own name)."""
         self.stage_out = 0
         self.charge(COMMAND + STEP * len(argv))
         word = argv[0]
@@ -1225,7 +1401,7 @@ class Shell:
             if "/" in word:
                 return _Result(err=f"{self.prefix}: {word}: No such file or directory\n",
                                status=127, scope=SESSION)
-            if name in ("nvidia-smi", "busybox") or name in NOT_COMMANDS:
+            if self.unknown(name):
                 return _Result(err=f"{self.prefix}: {word}: command not found\n", status=127,
                                scope=SESSION)
         entry = _COMMANDS.get(name)
@@ -1234,6 +1410,7 @@ class Shell:
             raise _Unsupported
         handler, scope = entry
         self.argv0 = name
+        self.argv = typed or argv
         self.exe = "bash" if name in SHELL_BUILTINS or name == "kill" else name
         result = handler(self, argv[1:], stdin)
         if result is None:
@@ -1268,7 +1445,7 @@ class Shell:
             return _Result(err=f"{self.prefix}: {word}: Permission denied\n", status=126,
                            scope=STATE)
         if entry.program is not None and entry.data == self.elf(entry.program):
-            result = self._command([entry.program] + args, stdin)
+            result = self._command([entry.program] + args, stdin, [word] + args)
             result.scope = STATE
             return result
         if not entry.data:
@@ -1299,6 +1476,12 @@ class Shell:
         if path in self.session.removed:
             return _Result(status=1, err=f"{{cmd}}: {path}: No such file or directory\n",
                            scope=SESSION)
+        if path == "/proc/self/cmdline":
+            # the reading program's arguments as typed, each ended by a NUL byte; what
+            # the shell itself would read (``< /proc/self/cmdline``) is left to the caller
+            if not self.argv or self.exe == "bash":
+                return None
+            return _Result("".join(word + "\x00" for word in self.argv), scope=FIXED)
         program = self.exe if path == "/proc/self/exe" else self.program(path)
         if program is not None and path not in _FILES:
             # A session could replace a program file, but no model can answer its bytes.
@@ -2267,11 +2450,15 @@ def _proc_uptime(sh: Shell) -> str:
     return f"{up}.{int(sh.now * 100) % 100:02d} {idle:.2f}\n"
 
 
+def _last_pid(host: Host) -> int:
+    """The last pid /proc/loadavg shows: stable per sensor, above every pid ``ps`` shows."""
+    return 40000 + host.rng("lp").randrange(1000, 9999)
+
+
 def _loadavg(sh: Shell) -> str:
     l1, l5, l15 = sh.host.loadavg(sh.now)
     tasks = 180 + sh.host.hardware.cpus * 8
-    last_pid = 40000 + sh.host.rng("lp").randrange(1000, 9999)
-    return f"{l1:.2f} {l5:.2f} {l15:.2f} 1/{tasks} {last_pid}\n"
+    return f"{l1:.2f} {l5:.2f} {l15:.2f} 1/{tasks} {_last_pid(sh.host)}\n"
 
 
 _FILES: dict[str, Callable[[Shell], Optional[str]]] = {
@@ -2806,10 +2993,13 @@ def _awk(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     return _Result("".join(out), errors, status, scope)
 
 
-@_command("sh", "bash", scope=SESSION)
+@_command("sh", "bash")
 def _sh(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
     """A shell fed nothing (a failed download piped into it) prints nothing; ``sh`` typed
-    as a botnet opener starts a subshell that looks the same."""
+    as a botnet opener starts a subshell that looks the same; ``sh -c SCRIPT`` runs a short
+    script (``_sh_c``)."""
+    if args[:1] == ["-c"]:
+        return _sh_c(sh, args[1:])
     if stdin or len(args) > 1 or args[:1] and args[0].startswith("-"):
         return None
     if args:                            # a script a loader fetched: only a missing one
@@ -2828,6 +3018,479 @@ def _sh(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
                            scope=STATE)
         return _Result(err=f"sh: 0: cannot open {shown}: No such file\n", status=2, scope=STATE)
     return _Result(scope=SESSION)
+
+
+# ---- sh -c: the short scripts bots send to tell a real shell from a fake one -------------------
+
+MAX_SCRIPT = MAX_WORD        # characters of one ``sh -c`` script (one word of the line)
+MAX_SCRIPT_STEPS = 256       # commands one script runs, function calls included
+MAX_FUNCTIONS = 16           # functions one script defines
+MAX_CALLS = 8                # function calls inside one another
+MAX_ARITH = 256              # characters of one $((...))
+MAX_SPAWNED = 10_000         # shells a session's pid count goes up to (``Session.spawned``)
+_INT_MIN, _INT_MAX = -(1 << 63), (1 << 63) - 1
+_SCRIPT_RESERVED = frozenset(("if", "then", "else", "elif", "fi", "do", "done", "case", "esac",
+                              "while", "until", "for", "in", "!", "function", "select", "time",
+                              "[[", "]]"))
+_SCRIPT_SPECIAL = set("<>`\\*?[]~#!{}")
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _script_dollar(text: str, i: int) -> tuple[int, tuple]:
+    """The expansion starting at ``text[i]`` (a ``$``): (index after it, (kind, value)) for
+    ``$$``, ``$#``, ``$0`` to ``$9`` and ``$((...))``; anything else is unsupported."""
+    nxt = text[i + 1:i + 2]
+    if nxt in ("$", "#") or (nxt.isdigit() and nxt.isascii()):
+        return i + 2, ("param", nxt)
+    if text[i + 1:i + 3] != "((":
+        raise _Unsupported                   # $NAME, ${...}, $(...), $@, $*, $?
+    depth, j = 0, i + 3
+    while j < len(text) and j - i <= MAX_ARITH:
+        c = text[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            if not depth:
+                if text[j + 1:j + 2] != ")":
+                    raise _Unsupported
+                return j + 2, ("arith", text[i + 3:j])
+            depth -= 1
+        j += 1
+    raise _Unsupported
+
+
+def _script_tokens(text: str) -> list:
+    """The script as words (lists of (kind, value, quoted) parts: ``lit`` text, ``param``
+    and ``arith`` expansions) and the operators ``;``, newline, ``&&``, ``||``, ``(`` and
+    ``)``. A standalone ``{`` or ``}`` is a one-part word. Pipes, redirections, globs,
+    substitutions, variables and backslashes outside single quotes are unsupported."""
+    if len(text) > MAX_SCRIPT or any(not c.isprintable() and c not in "\t\n" for c in text):
+        raise _Unsupported
+    tokens: list = []
+    word: Optional[list] = None
+    i, n = 0, len(text)
+
+    def end() -> None:
+        nonlocal word
+        if word is not None:
+            merged: list = []
+            for part in word:            # adjacent literal characters as one part
+                if merged and part[0] == "lit" == merged[-1][0] and part[2] == merged[-1][2]:
+                    merged[-1] = ("lit", merged[-1][1] + part[1], part[2])
+                else:
+                    merged.append(part)
+            tokens.append(merged)
+            word = None
+
+    while i < n:
+        c = text[i]
+        if c in " \t":
+            end()
+            i += 1
+        elif c in ";\n":
+            end()
+            if text[i:i + 2] == ";;":
+                raise _Unsupported
+            tokens.append(_Op(c))
+            i += 1
+        elif c in "&|":
+            if text[i:i + 2] not in ("&&", "||"):
+                raise _Unsupported           # a pipe or a background job
+            end()
+            tokens.append(_Op(text[i:i + 2]))
+            i += 2
+        elif c in "()":
+            end()
+            tokens.append(_Op(c))
+            i += 1
+        elif c in "{}" and word is None and text[i + 1:i + 2] in ("", " ", "\t", "\n", ";"):
+            tokens.append([("lit", c, False)])
+            i += 1
+        elif c == "'":
+            close = text.find("'", i + 1)
+            if close < 0:
+                raise _Unsupported
+            word = word if word is not None else []
+            word.append(("lit", text[i + 1:close], True))
+            i = close + 1
+        elif c == '"':
+            word = word if word is not None else []
+            word.append(("lit", "", True))   # "" is a word of its own
+            i += 1
+            while True:
+                if i >= n or text[i] == "`":
+                    raise _Unsupported
+                if text[i] == '"':
+                    i += 1
+                    break
+                if text[i] == "\\":
+                    i, value = _dq_backslash(text, i)
+                    word.append(("lit", value, True))
+                    continue
+                if text[i] == "$":
+                    i, (kind, value) = _script_dollar(text, i)
+                    word.append((kind, value, True))
+                    continue
+                stop = i
+                while stop < n and text[stop] not in '"$`\\':
+                    stop += 1
+                word.append(("lit", text[i:stop], True))
+                i = stop
+        elif c == "$":
+            word = word if word is not None else []
+            i, (kind, value) = _script_dollar(text, i)
+            word.append((kind, value, False))
+        elif c == "\\":
+            nxt = text[i + 1:i + 2]
+            if not nxt:
+                raise _Unsupported
+            if nxt != "\n":                 # a backslash-newline joins the lines
+                word = word if word is not None else []
+                word.append(("lit", nxt, True))  # the next character, quoted
+            i += 2
+        elif c in _SCRIPT_SPECIAL:
+            raise _Unsupported
+        else:
+            word = word if word is not None else []
+            word.append(("lit", c, False))
+            i += 1
+    end()
+    return tokens
+
+
+def _plain(token) -> Optional[str]:
+    """The text of a word written without quotes or expansions, else None."""
+    if isinstance(token, _Op) or any(kind != "lit" or quoted for kind, _, quoted in token):
+        return None
+    return "".join(value for _, value, _ in token)
+
+
+def _script_list(tokens: list, i: int, braced: bool) -> tuple[list, int]:
+    """[(operator before it, command)] from ``tokens[i]`` to the end, or to the ``}`` that
+    closes a brace group when ``braced``; and the index where it stopped. A command is
+    ("simple", words), ("group", list) or ("def", name, list)."""
+    items: list = []
+    joiner, last = ";", "start"              # last: start, cmd, sep or andor
+    while i < len(tokens):
+        tok = tokens[i]
+        if isinstance(tok, _Op):
+            if tok.op == "\n" and last != "cmd":
+                i += 1
+                continue
+            if last != "cmd" or tok.op in ("(", ")"):
+                raise _Unsupported           # a syntax error
+            joiner = ";" if tok.op == "\n" else tok.op
+            last = "andor" if tok.op in ("&&", "||") else "sep"
+            i += 1
+            continue
+        word = _plain(tok)
+        if word == "}" and braced:
+            break
+        if last == "cmd":
+            raise _Unsupported               # ``{ a; } b``
+        if word in _SCRIPT_RESERVED or word == "}":
+            raise _Unsupported
+        if word == "{":
+            body, i = _script_list(tokens, i + 1, True)
+            items.append((joiner, ("group", body)))
+            i += 1
+        elif word is not None and tokens[i + 1:i + 3] == [_Op("("), _Op(")")]:
+            if not _NAME.fullmatch(word) or word in ("set", "printf", "echo", "true", "false"):
+                raise _Unsupported           # a builtin's name: dash and bash differ
+            i += 3
+            while i < len(tokens) and tokens[i] == _Op("\n"):
+                i += 1
+            if i >= len(tokens) or _plain(tokens[i]) != "{":
+                raise _Unsupported           # only a { } body is supported
+            body, i = _script_list(tokens, i + 1, True)
+            items.append((joiner, ("def", word, body)))
+            i += 1
+        else:
+            words = []
+            while i < len(tokens) and not isinstance(tokens[i], _Op):
+                words.append(tokens[i])
+                i += 1
+            if len(words) > MAX_WORDS:
+                raise _Unsupported
+            items.append((joiner, ("simple", words)))
+        if len(items) > MAX_LIST:
+            raise _Unsupported
+        last = "cmd"
+    if braced and i >= len(tokens):
+        raise _Unsupported                   # no closing }
+    if last == "andor" or (braced and not items):
+        raise _Unsupported
+    return items, i
+
+
+def _arith(expr: str) -> int:
+    """``$((expr))`` for integer literals, ``+ - * / %``, unary signs and parentheses, in
+    64-bit two's complement as dash and bash compute it; anything else is unsupported."""
+    if not re.fullmatch(r"[0-9 \t+\-*/%()]+", expr) or "++" in expr or "--" in expr:
+        raise _Unsupported
+    tokens = re.findall(r"[0-9]+|[-+*/%()]", expr)
+    if len(tokens) > MAX_ARITH // 2:
+        raise _Unsupported
+    pos = 0
+
+    def wrap(value: int) -> int:
+        return (value - _INT_MIN) % (1 << 64) + _INT_MIN
+
+    def peek() -> Optional[str]:
+        return tokens[pos] if pos < len(tokens) else None
+
+    def primary(depth: int) -> int:
+        nonlocal pos
+        tok = peek()
+        if tok is None or depth > 32:
+            raise _Unsupported
+        pos += 1
+        if tok in "+-":
+            value = primary(depth + 1)
+            return wrap(-value) if tok == "-" else value
+        if tok == "(":
+            value = additive(depth + 1)
+            if peek() != ")":
+                raise _Unsupported
+            pos += 1
+            return value
+        if not tok.isdigit() or (len(tok) > 1 and tok[0] == "0") or int(tok) > _INT_MAX:
+            raise _Unsupported               # an octal literal or one out of range
+        return int(tok)
+
+    def term(depth: int) -> int:
+        nonlocal pos
+        value = primary(depth)
+        while peek() in ("*", "/", "%"):
+            op = tokens[pos]
+            pos += 1
+            right = primary(depth)
+            if op == "*":
+                value = wrap(value * right)
+                continue
+            if right == 0 or (value == _INT_MIN and right == -1):
+                raise _Unsupported           # an error message, worded differently by each shell
+            quotient = abs(value) // abs(right) * (1 if (value < 0) == (right < 0) else -1)
+            value = quotient if op == "/" else value - quotient * right
+        return value
+
+    def additive(depth: int) -> int:
+        nonlocal pos
+        value = term(depth)
+        while peek() in ("+", "-"):
+            op = tokens[pos]
+            pos += 1
+            right = term(depth)
+            value = wrap(value + right if op == "+" else value - right)
+        return value
+
+    result = additive(0)
+    if pos != len(tokens):
+        raise _Unsupported
+    return result
+
+
+def _script_printf(args: list[str]) -> str:
+    """What dash's and bash's printf print for a format of text, ``\\\\ \\n \\t \\r``, ``%s``,
+    ``%d``, ``%i`` and ``%%``, reused while arguments remain; anything else is unsupported."""
+    if not args or args[0].startswith("-"):
+        raise _Unsupported
+    fmt, args = args[0], args[1:]
+    pieces, text, i = [], [], 0
+    while i < len(fmt):
+        c = fmt[i]
+        if c in "\\%":
+            nxt = fmt[i + 1:i + 2]
+            escape = {"\\": "\\", "n": "\n", "t": "\t", "r": "\r"} if c == "\\" else {"%": "%"}
+            if nxt in escape:
+                text.append(escape[nxt])
+            elif c == "%" and nxt in ("s", "d", "i"):
+                pieces += ["".join(text), nxt]
+                text = []
+            else:
+                raise _Unsupported
+            i += 2
+            continue
+        text.append(c)
+        i += 1
+    pieces.append("".join(text))             # text at even indexes, conversions at odd
+    out, k = [], 0
+    while True:
+        for index, piece in enumerate(pieces):
+            if index % 2 == 0:
+                out.append(piece)
+                continue
+            value = args[k] if k < len(args) else None
+            k += 1
+            if piece == "s":
+                out.append(value or "")
+            elif value is None:
+                out.append("0")
+            elif not re.fullmatch(r"[+-]?(0|[1-9][0-9]*)", value) or not \
+                    _INT_MIN <= int(value) <= _INT_MAX:
+                raise _Unsupported           # not a decimal number (``08`` is octal to both)
+            else:
+                out.append(str(int(value)))
+        if len(pieces) == 1 or k >= len(args) or sum(map(len, out)) > MAX_ECHO_OUTPUT:
+            break
+    return "".join(out)
+
+
+class _Script:
+    """One ``sh -c`` script run by dash's rules on the subset ``_script_tokens`` and
+    ``_script_list`` accept: ``printf``, ``echo`` without options or backslashes, ``set --``,
+    ``true``, ``false``, ``:``, functions and ``{ }`` groups, joined by ``;``, newlines,
+    ``&&`` and ``||``. Each step is counted (``MAX_SCRIPT_STEPS``) and charged."""
+
+    def __init__(self, sh: Shell, argv0: str, params: list[str]) -> None:
+        self.sh, self.argv0, self.params = sh, argv0, params
+        self.functions: dict[str, list] = {}
+        self.steps = self.calls = 0
+        self.out: list[str] = []
+        self.pid: Optional[int] = None
+
+    def run(self, items: list) -> int:
+        status = 0
+        for joiner, cmd in items:
+            if (joiner == "&&" and status != 0) or (joiner == "||" and status == 0):
+                continue
+            self.steps += 1
+            self.sh.charge(COMMAND // 4)
+            if self.steps > MAX_SCRIPT_STEPS:
+                raise _Unsupported
+            if cmd[0] == "group":
+                status = self.run(cmd[1])
+            elif cmd[0] == "def":
+                if cmd[1] not in self.functions and len(self.functions) >= MAX_FUNCTIONS:
+                    raise _Unsupported
+                self.functions[cmd[1]] = cmd[2]
+                status = 0
+            else:
+                status = self.simple(cmd[1])
+        return status
+
+    def simple(self, words: list) -> int:
+        argv = [w for w in (self.expand(word) for word in words) if w is not None]
+        if not argv:
+            return 0
+        name, args = argv[0], argv[1:]
+        if name in self.functions:
+            if self.calls >= MAX_CALLS:
+                raise _Unsupported
+            saved, self.params = self.params, args
+            self.calls += 1
+            try:
+                return self.run(self.functions[name])
+            finally:
+                self.calls -= 1
+                self.params = saved
+        if name == "printf":
+            self.write(_script_printf(args))
+        elif name == "echo":
+            if args and re.fullmatch(r"-[neE]+", args[0]) or any("\\" in a for a in args):
+                raise _Unsupported           # options and escapes: dash's echo and bash's differ
+            self.write(" ".join(args) + "\n")
+        elif name == "set":
+            if args[:1] != ["--"]:
+                raise _Unsupported
+            self.params = args[1:]
+        elif name == "false":
+            return 1
+        elif name not in ("true", ":"):
+            raise _Unsupported               # any other command: left to the caller
+        return 0
+
+    def write(self, text: str) -> None:
+        self.sh.grow(len(text))
+        self.out.append(text)
+        if sum(map(len, self.out)) > MAX_ECHO_OUTPUT:
+            raise _OverBudget
+
+    def expand(self, word: list) -> Optional[str]:
+        """The word's text; None for a word that was only unquoted expansions of nothing."""
+        self.sh.charge(STEP * len(word))
+        out, quoted = [], False
+        for kind, value, inside in word:
+            quoted = quoted or inside
+            if kind == "lit":
+                out.append(value)
+                continue
+            text = self.param(value) if kind == "param" else str(_arith(value))
+            if not inside and any(c in text for c in " \t\n*?[\\"):
+                raise _Unsupported           # field splitting or globbing would apply
+            out.append(text)
+        text = "".join(out)
+        return text if text or quoted else None
+
+    def param(self, name: str) -> str:
+        if name == "#":
+            return str(len(self.params))
+        if name == "0":
+            return self.argv0
+        if name == "$":
+            if self.pid is None:
+                self.pid = _child_pid(self.sh)
+            return str(self.pid)
+        index = int(name)
+        return self.params[index - 1] if index <= len(self.params) else ""
+
+
+def _child_pid(sh: Shell) -> int:
+    """The pid of a shell the session starts: between its login shell's (``ps``) and the last
+    pid /proc/loadavg shows, rising with the clock and with every shell the session started
+    before it (once round that range, it starts again from the bottom)."""
+    login = _ps_rows(sh)[-1][1]
+    span = _last_pid(sh.host) - login - 1
+    session = sh.session
+    pid = login + 1 + (int(sh.now * 2) + session.spawned) % span
+    session.spawned = min(session.spawned + 1, MAX_SPAWNED)
+    return pid
+
+
+def _ps_rows(sh: Shell) -> list[tuple]:
+    """``_processes`` for its pids and programs, built once per line. Those read neither the
+    clock nor the address, so building the table leaves the answer shareable."""
+    if "ps-rows" not in sh.memo:
+        sh.charge(COMMAND)
+        private = sh.private
+        try:
+            sh.memo["ps-rows"] = _processes(sh)
+        finally:
+            sh.private = private
+    return sh.memo["ps-rows"]
+
+
+def _ps_names(sh: Shell) -> frozenset:
+    """The program names ``ps`` shows running (``cron``, ``rsyslogd``, ``dbus-daemon``)."""
+    if "ps-names" not in sh.memo:
+        names = set()
+        for row in _ps_rows(sh):
+            word = (row[11].split() or [""])[0]
+            if not word.startswith("["):
+                names.add(posixpath.basename(word.lstrip("@-").rstrip(":")))
+        sh.memo["ps-names"] = frozenset(names)
+    return sh.memo["ps-names"]
+
+
+def _sh_c(sh: Shell, args: list[str]) -> Optional[_Result]:
+    """``sh -c SCRIPT [NAME [ARG...]]``: the script's output when it stays within ``_Script``'s
+    subset, else None. Its answer depends on nothing a session changes (``FIXED``); ``$$``
+    reads the clock (``_child_pid``)."""
+    if not args or sh.depth + 1 >= MAX_DEPTH:
+        return None
+    argv0 = args[1] if len(args) > 1 else "sh" if sh.busybox else sh.argv[0]
+    script = _Script(sh, argv0, args[2:])
+    sh.depth += 1
+    try:
+        items, _ = _script_list(_script_tokens(args[0]), 0, False)
+        status = script.run(items)
+    except _OverBudget:
+        raise
+    except _Unsupported:
+        return None
+    finally:
+        sh.depth -= 1
+    return _Result("".join(script.out), status=status, scope=FIXED)
 
 
 # ---- builtins and navigation (session state) --------------------------------------------------
@@ -2947,8 +3610,9 @@ _SYSTEM_DIRS = frozenset(("/etc", "/usr", "/var", "/proc", "/dev", "/run", "/var
                           "/boot", "/usr/lib", "/usr/share", "/var/log", "/var/lib"))
 
 
-# System directories where a session may make a dot file without a listing: not the kernel's
-# own file systems, and not /var/run, which ``Shell.path`` resolves to /run.
+# System directories where a session may make a dot file or a one-character name without a
+# listing: not the kernel's own file systems, and not /var/run, which ``Shell.path`` resolves
+# to /run.
 _DOT_DIRS = _SYSTEM_DIRS - {"/proc", "/sys", "/var/run"}
 
 
@@ -3317,8 +3981,10 @@ def _busybox(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
         return _applet_usage(sh, applet)
     if applet in ("kill", "killall") and len(args) == 1:
         return _Result(err=f"{applet}: you need to specify whom to kill\n", status=1)
+    if applet == "ftpget":
+        return _ftpget(sh, args[1:])
     entry = _COMMANDS.get(applet)
-    if entry is None or applet in ("killall", "ftpget", "ftpput"):
+    if entry is None or applet in ("killall", "ftpput"):
         return None
     sh.argv0, sh.exe, sh.busybox = applet, "busybox", True
     try:
@@ -3421,7 +4087,28 @@ def _curl(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
 
 @_command("tftp", scope=STATE)
 def _tftp(sh: Shell, args: list[str], stdin) -> Optional[_Result]:
-    return _Result(err="Transfer timed out.\n\n", status=1) if args else None
+    """A transfer that times out. What each tftp client prints for busybox's options
+    (``-g -r -l``) differs, so ``answer`` leaves those to the model; the canned shell
+    (``reply``) keeps the failed transfer, so ``&&`` and ``||`` after it still see a failure."""
+    if not args:
+        return None
+    if not sh.partial and any(a.startswith("-") and a != "-c" for a in args):
+        return None
+    return _Result(err="Transfer timed out.\n\n", status=1)
+
+
+def _ftpget(sh: Shell, args: list[str]) -> Optional[_Result]:
+    """``busybox ftpget HOST LOCAL [REMOTE]``: it connects before it opens the local file, so
+    an address it cannot reach leaves no file; a name it cannot resolve is a bad address."""
+    if not 2 <= len(args) <= 3 or any(a.startswith("-") for a in args):
+        return None
+    host = _url_text(args[0])
+    if ":" in host:
+        return None                          # an IPv6 address: worded another way
+    if not _is_ip(host):
+        return _Result(err=f"ftpget: bad address '{host}'\n", status=1, scope=STATE)
+    return _Result(err=f"ftpget: can't connect to remote host ({host}): Network is "
+                       "unreachable\n", status=1, scope=STATE)
 
 
 # ---- the commands IoT loaders use: session files, dd, usage errors ----------------------------

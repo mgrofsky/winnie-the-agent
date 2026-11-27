@@ -3,6 +3,7 @@ pipelines evaluated in Python, hostile input, and the hooks that use it."""
 
 from __future__ import annotations
 
+import shlex
 import socket
 import time
 from types import SimpleNamespace
@@ -244,7 +245,7 @@ def test_pipelines_over_our_own_output(line, expected):
     "lspci | grep -w VGA",                 # unsupported option
     "uname -a &",                          # background job
     "uname -a |",                          # dangling pipe
-    "uname -a; frobnicate",                # one unknown command spoils the list
+    "uname -a; sort /etc/hostname",        # one command we cannot evaluate spoils the list
     "awk 'BEGIN{system(\"id\")}'",         # anything but {print ...}
     "lspci | awk '{print $1; system(\"id\")}'",
     "grep x",                              # would wait on the terminal
@@ -774,3 +775,146 @@ def test_a_fault_inside_a_command_falls_back_instead_of_raising(monkeypatch, cap
     assert out("uname -a") is None
     assert "canned shell failed" in caplog.text
     assert hooks.fallback_reply("uname -a", False, "root") == ""    # a known command: no tell
+
+
+# ---- sh -c: the short scripts bots send to tell a real shell from a fake one ----------------
+
+TOKEN = "probe_5e1f0c2a"          # an invented marker, as the checks print theirs
+
+
+def _sh_c(script: str, shell_name: str = "sh") -> str:
+    return f"{shell_name} -c {shlex.quote(script)}"
+
+
+@pytest.mark.parametrize("script,expected", [
+    (f"printf '\\n%s|%s\\n' '{TOKEN}_control' '{TOKEN}'", f"\n{TOKEN}_control|{TOKEN}\n"),
+    (f"printf '\\n%s|%s\\n' '{TOKEN}_math' \"$((417*29+5))\"", f"\n{TOKEN}_math|12098\n"),
+    (f"set -- '{TOKEN}_a1' '{TOKEN}_a2'; printf '\\n%s|%s\\n' '{TOKEN}_pos' \"$#|$1|$2\"",
+     f"\n{TOKEN}_pos|2|{TOKEN}_a1|{TOKEN}_a2\n"),
+    (f"f_{TOKEN}() {{ printf '\\n%s|%s\\n' '{TOKEN}_fn' \"$1|$#\"; }}; f_{TOKEN} '{TOKEN}_v'",
+     f"\n{TOKEN}_fn|{TOKEN}_v|1\n"),
+    (f"printf '\\n%s\\n' '{TOKEN}_done'", f"\n{TOKEN}_done\n"),
+    ("printf '%s-%s\\n' a b c", "a-b\nc-\n"),            # the format is used again
+    ("printf '%d|%i|%%\\n' 12 -7; printf '%d\\n'", "12|-7|%\n0\n"),
+    ("printf 'x\\n' a b", "x\n"),
+    ("echo $((7/2)) $((-7/2)) $((-7%3)) $((7%-3)) $(( (1+2)*3 )) $((-(3)))",
+     "3 -3 -1 1 9 -3\n"),
+    ("echo $((9223372036854775807+1)) $((9223372036854775807*2))",
+     "-9223372036854775808 -2\n"),                    # 64-bit two's complement
+    ("set -- a b c; f() { echo $#; }; f 1; echo $#", "1\n3\n"),
+    ("f() { set -- q; echo $1; }; set -- p; f; echo $1", "q\np\n"),
+    ("true && echo a || echo b; false && echo c || echo d; { echo e; :; }", "a\nd\ne\n"),
+    ("echo $2x \"$2\"y; printf '%s' $3; echo end -3", "x y\nend -3\n"),
+    ("echo \"$((2*3))x\" '$1' \"a'b\"", "6x $1 a'b\n"),
+    # a backslash inside double quotes quotes only $ ` " \\ and newline; unquoted, any one
+    ('printf "%s\\n" a', "a\n"),
+    ('printf "a\\n"', "a\n"),
+    (f'printf "\\n%s|%s\\n" {TOKEN}_dq "$((7*6))"', f"\n{TOKEN}_dq|42\n"),
+    ('printf "%s\\\\n" a; printf "a\\\\nb\\n"', "a\na\nb\n"),
+    ('printf "%s\\n" "a\\"b" "c\\\\d" "e\\$f" "x\\y" "\\%"', 'a"b\nc\\d\ne$f\nx\\y\n\\%\n'),
+    ("printf %s\\\\n a; printf %s\\ \\\\n b", "a\nb \n"),
+    ('echo a\\ b \\a\\b "\\`x"', "a b ab `x\n"),
+    ('f() { printf "%s\\n" "$1|$#"; }; f v', "v|1\n"),
+])
+def test_sh_c_prints_what_dash_prints(script, expected):
+    """Each expected output is what dash 0.5 and bash print for the script."""
+    a = shell.answer(host(), _sh_c(script), now=NOW)
+    assert a is not None and (a.output, a.status) == (expected, 0)
+    assert a.scope == shell.FIXED and a.shareable
+    assert out(_sh_c(script), interactive=False) == expected
+
+
+@pytest.mark.parametrize("line,expected", [
+    ("sh -c \"printf '%s\\n' a\"", "a\n"),
+    ("sh -c \"printf '\\n%s|%s\\n' tok_r tok_s\"", "\ntok_r|tok_s\n"),
+    ('sh -c "printf \\"%s\\n\\" a"', "a\n"),
+    ('sh -c "printf \\"%s\\\\n\\" a"', "a\n"),
+    ('echo "a\\b" "a\\"b" "a\\$b" a\\ b \\x\\y', 'a\\b a"b a$b a b xy\n'),
+])
+def test_backslashes_on_the_line_follow_posix(line, expected):
+    """Each expected output is what bash prints for the line, with sh as dash or bash."""
+    assert out(line) == expected
+
+
+@pytest.mark.parametrize("line", [
+    'echo "$HOME"', 'echo "a\\!b"', "sh -c 'echo \"$HOME\"'", 'echo "a', "echo a\\",
+    "sh -c 'echo \"a\\nb\"'",              # dash's echo reads the backslash, bash's does not
+])
+def test_backslash_lines_outside_the_subset_are_left_to_the_model(line):
+    assert shell.answer(host(), line, now=NOW) is None
+
+
+def test_sh_c_names_itself_and_takes_its_arguments():
+    assert out(_sh_c("echo $0 $#")) == "sh 0\n"
+    assert out(_sh_c("echo $0", "bash")) == "bash\n"
+    assert out(_sh_c("echo $0", "/bin/sh")) == "/bin/sh\n"
+    assert out(_sh_c("echo $0 $# $1") + " name one") == "name 1 one\n"
+    assert shell.answer(host(), _sh_c("false"), now=NOW).status == 1
+
+
+@pytest.mark.parametrize("script", [
+    "echo $HOME", "echo ${1}", "echo $(id)", "echo `id`", "echo $@", "echo $?",
+    "printf '%5s' a", "printf '%x' 10", "printf '%d' 08", "printf '%d' abc", "printf 'a\\c'",
+    "printf", "printf -v x y", "echo $((1/0))", "echo $((010))", "echo $((2**3))",
+    "echo $((x+1))", "echo -n x", "echo 'a\\nb'", "id", "frobnicate", "ls | wc -l",
+    "echo a > /tmp/x", "echo a &", "g() { g; }; g", "echo *", "echo ~", "{ echo a }",
+    "echo a;; echo b", "if true; then echo a; fi", "set -e", "x=1", "echo a #b",
+    "printf() { :; }; printf x", "f() ( echo a ); f", "; echo a", "echo a &&",
+    "echo $(( " + "(" * 40 + "1" + ")" * 40 + " ))",
+])
+def test_sh_c_outside_the_subset_is_left_to_the_model(script):
+    assert shell.answer(host(), _sh_c(script), now=NOW) is None
+
+
+def test_sh_c_is_bounded():
+    many = "g() { :; :; :; :; :; :; :; :; }; h() { g; g; g; g; g; g; g; g; }; h; h; h; h"
+    deep = "; ".join(f"f{i}() {{ f{i + 1}; }}" for i in range(12)) + "; f12() { :; }; f0"
+    wide = "printf '%s' " + "a " * (shell.MAX_WORDS + 1)
+    for script in (many, deep, wide, "x" * (shell.MAX_SCRIPT + 1)):
+        sh = shell._shell(host(), "root", True, None, NOW, None)
+        started = time.perf_counter()
+        assert sh.run(_sh_c(script)) is None
+        assert time.perf_counter() - started < 0.25
+        assert sh.work <= shell.MAX_WORK
+    assert len(out(_sh_c("printf '%s%s%s%s%s%s%s%s' " + "abcdefgh " * 50))) == 400
+
+
+def test_sh_c_pid_holds_within_a_shell_and_rises_from_one_to_the_next():
+    h, session = host(), shell.Session()
+    a = shell.answer(h, _sh_c("echo $$ $$; f() { echo $$; }; f"), now=NOW, session=session)
+    first, again, inner = a.output.split()
+    assert first == again == inner and a.scope == shell.FIXED and not a.shareable
+    b = shell.answer(h, _sh_c("echo $$"), now=NOW, session=session)
+    assert int(b.output) > int(first)                  # another process, started later
+    later = shell.answer(h, _sh_c("echo $$"), now=NOW + 30, session=shell.Session())
+    assert int(later.output) > int(first)              # the clock alone moves it on
+    login = [line.split() for line in out("ps aux").splitlines() if line.endswith("-bash")]
+    last = int(out("cat /proc/loadavg").split()[-1])
+    for pid in (first, b.output, later.output):        # a child of the login shell, and
+        assert int(login[-1][1]) < int(pid) < last     # older than the last pid loadavg shows
+    assert session.spawned == 2 and session.copy().spawned == 2
+
+
+async def test_sh_c_checks_are_answered_ahead_of_the_model_even_after_it_answered():
+    hooks.set_budget(Budget(BudgetConfig()))
+    history = RecordingHistory()
+    await _ask(history, "cd /tmp")                     # the model owns the session now
+    script = f"printf '\\n%s|%s\\n' '{TOKEN}_math' \"$((53*41+9))\""
+    r = await _ask(history, _sh_c(script))
+    assert getattr(r, "local_reply", False)
+    assert r.content.startswith(f"\r\n{TOKEN}_math|2182\r\n")
+    r = await _ask(history, _sh_c("printf '%s\\n' \"$$\""))
+    assert getattr(r, "local_reply", False) and r.content.split("\r\n")[0].isdigit()
+    assert history.calls == ["cd /tmp"]
+
+
+async def test_an_empty_line_is_a_bare_prompt_ahead_of_the_model():
+    hooks.set_budget(Budget(BudgetConfig()))
+    history = RecordingHistory()
+    r = await _ask(history, "")
+    assert getattr(r, "local_reply", False) and r.content == "root@srv01:~# "
+    r = await _ask(history, "cat notes.txt")
+    assert not getattr(r, "local_reply", False) and history.calls == ["cat notes.txt"]
+    r = await _ask(history, "")
+    assert getattr(r, "local_reply", False) and r.content == "root@srv01:~# "
+
