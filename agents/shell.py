@@ -294,7 +294,7 @@ class Host:
     def rng(self, *purpose) -> random.Random:
         digest = hashlib.sha256("\x00".join(("shell", self.seed) + tuple(map(str, purpose)))
                                 .encode("utf-8")).digest()
-        return random.Random(int.from_bytes(digest[:8], "big"))
+        return random.Random(int.from_bytes(digest[:8], "big"))  # noqa: S311 - seeded so decoy content is stable per sensor
 
     # -- clock --
 
@@ -484,7 +484,7 @@ systemd-timesync:x:996:996:systemd Time Synchronization:/:/usr/sbin/nologin
 messagebus:x:100:102::/nonexistent:/usr/sbin/nologin
 systemd-resolve:x:991:991:systemd Resolver:/:/usr/sbin/nologin
 sshd:x:101:65534::/run/sshd:/usr/sbin/nologin
-"""
+"""  # noqa: S105 - decoy /etc/passwd text
 
 _RHEL_PASSWD = """
 root:x:0:0:root:/root:/bin/bash
@@ -506,7 +506,7 @@ tss:x:59:59:Account used for TPM access:/:/usr/sbin/nologin
 sssd:x:998:996:User for sssd:/:/sbin/nologin
 sshd:x:74:74:Privilege-separated SSH:/usr/share/empty.sshd:/sbin/nologin
 chrony:x:997:995:chrony system user:/var/lib/chrony:/sbin/nologin
-"""
+"""  # noqa: S105 - decoy /etc/passwd text
 
 
 def host_for(scenario=None, seed: Optional[str] = None) -> Host:
@@ -514,7 +514,7 @@ def host_for(scenario=None, seed: Optional[str] = None) -> Host:
     neutral default host when no scenario is active."""
     if scenario is None:
         seed = seed or "winnie"
-        r = random.Random(int.from_bytes(hashlib.sha256(f"default-host|{seed}".encode())
+        r = random.Random(int.from_bytes(hashlib.sha256(f"default-host|{seed}".encode())  # noqa: S311 - seeded so decoy content is stable per sensor
                                          .digest()[:8], "big"))
         return Host(hardware=r.choice(HARDWARE_PRESETS), seed=seed)
     ident = scenario.scenario.identity
@@ -887,7 +887,7 @@ class Session:
 
 
 # Where a non-root login may create files.
-_OPEN_DIRS = frozenset(("/tmp", "/var/tmp", "/dev/shm"))
+_OPEN_DIRS = frozenset(("/tmp", "/var/tmp", "/dev/shm"))  # noqa: S108 - paths in the emulated filesystem
 
 
 class Shell:
@@ -1911,7 +1911,7 @@ def _mounts(sh: Shell) -> list[tuple[str, str, int, int, int, str]]:
     run = total // 10 // 4 * 4
     out = [("tmpfs", "tmpfs", run, 1064, run - 1064, "/run"),
            (device, fstype, blocks, used, avail, "/"),
-           ("tmpfs", "tmpfs", total // 2, 0, total // 2, "/dev/shm")]
+           ("tmpfs", "tmpfs", total // 2, 0, total // 2, "/dev/shm")]  # noqa: S108 - paths in the emulated filesystem
     if h.family != "rhel":
         out.append(("tmpfs", "tmpfs", 5120, 0, 5120, "/run/lock"))
     out.append(("tmpfs", "tmpfs", run, 4, run - 4, f"/run/user/{uid}"))
@@ -3581,8 +3581,8 @@ def _host_dirs(sh: Shell) -> dict[str, list[str]]:
     homes = sorted({u.home.split("/")[2] for u in h.all_users(sh.user)
                     if u.home.startswith("/home/") and u.home.count("/") == 2})
     out = {"/": root.split(), "/home": homes,
-           "/tmp": (["snap-private-tmp"] if h.family == "ubuntu" else []) + private,
-           "/var/tmp": list(private), "/dev/shm": [], "/root": [], "/opt": [], "/srv": [],
+           "/tmp": (["snap-private-tmp"] if h.family == "ubuntu" else []) + private,  # noqa: S108 - paths in the emulated filesystem
+           "/var/tmp": list(private), "/dev/shm": [], "/root": [], "/opt": [], "/srv": [],  # noqa: S108 - paths in the emulated filesystem
            "/mnt": [], "/media": []}
     for u in h.all_users(sh.user):
         if u.home.startswith("/home/"):
@@ -3712,7 +3712,7 @@ def _list_dir(sh: Shell, path: str, dirs: dict, flags: set) -> Optional[str]:
 _PRIVATE_DIRS = ("systemd-private-", "snap-private-tmp")
 # Dot entries of the directories ``ls -a`` may list (systemd makes the X11 ones in /tmp).
 _X11 = [".font-unix", ".ICE-unix", ".Test-unix", ".X11-unix", ".XIM-unix"]
-_HIDDEN = {"/tmp": _X11, "/var/tmp": [], "/dev/shm": [], "/mnt": [], "/media": [],
+_HIDDEN = {"/tmp": _X11, "/var/tmp": [], "/dev/shm": [], "/mnt": [], "/media": [],  # noqa: S108 - paths in the emulated filesystem
            "/opt": [], "/srv": []}
 
 
@@ -3741,7 +3741,7 @@ def _stat(sh: Shell, path: str) -> Optional[tuple]:
                 sh.session.dirs[path])
     if posixpath.basename(path).startswith(_PRIVATE_DIRS):
         return ("drwx------", 3, "root", 4096, boot + 40)
-    if posixpath.basename(path) in _X11 and posixpath.dirname(path) == "/tmp":
+    if posixpath.basename(path) in _X11 and posixpath.dirname(path) == "/tmp":  # noqa: S108 - paths in the emulated filesystem
         return ("drwxrwxrwt", 2, "root", 4096, boot + 30)
     dirs = _dirs(sh)
     if path not in dirs and path not in _SYSTEM_DIRS:

@@ -64,7 +64,7 @@ MAX_RELATED_RECORDS = 200
 MIN_SELECTOR_LEN = 8
 # Values too common to be a useful selector on their own (false positives everywhere).
 COMMON_TOKENS = {
-    "localhost", "127.0.0.1", "0.0.0.0", "8.8.8.8", "1.1.1.1", "example.com", "google.com",
+    "localhost", "127.0.0.1", "0.0.0.0", "8.8.8.8", "1.1.1.1", "example.com", "google.com",  # noqa: S104 - a benign indicator value, not a bind
     "github.com", "githubusercontent.com", "raw.githubusercontent.com", "ubuntu.com",
     "archive.ubuntu.com", "debian.org", "deb.debian.org", "pypi.org", "amazonaws.com",
 }

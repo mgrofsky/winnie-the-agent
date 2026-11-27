@@ -556,7 +556,7 @@ class LikePattern:
             return len(v) == self.first.length and self.first.at(v, 0)
         if self.min_len > len(v) or not self.first.at(v, 0):
             return False
-        assert self.last is not None
+        assert self.last is not None  # noqa: S101 - narrows the type; set above
         tail = len(v) - self.last.length
         if not self.last.at(v, tail):
             return False
@@ -736,7 +736,7 @@ class FakeSql:
         else:
             self.database = database or ""
         self.default_user_db = default
-        self.password_encryption = "scram-sha-256"   # PostgreSQL; set by the listener
+        self.password_encryption = "scram-sha-256"  # noqa: S105 - PostgreSQL setting; set by the listener
 
     # ---- catalog --------------------------------------------------------------------------
 

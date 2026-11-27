@@ -766,7 +766,7 @@ def build_server(settings: UiSettings, routes: Routes) -> UiServer:
 def sign_in_url(server: UiServer) -> str:
     """The link the operator opens. An unspecified bind (container) is reached on loopback."""
     bind = server.settings.bind.strip("[]")
-    if bind in ("0.0.0.0", ""):
+    if bind in ("0.0.0.0", ""):  # noqa: S104 - compares the bind, binds nothing
         host = "127.0.0.1"
     elif bind == "::":
         host = "[::1]"

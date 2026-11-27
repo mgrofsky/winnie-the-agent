@@ -105,7 +105,7 @@ def _scenario(cp: ConfigParser, data_dir: Path, overlay: Path):
     return load_scenario(cp["scenario"]["active"].strip(), seed, overlay)
 
 
-UI_TOKEN_ENV = "WINNIE_UI_TOKEN"
+UI_TOKEN_ENV = "WINNIE_UI_TOKEN"  # noqa: S105 - the variable's name, not a value
 
 
 def _ui(args, cp: ConfigParser, base: Path, *, data_dir: Path, reports: Path, state: Path,

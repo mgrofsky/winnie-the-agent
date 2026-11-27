@@ -1046,7 +1046,7 @@ async def _pause() -> None:
         import asyncio
         import random
 
-        await asyncio.sleep(random.uniform(0.5, 1.0) * _local_delay_ms / 1000)
+        await asyncio.sleep(random.uniform(0.5, 1.0) * _local_delay_ms / 1000)  # noqa: S311 - reply timing jitter, not a secret
 
 
 def replies_cut() -> int:

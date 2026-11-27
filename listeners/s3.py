@@ -1165,7 +1165,7 @@ class Exchange:
             raise S3Error("AccessDenied", "Request has expired",
                           **{"X-Amz-Expires": str(info.expires or 0),
                              "ServerTime": iso_date(time.time())})
-        assert akid is not None
+        assert akid is not None  # noqa: S101 - narrows the type; set above
         settings = self.ctx.service("s3")
         ok, reason = self.decide(akid, planted, settings)
         cache = self.conn.state.setdefault("s3_auth", {})
@@ -1765,7 +1765,7 @@ class Exchange:
         headers.append(("x-amz-server-side-encryption",
                         "aws:kms" if (sse or "").startswith("aws:kms") else "AES256"))
         if self.op == "UploadPart":
-            assert mpu is not None and part is not None
+            assert mpu is not None and part is not None  # noqa: S101 - narrows the type; set above
             mpu["parts"][part] = (fields["size"], etag, time.time())
         else:
             self.cat.add_upload(self.ip, bucket.name, self.key, fields["size"], etag,

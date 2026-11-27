@@ -244,7 +244,7 @@ class EmailConnector:
                 except Exception:
                     try:
                         smtp.close()
-                    except Exception:
+                    except Exception:  # noqa: S110 - best-effort cleanup
                         pass
         except Exception as exc:
             return error_result(exc)

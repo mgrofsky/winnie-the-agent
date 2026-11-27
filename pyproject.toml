@@ -66,3 +66,13 @@ markers = [
 [tool.uv]
 package = false
 
+# Security lint of the product code (Ruff's flake8-bandit rules), as the security workflow runs
+# it: uv run --group security ruff check
+# Deliberate cases (decoy credentials and paths, traps listening on every interface, digests a
+# protocol requires) carry a "# noqa: S<nnn> - <reason>" on their line.
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["tests"]
+
+[tool.ruff.lint]
+select = ["S"]

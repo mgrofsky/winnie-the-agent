@@ -291,7 +291,7 @@ def iter_strings(obj: Any, path: str = "") -> Iterator[tuple[str, str]]:
 
 def _rng(seed: str, *purpose: str) -> random.Random:
     digest = hashlib.sha256("|".join((seed,) + purpose).encode()).digest()
-    return random.Random(int.from_bytes(digest[:8], "big"))
+    return random.Random(int.from_bytes(digest[:8], "big"))  # noqa: S311 - seeded so decoy content is stable per sensor
 
 
 @dataclass

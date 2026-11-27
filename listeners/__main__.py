@@ -108,7 +108,7 @@ def build_context(config: ConfigParser, base: Path, scenario_name: Optional[str]
         quarantine_dir=_resolve(base, section.get("quarantine_dir", str(REPO_ROOT / "quarantine"))),
         budget=budget, json_llm=json_llm,
         honeytokens=scenario.recognised_tokens() if scenario else {},
-        bind_host=section.get("bind_host", "0.0.0.0"),
+        bind_host=section.get("bind_host", "0.0.0.0"),  # noqa: S104 - traps listen on every interface by design
         source_state_path=str(source_state_path()),
     )
     # One per-source view for this process: the budget (deep / shallow) and the telnet

@@ -808,7 +808,7 @@ async def start_tcp(ctx: ListenerContext, protocol: str, port: int, handler: Han
                       data={"bytes_read": conn.bytes_read, "commands": conn.commands})
             try:
                 writer.close()
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 - best-effort cleanup
                 pass
 
     return await asyncio.start_server(_client, host=host or ctx.bind_host, port=port,
