@@ -61,8 +61,9 @@ files. Each `[[indicators]]` entry has:
 Matching is plain string comparison; no regular expression is built from these files. A
 file that does not validate is left out whole and logged. `agentic-frameworks.toml` ships
 the ARTEX user agents `artex-enrich/` and `norma/` (medium) and `ReconProbe/1.0` (low), and
-low-confidence paths and queries one report listed, labelled as common reconnaissance. User
-agents are trivially changed. Add your own entries, including addresses, in another file.
+low-confidence paths and queries one report listed from the same activity. Those carry no
+framework, since any scanner may request them. User agents are trivially changed. Add your
+own entries, including addresses, in another file.
 
 ## Behaviour rules
 

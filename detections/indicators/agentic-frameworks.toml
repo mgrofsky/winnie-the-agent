@@ -3,8 +3,8 @@
 # User agents are trivially changed and some are shared with other tools, so no entry here
 # is more than medium confidence. A match is shown on the triage record and can be used in
 # a playbook condition; it never changes the record's judgement or reaches the blocklist.
-# Paths and queries are common reconnaissance targets that one report listed; they are
-# low confidence and not specific to any framework.
+# Paths and queries are requests one report listed from this activity; they are low
+# confidence and carry no framework, since any scanner may request them.
 
 [[indicators]]
 id = "artex-ua-enrich"
@@ -16,7 +16,7 @@ label = "ARTEX default user agent (asset enrichment)"
 confidence = "medium"
 sources = ["https://www.microsoft.com/en-us/security/blog/2026/11/25/what-defenders-need-to-know-artex-agentic-ai-framework-threat-actors-abuse/"]
 reported = "2026-11-25"
-notes = "Microsoft lists artex-enrich/* as sent with a short GET to each newly discovered web asset, without following redirects. Microsoft also says operators can and do change the user agent."
+notes = "Microsoft lists artex-enrich/* as sent with a short GET to each newly discovered web asset, without following redirects. Microsoft says threat actors using ARTEX can and do vary the user agent string."
 
 [[indicators]]
 id = "artex-ua-norma"
@@ -31,7 +31,7 @@ sources = [
     "https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors",
 ]
 reported = "2026-11-25"
-notes = "Microsoft lists norma/* as sent by the agents' built-in web-fetch tool. Wiz lists norma/0.4 and notes that many user agents in its list are not unique to this actor. Operators can change it."
+notes = "Microsoft lists norma/* as sent by the agents' built-in web-fetch tool. Wiz lists norma/0.4 and notes that many user agents in its list are not unique to this actor. Microsoft says threat actors using ARTEX can and do vary the user agent string."
 
 [[indicators]]
 id = "artex-ua-reconprobe"
@@ -50,85 +50,85 @@ id = "recon-env-js"
 type = "path"
 match = "exact"
 value = "/env.js"
-label = "Runtime configuration fetch (common reconnaissance)"
+label = "Runtime configuration fetch (reconnaissance path)"
 confidence = "low"
 sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
 reported = "2026-10-22"
-notes = "Listed by Wiz among requests made while harvesting runtime configuration. Common to many scanners."
+notes = "Wiz lists GET /env.js among requests that showed up minutes after first contact, before the agent called internal API routes by name."
 
 [[indicators]]
 id = "recon-assets-config-json"
 type = "path"
 match = "exact"
 value = "/assets/config.json"
-label = "Runtime configuration fetch (common reconnaissance)"
+label = "Runtime configuration fetch (reconnaissance path)"
 confidence = "low"
 sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
 reported = "2026-10-22"
-notes = "Listed by Wiz among requests made while harvesting runtime configuration. Common to many scanners."
+notes = "Wiz lists GET /assets/config.json among requests that showed up minutes after first contact, before the agent called internal API routes by name."
 
 [[indicators]]
 id = "recon-packs-js"
 type = "path"
 match = "prefix"
 value = "/packs/js/"
-label = "Bundle or source map fetch under /packs/js/ (common reconnaissance)"
+label = "Bundle or source map fetch under /packs/js/ (reconnaissance path)"
 confidence = "low"
 sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
 reported = "2026-10-22"
-notes = "Wiz lists a .js.map source map fetched under /packs/js/; this entry matches any request under that directory. Wiz reports that internal route names the agent later called appeared only in those source maps."
+notes = "Wiz lists GET of a .js.map source map under /packs/js/ and says the internal route names the agent later called appear only in the source maps it had just downloaded. This entry matches any request under that directory."
 
 [[indicators]]
 id = "recon-swagger-openapi"
 type = "query"
 match = "exact"
 value = "/swagger/?format=openapi"
-label = "OpenAPI document fetch (common reconnaissance)"
+label = "OpenAPI document fetch (reconnaissance path)"
 confidence = "low"
 sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
 reported = "2026-10-22"
-notes = "Listed by Wiz among requests for API documentation. Common to many scanners."
+notes = "Wiz lists GET /swagger/?format=openapi among requests that showed up minutes after first contact, before the agent called internal API routes by name."
 
 [[indicators]]
 id = "recon-sso-jwt"
 type = "query"
 match = "prefix"
 value = "/sso?jwt="
-label = "Token passed to a single sign-on endpoint (common reconnaissance)"
+label = "Token passed to a single sign-on endpoint (reconnaissance path)"
 confidence = "low"
 sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
 reported = "2026-10-22"
-notes = "Wiz lists a request to /sso with an unsigned token in the jwt parameter while testing sign-in flows."
+notes = "Wiz lists GET /sso with an unsigned token in the jwt parameter among requests testing unsigned JWTs."
 
 [[indicators]]
 id = "recon-validate-username"
 type = "path"
 match = "exact"
 value = "/Account/ValidateUserName"
-label = "Username existence check (common reconnaissance)"
+label = "Username existence check (reconnaissance path)"
 confidence = "low"
 sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
 reported = "2026-10-22"
-notes = "Listed by Wiz among repeated username-recovery and password-reset requests."
+notes = "Wiz reports the agent checked which usernames existed, then hammered the reset endpoints; this is one of the requests it lists. Wiz shows it with a UserName query."
 
 [[indicators]]
 id = "recon-password-reset-token"
 type = "path"
 match = "contains"
 value = "/GeneratePasswordResetToken"
-label = "Password reset token request (common reconnaissance)"
+label = "Password reset token request (reconnaissance path)"
 confidence = "low"
 sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
 reported = "2026-10-22"
-notes = "Wiz lists a POST to this endpoint under a versioned users API path, among repeated username-recovery and password-reset requests. Matched anywhere in the path."
+notes = "Wiz reports the agent checked which usernames existed, then hammered the reset endpoints; this is one of the requests it lists. Wiz shows a POST under a versioned users API path; this entry matches the endpoint name anywhere in the path."
 
 [[indicators]]
 id = "recon-forgot-password"
 type = "path"
 match = "exact"
 value = "/forgot_password"
-label = "Password recovery request (common reconnaissance)"
+label = "Password recovery request (reconnaissance path)"
 confidence = "low"
 sources = ["https://www.wiz.io/blog/artex-in-the-wild-storm-0940-expands-targeting-of-it-and-software-vendors"]
 reported = "2026-10-22"
-notes = "Listed by Wiz among repeated username-recovery and password-reset requests."
+notes = "Wiz reports the agent checked which usernames existed, then hammered the reset endpoints; this is one of the requests it lists."
