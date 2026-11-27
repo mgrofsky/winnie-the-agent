@@ -352,7 +352,8 @@ def test_entries_are_bounded_and_least_recently_used_go_first(tmp_path, monkeypa
     keyed = analyses.make_key("session", "ssh", "p", {}, ["d"])
     assert not store.put(keyed, *analyses.storable(
         {k: v for k, v in ANSWER.items() if k != "extra_iocs"} | {"narrative": "x" * 200,
-                                                                  "actions": []},
+                                                                  "actions": [],
+                                                                  "headline": "d"},
         keyed, src_ips=[], username=None, ioc_values=lambda t: []))
 
 
@@ -424,3 +425,22 @@ def test_cli_stats_list_forget_and_clear(tmp_path):
     assert _cli(tmp_path, "--forget", sid)["forgotten"] is False
     assert _cli(tmp_path, "--clear")["cleared"] == 1
     assert _store(tmp_path).entries == {}
+
+
+def test_a_token_from_the_replies_is_not_stored_when_the_key_has_no_values(tmp_path):
+    boot_id = "3f2a9c1e-8b7d-4e6f-9a0b-1c2d3e4f5a6b"
+    cmd = ["cat /proc/sys/kernel/random/boot_id"]
+    llm = FakeJsonLLM(PLAIN | {"headline": f"Read the boot id {boot_id}"})
+    _, reports = _run(tmp_path, ssh_session("session-1", "203.0.113.10", cmd)
+                      + ssh_session("session-2", "198.51.100.20", cmd, start=5), llm,
+                      _store(tmp_path))
+    assert len(llm.calls) == 2                      # not stored: the second session asks
+    assert not any(r.analysis_reused or r.analysis_key for r in load_records(reports))
+    keyed = analyses.make_key("session", "ssh", "p", {}, [json.dumps({"cmd": cmd[0]})])
+    assert keyed.values == ()
+    out = PLAIN | {"techniques": [], "assessment": [], "not_seen": [], "narrative": "",
+                   "headline": f"Read the boot id {boot_id}"}
+    assert analyses.storable(out, keyed, src_ips=[], username=None,
+                             ioc_values=triage._ioc_values) is None
+    assert analyses.storable(out | {"headline": "Read the boot id"}, keyed, src_ips=[],
+                             username=None, ioc_values=triage._ioc_values) is not None

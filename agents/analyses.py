@@ -240,7 +240,9 @@ def storable(out: dict, keyed: Keyed, *, src_ips: Iterable[str], username: Optio
     reused for another item.
 
     Every text is read with defanged dots and colons restored. Refused when any text names
-    a source address in ``src_ips`` (or a network's prefix); holds an IPv6-shaped run or an
+    a source address in ``src_ips`` (or a network's prefix); holds a random-looking token
+    (``learned.tokens``) that is not one of the key's values, even when it has none, or an
+    IPv6-shaped run or an
     IOC (``ioc_values``) that is neither a token of this item nor literal in the keyed
     lines; or fails ``learned.reply_template`` (a trace of a token that is not its
     verbatim value, two different tokens in one text, another random-looking token).
@@ -253,6 +255,12 @@ def storable(out: dict, keyed: Keyed, *, src_ips: Iterable[str], username: Optio
         plain = _refanged(text)
         if any(f in plain for f in sources):
             return None
+        # A random-looking token must be one of this item's values (or literal in the keyed
+        # lines): reply_template skips this check when the key has no values.
+        for start, end in learned.tokens(text):
+            value = text[start:end]
+            if value not in keyed.values and value not in keyed.text:
+                return None
         for value in [*_ipv6_runs(plain), *ioc_values(plain)]:
             value = value.lower()
             if value not in tokens and value not in keyed_text:
