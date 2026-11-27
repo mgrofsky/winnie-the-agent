@@ -1,0 +1,151 @@
+# ZAP rules for the operator console scans (tests/dast/run_zap.sh).
+# rule id<TAB>FAIL|WARN|IGNORE<TAB>(rule name) and, for IGNORE, the reason.
+# FAIL fails the job. WARN is reported only. IGNORE hides a passive alert and keeps an
+# active rule from running.
+
+# passive rules
+2	WARN	(Private IP Disclosure)
+3	FAIL	(Session ID in URL Rewrite)
+10003	FAIL	(Vulnerable JS Library (Powered by Retire.js))
+10009	FAIL	(In Page Banner Information Leak)
+10010	FAIL	(Cookie No HttpOnly Flag)
+10011	IGNORE	(Cookie Without Secure Flag) loopback is plain HTTP; under the HTTPS external name the cookie is Secure
+10015	FAIL	(Re-examine Cache-control Directives)
+10017	FAIL	(Cross-Domain JavaScript Source File Inclusion)
+10019	WARN	(Content-Type Header Missing)
+10020	FAIL	(Anti-clickjacking Header)
+10021	FAIL	(X-Content-Type-Options Header Missing)
+10023	FAIL	(Information Disclosure - Debug Error Messages)
+10024	WARN	(Information Disclosure - Sensitive Information in URL)
+10025	FAIL	(Information Disclosure - Sensitive Information in HTTP Referrer Header)
+10026	WARN	(HTTP Parameter Override)
+10027	IGNORE	(Information Disclosure - Suspicious Comments) flags words such as 'user' and 'select' in the console's public, commented source
+10028	FAIL	(Off-site Redirect)
+10029	FAIL	(Cookie Poisoning)
+10030	FAIL	(User Controllable Charset)
+10031	WARN	(User Controllable HTML Element Attribute (Potential XSS))
+10032	FAIL	(Viewstate)
+10033	FAIL	(Directory Browsing)
+10034	IGNORE	(Heartbleed OpenSSL Vulnerability (Indicative)) plain HTTP on loopback; there is no TLS to test
+10035	IGNORE	(Strict-Transport-Security Header) loopback is plain HTTP; HSTS is sent under the HTTPS external name
+10036	FAIL	(HTTP Server Response Header)
+10037	FAIL	(Server Leaks Information via "X-Powered-By" HTTP Response Header Field(s))
+10038	FAIL	(Content Security Policy (CSP) Header Not Set)
+10039	FAIL	(X-Backend-Server Header Information Leak)
+10040	FAIL	(Secure Pages Include Mixed Content)
+10041	FAIL	(HTTP to HTTPS Insecure Transition in Form Post)
+10042	FAIL	(HTTPS to HTTP Insecure Transition in Form Post)
+10043	FAIL	(User Controllable JavaScript Event (XSS))
+10044	FAIL	(Big Redirect Detected (Potential Sensitive Information Leak))
+10049	IGNORE	(Content Cacheability) informational: Cache-Control no-store on every response is deliberate
+10050	FAIL	(Retrieved from Cache)
+10052	FAIL	(X-ChromeLogger-Data (XCOLD) Header Information Leak)
+10054	FAIL	(Cookie without SameSite Attribute)
+10055	FAIL	(CSP)
+10056	FAIL	(X-Debug-Token Information Leak)
+10057	WARN	(Username Hash Found)
+10061	FAIL	(X-AspNet-Version Response Header)
+10062	WARN	(PII Disclosure)
+10063	FAIL	(Permissions Policy Header Not Set)
+10096	WARN	(Timestamp Disclosure)
+10097	WARN	(Hash Disclosure)
+10098	FAIL	(Cross-Domain Misconfiguration)
+10099	WARN	(Source Code Disclosure)
+10105	FAIL	(Weak Authentication Method)
+10108	FAIL	(Reverse Tabnabbing)
+10109	IGNORE	(Modern Web Application) informational: says the console is a JavaScript application
+10110	FAIL	(Dangerous JS Functions)
+10111	IGNORE	(Authentication Request Identified) informational: marks a request ZAP takes for a sign-in
+10112	IGNORE	(Session Management Response Identified) informational: marks a response ZAP takes for session management
+10113	IGNORE	(Verification Request Identified) informational: marks a request ZAP takes for verification
+10115	FAIL	(Script Served From Malicious Domain (polyfill))
+10116	IGNORE	(ZAP is Out of Date) the image is pinned by digest and updated on purpose
+10202	FAIL	(Absence of Anti-CSRF Tokens)
+20020	FAIL	(Server Side Technology Version with Known Vulnerabilities)
+50001	WARN	(Script Passive Scan Rules)
+50003	IGNORE	(Stats Passive Scan Rule) collects scan statistics, raises no alerts
+90001	FAIL	(Insecure JSF ViewState)
+90002	FAIL	(Java Serialization Object)
+90003	FAIL	(Sub Resource Integrity Attribute Missing)
+90004	FAIL	(Insufficient Site Isolation Against Spectre Vulnerability)
+90011	WARN	(Charset Mismatch)
+90022	FAIL	(Application Error Disclosure)
+90030	WARN	(WSDL File Detection)
+90033	FAIL	(Loosely Scoped Cookie)
+
+# active rules
+0	FAIL	(Directory Browsing)
+6	FAIL	(Path Traversal)
+7	FAIL	(Remote File Inclusion)
+41	FAIL	(Source Code Disclosure - Git)
+42	FAIL	(Source Code Disclosure - SVN)
+43	IGNORE	(Source Code Disclosure - File Inclusion) reads the API refusing "/" in a query value (400) as file inclusion; the console reads no file named by a request
+10045	FAIL	(Source Code Disclosure - /WEB-INF Folder)
+10047	IGNORE	(HTTPS Content Available via HTTP) there is no HTTPS listener on loopback to compare with
+10048	FAIL	(Remote Code Execution - Shell Shock)
+10051	FAIL	(Relative Path Confusion)
+10058	FAIL	(GET for POST)
+10095	FAIL	(Backup File Disclosure)
+10104	WARN	(User Agent Fuzzer)
+10106	IGNORE	(HTTP Only Site) the console serves plain HTTP on loopback by design; HTTPS comes from a proxy under external_host
+10107	FAIL	(Httpoxy - Proxy Header Misuse)
+20012	FAIL	(Anti-CSRF Tokens Check)
+20014	WARN	(HTTP Parameter Pollution)
+20015	IGNORE	(Heartbleed OpenSSL Vulnerability) plain HTTP on loopback; there is no TLS to test
+20016	FAIL	(Cross-Domain Misconfiguration)
+20017	FAIL	(Source Code Disclosure - CVE-2012-1823)
+20018	FAIL	(Remote Code Execution - CVE-2012-1823)
+20019	FAIL	(External Redirect)
+30001	FAIL	(Buffer Overflow)
+30002	FAIL	(Format String Error)
+30003	FAIL	(Integer Overflow Error)
+40003	FAIL	(CRLF Injection)
+40008	WARN	(Parameter Tampering)
+40009	FAIL	(Server Side Include)
+40012	FAIL	(Cross Site Scripting (Reflected))
+40013	FAIL	(Session Fixation)
+40014	FAIL	(Cross Site Scripting (Persistent))
+40016	FAIL	(Cross Site Scripting (Persistent) - Prime)
+40017	FAIL	(Cross Site Scripting (Persistent) - Spider)
+40018	FAIL	(SQL Injection)
+40019	IGNORE	(SQL Injection - MySQL (Time Based)) time-based probe for a database the console does not have; flaky on shared runners
+40020	IGNORE	(SQL Injection - Hypersonic SQL (Time Based)) time-based probe for a database the console does not have; flaky on shared runners
+40021	IGNORE	(SQL Injection - Oracle (Time Based)) time-based probe for a database the console does not have; flaky on shared runners
+40022	IGNORE	(SQL Injection - PostgreSQL (Time Based)) time-based probe for a database the console does not have; flaky on shared runners
+40023	WARN	(Possible Username Enumeration)
+40025	WARN	(Proxy Disclosure)
+40026	IGNORE	(Cross Site Scripting (DOM Based)) needs a browser inside the scan container; tests/browser covers DOM injection in Chromium
+40027	IGNORE	(SQL Injection - MsSQL (Time Based)) time-based probe for a database the console does not have; flaky on shared runners
+40028	FAIL	(ELMAH Information Leak)
+40029	FAIL	(Trace.axd Information Leak)
+40031	IGNORE	(Out of Band XSS) needs an out-of-band callback host; the scan contacts only 127.0.0.1
+40032	FAIL	(.htaccess Information Leak)
+40033	FAIL	(NoSQL Injection - MongoDB)
+40034	FAIL	(.env Information Leak)
+40035	FAIL	(Hidden File Finder)
+40038	FAIL	(Bypassing 403)
+40040	FAIL	(CORS Header)
+40042	FAIL	(Spring Actuator Information Leak)
+40043	IGNORE	(Log4Shell) needs an out-of-band callback host; the scan contacts only 127.0.0.1
+40044	FAIL	(Exponential Entity Expansion (Billion Laughs Attack))
+40045	FAIL	(Spring4Shell)
+40046	IGNORE	(Server Side Request Forgery) needs an out-of-band callback host; the scan contacts only 127.0.0.1
+40047	IGNORE	(Text4shell (CVE-2022-42889)) needs an out-of-band callback host; the scan contacts only 127.0.0.1
+40048	FAIL	(Remote Code Execution (React2Shell))
+50000	WARN	(Script Active Scan Rules)
+90017	FAIL	(XSLT Injection)
+90019	FAIL	(Server Side Code Injection)
+90020	FAIL	(Remote OS Command Injection)
+90021	FAIL	(XPath Injection)
+90023	FAIL	(XML External Entity Attack)
+90024	FAIL	(Generic Padding Oracle)
+90025	FAIL	(Expression Language Injection)
+90026	FAIL	(SOAP Action Spoofing)
+90027	WARN	(Cookie Slack Detector)
+90028	FAIL	(Insecure HTTP Method)
+90029	FAIL	(SOAP XML Injection)
+90034	FAIL	(Cloud Metadata Potentially Exposed)
+90035	FAIL	(Server Side Template Injection)
+90036	WARN	(Server Side Template Injection (Blind))
+90037	WARN	(Remote OS Command Injection (Time Based))
+90039	WARN	(NoSQL Injection - MongoDB (Time Based))
