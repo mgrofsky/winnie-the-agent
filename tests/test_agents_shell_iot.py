@@ -663,6 +663,12 @@ def test_a_file_made_under_var_run_is_the_same_file_under_run():
             "cat: .f: No such file or directory\n"]
 
 
+def test_cd_enters_a_directory_made_under_var_run():
+    session = shell.Session(cwd="/root")
+    assert run(["cd /var/run", "mkdir .d", "cd .d", "pwd", ">x", "ls /run/.d"], session=session) \
+        == ["", "", "", "/var/run/.d\n", "", "x\n"]
+
+
 def test_a_whole_loader_probe_is_answered_without_the_model():
     session = shell.Session(cwd="/root")
     dirs = ("/var", "/var/tmp", "/var/run", "/dev", "/dev/shm", "/data", "/etc", "/mnt", "/usr",
