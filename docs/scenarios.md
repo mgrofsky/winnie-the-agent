@@ -257,9 +257,9 @@ Service-specific keys:
     `lure` (its lure ID), `advertises` (route paths) and an optional `body`. Without a
     `body` the content is generated from the advertised routes: a minified webpack chunk
     with an API client table, a source map whose `sourcesContent` holds that client, or a
-    config object with `apiBase`, feature flags and an endpoint table (a
-    `window.__ENV__` assignment when the path ends in `.js`). A `static` asset needs a
-    `body`. Assets answer GET and HEAD with their own content type, `ETag`,
+    config object with `apiBase`, feature flags and an endpoint table relative to
+    `apiBase` (a `window.__ENV__` assignment when the path ends in `.js`). A `static`
+    asset needs a `body`. Assets answer GET and HEAD with their own content type, `ETag`,
     `Last-Modified` and cache headers.
   - A source that fetches an asset, or the OpenAPI document (at `openapi_path` or an
     `openapi_aliases` path) when `openapi_advertises` is set, is recorded as shown those

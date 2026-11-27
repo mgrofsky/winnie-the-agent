@@ -148,8 +148,11 @@ def source_map(asset, service, app: str) -> str:
 
 def runtime_config(asset, service, app: str) -> str:
     h = _hash(asset.path, app, "config")
-    table = {name: path for name, _method, path in endpoints(asset, service)}
-    doc = {"apiBase": service.api_prefix or "", "environment": "production",
+    # Endpoints are relative to apiBase, so apiBase + endpoint is the route's path.
+    base = (service.api_prefix or "").rstrip("/")
+    table = {name: path[len(base):] if base and path.startswith(base + "/") else path
+             for name, _method, path in endpoints(asset, service)}
+    doc = {"apiBase": base, "environment": "production",
            "release": h[:5].hex(), "features": {"newDashboard": True, "bulkExport": h[5] % 2 == 0,
                                                "sso": True, "betaReports": False},
            "endpoints": table}

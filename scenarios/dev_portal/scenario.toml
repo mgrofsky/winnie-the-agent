@@ -304,7 +304,7 @@ window.__ENV__ = {
   "release": "{marker:build}",
   "oauthClientId": "{marker:client_id}",
   "publicApiKey": "{marker:public_api_key}",
-  "exportsPath": "/api/internal/export",
+  "exportsPath": "/internal/export",
   "features": { "bulkExport": true, "sso": false, "betaReports": false }
 };
 '''
@@ -326,7 +326,7 @@ version = "3.8.2"
 description = "Projects, users and account management for the {{org.short}} workspace."
 
 [[services.http.openapi.servers]]
-url = "https://app.{{org.domain}}/api"
+url = "https://app.{{org.domain}}"
 description = "Production"
 
 [services.http.openapi.components.securitySchemes.ApiKeyAuth]

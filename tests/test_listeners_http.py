@@ -833,8 +833,9 @@ async def test_generated_bundle_map_and_config_name_the_advertised_routes():
     source = "".join(doc["sourcesContent"])
     assert "`/api/v1/users/${encodeURIComponent(id)}`" in source
     assert "`/api/v1/auth/activate/${encodeURIComponent(token)}`" in source
-    assert set(json.loads(config)["endpoints"].values()) == {"/api/v1/projects",
-                                                             "/api/v1/projects/{id}"}
+    cfg = json.loads(config)
+    assert {cfg["apiBase"] + p for p in cfg["endpoints"].values()} == {
+        "/api/v1/projects", "/api/v1/projects/{id}"}
 
 
 async def test_hidden_route_is_answered_but_left_out_of_the_generated_openapi():
@@ -1225,3 +1226,39 @@ async def test_asset_text_is_built_once_per_scenario(monkeypatch):
     finally:
         await stop(servers)
     assert len(calls) == len(ctx.scenario.scenario.services.http.assets)
+
+
+
+async def test_dev_portal_documents_build_urls_the_trap_answers():
+    """Every OpenAPI operation joined to its server URL, every runtime-config endpoint
+    joined to apiBase, and the bundle's own URLs reach a configured route, never /api/api."""
+    from urllib.parse import urlsplit
+
+    ctx, servers, port = await start_pack()
+    paths = assets_of(ctx)
+    try:
+        _, _, doc = await req(port, "GET", "/api/openapi.json")
+        _, _, config = await req(port, "GET", "/assets/config.json")
+        _, _, env = await req(port, "GET", "/env.js")
+        _, _, bundle = await req(port, "GET", paths["bundle"])
+        doc, config, env = json.loads(doc), json.loads(config), env_values(env)
+        urls = []
+        for server in doc["servers"]:
+            base = urlsplit(server["url"]).path.rstrip("/")
+            for path, ops in doc["paths"].items():
+                urls += [(method.upper(), base + path) for method in ops]
+        urls += [("GET", config["apiBase"] + p) for p in config["endpoints"].values()]
+        urls += [("GET", env["apiBase"] + env["exportsPath"] + "/{dataset}")]
+        urls += [("GET", p.decode() + "1") for p in re.findall(rb'"(/[^"]+/)"\+encode', bundle)]
+        start = len(events(ctx, "command"))
+        for method, url in urls:
+            await req(port, method, re.sub(r"\{[^}]+\}", "1", url))
+        await settle()
+    finally:
+        await stop(servers)
+    routes = {r.path for r in ctx.scenario.scenario.services.http.routes}
+    answered = [e["data"] for e in events(ctx, "command")[start:]]
+    assert len(answered) == len(urls) >= 10
+    for (method, url), data in zip(urls, answered):
+        assert "/api/api" not in data["path"], url
+        assert data["route"] in routes, (method, url, data["route"])
