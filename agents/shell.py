@@ -294,7 +294,7 @@ class Host:
     def rng(self, *purpose) -> random.Random:
         digest = hashlib.sha256("\x00".join(("shell", self.seed) + tuple(map(str, purpose)))
                                 .encode("utf-8")).digest()
-        return random.Random(int.from_bytes(digest[:8], "big"))
+        return random.Random(int.from_bytes(digest[:8], "big"))  # noqa: S311 - seeded so decoy content is stable per sensor
 
     # -- clock --
 
@@ -484,7 +484,7 @@ systemd-timesync:x:996:996:systemd Time Synchronization:/:/usr/sbin/nologin
 messagebus:x:100:102::/nonexistent:/usr/sbin/nologin
 systemd-resolve:x:991:991:systemd Resolver:/:/usr/sbin/nologin
 sshd:x:101:65534::/run/sshd:/usr/sbin/nologin
-"""
+"""  # noqa: S105 - decoy /etc/passwd text
 
 _RHEL_PASSWD = """
 root:x:0:0:root:/root:/bin/bash
@@ -506,7 +506,7 @@ tss:x:59:59:Account used for TPM access:/:/usr/sbin/nologin
 sssd:x:998:996:User for sssd:/:/sbin/nologin
 sshd:x:74:74:Privilege-separated SSH:/usr/share/empty.sshd:/sbin/nologin
 chrony:x:997:995:chrony system user:/var/lib/chrony:/sbin/nologin
-"""
+"""  # noqa: S105 - decoy /etc/passwd text
 
 
 def host_for(scenario=None, seed: Optional[str] = None) -> Host:
@@ -514,7 +514,7 @@ def host_for(scenario=None, seed: Optional[str] = None) -> Host:
     neutral default host when no scenario is active."""
     if scenario is None:
         seed = seed or "winnie"
-        r = random.Random(int.from_bytes(hashlib.sha256(f"default-host|{seed}".encode())
+        r = random.Random(int.from_bytes(hashlib.sha256(f"default-host|{seed}".encode())  # noqa: S311 - seeded so decoy content is stable per sensor
                                          .digest()[:8], "big"))
         return Host(hardware=r.choice(HARDWARE_PRESETS), seed=seed)
     ident = scenario.scenario.identity

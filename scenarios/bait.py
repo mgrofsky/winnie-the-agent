@@ -291,7 +291,7 @@ def iter_strings(obj: Any, path: str = "") -> Iterator[tuple[str, str]]:
 
 def _rng(seed: str, *purpose: str) -> random.Random:
     digest = hashlib.sha256("|".join((seed,) + purpose).encode()).digest()
-    return random.Random(int.from_bytes(digest[:8], "big"))
+    return random.Random(int.from_bytes(digest[:8], "big"))  # noqa: S311 - seeded so decoy content is stable per sensor
 
 
 @dataclass
@@ -590,7 +590,7 @@ class Bait:
         pw_tpl = self._declared.get(pw_key) or Template(
             "{{password:" + label + "}}", "password", pw_key, ("human",))
         self._declared.setdefault(pw_key, pw_tpl)
-        return hashlib.sha1(self.value(pw_tpl).encode()).hexdigest()
+        return hashlib.sha1(self.value(pw_tpl).encode(), usedforsecurity=False).hexdigest()
 
     def _secret(self, tpl: Template) -> str:
         fmt = tpl.args[0]

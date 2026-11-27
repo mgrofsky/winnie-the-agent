@@ -465,7 +465,10 @@ loopback, and the bind guard is unchanged. What changes:
 and transcripts are all hostile input. The console renders them as text only, never as
 HTML: no inline script, a strict Content-Security-Policy (`default-src 'none'`, scripts
 and styles from the console itself only, `frame-ancestors 'none'`), `nosniff`, no
-referrer, no caching, and JSON with `<`, `>`, `&`, U+2028 and U+2029 escaped.
+referrer, no caching, cross-origin isolation (`Cross-Origin-Opener-Policy`,
+`Cross-Origin-Embedder-Policy` and `Cross-Origin-Resource-Policy`), a
+`Permissions-Policy` that turns off device and browser features, and JSON with `<`, `>`,
+`&`, U+2028 and U+2029 escaped.
 
 **The Activity screen adds no new trust.** It reads the same event log the transcript
 replay reads, read-only, through the same GET-only checks (signed-in session, Host and

@@ -39,14 +39,49 @@ dev = [
     "stix2==3.0.2",
     "stix2-validator==3.3.2",
 ]
+# Browser tests of the operator console (tests/browser, marker "browser"); Chromium is
+# installed with: uv run --group browser playwright install chromium
+browser = [
+    "pytest-playwright==0.10.0",
+]
+# Static analysis and dependency audit, as the security workflow runs them.
+security = [
+    "ruff==0.17.5",
+    "pip-audit==2.10.1",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-# Slow tests (pathological-input timing, large-history runs) are skipped by default;
-# run everything with: uv run pytest -m "slow or not slow"
-addopts = "-m 'not slow'"
-markers = ["slow: long-running timing and scale tests (excluded from the default run)"]
+# Slow tests (pathological-input timing, large-history runs) and browser tests are skipped
+# by default; run everything but the browser tests with:
+#   uv run pytest -m "(slow or not slow) and not browser"
+# and the browser tests with: uv run --group browser pytest -m browser tests/browser
+addopts = "-m 'not slow and not browser'"
+markers = [
+    "slow: long-running timing and scale tests (excluded from the default run)",
+    "browser: Playwright tests of the operator console in Chromium (excluded from the default run)",
+]
 
 [tool.uv]
 package = false
+
+# Security lint of the product code (Ruff's flake8-bandit rules), as the security workflow runs
+# it: uv run --group security ruff check
+# Deliberate cases (decoy credentials, traps listening on every interface, seeded decoy
+# randomness) carry a "# noqa: S<nnn> - <reason>" on their line; a rule that repeats through
+# one file is ignored for that file below.
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["tests"]
+
+[tool.ruff.lint]
+select = ["S"]
+
+[tool.ruff.lint.per-file-ignores]
+# S101: these asserts only narrow a type after the value was set above; they guard nothing.
+"listeners/ftp.py" = ["S101"]
+"listeners/s3.py" = ["S101"]
+"listeners/sqlfake.py" = ["S101"]
+# S108: /tmp, /var/tmp and /dev/shm here are paths in the emulated filesystem, never opened.
+"agents/shell.py" = ["S108"]

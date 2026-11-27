@@ -285,7 +285,7 @@ def pasv_host(conn: Conn) -> Optional[str]:
             continue
         plain = _plain_ip(candidate)
         try:
-            if ipaddress.ip_address(plain).version == 4 and plain != "0.0.0.0":
+            if ipaddress.ip_address(plain).version == 4 and plain != "0.0.0.0":  # noqa: S104 - compares an address, binds nothing
                 return plain
         except ValueError:
             continue
@@ -377,7 +377,7 @@ class Passive:
                 pair = self.ready.result()
                 if pair is not None:
                     pair[1].close()
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 - best-effort cleanup
                 pass
         elif not self.ready.done():
             self.ready.cancel()

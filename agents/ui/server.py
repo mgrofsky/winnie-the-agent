@@ -87,6 +87,11 @@ CONTENT_SECURITY_POLICY = (
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
     "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 )
+# The console uses no device or browser feature; every one a page could ask for is off.
+PERMISSIONS_POLICY = (
+    "accelerometer=(), camera=(), display-capture=(), fullscreen=(), geolocation=(), "
+    "gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+)
 SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
     ("X-Content-Type-Options", "nosniff"),
     ("Referrer-Policy", "no-referrer"),
@@ -94,6 +99,8 @@ SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
     ("X-Frame-Options", "DENY"),
     ("Cross-Origin-Opener-Policy", "same-origin"),
     ("Cross-Origin-Resource-Policy", "same-origin"),
+    ("Cross-Origin-Embedder-Policy", "require-corp"),
+    ("Permissions-Policy", PERMISSIONS_POLICY),
     ("Content-Security-Policy", CONTENT_SECURITY_POLICY),
 )
 # Added only for requests under the external name, which the browser reaches over HTTPS.
@@ -759,7 +766,7 @@ def build_server(settings: UiSettings, routes: Routes) -> UiServer:
 def sign_in_url(server: UiServer) -> str:
     """The link the operator opens. An unspecified bind (container) is reached on loopback."""
     bind = server.settings.bind.strip("[]")
-    if bind in ("0.0.0.0", ""):
+    if bind in ("0.0.0.0", ""):  # noqa: S104 - compares the bind, binds nothing
         host = "127.0.0.1"
     elif bind == "::":
         host = "[::1]"

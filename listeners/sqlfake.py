@@ -736,7 +736,7 @@ class FakeSql:
         else:
             self.database = database or ""
         self.default_user_db = default
-        self.password_encryption = "scram-sha-256"   # PostgreSQL; set by the listener
+        self.password_encryption = "scram-sha-256"  # noqa: S105 - PostgreSQL setting; set by the listener
 
     # ---- catalog --------------------------------------------------------------------------
 

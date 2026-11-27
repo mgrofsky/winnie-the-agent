@@ -180,7 +180,7 @@ CfnLoader.add_multi_constructor("!", _tag)
 
 
 def load(path: Path) -> dict:
-    return yaml.load(path.read_text(encoding="utf-8"), Loader=CfnLoader)
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=CfnLoader)  # noqa: S506 - CfnLoader subclasses SafeLoader
 
 
 # ---- helpers ------------------------------------------------------------------------------
@@ -367,7 +367,7 @@ def deploy_copy_problems(raw: str) -> list[str]:
     stripped = strip_comments.strip(raw)
     errors: list[str] = []
     try:
-        same = yaml.load(stripped, Loader=CfnLoader) == yaml.load(raw, Loader=CfnLoader)
+        same = yaml.load(stripped, Loader=CfnLoader) == yaml.load(raw, Loader=CfnLoader)  # noqa: S506 - CfnLoader subclasses SafeLoader
     except yaml.YAMLError as exc:
         return [f"the comment-stripped copy does not parse ({str(exc)[:80]})"]
     if not same:
@@ -1098,7 +1098,7 @@ def _render_otx(script: str, ship: str, otx: str, kind: Optional[str]) -> Option
         idb = [] if kind is None else ["lookup"] if kind == "lookup" else \
             ["true", "events/internetdb/wanted.json", "internetdb/answers.json"]
         try:
-            subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),
+            subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),  # noqa: S603 - runs a repo script with this interpreter
                             "winnie-sensor", "example", "192.0.2.10", "false",
                             "example-events", "events", "us-east-1", "123456789012", "false",
                             "events/tracked/tracked.json", "", ship, *idb, f"otx-{otx}"],
@@ -1119,7 +1119,7 @@ def _render_internetdb(script: str, ship: str, kind: str = "s3") -> Optional[dic
         path.write_text(script, encoding="utf-8")
         out = Path(tmp) / "config.ini"
         try:
-            subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),
+            subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),  # noqa: S603 - runs a repo script with this interpreter
                             "winnie-sensor", "example", "192.0.2.10", "false",
                             "example-events", "events", "us-east-1", "123456789012", "false",
                             "events/tracked/tracked.json", "", ship]
@@ -1150,7 +1150,7 @@ def _render(script: str, ship: str, tracked: str) -> Optional[dict]:
         path.write_text(script, encoding="utf-8")
         out = Path(tmp) / "config.ini"
         try:
-            subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),
+            subprocess.run([sys.executable, "-I", str(path), str(CONFIG_TEMPLATE), str(out),  # noqa: S603 - runs a repo script with this interpreter
                             "winnie-sensor", "example", "192.0.2.10", "false",
                             "example-events", "events", "us-east-1", "123456789012", tracked,
                             "events/tracked/tracked.json", "", ship],

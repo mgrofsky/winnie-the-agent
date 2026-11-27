@@ -98,7 +98,7 @@ if want is None:
         want["connector.otx"] = {"enabled": "true", "submit": ship,
                                  "dry_run": "false" if otx == "otx-send" else "true"}
         if ship == "true":
-            want["connector.otx"].update(secret_file="/run/otx-key",
+            want["connector.otx"].update(secret_file="/run/otx-key",  # noqa: S106 - a file path, not a secret
                                          candidates_file="/blocklist/otx_candidates.json",
                                          addresses_file="/egress/otx-addresses")
     if smtp != "true":

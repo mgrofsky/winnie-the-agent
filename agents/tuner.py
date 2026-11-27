@@ -376,7 +376,7 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
     env.setdefault("GIT_AUTHOR_EMAIL", "tuner@winnie.invalid")
     env.setdefault("GIT_COMMITTER_NAME", "winnie-tuner")
     env.setdefault("GIT_COMMITTER_EMAIL", "tuner@winnie.invalid")
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,  # noqa: S603, S607 - fixed git argv, no shell; git from PATH in the agents image
                           env=env, timeout=60)
 
 

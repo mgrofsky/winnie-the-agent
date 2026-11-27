@@ -666,7 +666,7 @@ class RedisSession:
             if sub == "LOAD":
                 if len(a) != 3:
                     raise IndexError
-                sha = hashlib.sha1(a[2].encode()).hexdigest()
+                sha = hashlib.sha1(a[2].encode(), usedforsecurity=False).hexdigest()
                 if sha not in self.scripts and len(self.scripts) >= MAX_SCRIPTS:
                     self.scripts.pop(next(iter(self.scripts)))
                 self.scripts[sha] = a[2]
@@ -930,7 +930,7 @@ class RedisSession:
 
     def script_error(self, text: str, script: str) -> bytes:
         """An error raised by redis.call(), as the server version reports it."""
-        sha = hashlib.sha1(script.encode()).hexdigest()
+        sha = hashlib.sha1(script.encode(), usedforsecurity=False).hexdigest()
         if self.major_version >= 7:
             return err(f"{text} script: {sha}, on @user_script:1.")
         return err(f"ERR Error running script (call to f_{sha}): @user_script:1: {text}")

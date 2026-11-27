@@ -1,0 +1,112 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser:
+    name: Browser tests (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install dependencies
+        run: uv sync --frozen --group browser
+
+      - name: Install Chromium
+        run: uv run --frozen playwright install --with-deps chromium
+
+      - name: Run browser tests
+        run: uv run --frozen pytest -m browser tests/browser
+
+  dast:
+    name: DAST (OWASP ZAP on the loopback console)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Baseline (passive) and full (active) scans of the console on 127.0.0.1 only, with the
+      # synthetic fixture tree. Fails on a FAIL-level alert in tests/dast/zap-rules.tsv.
+      - name: Scan the operator console
+        run: tests/dast/run_zap.sh "$RUNNER_TEMP/zap"
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zap-reports
+          path: ${{ runner.temp }}/zap
+          if-no-files-found: warn
+          retention-days: 14
+
+  sast:
+    name: SAST and dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install the security tools
+        run: uv sync --frozen --only-group security
+
+      - name: Ruff security rules
+        run: uv run --frozen --no-sync ruff check --output-format github
+
+      # Every package in uv.lock (all extras and groups), checked by hash without resolving.
+      # PYSEC-2026-2447: diskcache, pulled in only by the test-only pysigma, unpickles what
+      # is in its cache directory, so it needs an attacker who can write there; no fixed
+      # release exists.
+      - name: Audit locked dependencies
+        run: |
+          uv export --frozen --format requirements-txt --all-extras --all-groups \
+            --no-emit-project -o "$RUNNER_TEMP/requirements.txt"
+          uv run --frozen --no-sync pip-audit -r "$RUNNER_TEMP/requirements.txt" \
+            --require-hashes --disable-pip --strict --progress-spinner off \
+            --ignore-vuln PYSEC-2026-2447

@@ -200,7 +200,7 @@ def _built(reader: object) -> str:
         epoch = reader.metadata().build_epoch
         if isinstance(epoch, int) and not isinstance(epoch, bool) and 0 < epoch < 2 ** 40:
             return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).date().isoformat()
-    except Exception:  # noqa: BLE001 - metadata is optional
+    except Exception:  # noqa: BLE001, S110 - metadata is optional
         pass
     return ""
 
@@ -263,7 +263,7 @@ class _Db:
 def _close(reader: object) -> None:
     try:
         reader.close()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 - best-effort cleanup
         pass
 
 

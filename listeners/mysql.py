@@ -120,9 +120,9 @@ def _xor(a: bytes, b: bytes) -> bytes:
 def native_scramble(password: str, salt: bytes) -> bytes:
     if not password:
         return b""
-    h1 = hashlib.sha1(password.encode("utf-8")).digest()
-    h2 = hashlib.sha1(h1).digest()
-    return _xor(h1, hashlib.sha1(salt + h2).digest())
+    h1 = hashlib.sha1(password.encode("utf-8"), usedforsecurity=False).digest()
+    h2 = hashlib.sha1(h1, usedforsecurity=False).digest()
+    return _xor(h1, hashlib.sha1(salt + h2, usedforsecurity=False).digest())
 
 
 def sha2_scramble(password: str, salt: bytes) -> bytes:

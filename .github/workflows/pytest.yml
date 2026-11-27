@@ -40,4 +40,4 @@ jobs:
         run: uv sync --frozen --extra geoip --python ${{ matrix.python-version }}
 
       - name: Run tests
-        run: uv run --frozen pytest -m "slow or not slow"
+        run: uv run --frozen pytest -m "(slow or not slow) and not browser"
