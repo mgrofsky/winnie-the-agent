@@ -385,3 +385,97 @@ def test_a_slow_answer_for_an_earlier_window_is_dropped(signed_in, lab):
     expect(page.locator("canvas.map-canvas")).to_have_attribute(
         "aria-label", re.compile(r"^World map: 1 source,"))
     assert seen.problems() == []
+
+
+def test_collapsed_navigation_keeps_section_names_and_queue_count(signed_in):
+    page, seen = signed_in
+    toggle = page.get_by_role("button", name="Collapse navigation")
+    nav = page.get_by_role("navigation", name="Sections")
+    wide = nav.bounding_box()["width"]
+    toggle.click()
+    expect(page.get_by_role("button", name="Expand navigation")).to_have_attribute(
+        "aria-expanded", "false")
+    expect(nav.get_by_role("link", name=re.compile("1 pending approval"))).to_be_visible()
+    records = nav.get_by_role("link", name="Records")
+    records.focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_role("heading", level=1)).to_have_text("Records")
+    assert nav.bounding_box()["width"] < wide
+    page.get_by_role("button", name="Expand navigation").click()
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    assert seen.problems() == []
+
+
+def test_overview_map_link_opens_investigation_and_private_wall_display(signed_in, lab):
+    page, seen = signed_in
+    preview = page.get_by_role("link", name=re.compile("open full map", re.I))
+    preview.focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_role("heading", level=1)).to_have_text("Map")
+    display = page.get_by_role("button", name="Display mode").or_(
+        page.get_by_role("link", name="Display mode"))
+    display.click()
+    feed = page.get_by_role("list", name="Events, newest first")
+    expect(feed.locator("li").first).to_be_visible()
+    expect(page.get_by_role("navigation", name="Sections")).not_to_be_visible()
+    page.keyboard.press("7")
+    expect(page.get_by_role("heading", level=1)).to_have_text("Live activity")
+    body = page.locator("body").inner_text()
+    assert all(address not in body for address in (CANARY_SOURCE, "198.51.100.21"))
+    assert CANARY_USER not in body and CANARY_SCRIPT not in body
+    leave = page.get_by_role("button", name=re.compile("Exit display", re.I)).or_(
+        page.get_by_role("link", name=re.compile("Exit display", re.I)))
+    leave.focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_role("navigation", name="Sections")).to_be_visible()
+    expect(page.get_by_role("heading", level=1)).to_have_text("Map")
+    assert seen.problems() == []
+
+
+def test_overview_receives_new_record_without_moving_keyboard_focus(signed_in, lab):
+    page, seen = signed_in
+    preview = page.get_by_role("link", name=re.compile("open full map", re.I))
+    preview.focus()
+    sessions = lab.tree.reports / "sessions"
+    original = json.loads((sessions / (lab.tree.ids["session_a"] + ".json")).read_text())
+    record = {**original, "id": "session-" + "a" * 32,
+              "last_seen": lab.tree.now.isoformat(), "headline": "New fixture incident"}
+    (sessions / (record["id"] + ".json")).write_text(json.dumps(record))
+    expect(page.locator("main")).to_contain_text("New fixture incident", timeout=10000)
+    expect(preview).to_be_focused()
+    assert seen.problems() == []
+
+
+def test_selected_source_has_its_own_judgement_and_activity_link(signed_in, lab):
+    page, seen = signed_in
+    sources = ["198.51.100.7", "198.51.100.8"]
+    data = map_answer(2, sources)
+    data["sources"][0].update(judgement="MALICIOUS", last=lab.tree.now.isoformat(), service="ftp")
+    data["totals"]["services"] = {"ftp": 1, "ssh": 1}
+    data["items"] = [{"src": sources[0], "service": "ssh", "offset": 10,
+                      "time": lab.tree.now.isoformat()}]
+    page.route("**/api/map?*", lambda route: route.fulfill(json=data))
+    open_section(page, lab.base_url, "#/map")
+    canvas = page.get_by_role("img", name=re.compile("World map: 2 sources"))
+    # This source also used SSH. Hiding its latest service preserves the source marker.
+    page.get_by_role("group", name="Services shown").get_by_role("button", name="ftp").click()
+    expect(page.get_by_role("list", name="Events, newest first")).to_contain_text(sources[0])
+    canvas.focus()
+    page.keyboard.press("ArrowRight")
+    details = page.locator(".map-detail")
+    expect(details).to_contain_text(sources[0])
+    expect(details).to_contain_text("MALICIOUS", ignore_case=True)
+    page.keyboard.press("ArrowRight")
+    expect(details).to_contain_text(sources[1])
+    expect(details).to_contain_text("Untriaged", ignore_case=True)
+    expect(details).to_contain_text("Age unknown", ignore_case=True)
+    hide = page.get_by_role("checkbox", name="Hide addresses")
+    hide.check()
+    expect(details).not_to_contain_text(sources[1])
+    expect(details.get_by_role("link")).to_have_count(0)
+    hide.uncheck()
+    expect(details).to_contain_text(sources[1])
+    details.get_by_role("link", name=re.compile("View activity", re.I)).click()
+    expect(page.get_by_role("heading", level=1)).to_have_text("Activity")
+    assert "src=" + sources[1] in page.url
+    assert seen.problems() == []

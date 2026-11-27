@@ -175,6 +175,23 @@ def test_overview(api, tree):
     assert get(api, "/api/overview", window="30d") == (400, {"error": "bad query"})
 
 
+def test_overview_incidents_and_honeytoken_count(api, tree):
+    # More hits than fit in either list. One source and headline contain a planted value.
+    base = json.loads((tree.reports / "sessions" / (tree.ids["session_a"] + ".json")).read_text())
+    for i in range(23):
+        record = {**base, "id": f"sample-{i}", "src_ip": HONEYTOKEN_VALUE,
+                  "headline": f"{HONEYTOKEN_VALUE} used", "last_seen": tree.now.isoformat()}
+        (tree.reports / "sessions" / (record["id"] + ".json")).write_text(json.dumps(record))
+    day = ok(api, "/api/overview")
+    assert day["honeytoken_records"] == 24
+    assert len(day["honeytoken_hits"]) == 20
+    recent = day["recent_incidents"]
+    assert len(recent) == 5 and all(r["id"].startswith("sample-") for r in recent)
+    assert HONEYTOKEN_VALUE not in json.dumps(recent)
+    assert all(set(r) == {"id", "time", "judgement", "src_ip", "protocol", "summary"}
+               for r in recent)
+
+
 def test_overview_health(api, tree):
     h = ok(api, "/api/overview")["health"]
     assert h["event_log"]["state"] == "ok" and h["event_log"]["bytes"] > 0
