@@ -1,7 +1,9 @@
 # ZAP rules for the operator console scans (tests/dast/run_zap.sh).
 # rule id<TAB>FAIL|WARN|IGNORE<TAB>(rule name) and, for IGNORE, the reason.
 # FAIL fails the job. WARN is reported only. IGNORE hides a passive alert and keeps an
-# active rule from running.
+# active rule from running. Alerts of Informational risk never fail the job, whatever the
+# level. The image pins ZAP itself; the scan scripts update and install the beta rule
+# add-ons at start, and a rule missing from this file is treated as WARN.
 
 # passive rules
 2	WARN	(Private IP Disclosure)
@@ -59,7 +61,7 @@
 10112	IGNORE	(Session Management Response Identified) informational: marks a response ZAP takes for session management
 10113	IGNORE	(Verification Request Identified) informational: marks a request ZAP takes for verification
 10115	FAIL	(Script Served From Malicious Domain (polyfill))
-10116	IGNORE	(ZAP is Out of Date) the image is pinned by digest and updated on purpose
+10116	IGNORE	(ZAP is Out of Date) ZAP itself is pinned by image digest and updated on purpose
 10202	FAIL	(Absence of Anti-CSRF Tokens)
 20020	FAIL	(Server Side Technology Version with Known Vulnerabilities)
 50001	WARN	(Script Passive Scan Rules)
