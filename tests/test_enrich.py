@@ -253,6 +253,61 @@ def test_a_reader_that_raises_answers_nothing(tmp_path):
     assert geo.status == "on: location fake.mmdb"      # no build date without metadata
 
 
+# ---- positions for the map -------------------------------------------------------------------
+
+def test_point_is_rounded_to_one_decimal_in_both_shapes(tmp_path):
+    geo = _lookup(tmp_path)
+    assert geo.point("8.8.8.8") == (37.8, -97.8)
+    assert geo.point(V6) is None                 # a range without a location
+    assert geo.point("8.8.4.4") is None          # in no range
+    (tmp_path / "dbip").mkdir()
+    assert _lookup(tmp_path / "dbip", city=DBIP_CITY).point("8.8.8.8") == (37.8, -97.8)
+
+
+@pytest.mark.parametrize("address", ["10.0.0.5", "127.0.0.1", "192.0.2.10", "198.51.100.7",
+                                     "not an address", "", None, 7])
+def test_point_is_none_for_non_global_or_bad_values(tmp_path, address):
+    geo, readers = _fake(tmp_path, {"10.0.0.5": {"location": {"latitude": 1, "longitude": 2}}})
+    assert geo.point(address) is None
+    assert readers[0].calls == 0                 # no lookup for a non-global address
+
+
+@pytest.mark.parametrize("location", [
+    {"latitude": 91, "longitude": 0}, {"latitude": 0, "longitude": -181},
+    {"latitude": float("nan"), "longitude": 0}, {"latitude": True, "longitude": 0},
+    {"latitude": "1", "longitude": "2"}, {"longitude": 2}, "x", None])
+def test_point_refuses_malformed_locations(tmp_path, location):
+    geo, _ = _fake(tmp_path, {"8.8.8.8": {"location": location}})
+    assert geo.point("8.8.8.8") is None
+
+
+def test_point_without_a_location_database_or_with_a_failing_reader(tmp_path):
+    assert GeoLookup(GeoSettings()).point("8.8.8.8") is None
+    asn_only = _lookup(tmp_path, city=None)
+    assert asn_only.point("8.8.8.8") is None
+
+    class Exploding(FakeReader):
+        def get(self, ip):
+            raise RuntimeError("corrupt")
+
+    path = tmp_path / "x.mmdb"
+    path.write_bytes(b"x")
+    geo = GeoLookup(GeoSettings(city_db=str(path)), opener=lambda p: Exploding({}))
+    assert geo.point("8.8.8.8") is None
+
+
+def test_points_are_cached_and_bounded(tmp_path):
+    geo, readers = _fake(tmp_path, {"8.8.8.8": {"location": {"latitude": 1.26,
+                                                             "longitude": 2.24}}},
+                         cache_size=2)
+    for _ in range(3):
+        assert geo.point("8.8.8.8") == (1.3, 2.2)
+    assert readers[0].calls == 1
+    geo.point("8.8.4.4")
+    geo.point("9.9.9.9")
+    assert len(geo._points) == 2
+
+
 def test_config_paths_and_attribution(tmp_path, caplog):
     cp = configparser.ConfigParser()
     cp.read_string("[geoip]\ncity_db = relative/city.mmdb\n")
