@@ -51,7 +51,8 @@ def test_markers_are_derived_per_source_and_found_across_sources():
 
 
 def test_marker_values_have_realistic_shapes():
-    values = {n: marker_value("s", "p", "k", n) for n in ("build", "client_id", "api_key", "tenant")}
+    names = ("build", "client_id", "api_key", "tenant")
+    values = {n: marker_value("s", "p", "k", n) for n in names}
     assert len(values["build"]) == 12 and int(values["build"], 16) >= 0
     assert len(values["client_id"]) == 36 and values["client_id"][14] == "4"
     assert len(values["api_key"]) == 32 and values["api_key"].isalnum()
@@ -72,7 +73,7 @@ def test_idle_sources_are_dropped_with_their_markers():
     va = st.marker("a", "api_key")
     st.show("a", ["/x"], "bundle")
     clock.now += hs.SOURCE_TTL + 1
-    st.next_seq("b")
+    st.show("b", ["/x"], "bundle")
     assert "a" not in st.sources and st.find_marker([va]) is None
     assert st.discovery("a", "/x") is None and not st._probe
 
@@ -82,7 +83,7 @@ def test_source_count_is_bounded(monkeypatch):
     monkeypatch.setattr(hs, "MAX_SOURCES", 3)
     first = st.marker("s0", "api_key")
     for i in range(1, 6):
-        st.next_seq(f"s{i}")
+        st.show(f"s{i}", ["/x"], "bundle")
     assert len(st.sources) == 3 and st.find_marker([first]) is None
 
 
@@ -105,3 +106,24 @@ def test_state_starts_over_when_the_scenario_changes():
     assert hs.http_state(ctx) is st and st.find_marker([value])
     ctx.scenario = SimpleNamespace(scenario=SimpleNamespace(name="two"))
     assert hs.http_state(ctx).find_marker([value]) is None
+
+
+def test_a_request_alone_keeps_only_a_counter(monkeypatch):
+    _, st, clock = make()
+    monkeypatch.setattr(hs, "MAX_COUNTERS", 3)
+    for i in range(5):
+        st.next_seq(f"scan{i}")
+    assert not st.sources and list(st.counters) == ["scan2", "scan3", "scan4"]
+    clock.now += hs.SOURCE_TTL + 1
+    assert st.next_seq("scan4") == 1 and list(st.counters) == ["scan4"]
+
+
+def test_ids_held_for_all_sources_are_bounded(monkeypatch):
+    _, st, _ = make()
+    monkeypatch.setattr(hs, "MAX_TOTAL_IDS", 5)
+    for v in range(3):
+        st.count_id("old", "/r/{id}", str(v))
+    for v in range(4):
+        st.count_id("new", "/r/{id}", str(v))
+    assert "old" not in st.sources and st.id_total == 4
+    assert st.count_id("new", "/r/{id}", "x" * 100_000) == 5

@@ -652,7 +652,9 @@ header and body fields, so the 32-key cap never drops them:
 | `object_id_count` | an item route with a `lure` | Distinct IDs this source has asked of the route. |
 
 Discovery, markers and ID counts are held per source in memory, for a day after the
-source's last request and for at most 4,096 sources; a listener restart starts them over.
+source's last request: request counters for up to 65,536 sources, the rest for up to 8,192
+sources that fetched an asset, were issued a marker or asked an ID (200 IDs per route,
+400,000 in all). A listener restart starts them over.
 
 ### Source proof
 

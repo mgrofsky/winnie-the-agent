@@ -81,6 +81,9 @@ _SESSIONS: "weakref.WeakKeyDictionary[ListenerContext, OrderedDict[str, dict]]" 
 # is kept without a body and rendered per request as the stack's own page.
 _PAGE_CACHE: "weakref.WeakKeyDictionary[ListenerContext, OrderedDict[tuple[str, str], tuple]]" = \
     weakref.WeakKeyDictionary()
+# Per listener context: (scenario, {asset path: (asset, text)}, marker names), built once
+# per scenario instead of once per connection.
+_ASSETS: "weakref.WeakKeyDictionary[ListenerContext, tuple]" = weakref.WeakKeyDictionary()
 
 # Unknown paths that every stack here answers with its 404: no scenario runs WordPress, PHP
 # info pages, Spring Boot actuators or a separate /config.json.
@@ -223,12 +226,15 @@ def build_cfg(ctx: ListenerContext, settings: ServiceSettings) -> HttpCfg:
         cfg.openapi = svc.openapi
         cfg.llm_unknown = svc.llm_unknown_api_routes
         cfg.llm_unknown_paths = svc.llm_unknown_paths
-        app = app_name(cfg.domain)
-        cfg.assets = {a.path: (a, asset_text(a, svc, app)) for a in svc.assets}
+        cached = _ASSETS.get(ctx)
+        if cached is None or cached[0] is not scen:
+            app = app_name(cfg.domain)
+            cached = _ASSETS[ctx] = (scen, {a.path: (a, asset_text(a, svc, app))
+                                            for a in svc.assets}, svc.marker_names())
+        _, cfg.assets, cfg.markers = cached
         cfg.openapi_aliases = tuple(svc.openapi_aliases)
         cfg.openapi_advertises = tuple(svc.openapi_advertises)
         cfg.openapi_lure = svc.openapi_lure
-        cfg.markers = svc.marker_names()
     else:
         cfg.server = settings.banner or "nginx"
         cfg.pages = list(DEFAULT_PAGES)
@@ -651,12 +657,13 @@ class Exchange:
                 if page.requires_login and not self.schemes:
                     return 302, b"", "text/html", [("Location", cfg.login_path)]
                 return 200, self.render_page(page), "text/html; charset=utf-8", []
-        matched_path = False
+        matched_path = None
         for route in cfg.routes:
             m = route_regex(route.path).match(path)
             if not m:
                 continue
-            matched_path = True
+            if matched_path is None:
+                matched_path = route
             if route.method != method:
                 continue
             self.log["route"] = route.path
@@ -667,8 +674,9 @@ class Exchange:
             if route.flow:
                 return self.run_flow(route, params)
             return self.serve_route(route, params)
-        if matched_path:
+        if matched_path is not None:
             self.log["route"] = "method_not_allowed"
+            self.route_evidence(matched_path, {}, count_ids=False)
             return 405, json_bytes({"error": "method not allowed"}), "application/json", []
         asset = cfg.assets.get(path)
         if asset is not None:
@@ -955,23 +963,30 @@ class Exchange:
         if not self.cfg.markers:
             return
         req = self.req
-        texts = (req.target, req.body[:MAX_BODY].decode("utf-8", "replace") if req.body else None,
-                 req.header("authorization"), req.header(self.cfg.api_key_header),
-                 req.header("cookie"))
+        auth = req.header("authorization")
+        texts = [req.target, req.body[:MAX_BODY].decode("utf-8", "replace") if req.body else None,
+                 auth, req.header(self.cfg.api_key_header), req.header("cookie")]
+        scheme, _, cred = (auth or "").partition(" ")
+        if scheme.lower() == "basic" and cred:
+            try:    # a key tried as "-u key:" arrives base64 encoded
+                texts.append(base64.b64decode(cred.strip()[:4096], validate=False)
+                             .decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001
+                pass
         hit = self.state.find_marker(texts)
         if hit is not None:
             self.ev["marker"] = hit[0]
             if hit[1] != self.key:
                 self.ev["marker_src"] = True
 
-    def route_evidence(self, route, params: dict[str, str]) -> None:
+    def route_evidence(self, route, params: dict[str, str], count_ids: bool = True) -> None:
         """Lure, discovery and object-ID evidence for a matched route."""
         if route.lure:
             self.ev["lure_id"] = route.lure
         found = self.state.discovery(self.key, route.path)
         if found is not None:
             self.ev["discovered_via"], self.ev["discovered_age"] = found
-        if route.lure and route.item_from:
+        if count_ids and route.lure and route.item_from:
             value = params.get(route.item_key) if route.item_key in params else (
                 list(params.values())[-1] if params else None)
             if value is not None:

@@ -163,15 +163,14 @@ username = "qa@{{org.domain}}"
 password = "{{password:qa}}"
 
 [[services.http.pages]]
-path = "/app"
+path = "/"
 title = "Workspace"
 requires_login = false
 body_html = '''
 <div id="root">Loading workspace...</div>
-<noscript>You need to enable JavaScript to run this app.</noscript>
-<p><a href="/signin">Sign in</a></p>
-<p>API reference: <a href="/api/openapi.json">/api/openapi.json</a></p>
-<!-- runtime config: /env.js, bundle: /static/js/main.{{hex:8:bundle}}.js -->
+<noscript>You need to enable JavaScript to run this app. <a href="/signin">Sign in</a></noscript>
+<script src="/env.js"></script>
+<script defer src="/static/js/main.{{hex:8:bundle}}.js"></script>
 '''
 
 [[services.http.routes]]

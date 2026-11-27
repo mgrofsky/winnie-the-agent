@@ -1173,3 +1173,55 @@ async def test_req_counts_requests_on_one_connection_and_seq_across_them():
     assert got == [(1, 1), (2, 2), (3, 3), (4, 1)]
     redirect = [e["data"] for e in events(ctx, "command")]
     assert all(isinstance(d["resp_type"], str) for d in redirect)
+
+
+async def test_marker_tried_as_basic_credentials_is_recognised(monkeypatch):
+    who = {"key": "198.51.100.60"}
+    as_source(monkeypatch, who)
+    ctx, servers, port = await start_pack()
+    try:
+        _, _, env = await req(port, "GET", "/env.js")
+        key = env_values(env)["publicApiKey"]
+        await req(port, "GET", "/api/v1/projects", basic(key, ""))
+        await settle()
+    finally:
+        await stop(servers)
+    assert cmd(ctx, "/api/v1/projects")[0]["marker"] == "public_api_key"
+
+
+async def test_wrong_method_on_a_shown_route_still_carries_its_discovery(monkeypatch):
+    who = {"key": "198.51.100.61"}
+    as_source(monkeypatch, who)
+    ctx, servers, port = await start_pack()
+    try:
+        await req(port, "GET", assets_of(ctx)["bundle"])
+        status, _, _ = await req(port, "DELETE", "/api/v1/users/9")
+        await settle()
+    finally:
+        await stop(servers)
+    data = cmd(ctx, "/api/v1/users/9")[0]
+    assert status == 405 and data["route"] == "method_not_allowed"
+    assert data["discovered_via"] == "main-bundle" and "object_id_count" not in data
+
+
+async def test_app_shell_links_the_runtime_config_and_bundle():
+    ctx, servers, port = await start_pack()
+    try:
+        status, _, page = await req(port, "GET", "/")
+    finally:
+        await stop(servers)
+    srcs = re.findall(rb'<script[^>]*src="([^"]+)"', page)
+    assert status == 200 and srcs == [b"/env.js", assets_of(ctx)["bundle"].encode()]
+
+
+async def test_asset_text_is_built_once_per_scenario(monkeypatch):
+    calls = []
+    real = http.asset_text
+    monkeypatch.setattr(http, "asset_text", lambda *a: calls.append(1) or real(*a))
+    ctx, servers, port = await start_pack()
+    try:
+        for _ in range(3):
+            await req(port, "GET", "/assets/config.json")
+    finally:
+        await stop(servers)
+    assert len(calls) == len(ctx.scenario.scenario.services.http.assets)

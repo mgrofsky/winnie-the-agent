@@ -7,8 +7,8 @@ A bundle is a minified webpack chunk holding an API client table, a source map c
 TypeScript of that client in ``sourcesContent``, and a runtime config is a JSON object (or a
 ``window.__ENV__`` assignment when the path ends in ``.js``) with ``apiBase``, feature flags
 and the endpoint table. Every advertised route appears in each. The text depends only on the
-scenario, so it is built once per listener; ``{marker:NAME}`` in a scenario's own body is
-filled in per source by the listener.
+scenario, so the listener builds it once per scenario; ``{marker:NAME}`` in a scenario's own
+body is filled in per source by the listener.
 """
 
 from __future__ import annotations

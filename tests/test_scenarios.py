@@ -11,7 +11,8 @@ from scenarios.describe import describe, list_text
 from scenarios.loader import list_scenarios, load_scenario
 from scenarios.schema import Scenario
 
-SHIPPED = ["api_platform", "bank", "contact_center", "healthcare", "saas", "sip_provider", "dev_portal"]
+SHIPPED = ["api_platform", "bank", "contact_center", "healthcare", "saas", "sip_provider",
+           "dev_portal"]
 
 
 def test_all_expected_scenarios_ship():
@@ -186,7 +187,8 @@ def test_tables_generate_deterministically(name):
 def _http(**over):
     from scenarios.schema import HttpService
 
-    base = {"enabled": True, "port": 8080, "api_prefix": "/api", "openapi_path": "/api/openapi.json",
+    base = {"enabled": True, "port": 8080, "api_prefix": "/api",
+            "openapi_path": "/api/openapi.json",
             "routes": [{"path": "/api/v1/items/{id}", "item_from": "db.items", "item_key": "id"},
                        {"method": "POST", "path": "/api/v1/forgot", "auth": "none",
                         "flow": "recovery_request"}]}

@@ -429,7 +429,8 @@ async def test_http_deception_scenario_survives_pathological_input(tmp_path):
         _line(b"GET /static/js/", b"a." * 1950 + b" HTTP/1.1"),
     ] + [_line(b"GET /api/v1/projects/", str(i).encode() + b" HTTP/1.1") for i in range(10)]
     try:
-        result = await hammer(port, payloads, probe_request=b"GET /env.js HTTP/1.1\r\nHost: x\r\n\r\n")
+        result = await hammer(port, payloads,
+                              probe_request=b"GET /env.js HTTP/1.1\r\nHost: x\r\n\r\n")
     finally:
         for s in servers:
             s.close()
