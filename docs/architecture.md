@@ -495,11 +495,54 @@ indicator naming a framework is described as like that framework (for example
 "ARTEX-like"), never as attributed to it. Records written before these fields existed load
 with them empty. [web-deception.md](web-deception.md) shows an example record.
 
+#### Stored analyses
+
+The same bot script arrives from many addresses. Triage keeps each model answer in
+`<state dir>/triage_analyses.json` and answers a later session or campaign with the same
+input from it, with no model call:
+
+- The key is a SHA-256 digest of the item's kind and protocol, the system prompt and output
+  schema, a campaign's header facts (counts, clients, dialed numbers, high-signal events;
+  not its address), and the command or request lines the model sees. Random-looking
+  tokens in those lines (UUIDs, hex runs of 16 or more, mixed-case base64-like runs of 20
+  or more, as found for learned replies) become numbered placeholders, and each token's
+  length and class is part of the key. A line that computes over its text (`base64 -d`,
+  `awk`, `printf` and the like) and a token that decodes to readable text stay literal.
+  The source address, username, passwords tried and an SSH session's replies are not in
+  the key. A change to the prompt or schema asks the model again.
+- The stored value is the classification, techniques and narrative parts, with each token
+  value replaced by its placeholder. A served answer is filled with the new item's own
+  tokens, so its text names that item's values. Model-suggested IOCs are not stored; the
+  record's IOCs come from its own commands.
+- An answer is stored only when every specific string in it is a placeholder or appears
+  literally in the keyed lines. Text naming the source address, a password tried, an
+  address or other IOC from elsewhere (such as the honeypot's replies), or two different
+  tokens in one sentence, is not stored, and the next copy asks the model. Text naming the
+  session's username is served only to sessions that logged in with that username.
+- A served answer goes through the same path as a model answer: the rule floors above
+  and the campaign max-merge with the rule-based judgement still apply, so it never lowers
+  a judgement below what the rules give.
+- The record has `analysis_reused: true`, `llm_used: false` and `analysis_key`, the entry's
+  16-character id (also set on the record whose answer was stored). The console shows it as
+  model-assisted triage from a stored analysis; the digest counts it as LLM-triaged and
+  adds an "Analyses reused" line.
+- An entry is asked again after `[agents] analysis_reuse_days` (default 30) or
+  `analysis_reuse_max_uses` serves (default 0, no limit). When the fresh answer disagrees
+  on judgement, the higher judgement is kept and the disagreement counted.
+- The store keeps at most `analysis_reuse_max_entries` (default 5,000) entries, least
+  recently used dropped first, and 16 KB per entry. The file is mode 0600 and replaced
+  atomically; an unreadable one is logged, read as empty and replaced on the next save.
+  A dry run writes nothing. `analysis_reuse = false` turns it off; with no model
+  configured it is not used.
+- `python -m agents analyses --stats` shows entry counts and model calls saved today and
+  in total; `--list` shows the entries (placeholders as `{N}`), `--forget ID` drops one
+  and `--clear` drops all.
+
 Without any model configured (no Anthropic credentials, or `--no-llm`), every SSH session
 and campaign gets a deterministic record. When a model is configured but temporarily
 unavailable (rate limit, outage, timeout) or the call cap is reached, model work stops for
 that run and the affected items are deferred to the next run; nothing is lost because the
-cursor is saved after every item.
+cursor is saved after every item. Items with a stored analysis are still answered from it.
 
 The digest (`reports/daily/YYYY-MM-DD.md`) lists counts, the top three items (honeytoken
 use first, then judgement, stage, high-signal events and novelty), high-signal events,
@@ -788,7 +831,9 @@ model is not called: the attacker gets a canned error and the session closes, an
   `llm_timeout`. HTTP request events carry `rung` (`llm`, `llm_retry` or `fallback`). Telnet
   persona calls follow the SSH persona path, including `persona_retries`.
 - Analyst calls are capped per run (`[agents] max_llm_calls_per_run`, shared by all stages)
-  and per UTC day (`max_analyst_calls_per_day`).
+  and per UTC day (`max_analyst_calls_per_day`). A triage record answered from a stored
+  analysis ([Stored analyses](#stored-analyses)) makes no call and counts against
+  neither cap; the console's Analyst calls row adds how many were reused today.
 
 SSH reads a whole line before the line cap applies (the SSH library buffers it), so a very
 long line without a newline still costs memory before it is truncated.

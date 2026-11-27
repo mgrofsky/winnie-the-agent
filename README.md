@@ -35,6 +35,8 @@ On top of that SSH honeypot this project adds:
   `python -m agents learned` shows the share of commands each step answered and what still
   reaches the model.
 - **Triage**: one validated record per SSH session or per trap campaign, plus a daily digest.
+  A command sequence the model already analysed, from any address, gets the stored answer
+  filled with its own tokens, with no model call (`python -m agents analyses`).
 - **Where addresses are** (optional): country, city and network owner of each source,
   read from GeoLite2 or DB-IP Lite database files on disk (no network call), stored on
   the triage record and shown in the console and the digest.

@@ -235,6 +235,7 @@ Everything runs without any model configured:
 | Event log | `frontend`: `/data/ssh_log.log` | no |
 | Quarantine | `frontend` | no, but capped per file, per source and in total |
 | Learned replies (attacker command text and model replies) | `frontend`: `/data/learned_replies.json` | capped at `[llm] learned_max_entries`; `python -m agents learned --clear` empties it |
+| Stored triage analyses (attacker command templates and model answers) | `agentdata`: `/agents/state/triage_analyses.json` | capped at `[agents] analysis_reuse_max_entries` (5,000); entries expire after `analysis_reuse_days` (30); `python -m agents analyses --clear` empties it |
 | Triage session and campaign records | `agentdata`: `/agents/reports/sessions/`, `/agents/reports/campaigns/` | yes, after `[agents] record_retention_days` (90) |
 | Digests | `agentdata`: `/agents/reports/daily/` | no |
 | Response run records, decided approvals | `agentdata` | yes, after `[respond] retention_days` (30) |
