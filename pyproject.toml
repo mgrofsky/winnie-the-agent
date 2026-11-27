@@ -68,11 +68,20 @@ package = false
 
 # Security lint of the product code (Ruff's flake8-bandit rules), as the security workflow runs
 # it: uv run --group security ruff check
-# Deliberate cases (decoy credentials and paths, traps listening on every interface, digests a
-# protocol requires) carry a "# noqa: S<nnn> - <reason>" on their line.
+# Deliberate cases (decoy credentials, traps listening on every interface, seeded decoy
+# randomness) carry a "# noqa: S<nnn> - <reason>" on their line; a rule that repeats through
+# one file is ignored for that file below.
 [tool.ruff]
 target-version = "py311"
 extend-exclude = ["tests"]
 
 [tool.ruff.lint]
 select = ["S"]
+
+[tool.ruff.lint.per-file-ignores]
+# S101: these asserts only narrow a type after the value was set above; they guard nothing.
+"listeners/ftp.py" = ["S101"]
+"listeners/s3.py" = ["S101"]
+"listeners/sqlfake.py" = ["S101"]
+# S108: /tmp, /var/tmp and /dev/shm here are paths in the emulated filesystem, never opened.
+"agents/shell.py" = ["S108"]

@@ -47,7 +47,8 @@ Each runs locally as well:
 
 - **SAST and dependency audit.** Ruff's flake8-bandit rules (`S`) over the product code,
   configured in `pyproject.toml`; a deliberate case carries `# noqa: S<nnn> - <reason>` on
-  its line. pip-audit checks every package in `uv.lock`, all extras and groups, by hash.
+  its line, and a rule that repeats through one file is ignored for that file in
+  `pyproject.toml` with its reason. pip-audit checks every package in `uv.lock`, all extras and groups, by hash.
   PYSEC-2026-2447 is ignored: diskcache, pulled in only by the test-only pysigma, unpickles
   what is in its cache directory, so it needs someone who can write there, and no fixed
   release exists.

@@ -887,7 +887,7 @@ class Session:
 
 
 # Where a non-root login may create files.
-_OPEN_DIRS = frozenset(("/tmp", "/var/tmp", "/dev/shm"))  # noqa: S108 - paths in the emulated filesystem
+_OPEN_DIRS = frozenset(("/tmp", "/var/tmp", "/dev/shm"))
 
 
 class Shell:
@@ -1911,7 +1911,7 @@ def _mounts(sh: Shell) -> list[tuple[str, str, int, int, int, str]]:
     run = total // 10 // 4 * 4
     out = [("tmpfs", "tmpfs", run, 1064, run - 1064, "/run"),
            (device, fstype, blocks, used, avail, "/"),
-           ("tmpfs", "tmpfs", total // 2, 0, total // 2, "/dev/shm")]  # noqa: S108 - paths in the emulated filesystem
+           ("tmpfs", "tmpfs", total // 2, 0, total // 2, "/dev/shm")]
     if h.family != "rhel":
         out.append(("tmpfs", "tmpfs", 5120, 0, 5120, "/run/lock"))
     out.append(("tmpfs", "tmpfs", run, 4, run - 4, f"/run/user/{uid}"))
@@ -3581,8 +3581,8 @@ def _host_dirs(sh: Shell) -> dict[str, list[str]]:
     homes = sorted({u.home.split("/")[2] for u in h.all_users(sh.user)
                     if u.home.startswith("/home/") and u.home.count("/") == 2})
     out = {"/": root.split(), "/home": homes,
-           "/tmp": (["snap-private-tmp"] if h.family == "ubuntu" else []) + private,  # noqa: S108 - paths in the emulated filesystem
-           "/var/tmp": list(private), "/dev/shm": [], "/root": [], "/opt": [], "/srv": [],  # noqa: S108 - paths in the emulated filesystem
+           "/tmp": (["snap-private-tmp"] if h.family == "ubuntu" else []) + private,
+           "/var/tmp": list(private), "/dev/shm": [], "/root": [], "/opt": [], "/srv": [],
            "/mnt": [], "/media": []}
     for u in h.all_users(sh.user):
         if u.home.startswith("/home/"):
@@ -3712,7 +3712,7 @@ def _list_dir(sh: Shell, path: str, dirs: dict, flags: set) -> Optional[str]:
 _PRIVATE_DIRS = ("systemd-private-", "snap-private-tmp")
 # Dot entries of the directories ``ls -a`` may list (systemd makes the X11 ones in /tmp).
 _X11 = [".font-unix", ".ICE-unix", ".Test-unix", ".X11-unix", ".XIM-unix"]
-_HIDDEN = {"/tmp": _X11, "/var/tmp": [], "/dev/shm": [], "/mnt": [], "/media": [],  # noqa: S108 - paths in the emulated filesystem
+_HIDDEN = {"/tmp": _X11, "/var/tmp": [], "/dev/shm": [], "/mnt": [], "/media": [],
            "/opt": [], "/srv": []}
 
 
@@ -3741,7 +3741,7 @@ def _stat(sh: Shell, path: str) -> Optional[tuple]:
                 sh.session.dirs[path])
     if posixpath.basename(path).startswith(_PRIVATE_DIRS):
         return ("drwx------", 3, "root", 4096, boot + 40)
-    if posixpath.basename(path) in _X11 and posixpath.dirname(path) == "/tmp":  # noqa: S108 - paths in the emulated filesystem
+    if posixpath.basename(path) in _X11 and posixpath.dirname(path) == "/tmp":
         return ("drwxrwxrwt", 2, "root", 4096, boot + 30)
     dirs = _dirs(sh)
     if path not in dirs and path not in _SYSTEM_DIRS:

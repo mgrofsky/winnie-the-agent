@@ -556,7 +556,7 @@ class LikePattern:
             return len(v) == self.first.length and self.first.at(v, 0)
         if self.min_len > len(v) or not self.first.at(v, 0):
             return False
-        assert self.last is not None  # noqa: S101 - narrows the type; set above
+        assert self.last is not None
         tail = len(v) - self.last.length
         if not self.last.at(v, tail):
             return False

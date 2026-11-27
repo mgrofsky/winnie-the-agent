@@ -474,7 +474,7 @@ class FtpSession:
 
     async def post_login(self, cmd: str, arg: str) -> None:
         tree = self.tree
-        assert tree is not None  # noqa: S101 - narrows the type; set above
+        assert tree is not None
         if cmd in ("PWD", "XPWD"):
             await self.reply(f'257 "{self.cwd}" is the current directory')
         elif cmd in ("CWD", "XCWD"):
@@ -607,7 +607,7 @@ class FtpSession:
         if cmd == "EPSV":
             await self.reply(f"229 Entering Extended Passive Mode (|||{port}|)")
             return
-        assert host is not None  # noqa: S101 - narrows the type; set above
+        assert host is not None
         h = host.replace(".", ",")
         await self.reply(f"227 Entering Passive Mode ({h},{port // 256},{port % 256}).")
 
@@ -625,7 +625,7 @@ class FtpSession:
 
     async def rmd(self, arg: str) -> None:
         tree = self.tree
-        assert tree is not None  # noqa: S101 - narrows the type; set above
+        assert tree is not None
         p = self.path(arg)
         name = arg[:200] or p
         pro = self.family == "proftpd"
@@ -710,7 +710,7 @@ class FtpSession:
         elif sub == "CHMOD":
             target = rest.partition(" ")[2].strip()
             tree = self.tree
-            assert tree is not None  # noqa: S101 - narrows the type; set above
+            assert tree is not None
             if not target:
                 await self.reply("501 SITE CHMOD needs 2 arguments.")
             elif self.path(target) in tree.files or self.path(target) in tree.dirs:
@@ -729,7 +729,7 @@ class FtpSession:
     async def proftpd_site(self, sub: str, rest: str) -> None:
         """ProFTPD's core SITE subcommands: CHMOD (nothing changes), CHGRP and HELP."""
         tree = self.tree
-        assert tree is not None  # noqa: S101 - narrows the type; set above
+        assert tree is not None
         if sub == "HELP":
             await self.conn.write("214-The following SITE commands are recognized (* =>'s "
                                   "unimplemented)\r\n CHGRP   CHMOD   HELP    \r\n"
@@ -749,7 +749,7 @@ class FtpSession:
         args = [a for a in arg.split() if not a.startswith("-")]
         target = self.path(args[0]) if args else self.cwd
         tree = self.tree
-        assert tree is not None  # noqa: S101 - narrows the type; set above
+        assert tree is not None
         if target in tree.files:
             entries = [(posixpath.basename(target), False, tree.files[target])]
         elif target in tree.dirs:
@@ -782,7 +782,7 @@ class FtpSession:
     async def retr(self, arg: str) -> None:
         p = self.path(arg)
         tree = self.tree
-        assert tree is not None  # noqa: S101 - narrows the type; set above
+        assert tree is not None
         entry = tree.files.get(p)
         if entry is None:
             await self.reply("550 Failed to open file.")
@@ -895,7 +895,7 @@ class FtpSession:
             await self.reply("552 Requested file action aborted. Exceeded storage allocation.")
             return
         self.conn.emit("command", "FTP upload", username=self.user, data=fields)
-        assert self.tree is not None  # noqa: S101 - narrows the type; set above
+        assert self.tree is not None
         self.tree.add_file(p, Entry(bytes(keep) if keep is not None else None, size,
                                     DEFAULT_MTIME, uploaded=True))
         await self.reply("226 Transfer complete.")
