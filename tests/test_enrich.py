@@ -304,8 +304,8 @@ def test_points_are_cached_and_bounded(tmp_path):
         assert geo.point("8.8.8.8") == (1.3, 2.2)
     assert readers[0].calls == 1
     geo.point("8.8.4.4")
-    geo.point("9.9.9.9")
-    assert len(geo._points) == 2
+    geo.point("1.1.1.1")
+    assert len(geo._points) == 2 and "8.8.8.8" not in geo._points
 
 
 def test_config_paths_and_attribution(tmp_path, caplog):
