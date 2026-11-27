@@ -19,6 +19,11 @@ On top of that SSH honeypot this project adds:
 - **Scenarios**: one TOML file describes the whole fake target (organisation, host, users,
   services, banners, accounts, fake data, HTTP pages and APIs, honeytokens), so every
   protocol on a sensor tells the same story. Seven scenarios ship with the project.
+- **Web deception**: decoy JavaScript bundles, source maps, runtime config and OpenAPI
+  documents that show a scenario's API, per-source values that show when something served
+  comes back, and safe account flows. Triage keeps each HTTP campaign's request sequence
+  and matches it against indicator lists and behaviour rules kept in data files, shown
+  beside the judgement and never feeding it. See [docs/web-deception.md](docs/web-deception.md).
 - **Budgets**: every model call first reserves its estimated tokens against per-session,
   per-source and daily token budgets, with concurrency limits, all enforced in code. They
   are estimates, not provider billing, and calls in flight can pass a limit by the
@@ -281,7 +286,8 @@ or go into detail:
 Every organisation, person, phone number, card number and domain in them is invented, and a
 checker enforces that (`uv run python -m scenarios.check`). The SSH honeypot is available
 in every scenario. See [docs/scenarios.md](docs/scenarios.md) for the schema and how to
-add one.
+add one, and [docs/web-deception.md](docs/web-deception.md) for the decoy assets, lures and
+flows `dev_portal` uses.
 
 The bait is per sensor. The organisation name and domain, host names, internal networks,
 people, passwords, password hashes, keys, tokens and session ids in the bundled scenarios

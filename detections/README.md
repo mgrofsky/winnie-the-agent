@@ -84,7 +84,8 @@ kind's thresholds:
 behaviour matches appear on the triage record, in the digest and in the console, and
 playbooks can use them (`behaviours_any`, `indicator_confidence_at_least`; see
 [docs/playbooks.md](../docs/playbooks.md#conditions)). They never change a record's
-judgement and never put a source in `blocklist-candidates.csv`.
+judgement and never put a source in `blocklist-candidates.csv`. The shipped entries and
+rules, with an example record, are in [docs/web-deception.md](../docs/web-deception.md).
 
 ## Promoting a draft
 

@@ -91,7 +91,8 @@ Behaviour and indicator matches are pattern and list matches, not proof. A playb
 refused when an enforce step's only conditions, in `[when]` and the step's `only_if`
 together, are `behaviours_any` and `indicator_confidence_at_least`; `kinds`, `protocols`
 and `scenarios` only scope a playbook and do not count. Add a condition such as
-`judgement_at_least` or `honeytoken` to such a step.
+`judgement_at_least` or `honeytoken` to such a step. [web-deception.md](web-deception.md)
+shows the matches these conditions read.
 
 ## Actions and tiers
 

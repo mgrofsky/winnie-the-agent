@@ -40,6 +40,11 @@ provider, and a malicious operator.
   generated filler; object keys are only looked up in memory and never become file paths.
 - Uploaded files (FTP `STOR`, S3 `PutObject` and `UploadPart`) go to a capped quarantine (stored once per SHA-256, mode 0600) and are
   never read back, parsed or executed.
+- The HTTP trap's account flows answer with fixed local replies: a username check says
+  whether the name is one of the scenario's accounts, a recovery request gets the same
+  reply for every address and sends no mail, and every reset or activation token is
+  invalid or expired. No flow makes a credential valid or issues a session
+  ([web-deception.md](web-deception.md#safety)).
 
 ### Front-ends do not connect out
 
@@ -97,6 +102,11 @@ line and appears in the daily digest.
   cap or a quota, with `aws-chunked` framing overhead capped; a download sends at most the
   scenario's `get_max_bytes` and a connection at most 64 MB; listings return at most 1,000
   keys per page; per-source upload and delete state is bounded and expires after an hour.
+- HTTP web-deception state (routes shown, per-source markers issued, object IDs asked) is
+  in memory and expires a day after a source's last request: request counters for up to
+  65,536 sources, the rest for up to 8,192 sources, 200 IDs per route and 400,000 in all.
+  Marker recognition reads at most the first 16,384 characters of each request field, in
+  linear time.
 - No regular expression or `fnmatch` runs on attacker-supplied patterns; Redis globs and SQL
   `LIKE` use linear-time matchers. A test feeds every listener long runs of its protocol's
   special characters under a time bound.
@@ -528,7 +538,11 @@ scenarios can still match:
 Planted tokens (honeytokens and per-source pairs) carry no fixed marker. Each has the length
 and alphabet of the real format and is derived from the seed; the sensor recognises one by
 looking it up in an index of every value it can have issued, not by its shape, so a reader
-of the source has nothing to search for.
+of the source has nothing to search for. Per-source HTTP markers (`{marker:NAME}` in a
+scenario) work the same way: each value is derived from the seed, the scenario, the source
+and the name, in a plain format its name suggests (a short hex hash, a UUID, a 32-character
+key, or 20 lowercase letters and digits), and is recognised by lookup of what the listener
+issued.
 
 **AWS-style access key ids.** A planted key id is `AKIA` and 16 characters of `A-Z2-7`,
 which is the shape real key ids have. There is no shape-based guarantee that such an id was
