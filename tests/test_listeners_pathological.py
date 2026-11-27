@@ -116,6 +116,40 @@ async def test_listener_survives_pathological_input(name, tmp_path):
                    for e in ctx.writer.events)
 
 
+# Lines for the Telnet trap's canned shell (``agents.shell``): ( ) groups and sh -c scripts.
+SHELL_LINES = [
+    _line(b"", b"(" * 3900),
+    _line(b"", b"( " * 1000 + b"echo a" + b" )" * 1000),
+    _line(b"", b"(echo a);" * 430),
+    _line(b"", b"(busybox X; echo a) >/tmp/x;" * 140),
+    _line(b"sh -c '", b"f() { f; }; f; " * 60 + b"'"),
+    _line(b"sh -c 'echo $((", b"(" * 600 + b"1" + b")" * 600 + b"))'"),
+    _line(b"sh -c 'echo $((", b"1*" * 120 + b"1))'"),
+    _line(b"sh -c 'printf %s", b" a" * 60 + b"'"),
+    _line(b"sh -c '", b"g() { :; :; :; :; :; :; :; :; }; h() { g; g; g; g; g; g; g; g; }; "
+          + b"h; " * 20 + b"'"),
+    _line(b"sh -c 'set -- ", b"a " * 60 + b"; echo \"$#|$1|$$\"'"),
+    _line(b"", b"sh -c 'echo $$';" * 200),
+    _line(b"echo ", b"\\" * 3900),
+    _line(b"echo \"", b"\\\"" * 1900 + b"\""),
+    _line(b"sh -c 'printf \"%s", b"\\\\" * 1000 + b"\" a'"),
+]
+
+
+async def test_telnet_canned_shell_survives_pathological_lines(tmp_path):
+    ctx, servers, port = await _start("telnet", tmp_path)
+    try:
+        result = await hammer(port, SHELL_LINES, preamble=[b"root\r\n", b"root\r\n"])
+    finally:
+        for s in servers:
+            s.close()
+    assert result.worst_payload_seconds < PAYLOAD_BOUND, result
+    assert result.worst_probe_seconds < PROBE_BOUND, result
+    assert not any(e["event"] == "error" for e in ctx.writer.events)
+    # each line reached the shell after the login
+    assert sum(e["event"] == "command" for e in ctx.writer.events) >= len(SHELL_LINES)
+
+
 SQL_STATEMENTS = [
     "SELECT * FROM users WHERE email LIKE '" + "%" * 50 + "!'",
     "SHOW VARIABLES LIKE '" + "%" * 50 + "!'",

