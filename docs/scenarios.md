@@ -277,6 +277,8 @@ Service-specific keys:
     `recovery_reset` and `activation` (every token is invalid or expired). A flow route
     has no other content source.
   - Item routes with a `lure` log `object_id_count`, the distinct IDs this source asked.
+  - [web-deception.md](web-deception.md) walks through a visitor to `dev_portal` and the
+    triage record it produces.
 - **`mllp`**: `sending_facility`.
 - **`s3`**: `server_header`, `region`, `owner_name`, `get_max_bytes` (bytes one download
   sends, at most 16 MB) and `[[services.s3.buckets]]` with `name`, `region`, `created`,
