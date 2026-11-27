@@ -214,12 +214,34 @@ def test_an_answer_naming_an_address_from_the_replies_is_not_stored(tmp_path):
     assert len(llm.calls) == 2
 
 
-def test_an_answer_naming_a_tried_password_is_not_stored(tmp_path):
-    llm = FakeJsonLLM(dict(ANSWER, assessment=["Logged in with toor."]))
+def test_credentials_the_model_never_saw_do_not_block_storing(tmp_path):
+    llm = FakeJsonLLM(answer(PW1, HEX1, assessment=["Logged in as root with a password."]))
     store = _store(tmp_path)
-    ss = _sessions(tmp_path, ssh_session("session-1", "203.0.113.10", script(PW1, HEX1)))
-    triage_session(ss["session-1"], llm, {}, store=store)
-    assert store.entries == {}
+    ss = _sessions(tmp_path, ssh_session("session-1", "203.0.113.10", script(PW1, HEX1),
+                                         password="root")
+                   + ssh_session("session-2", "198.51.100.20", script(PW1, HEX1), start=5,
+                                 password="password"))
+    first = triage_session(ss["session-1"], llm, {}, store=store)
+    second = triage_session(ss["session-2"], llm, {}, store=store)
+    assert len(llm.calls) == 1 and first.analysis_key and second.analysis_reused
+
+
+@pytest.mark.parametrize("src, text", [
+    ("2001:db8:1:2::/64", "A bot in 2001:db8:1:2."),
+    ("2001:db8:1:2::/64", "A bot at 2001:db8:1:2::9."),
+    ("203.0.113.10", "A bot at 203[.]0[.]113[.]10."),
+    ("203.0.113.10", "Reported 198.51.100.77 (dot) style: 198(.)51(.)100(.)77."),
+    ("203.0.113.10", "Talked to 2001:db8:ffff::1 after login."),
+])
+def test_an_answer_naming_an_address_in_another_spelling_is_not_stored(src, text):
+    keyed = analyses.make_key("session", "ssh", "p", {}, ['{"cmd": "uname -a"}'])
+    out = {k: v for k, v in PLAIN.items()} | {"techniques": [], "assessment": [text],
+                                               "not_seen": [], "narrative": ""}
+    assert analyses.storable(out, keyed, src_ips=[src, "2001:db8:1:2::9"], username=None,
+                             ioc_values=triage._ioc_values) is None
+    clean = out | {"assessment": ["A bot ran uname at 12:30:45."]}
+    assert analyses.storable(clean, keyed, src_ips=[src], username=None,
+                             ioc_values=triage._ioc_values) is not None
 
 
 def test_two_tokens_in_one_text_are_not_stored(tmp_path):
@@ -319,7 +341,7 @@ def test_entries_are_bounded_and_least_recently_used_go_first(tmp_path, monkeypa
     for i, cmd in enumerate(["a", "b", "c"]):
         keyed = analyses.make_key("session", "ssh", "p", {}, [cmd])
         stored = analyses.storable(dict(ANSWER, headline=cmd, actions=[], extra_iocs=None) | {
-            "narrative": ""}, keyed, src_ips=[], secrets=[], username=None,
+            "narrative": ""}, keyed, src_ips=[], username=None,
             ioc_values=lambda t: [])
         clock.t += 1
         assert store.put(keyed, *stored)
@@ -331,7 +353,7 @@ def test_entries_are_bounded_and_least_recently_used_go_first(tmp_path, monkeypa
     assert not store.put(keyed, *analyses.storable(
         {k: v for k, v in ANSWER.items() if k != "extra_iocs"} | {"narrative": "x" * 200,
                                                                   "actions": []},
-        keyed, src_ips=[], secrets=[], username=None, ioc_values=lambda t: []))
+        keyed, src_ips=[], username=None, ioc_values=lambda t: []))
 
 
 def test_settings_defaults_and_bounds():
@@ -361,6 +383,22 @@ def test_digest_counts_reused_analyses(tmp_path):
     _, reports = _run(tmp_path, _two_sessions(), FakeJsonLLM(ANSWER), _store(tmp_path))
     text = digest(reports, day=T0.date().isoformat(), dry_run=True)
     assert "LLM-triaged: 2." in text and "Analyses reused: 1 " in text
+
+
+def test_the_triage_command_builds_the_store_only_when_on_and_with_a_model(tmp_path):
+    from configparser import ConfigParser
+
+    from agents.__main__ import _analyses_store
+
+    cp = ConfigParser()
+    store = _analyses_store(cp, tmp_path, object())
+    assert isinstance(store, AnalysisStore) and store.path == tmp_path / analyses.FILE_NAME
+    assert _analyses_store(cp, tmp_path, None) is None
+    cp.read_string("[agents]\nanalysis_reuse = false\n")
+    assert _analyses_store(cp, tmp_path, object()) is None
+    cp["agents"]["analysis_reuse"] = "true"
+    cp["agents"]["analysis_reuse_days"] = "-1"
+    assert _analyses_store(cp, tmp_path, object()) is None
 
 
 def _cli(tmp_path, *extra):

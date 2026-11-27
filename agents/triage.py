@@ -756,13 +756,13 @@ def _ioc_values(text: str) -> list[str]:
 
 
 def _keep(store: Optional[AnalysisStore], keyed: Optional[Keyed], out: TriageModelOutput, *,
-          src_ips: Iterable[str], secrets: Iterable[str], username: Optional[str]) -> bool:
+          src_ips: Iterable[str], username: Optional[str]) -> bool:
     """Store a fresh model answer for reuse when it can be reused (``analyses.storable``).
     Model-suggested IOCs are never stored."""
     if store is None or keyed is None:
         return False
     value = analyses.storable(out.model_dump(mode="json", exclude={"extra_iocs"}), keyed,
-                              src_ips=src_ips, secrets=secrets, username=username,
+                              src_ips=src_ips, username=username,
                               ioc_values=_ioc_values)
     if value is None:
         log.info("model answer for %s not stored: it names something specific to its source",
@@ -1345,10 +1345,7 @@ def triage_session(s: Session, llm: Optional[JsonLLM],
     else:
         out = _ask_model(llm, "SSH session transcript", _transcript_session(s)) if llm else None
         if out is not None and found is not None:
-            kept = _keep(store, found.keyed, out, src_ips=[s.src_ip],
-                         secrets=[a.password for a in s.auth_attempts]
-                         + [a.username for a in s.auth_attempts if a.username != s.username],
-                         username=s.username)
+            kept = _keep(store, found.keyed, out, src_ips=[s.src_ip], username=s.username)
     if out is None and llm is not None and not (signals or tokens):
         return None
     transcript = "\n".join(commands)
@@ -1440,7 +1437,7 @@ def triage_campaign(c: Campaign, llm: Optional[JsonLLM], honeytoken_values: dict
             return det, True
         if found is not None:
             kept = _keep(store, found.keyed, out, src_ips=[c.src_ip, *c.addresses],
-                         secrets=list(c.usernames) + list(c.passwords), username=None)
+                         username=None)
     mark = {"llm_used": not reused, "analysis_reused": reused,
             "analysis_key": found.keyed.short if (reused or kept) and found.keyed else ""}
     if narrative_only:

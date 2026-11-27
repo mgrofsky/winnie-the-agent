@@ -15,8 +15,8 @@ with the same key gets the stored answer and no model call.
 - The value is the model's classification and narrative parts with each token value
   replaced by its placeholder; serving fills them with the new item's tokens. An answer
   is stored only when every specific string in it is a placeholder or appears literally
-  in the keyed lines: text naming the source address, a password tried, or an IOC that
-  is neither, is not stored. Text naming the session's username is stored bound to that
+  in the keyed lines: text naming the source address (also defanged, or a network's
+  prefix), or an address or other IOC that is neither, is not stored. Text naming the session's username is stored bound to that
   username and served only to sessions that logged in with it. Model-suggested IOCs are
   never stored; a record's IOCs come from its own commands.
 - An entry expires ``days`` after it was stored and, with ``max_uses``, after that many
@@ -70,7 +70,6 @@ JUDGEMENTS = ("BENIGN", "SUSPICIOUS", "MALICIOUS")   # lowest first
 _KEY = re.compile(r"^[0-9a-f]{64}$")
 _SHORT = re.compile(r"^[0-9a-f]{16}$")
 _WORD = r"(?<![A-Za-z0-9_]){}(?![A-Za-z0-9_])"
-FORBIDDEN_MIN = 3             # shorter credential strings are not checked for in text
 
 
 def short_id(key: str) -> str:
@@ -200,39 +199,63 @@ def _map_texts(out: dict, one: Callable[[str], Optional[str]]) -> Optional[dict]
     return new
 
 
-def _contains(text: str, value: str) -> bool:
-    return value.lower() in text.lower()
+_DEFANG = (("[.]", "."), ("(.)", "."), ("[dot]", "."), ("(dot)", "."), ("[:]", ":"))
+_IPV6_RUN = re.compile(r"[0-9A-Fa-f:]*:[0-9A-Fa-f:]*:[0-9A-Fa-f:]*")
 
 
-def _names(text: str, value: str) -> bool:
-    """``value`` appears in ``text`` as a whole word, case as given."""
-    return re.search(_WORD.format(re.escape(value)), text) is not None
+def _refanged(text: str) -> str:
+    """``text`` with defanged dots and colons (``[.]``, ``(dot)``, ``[:]``) restored."""
+    low = text.lower()
+    for old, new in _DEFANG:
+        low = low.replace(old, new)
+    return low
 
 
-def storable(out: dict, keyed: Keyed, *, src_ips: Iterable[str], secrets: Iterable[str],
-             username: Optional[str], ioc_values: Callable[[str], list[str]]
-             ) -> Optional[tuple[dict, str]]:
+def _source_forms(src_ips: Iterable[str]) -> list[str]:
+    """Each source address, and for a network (``2001:db8:1:2::/64``) its prefix without
+    the length and without the trailing colons, lower case."""
+    forms: list[str] = []
+    for value in src_ips:
+        value = (value or "").strip().lower()
+        if not value:
+            continue
+        forms.append(value)
+        if "/" in value:
+            base = value.split("/", 1)[0]
+            forms += [base, base.rstrip(":")]
+    return [f for f in forms if f]
+
+
+def _ipv6_runs(text: str) -> list[str]:
+    """Runs of hex digits and colons in ``text`` shaped like an IPv6 address or prefix:
+    three or more colons, or a ``::``."""
+    return [m.group(0).strip(":") or m.group(0) for m in _IPV6_RUN.finditer(text)
+            if m.group(0).count(":") >= 3 or "::" in m.group(0)]
+
+
+def storable(out: dict, keyed: Keyed, *, src_ips: Iterable[str], username: Optional[str],
+             ioc_values: Callable[[str], list[str]]) -> Optional[tuple[dict, str]]:
     """The model answer ``out`` (a validated ``TriageModelOutput`` dump) as a stored value,
     and the digest of the username it is bound to ("" for none); None when it cannot be
     reused for another item.
 
-    Refused when any text names a source address in ``src_ips``; names a string in
-    ``secrets`` (passwords, other usernames; whole word, case as given) that the keyed
-    lines do not hold literally;
-    holds an IOC (``ioc_values``) that is neither a token of this item nor literal in the
-    keyed lines; or fails ``learned.reply_template`` (a trace of a token that is not its
-    verbatim value, two different tokens in one text, another random-looking token)."""
-    keyed_text = keyed.text
-    src = [s for s in src_ips if s]
-    forbidden = [s for s in secrets if s and len(s) >= FORBIDDEN_MIN]
+    Every text is read with defanged dots and colons restored. Refused when any text names
+    a source address in ``src_ips`` (or a network's prefix); holds an IPv6-shaped run or an
+    IOC (``ioc_values``) that is neither a token of this item nor literal in the keyed
+    lines; or fails ``learned.reply_template`` (a trace of a token that is not its
+    verbatim value, two different tokens in one text, another random-looking token).
+    Text naming ``username`` as a word binds the value to that username."""
+    keyed_text = keyed.text.lower()
+    tokens = {v.lower() for v in keyed.values}
+    sources = _source_forms(src_ips)
     bound = ""
     for text in _texts(out):
-        if any(_contains(text, s) for s in src):
+        plain = _refanged(text)
+        if any(f in plain for f in sources):
             return None
-        if any(_names(text, s) and s not in keyed_text for s in forbidden):
-            return None
-        for value in ioc_values(text):
-            if value not in keyed.values and not _contains(keyed_text, value):
+        for value in [*_ipv6_runs(plain), *ioc_values(plain)]:
+            value = value.lower()
+            if value not in tokens and value not in keyed_text:
                 return None
         if username and re.search(_WORD.format(re.escape(username)), text, re.I):
             bound = _sha("user\x00" + username)
