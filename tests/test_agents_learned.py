@@ -126,7 +126,9 @@ def test_fill_substitutes_and_refuses_unknown_placeholders():
     ("find /tmp -type f", False), ("find /tmp -type f -delete", True),
     ("find / -name x -exec rm {} \\;", True), ("sudo find /tmp -delete", True),
     ("sort /etc/passwd", False), ("sort -o /tmp/s /etc/passwd", True), ("date", False),
-    ("date -s 2020-01-01", True),
+    ("date -s 2020-01-01", True), ("env /usr/bin/unlink /tmp/marker", True),
+    ("timeout 5 /opt/tool/run", True), ("sudo /bin/cat /etc/issue", False),
+    ("unlink /tmp/marker", True), ("env A=1 id", True), ("nice -n 5 uname -a", False),
 ])
 def test_may_change_state(line, changes):
     assert learned.may_change_state(line) is changes

@@ -324,6 +324,7 @@ def _clean(text: str) -> bool:
 # Programs that can change what a later command prints (files, users, the environment, the
 # working directory, processes, packages) or run other code.
 WRITERS = frozenset((
+    "unlink", "mkfifo", "mknod",
     "cd", "pushd", "popd", "export", "unset", "set", "alias", "unalias", "source", ".",
     "eval", "exec", "touch", "mkdir", "rmdir", "rm", "mv", "cp", "ln", "install", "chmod",
     "chown", "chgrp", "chattr", "truncate", "shred", "tee", "dd", "sed", "awk", "perl",
@@ -387,6 +388,11 @@ def may_change_state(text: str) -> bool:
         if name in _WRAPPERS:
             # ``sudo -u root rm x``, ``busybox wget``: any later word may be the program.
             if any(w.rpartition("/")[2] in WRITERS for w in words[1:]):
+                return True
+            # The program it runs: the first later word that is not an option or a number.
+            run = next((w for w in words[1:] if w and not w.startswith("-")
+                        and not w.replace(".", "").isdigit()), "")
+            if _ASSIGN.match(run) or ("/" in run and run.rpartition("/")[2] not in _READERS):
                 return True
             continue
         if name in WRITERS:
