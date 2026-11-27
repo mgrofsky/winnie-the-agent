@@ -1326,8 +1326,8 @@ map_label = edge-1
 ```
 
 A `map_home` that is not two numbers in range stops the console at start with an error.
-Without it, the sensor is drawn at sea in the South Atlantic, labelled with
-`[honeypot] sensor_name`.
+Without a configured position the sensor is shown at the lower right. The investigation
+view uses `map_label` or, by default, `[honeypot] sensor_name`.
 
 The console refuses to bind anything but a loopback address unless given
 `--allow-non-loopback`. The Docker service uses it because the container binds 0.0.0.0
@@ -1480,6 +1480,17 @@ rules, which live in the tailnet's admin console):
   token stops being a second check. Use it only when the access rules name exactly the
   people who should sign in.
 
+### Overview
+
+Overview shows the approval queue, recent triage records and pipeline health. While the
+tab is visible, the console checks for updates about every five seconds. The update
+indicator shows when the last request succeeded. A quiet sensor can still be up to date.
+
+The 24-hour and 7-day controls apply to triage records. The small map beside them shows
+the last 15 minutes of raw events, including traffic that has yet to be triaged. Open it
+to investigate a source or put the map on a shared screen. The navigation button in the
+header expands the section names or collapses the sidebar to icons.
+
 ### Activity
 
 The Activity screen (key `7`) lists every line of the event log, newest first: time,
@@ -1567,32 +1578,25 @@ before: it gathers commands from many connections and has no single sequence to 
 
 ### Map
 
-The Map screen (key `8`) draws the last 5 minutes, 15 minutes or hour of the event log on
-a world map. Each source is a dot at its city's position, sized by how many events it
-sent in the window and coloured by its newest triage judgement (grey until triage has
-written a record for it). The sensor is a honey pot ringed by one dock per service that
-received traffic, labelled with the service and its port, and each new event is a bee
-flying from its source to the dock of the service it reached. Beside the map, a feed
-lists the same events as text: time, service and port, event, outcome, place, source and
-a one-line summary. The tiles above count events, events per minute, the top countries
-and services, and the bees in flight.
+The Map screen (key `8`) shows the last 5 minutes, 15 minutes or hour of the event log.
+A source marker shows its latest triage judgement. Coral triangles are malicious, amber
+diamonds suspicious, and mint circles benign. A neutral marker means the source is
+untriaged. Brightness shows how recently the sensor heard from that source. Older markers
+fade within the selected window. The feed gives event times and service names in text.
 
-- Hover or focus a dot or a feed row to highlight the other; click either (or press Enter
-  on a row) to open Activity filtered to that source.
-- Pause freezes the map and holds new events until you resume. Hide addresses leaves only
-  places on screen, for screenshots. The service buttons under the map hide a service's
-  bees and feed rows.
-- The screen asks for new events every 5 seconds and releases them at their original
-  spacing, so motion stays continuous. At most 60 bees fly at once; beyond that, events
-  from the same source and service share a bee with a count. When more than 300 events
-  arrive between two polls, the map draws the newest 300 and the counts include the rest.
-- With reduced motion set in the operating system, sources light up in place instead of
-  sending bees, and the feed updates as usual.
-- Positions need a City database ([Where addresses are](#where-addresses-are)). Without
-  one, or for private, documentation and unverified addresses, sources arrive from the
-  "Unlocated" lane at the map's lower left and are still listed in the feed. Positions are
-  city level and approximate, and show the exit of any VPN or proxy.
-- When the event log is rotated, the map reloads from the current log.
+- Select a source to inspect it, then open its Activity history. You can also open a feed
+  row with the keyboard. Service filters apply to the event feed and moving dots. Source
+  markers summarize every service seen in the selected window.
+- **Pause motion** stops the animation while the feed continues receiving events. The map
+  respects the operating system's reduced-motion preference.
+- **Display mode** gives the map and recent activity the full browser window. Addresses
+  are hidden when you enter. Use **Exit display** to return to the investigation view.
+- The map checks for events about every five seconds. If more than 300 arrive between
+  requests, the map draws the newest 300 and the counts include the rest. When the event
+  log rotates, the map reloads from the current log.
+- Geographic positions require a City database ([Where addresses are](#where-addresses-are)).
+  Locations are approximate and may identify the exit of a VPN or proxy. Events without
+  a usable location still appear in the feed.
 
 The land outline is from Natural Earth (public domain).
 

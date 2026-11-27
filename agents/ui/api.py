@@ -128,6 +128,7 @@ SHIP_TAIL_BYTES = 64 * 1024
 SHIP_TAIL_EVENTS = 10
 TOP_SOURCES = 10
 HONEYTOKEN_HITS = 20
+OVERVIEW_INCIDENTS = 5
 TUNER_RECORDS = 20
 MAX_TUNER_FILE = 1024 * 1024
 MAX_JSON_FILE = 16 * 1024 * 1024
@@ -1016,7 +1017,14 @@ class Api:
             seen = worst.get(r.src_ip)
             if seen is None or JUDGEMENT_RANK[r.judgement] > JUDGEMENT_RANK[seen]:
                 worst[r.src_ip] = r.judgement
-        hits = [_summary(self._shown(r)) for r in inside if r.honeytokens][:HONEYTOKEN_HITS]
+        matches = [r for r in inside if r.honeytokens]
+        hits = [_summary(self._shown(r)) for r in matches[:HONEYTOKEN_HITS]]
+        mask = self._masker()
+        recent = [{"id": r.id if RECORD_ID_RE.fullmatch(r.id) and mask(r.id) == r.id else None,
+                   "time": recs.stamps[r.id].isoformat(timespec="seconds"),
+                   "judgement": r.judgement.value, "src_ip": mask(r.src_ip),
+                   "protocol": mask(r.protocol), "summary": mask(r.headline or r.narrative)[:300]}
+                  for r in inside[:OVERVIEW_INCIDENTS]]
         pending = [a.raw for a in self._queue_now() if a.status_at(now) == "pending"]
         expiries = sorted(str(a.get("expires_at", "")) for a in pending if a.get("expires_at"))
         return 200, {
@@ -1031,6 +1039,8 @@ class Api:
                                                "worst": worst[ip].value}, self._where(ip)),
                                       self._known(ip))
                             for ip, n in sources.most_common(TOP_SOURCES)],
+            "recent_incidents": recent,
+            "honeytoken_records": len(matches),
             "honeytoken_hits": hits,
             "approvals": {"pending": len(pending),
                           "soonest_expiry": expiries[0] if expiries else None},

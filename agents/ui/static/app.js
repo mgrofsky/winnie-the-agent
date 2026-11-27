@@ -18,6 +18,7 @@
   // ---- constants ------------------------------------------------------------------------
 
   const POLL_MS = 30000;
+  const LIVE_POLL_MS = 5000;
   const LOADING_DELAY_MS = 250;
   const REVEAL_MS = 60000;
   const STALE_WARN_HOURS = 6;
@@ -337,6 +338,8 @@
       init.headers["X-Winnie-CSRF"] = state.session ? str(state.session.csrf) : "";
       init.body = JSON.stringify(body);
     }
+    const liveRead = method === "GET" && (path === API.overview || path === API.map);
+    if (liveRead) init.signal = AbortSignal.timeout(20000);
     let resp;
     try {
       resp = await fetch(url, init);
@@ -356,6 +359,13 @@
     if (!resp.ok) {
       const message = data && typeof data.error === "string" ? data.error : "HTTP " + resp.status;
       throw new ApiError(resp.status, message);
+    }
+    if (liveRead) {
+      const count = path === API.overview ? data?.totals?.records : data?.totals?.events;
+      if (!Number.isSafeInteger(count) || count < 0 ||
+          (path === API.map && (!Array.isArray(data.items) || !Array.isArray(data.sources)))) {
+        throw new ApiError(0, "The console returned an incomplete update.");
+      }
     }
     return data;
   }
@@ -673,17 +683,52 @@
   // ---- shell: header, router, polling ---------------------------------------------------
 
   function buildShell() {
-    const nav = el("nav", { cls: "nav", attrs: { "aria-label": "Sections" } });
-    SECTIONS.forEach((sec, i) => {
-      const a = link(sec.hash, sec.label);
-      a.setAttribute("aria-keyshortcuts", String(i + 1));
-      if (sec.key === "queue") {
-        shell.badge = el("span", { cls: "nav-badge" });
-        shell.badge.hidden = true;
-        a.append(shell.badge);
+    const icons = document.getElementById("console-icons").content;
+    const icon = (name) => icons.querySelector('[data-icon="' + name + '"]').cloneNode(true);
+    const nav = el("nav", { cls: "nav sidebar", attrs: { id: "console-navigation", "aria-label": "Sections" } });
+    const groups = [
+      ["Monitor", ["overview", "activity", "map"]],
+      ["Investigate", ["records", "digests"]],
+      ["Respond", ["queue", "playbooks"]],
+      ["System", ["decoy"]],
+    ];
+    for (const [name, keys] of groups) {
+      const group = el("div", { cls: "nav-group", attrs: { role: "group", "aria-label": name } },
+        el("span", { cls: "nav-group-label", text: name, attrs: { "aria-hidden": "true" } }));
+      for (const key of keys) {
+        const i = SECTIONS.findIndex((section) => section.key === key);
+        const sec = SECTIONS[i];
+        const a = link(sec.hash, icon(key), el("span", { cls: "nav-label", text: sec.label }));
+        a.setAttribute("title", sec.label);
+        a.setAttribute("aria-label", sec.label);
+        a.setAttribute("aria-keyshortcuts", String(i + 1));
+        if (key === "queue") {
+          shell.badge = el("span", { cls: "nav-badge" });
+          shell.badge.hidden = true;
+          a.append(shell.badge);
+        }
+        shell.links[key] = a;
+        group.append(a);
       }
-      shell.links[sec.key] = a;
-      nav.append(a);
+      nav.append(group);
+    }
+
+    const narrow = window.matchMedia("(max-width: 760px)");
+    const toggle = button("", () => setCollapsed(!document.body.classList.contains("nav-collapsed")),
+      "nav-toggle");
+    toggle.append(icon("sidebar"));
+    toggle.setAttribute("aria-controls", nav.id);
+    function setCollapsed(collapsed) {
+      document.body.classList.toggle("nav-collapsed", collapsed);
+      toggle.setAttribute("aria-expanded", String(!collapsed));
+      const label = collapsed ? "Expand navigation" : "Collapse navigation";
+      toggle.setAttribute("aria-label", label);
+      toggle.title = label;
+    }
+    setCollapsed(narrow.matches);
+    narrow.addEventListener("change", () => setCollapsed(narrow.matches));
+    nav.addEventListener("click", (event) => {
+      if (narrow.matches && event.target.closest("a")) setCollapsed(true);
     });
 
     const actions = state.session.actions === true;
@@ -695,15 +740,16 @@
     const refresh = button("Refresh", manualRefresh, "btn-small");
     refresh.setAttribute("aria-keyshortcuts", "r");
 
+    refresh.prepend(icon("refresh"));
     const header = el("header", "header",
-      el("div", "brand", "Winnie console"), nav,
+      el("div", "brand", "Winnie the Agent"), toggle,
       el("div", "header-right", shell.mode, who, shell.updated, refresh));
     shell.main = el("main", "main");
     const hint = el("div", { cls: "footer-hint",
       text: "Keys: 1-8 switch sections, r refreshes, / searches records or activity, Esc closes a confirmation." });
     // [geoip] attribution (free databases require credit), plain text.
     const credit = str(state.session.attribution);
-    document.body.replaceChildren(header, shell.main, el("div", "main", hint,
+    document.body.replaceChildren(header, nav, shell.main, el("footer", "console-footer", hint,
       credit ? el("div", { cls: "footer-hint", text: credit }) : null));
   }
 
@@ -780,11 +826,12 @@
     setNav(key);
     shell.main.replaceChildren();
     state.view = view(route, shell.main) || {};
+    startPolling();
     window.scrollTo(0, 0);
     refreshView("initial");
   }
 
-  // kind: "initial" (first draw of a screen), "poll" (background, every 30 s) or "manual"
+  // kind: "initial" (first draw of a screen), "poll" (background) or "manual"
   // (the Refresh control). Screens skip parts that would lose what the operator is doing.
   async function refreshView(kind) {
     const view = state.view;
@@ -796,16 +843,22 @@
     } catch (err) {
       console.error(err);
     }
-    if (gen === state.gen && !state.signedOut) markUpdated(ok !== false);
+    if (gen === state.gen && !state.signedOut && !view.managesStatus) markUpdated(ok !== false);
   }
 
   async function updatePendingBadge() {
+    if (state.view && state.view.handlesPending) return;
+    const gen = state.gen;
     try {
       const data = await apiGet(API.queue, { per: 1 });
-      state.pending = typeof data.total === "number" ? data.total : 0;
+      if (gen === state.gen && !state.signedOut) setPendingCount(typeof data.total === "number" ? data.total : 0);
     } catch (err) {
       return;
     }
+  }
+
+  function setPendingCount(count) {
+    state.pending = count;
     shell.badge.hidden = state.pending === 0;
     shell.badge.textContent = num(state.pending);
     shell.links.queue.setAttribute("aria-label",
@@ -828,7 +881,7 @@
 
   function startPolling() {
     stopPolling();
-    if (!document.hidden) state.pollTimer = setInterval(pollTick, POLL_MS);
+    if (!document.hidden) state.pollTimer = setInterval(pollTick, state.view?.pollMs || POLL_MS);
   }
 
   function stopPolling() {
@@ -839,6 +892,7 @@
   function showSignedOut() {
     if (state.signedOut) return;
     state.signedOut = true;
+    if (state.view && state.view.stop) state.view.stop();
     stopPolling();
     hideRevealed();
     document.title = "Signed out - Winnie console";
@@ -854,7 +908,8 @@
       closeConfirm();
       return;
     }
-    if (ev.ctrlKey || ev.metaKey || ev.altKey || state.signedOut || !shell.main) return;
+    if (ev.ctrlKey || ev.metaKey || ev.altKey || state.signedOut || !shell.main ||
+        document.body.classList.contains("map-display")) return;
     const target = ev.target;
     if (target instanceof Element && target.closest("input, select, textarea, button, [contenteditable]")) return;
     if (ev.key === "r") {
@@ -894,7 +949,6 @@
     });
     render();
     updatePendingBadge();
-    startPolling();
   }
 
   // ---- screen: overview -----------------------------------------------------------------
@@ -902,78 +956,192 @@
   function viewOverview(route, main) {
     setTitle("Overview");
     const win = route.params.get("window") === "7d" ? "7d" : "24h";
+    const windowLabel = win === "7d" ? "last 7 days" : "last 24 hours";
     const toggle = segmented([["24h", "Last 24 hours"], ["7d", "Last 7 days"]], win, (value) => {
       location.hash = hashFor("/", value === "7d" ? { window: "7d" } : {});
     });
-    const body = el("div");
-    main.append(pageHead("Overview", toggle),
-      intro("What the sensor has seen lately and whether the pipeline is healthy. Start here."), body);
+    const preview = createMapPreview();
+    const note = el("div", "overview-note");
+    const queueLabel = el("strong", { cls: "overview-queue-label", text: "Pending approvals" });
+    const queueDetail = el("span", { cls: "overview-queue-detail" });
+    const queueLink = link("#/queue", "Open queue");
+    queueLink.classList.add("btn", "btn-small");
+    const queue = el("div", "overview-queue", el("div", null, queueLabel, queueDetail), queueLink);
+    const records = tile("Records, " + windowLabel, "—");
+    const honey = tile("Honeytoken use", "—");
+    const newest = tile("Newest record", "—");
+    const incidents = section("Recent incidents", { flush: true, extra: link("#/records", "View records →") });
+    const judgement = section("By judgement, " + windowLabel);
+    const protocol = section("By protocol, " + windowLabel);
+    const health = section("Pipeline health", { flush: true });
+    const urgentChecks = el("div");
+    const otherChecks = el("div");
+    const moreChecks = el("summary");
+    const healthMore = el("details", "overview-health-more", moreChecks, otherChecks);
+    healthMore.hidden = true;
+    health.body.append(urgentChecks, healthMore);
+    const sources = section("Top sources, " + windowLabel, { flush: true });
+    const hits = section("Honeytoken use", { flush: true });
+    const detail = el("div", "overview-body",
+      el("div", "overview-metrics", queue, records, honey, newest),
+      el("div", "overview-investigation", incidents.node, preview.node),
+      el("div", "overview-signals", judgement.node, protocol.node, health.node),
+      el("div", "overview-secondary", sources.node, hits.node));
+    main.append(el("div", "overview-page", pageHead("Overview", toggle),
+      intro("Live signal and response posture"), note, detail));
+
+    const recentTable = table(["Last seen", "Severity", "Source", "Service", "Summary"].map((label) => ({ label })), [], { short: true });
+    const sourceTable = table([{ label: "Source" }, { label: "Records", num: true }, { label: "Worst" }], [], { short: true });
+    const hitItems = el("ul", "hit-list");
+    const updateRecent = overviewList(incidents.body, recentTable, "No incidents in this window.", (r) => r.id,
+      (r) => el("tr", null, el("td", null, recordLink(r.id, timeNode(r.time))), el("td", null, judgementBadge(r.judgement)),
+        el("td", null, mono(r.src_ip)), el("td", null, mono(r.protocol)),
+        el("td", null, el("span", { cls: "clip clip-wide", text: str(r.summary) }))));
+    const updateSources = overviewList(sources.body, sourceTable, "No sources in this window.", (s) => s.src_ip,
+      (s) => el("tr", null, el("td", null, addressNode(s.src_ip, s.geo), shodanNode(s.shodan, { prefix: true })),
+        el("td", { cls: "num", text: num(s.records) }), el("td", null, judgementBadge(s.worst))));
+    const updateHits = overviewList(hits.body, hitItems, "No stored record used a honeytoken in this window.", (r) => r.id, hitItem);
+
+    function renderData(data) {
+      const totals = obj(data.totals), h = obj(data.health), approvals = obj(data.approvals);
+      const pending = Number(approvals.pending) || 0;
+      const matches = arr(data.honeytoken_hits);
+      queueLabel.textContent = plural(pending, "pending approval", "pending approvals");
+      queue.classList.toggle("tile-attention", pending > 0);
+      setKids(queueDetail, pending && approvals.soonest_expiry
+        ? ["Soonest expires ", timeNode(approvals.soonest_expiry)] : null);
+      setPendingCount(pending);
+      function metric(node, value, sub) {
+        setKids(node.querySelector(".tile-value"), value);
+        setKids(node.querySelector(".tile-sub"), sub);
+      }
+      metric(records, num(totals.records), plural(totals.sessions || 0, "session", "sessions") + ", " +
+        plural(totals.campaigns || 0, "campaign", "campaigns"));
+      metric(honey, num(data.honeytoken_records), matches.length
+        ? ["Newest ", timeNode(matches[0].last_seen || matches[0].first_seen)] : "None seen");
+      metric(newest, timeNode(h.newest_record, "None"), plural(h.records_total || 0, "record", "records") + " stored");
+      updateRecent(arr(data.recent_incidents));
+      updateSources(arr(data.top_sources));
+      updateHits(matches);
+      const byJ = obj(totals.by_judgement);
+      const jEntries = [...JUDGEMENTS, ...Object.keys(byJ).filter((j) => !JUDGEMENTS.includes(j))]
+        .map((j) => [j, Number(byJ[j]) || 0]);
+      const pEntries = Object.entries(obj(totals.by_protocol))
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+      function replaceChanged(body, node) {
+        if (!node.isEqualNode(body.firstChild)) body.replaceChildren(node);
+      }
+      replaceChanged(judgement.body, totals.records
+        ? bars(jEntries, judgementBadge, (j) => lookup(JUDGEMENT_CLASS, j, "j-unknown"))
+        : empty("No records in this window."));
+      replaceChanged(protocol.body, pEntries.length ? bars(pEntries, mono, null) : empty("No records in this window."));
+      const priority = { bad: 0, warn: 1, ok: 2 };
+      const checks = healthRows(h).sort((a, b) => priority[a[1]] - priority[b[1]]);
+      replaceChanged(urgentChecks, healthList(checks.slice(0, 3)));
+      replaceChanged(otherChecks, healthList(checks.slice(3)));
+      healthMore.hidden = checks.length <= 3;
+      const remainder = plural(checks.length - 3, "more check", "more checks");
+      if (moreChecks.textContent !== remainder) moreChecks.textContent = remainder;
+      // The same rows can stay on screen longer than their relative time labels.
+      for (const node of detail.querySelectorAll("time[datetime]")) {
+        const label = relative(new Date(node.dateTime), Date.now());
+        if (node.textContent !== label) node.textContent = label;
+      }
+      setKids(note, data.truncated ? empty("Part of this answer was cut at the server's size limits.") : null);
+    }
+
+    let stopped = false, pendingRequest = null, lastGood = 0, deadline = null;
+    function status(label) {
+      if (shell.updated.textContent !== label) shell.updated.textContent = label;
+      shell.updated.classList.toggle("updated-live", label === "Live");
+      shell.updated.classList.toggle("updated-failed", label === "Delayed" || label === "Reconnecting");
+      shell.updated.title = lastGood ? "Last successful update " + absUtc(new Date(lastGood)) : "";
+    }
+    function delayed() {
+      clearTimeout(deadline);
+      deadline = setTimeout(() => {
+        if (!stopped && !document.hidden) status("Delayed");
+      }, LIVE_POLL_MS * 2);
+    }
+    status("Connecting");
+    delayed();
+    async function update() {
+      if (lastGood && Date.now() - lastGood >= LIVE_POLL_MS * 2 && shell.updated.textContent === "Live") status("Delayed");
+      try {
+        const data = await apiGet(API.overview, { window: win });
+        if (stopped) return;
+        renderData(obj(data));
+        lastGood = Date.now();
+        status("Live");
+        delayed();
+      } catch (err) {
+        if (stopped) return;
+        clearTimeout(deadline);
+        status("Reconnecting");
+        if (!lastGood) setKids(note, errorState(err, () => refreshView("manual")));
+        if (!(err instanceof ApiError)) console.error(err);
+      }
+    }
     return {
-      refresh: (kind) => fill(body, () => apiGet(API.overview, { window: win }),
-        (data) => drawOverview(obj(data), win), kind !== "initial"),
+      managesStatus: true, handlesPending: true, pollMs: LIVE_POLL_MS,
+      refresh(kind) {
+        if (kind !== "poll") preview.refresh(kind);
+        if (!pendingRequest) pendingRequest = update().finally(() => { pendingRequest = null; });
+        return pendingRequest;
+      },
+      stop() {
+        stopped = true;
+        clearTimeout(deadline);
+        preview.stop();
+        shell.updated.classList.remove("updated-live", "updated-failed");
+        shell.updated.removeAttribute("title");
+        shell.updated.textContent = "";
+      },
     };
   }
 
-  function drawOverview(data, win) {
-    const totals = obj(data.totals);
-    const approvals = obj(data.approvals);
-    const health = obj(data.health);
-    const hits = arr(data.honeytoken_hits).map(obj);
-    const windowLabel = win === "7d" ? "last 7 days" : "last 24 hours";
-
-    const pending = typeof approvals.pending === "number" ? approvals.pending : 0;
-    const soonest = parseTime(approvals.soonest_expiry);
-    const tiles = el("div", "tiles",
-      tile("Pending approvals", num(pending), pending > 0,
-        pending > 0 && soonest ? ["Soonest expires ", timeNode(approvals.soonest_expiry), ". "] : null,
-        link("#/queue", pending > 0 ? "Open queue" : "Queue")),
-      tile("Records, " + windowLabel, num(totals.records), false,
-        plural(totals.sessions || 0, "session", "sessions") + ", " +
-        plural(totals.campaigns || 0, "campaign", "campaigns")),
-      tile("Records that used a honeytoken", num(hits.length), hits.length > 0,
-        hits.length ? "Newest " : "None seen", hits.length ? timeNode(hits[0].last_seen || hits[0].first_seen) : null),
-      tile("Newest record", health.newest_record ? timeNode(health.newest_record) : "none", false,
-        plural(health.records_total || 0, "record", "records") + " stored"));
-
-    const hitSection = section("Honeytoken use", { flush: true });
-    append(hitSection.body, [hits.length ? hitList(hits)
-      : empty("No stored record used a honeytoken.")]);
-
-    const judgement = section("By judgement, " + windowLabel);
-    const byJ = obj(totals.by_judgement);
-    const jEntries = JUDGEMENTS.map((j) => [j, Number(byJ[j]) || 0]);
-    for (const key of Object.keys(byJ)) {
-      if (!JUDGEMENTS.includes(key)) jEntries.push([key, Number(byJ[key]) || 0]);
-    }
-    append(judgement.body, [(totals.records || 0) > 0
-      ? bars(jEntries, judgementBadge, (label) => lookup(JUDGEMENT_CLASS, label, "j-unknown"))
-      : empty("No records in this window.")]);
-
-    const protocol = section("By protocol, " + windowLabel);
-    const byP = obj(totals.by_protocol);
-    const pEntries = Object.keys(byP).map((k) => [k, Number(byP[k]) || 0])
-      .sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]));
-    append(protocol.body, [pEntries.length ? bars(pEntries, mono, null)
-      : empty("No records in this window.")]);
-
-    const sources = section("Top sources, " + windowLabel, { flush: true });
-    const top = arr(data.top_sources);
-    append(sources.body, [top.length
-      ? table([{ label: "Source" }, { label: "Records", num: true }, { label: "Worst" }],
-        top.map((s) => ({ cells: [el("div", null, addressNode(s.src_ip, s.geo), shodanNode(s.shodan, { prefix: true })),
-          num(s.records), judgementBadge(s.worst)] })),
-        { short: true })
-      : empty("No sources in this window.")]);
-
-    const healthSection = section("Pipeline health", { flush: true });
-    healthSection.body.append(healthList(health));
-
-    return [
-      tiles,
-      hitSection.node,
-      el("div", "grid-2", judgement.node, protocol.node),
-      el("div", "grid-2", sources.node, healthSection.node),
-    ];
+  // Keep each live row in place across polls. A focused row or an open disclosure
+  // keeps its contents while the operator reads it; the other rows keep updating.
+  function overviewList(container, list, emptyLabel, keyOf, drawRow) {
+    const parent = list.querySelector("tbody") || list;
+    const noItems = empty(emptyLabel);
+    const rows = new Map();
+    list.hidden = noItems.hidden = true;
+    container.append(list, noItems);
+    return (items) => {
+      const present = new Set();
+      let position = parent.firstElementChild;
+      for (const [index, item] of items.entries()) {
+        const key = keyOf(item) || index;
+        present.add(key);
+        const value = JSON.stringify(item);
+        let row = rows.get(key);
+        if (!row || (row.value !== value && !row.node.contains(document.activeElement) &&
+            !row.node.querySelector("details[open]"))) {
+          const node = drawRow(item);
+          if (row) {
+            if (position === row.node) position = node;
+            row.node.replaceWith(node);
+          }
+          row = { value, node };
+          rows.set(key, row);
+        }
+        if (position !== row.node) {
+          const focused = row.node.contains(document.activeElement) ? document.activeElement : null;
+          parent.insertBefore(row.node, position);
+          if (focused && document.activeElement !== focused) focused.focus({ preventScroll: true });
+        }
+        position = row.node.nextElementSibling;
+      }
+      for (const [key, row] of rows) {
+        if (!present.has(key) && !row.node.contains(document.activeElement)) {
+          row.node.remove();
+          rows.delete(key);
+        }
+      }
+      list.hidden = rows.size === 0;
+      noItems.hidden = rows.size > 0;
+    };
   }
 
   function tile(label, value, attention, ...sub) {
@@ -997,8 +1165,8 @@
     return grid;
   }
 
-  function hitList(records) {
-    return el("ul", "hit-list", records.map((r) => el("li", null,
+  function hitItem(r) {
+    return el("li", null,
       el("div", "hit-line",
         judgementBadge(r.judgement),
         recordLink(r.id, mono(r.id)),
@@ -1006,7 +1174,7 @@
         addressNode(r.src_ip, r.geo),
         tags(r.honeytokens),
         el("span", "faint", timeNode(r.last_seen || r.first_seen))),
-      narrativeView(r.layout, r.narrative))));
+      narrativeView(r.layout, r.narrative));
   }
 
   // Each row: name, level ("ok" | "warn" | "bad") and a detail. Healthy rows stay quiet.
@@ -1087,9 +1255,9 @@
       (level === "bad" ? ", limit reached." : ".")];
   }
 
-  function healthList(h) {
+  function healthList(rows) {
     const list = el("div", "health");
-    for (const [name, level, detail] of healthRows(h)) {
+    for (const [name, level, detail] of rows) {
       const row = el("div", "health-row");
       row.classList.add(lookup({ ok: "ok", warn: "warn", bad: "bad" }, level, "ok"));
       row.append(el("div", "health-name",
@@ -2940,26 +3108,20 @@
 
   // ---- screen: map ----------------------------------------------------------------------
 
-  // Live attack map: each event flies from where its source is to the dock of the service it
-  // reached, beside a feed of the same events as text. One canvas; attacker text reaches it
-  // only through fillText, and the feed builds text nodes with el() like every other screen.
-
+  // The preview, investigation view and shared display use the same map data and marks.
   const MAP_POLL_MS = 5000;
   const MAP_FLYING = 60;
-  const MAP_QUEUE = 600;
   const MAP_FEED = 80;
   const MAP_KEEP = 400;
-  const MAP_DOCKS = 12;
   const MAP_REPLAY = 6;
+  const REGION_NAMES = typeof Intl.DisplayNames === "function" ? new Intl.DisplayNames(undefined, { type: "region" }) : null;
   const MAP_TOP = 84;
   const MAP_BOTTOM = -58;
   const MAP_WINDOWS = [["5m", "5 min"], ["15m", "15 min"], ["1h", "1 hour"]];
   const MAP_WINDOW_TEXT = { "5m": "5 minutes", "15m": "15 minutes", "1h": "hour" };
-  const MAP_SERVICES = ["ssh", "http", "telnet", "ftp", "redis", "sip", "mysql", "smtp",
-    "postgres", "mssql", "s3", "mllp"];
-  const MAP_SVC_CLASS = ["svc-0", "svc-1", "svc-2", "svc-3", "svc-4", "svc-5", "svc-6", "svc-7"];
+  const MAP_WINDOW_MS = { "5m": 300000, "15m": 900000, "1h": 3600000 };
+  const MAP_AGE_MINUTES = { "5m": [1, 3], "15m": [2, 5], "1h": [10, 30] };
   const MAP_JUDGEMENT_VAR = { BENIGN: "--benign", SUSPICIOUS: "--suspicious", MALICIOUS: "--malicious" };
-  const BEE = 26;
 
   // Land outline: Natural Earth, public domain. 110m land, simplified, Antarctica left out;
   // each string is one ring of longitude,latitude pairs in tenths of a degree.
@@ -3073,92 +3235,150 @@
   ];
   let landRings = null;
 
-  function svcIndex(service) {
-    const i = MAP_SERVICES.indexOf(service);
-    if (i >= 0) return i % MAP_SVC_CLASS.length;
-    let h = 0;
-    for (const c of str(service)) h = (h * 31 + c.charCodeAt(0)) % 997;
-    return h % MAP_SVC_CLASS.length;
+  function mapState(mode, win = "15m") {
+    const m = {
+      mode, win, gen: state.gen, cursor: null, logId: null, req: 0, loading: false, busy: false,
+      timer: 0, staleTimer: 0, raf: 0, zoom: 1, center: [0.5, 0.5], w: 0, h: 0, dpr: 1,
+      land: null, colors: {}, lastOK: 0, paused: false, still: false, hide: mode !== "full",
+      off: new Set(), services: [], sources: new Map(), feed: [], flights: [], rows: new Map(),
+      sensor: null, hover: null, selected: null, status: el("span", { cls: "map-status", text: "Connecting" }),
+      note: el("div", { cls: "stack", attrs: { "aria-live": "polite" } }),
+      canvas: el("canvas", { cls: "map-canvas", attrs: { role: "img", "aria-label": "World map of recent activity" } }),
+    };
+    m.wrap = el("div", "map-wrap", m.canvas);
+    return m;
   }
 
-  function easeInOut(t) {
-    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+  function createMapPreview() {
+    const m = mapState("preview");
+    m.previewCount = el("span");
+    const target = link("#/map", m.wrap, el("div", "map-preview-footer", m.previewCount,
+      el("span", { text: "Open full map →" })));
+    target.className = "map-preview-link";
+    target.setAttribute("aria-label", "Open full map, last 15 minutes");
+    const node = el("section", "map-preview",
+      el("div", "section-head", el("h2", { text: "Live map" }), m.status),
+      el("p", { cls: "muted", text: "Last 15 minutes · Color shows severity. Brighter marks are newer." }),
+      target, m.note);
+    return Object.assign({ node }, watchMap(m));
+  }
+
+  function mapHref(m, display) {
+    const params = new URLSearchParams({ window: m.win });
+    if (display) params.set("display", "1");
+    if (m.privateView) params.set("hide", "1");
+    if (m.off.size) params.set("off", [...m.off].join(","));
+    return "#/map?" + params.toString();
   }
 
   function viewMap(route, main) {
-    setTitle("Map");
-    const m = {
-      gen: state.gen, win: "15m", cursor: null, logId: null, busy: false, timer: null,
-      raf: 0, last: 0, t: 0, bee: BEE, small: false, req: 0, loading: 0, paused: false, hide: false, off: new Set(),
-      still: false, w: 0, h: 0, dpr: 1, colors: {}, land: null, sheet: null,
-      sensor: null, sources: new Map(), docks: [], ports: new Map(), feed: [],
-      queue: [], flights: [], pulses: [], hover: null, rows: new Map(), shownFlying: -1,
-    };
-    const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const scheme = window.matchMedia("(prefers-color-scheme: dark)");
-    m.still = motion.matches;
-
-    const pause = button("Pause", () => {
-      m.paused = !m.paused;
-      pause.textContent = m.paused ? "Resume" : "Pause";
-      pause.setAttribute("aria-pressed", m.paused ? "true" : "false");
-      kick(m);
-    }, "btn-small");
-    pause.setAttribute("aria-pressed", "false");
-    const winGroup = segmented(MAP_WINDOWS, m.win, (value) => {
-      m.win = value;
-      [...winGroup.children].forEach((b, i) => b.setAttribute("aria-pressed", MAP_WINDOWS[i][0] === value ? "true" : "false"));
-      loadMap(m);
-    });
-    winGroup.setAttribute("aria-label", "Time window");
-    const hideBox = el("input", { attrs: { type: "checkbox" } });
-    hideBox.addEventListener("change", () => {
-      m.hide = hideBox.checked;
-      drawFeed(m);
-      kick(m);
-    });
-    const hideField = el("label", "map-check", hideBox, el("span", { text: "Hide addresses" }));
-
-    m.canvas = el("canvas", { cls: "map-canvas", attrs: { role: "img", "aria-label": "World map of attack sources" } });
-    m.wrap = el("div", "map-wrap", m.canvas);
-    m.legend = el("div", { cls: "map-legend", attrs: { role: "group", "aria-label": "Services shown" } });
+    const wall = route.params.get("display") === "1";
+    const win = route.params.get("window");
+    const m = mapState(wall ? "wall" : "full", MAP_WINDOWS.some(([key]) => key === win) ? win : "15m");
+    m.privateView = route.params.get("hide") === "1";
+    m.hide = wall || m.privateView;
+    m.off = new Set((route.params.get("off") || "").split(",").filter((s) => PROTOCOL_RE.test(s)).slice(0, 20));
+    setTitle(wall ? "Live activity" : "Map");
     m.counters = el("div", "map-counters");
-    m.flyingNode = el("div", "tile-value");
-    m.note = el("div", { cls: "stack", attrs: { "aria-live": "polite" } });
     m.list = el("ol", { cls: "map-feed-list", attrs: { "aria-label": "Events, newest first" } });
-    m.feedNote = el("div", { cls: "map-feed-note muted" });
+    m.feedNote = el("p", "map-feed-note muted");
     const feed = el("section", { cls: "map-feed", attrs: { "aria-label": "Live events" } },
-      el("div", "section-head", el("h2", { text: "Live events" })), m.feedNote, m.list);
-    main.append(pageHead("Map", winGroup, hideField, pause),
-      intro("Where attacks come from and which service each one reached, as they happen. " +
-        "Each bee is one event flying from its source to the sensor; the feed lists the same events as text."),
-      m.note, m.counters,
-      el("div", "map-layout", el("div", "map-stage", m.wrap, m.legend), feed));
+      el("div", "section-head", el("h2", { text: wall ? "Recent activity" : "Live events" })), m.feedNote, m.list);
+    const stage = el("div", "map-stage", m.wrap);
+    const layout = el("div", "map-layout", stage, feed);
+    m.key = el("div", "map-reading-key");
+    drawReadingKey(m);
 
-    m.canvas.addEventListener("pointermove", (ev) => {
-      const r = m.canvas.getBoundingClientRect();
-      setHover(m, sourceAt(m, ev.clientX - r.left, ev.clientY - r.top));
-    });
-    m.canvas.addEventListener("pointerleave", () => setHover(m, null));
-    m.canvas.addEventListener("click", (ev) => {
-      const r = m.canvas.getBoundingClientRect();
-      openSource(sourceAt(m, ev.clientX - r.left, ev.clientY - r.top));
-    });
+    if (wall) {
+      document.body.classList.add("map-display");
+      const exitDisplay = link(mapHref(m, false), "Exit display");
+      exitDisplay.className = "btn btn-small";
+      m.exitDisplay = exitDisplay;
+      main.append(el("section", "map-wall",
+        el("div", "map-display-head", el("div", null, el("span", { cls: "brand", text: "Winnie the Agent" }),
+          el("h1", { text: "Live activity" })), m.status, exitDisplay),
+        m.note, m.counters, layout, m.key, el("div", "map-display-footer", "Addresses hidden",
+          state.session.attribution ? el("span", { text: str(state.session.attribution) }) : null)));
+      exitDisplay.focus();
+    } else {
+      const pause = button("Pause motion", () => {
+        m.paused = !m.paused;
+        m.flights = [];
+        pause.textContent = m.paused ? "Resume motion" : "Pause motion";
+        pause.setAttribute("aria-pressed", String(m.paused));
+        kick(m);
+      }, "btn-small");
+      pause.setAttribute("aria-pressed", "false");
+      const winGroup = segmented(MAP_WINDOWS, m.win, (value) => {
+        m.win = value;
+        m.cursor = null;
+        m.logId = null;
+        m.selected = null;
+        m.sources.clear();
+        m.feed = [];
+        m.flights = [];
+        m.counters.replaceChildren();
+        drawFeed(m);
+        drawDetail(m);
+        drawReadingKey(m);
+        kick(m);
+        [...winGroup.children].forEach((b, i) => b.setAttribute("aria-pressed", String(MAP_WINDOWS[i][0] === value)));
+        loadMap(m);
+      });
+      winGroup.setAttribute("aria-label", "Time window");
+      const hideBox = el("input", { attrs: { type: "checkbox" } });
+      hideBox.checked = m.hide;
+      hideBox.addEventListener("change", () => {
+        m.hide = m.privateView = hideBox.checked;
+        m.detail.replaceChildren();
+        drawFeed(m);
+        drawDetail(m);
+        kick(m);
+      });
+      const hideField = el("label", "map-check", hideBox, "Hide addresses");
+      m.legend = el("div", { cls: "map-legend", attrs: { role: "group", "aria-label": "Services shown" } });
+      m.detail = el("div", { cls: "map-detail", attrs: { "aria-live": "polite" } });
+      m.detail.hidden = true;
+      const display = button("Display mode", () => { location.hash = mapHref(m, true); }, "btn-small");
+      main.append(pageHead("Map", display), intro("Explore recent activity by source and service."),
+        el("div", "map-tools", m.status, winGroup, hideField, pause), m.note, m.counters, layout);
+      addMapControls(m);
+      m.breakdown = el("div", "stack");
+      stage.append(m.detail, m.key, m.legend, el("details", "map-breakdown",
+        el("summary", { text: "Countries and services" }), m.breakdown), m.help);
+    }
+    return watchMap(m);
+  }
 
-    const onTheme = () => {
-      m.colors = {};
-      m.land = m.sheet = null;
-      kick(m);
-    };
+  function watchMap(m) {
+    const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    m.still = motion.matches;
     const onMotion = () => {
       m.still = motion.matches;
       m.flights = [];
       kick(m);
     };
+    const scheme = window.matchMedia("(prefers-color-scheme: dark)");
+    const onTheme = () => {
+      m.colors = {};
+      m.land = null;
+      kick(m);
+    };
     const onVisible = () => {
-      if (!document.hidden && alive(m)) {
+      if (document.hidden) {
+        clearTimeout(m.timer);
+        clearTimeout(m.staleTimer);
+        m.flights = [];
+      } else if (alive(m)) {
+        if (Date.now() - m.lastOK > MAP_POLL_MS * 2) setMapStatus(m, "Delayed");
         schedule(m, 0);
         kick(m);
+      }
+    };
+    const onKey = (ev) => {
+      if (ev.key === "Escape" && m.exitDisplay) {
+        ev.preventDefault();
+        m.exitDisplay.click();
       }
     };
     const resize = new ResizeObserver(() => sizeCanvas(m));
@@ -3166,18 +3386,22 @@
     scheme.addEventListener("change", onTheme);
     motion.addEventListener("change", onMotion);
     document.addEventListener("visibilitychange", onVisible);
-    m.stop = () => {
-      m.gen = -1;
-      resize.disconnect();
-      scheme.removeEventListener("change", onTheme);
-      motion.removeEventListener("change", onMotion);
-      document.removeEventListener("visibilitychange", onVisible);
-      clearTimeout(m.timer);
-      cancelAnimationFrame(m.raf);
-    };
+    if (m.exitDisplay) document.addEventListener("keydown", onKey);
     return {
-      refresh: (kind) => kind === "poll" ? true : loadMap(m),
-      stop: m.stop,
+      managesStatus: true,
+      refresh: (kind) => kind === "poll" ? Promise.resolve(true) : loadMap(m),
+      stop: () => {
+        m.gen = -1;
+        resize.disconnect();
+        scheme.removeEventListener("change", onTheme);
+        motion.removeEventListener("change", onMotion);
+        document.removeEventListener("visibilitychange", onVisible);
+        document.removeEventListener("keydown", onKey);
+        if (m.mode === "wall") document.body.classList.remove("map-display");
+        clearTimeout(m.staleTimer);
+        clearTimeout(m.timer);
+        cancelAnimationFrame(m.raf);
+      },
     };
   }
 
@@ -3190,196 +3414,394 @@
     if (alive(m) && !document.hidden) m.timer = setTimeout(() => pollMap(m), delay);
   }
 
-  // A fresh window: everything on the map is replaced. Each load or poll takes a request
-  // number; an answer to anything but the latest request (an earlier window, or a poll
-  // overtaken by a reload) is dropped.
+  function setMapStatus(m, status) {
+    const stamp = m.lastOK ? clockUtc(new Date(m.lastOK)) + " UTC" : "";
+    m.status.textContent = status + (stamp ? " · " + stamp : "");
+    m.status.classList.toggle("live", status === "Live");
+    if (m.mode === "full") {
+      shell.updated.textContent = stamp ? "Updated " + stamp : status;
+      shell.updated.classList.toggle("updated-failed", status === "Reconnecting" || status === "Delayed");
+    }
+    clearTimeout(m.staleTimer);
+    if (status === "Live" || status === "Connecting") {
+      m.staleTimer = setTimeout(() => {
+        if (alive(m)) setMapStatus(m, "Delayed");
+      }, 2 * MAP_POLL_MS);
+    }
+  }
+
   async function loadMap(m) {
     clearTimeout(m.timer);
     const req = ++m.req;
-    m.loading = req;
-    let d;
+    m.loading = true;
+    m.busy = false;
+    m.cursor = null;
+    setMapStatus(m, "Connecting");
     try {
-      d = obj(await apiGet(API.map, { window: m.win }));
-    } catch (err) {
-      if (m.loading === req) m.loading = 0;
+      const d = obj(await apiGet(API.map, { window: m.win }));
       if (!alive(m) || req !== m.req) return false;
-      setKids(m.note, errorState(err, () => loadMap(m)));
+      ingest(m, d, true);
+      return true;
+    } catch (err) {
+      if (!alive(m) || req !== m.req) return false;
+      setMapStatus(m, "Reconnecting");
+      setKids(m.note, m.mode === "wall" ? notice("warn", "Waiting for the console connection.") :
+        errorState(err, () => loadMap(m)));
       return false;
+    } finally {
+      if (alive(m) && m.req === req) {
+        m.loading = false;
+        schedule(m, MAP_POLL_MS);
+      }
     }
-    if (m.loading === req) m.loading = 0;
-    if (!alive(m) || req !== m.req) return false;
-    setKids(m.note);
-    m.sources.clear();
-    m.ports.clear();
-    m.feed = [];
-    m.queue = [];
-    m.flights = [];
-    m.pulses = [];
-    ingest(m, d, true);
-    schedule(m, MAP_POLL_MS);
-    return true;
   }
 
   async function pollMap(m) {
-    // A window load in progress owns the next answer; polling resumes after it.
     if (!alive(m) || m.busy || m.loading || document.hidden) return;
     if (m.cursor === null) {
-      loadMap(m);
+      await loadMap(m);
       return;
     }
-    m.busy = true;
     const req = ++m.req;
-    let ok = true;
+    m.busy = true;
     try {
       const d = obj(await apiGet(API.map, { window: m.win, after: m.cursor, log_id: m.logId }));
-      if (req !== m.req) {
-        m.busy = false;
-        return;
-      }
-      if (alive(m)) ingest(m, d, false);
+      if (!alive(m) || req !== m.req) return;
+      ingest(m, d, false);
     } catch (err) {
-      ok = false;
-      if (req !== m.req) {
-        m.busy = false;
-        return;
+      if (!alive(m) || req !== m.req) return;
+      if (err.status === 409) {
+        await loadMap(m);
+      } else {
+        setMapStatus(m, "Reconnecting");
       }
-      if (alive(m) && err.status === 409) {
-        // The log was rotated or replaced (or the console restarted): start over.
+    } finally {
+      if (alive(m) && m.req === req) {
         m.busy = false;
-        if (await loadMap(m)) setKids(m.note, notice("ok", "The event log was rotated or replaced, so the map was reloaded."));
-        return;
+        schedule(m, MAP_POLL_MS);
       }
     }
-    m.busy = false;
-    if (alive(m)) {
-      markUpdated(ok);
-      schedule(m, MAP_POLL_MS);
-    }
+  }
+
+  function mapSource(o) {
+    const p = arr(o.point);
+    return { src: str(o.src), events: Number(o.events) || 1, place: str(o.place), country: str(o.country),
+      judgement: str(o.judgement), service: str(o.service), last: parseTime(o.last || o.time),
+      lat: p.length === 2 && p.every(Number.isFinite) ? p[0] : null,
+      lon: p.length === 2 && p.every(Number.isFinite) ? p[1] : null };
   }
 
   function ingest(m, d, fresh) {
-    m.cursor = typeof d.newest === "number" ? d.newest : null;
+    m.lastOK = Date.now();
+    setMapStatus(m, "Live");
+    m.cursor = Number.isSafeInteger(d.newest) ? d.newest : null;
     m.logId = str(d.log_id);
-    const s = obj(d.sensor);
-    const at = arr(s.point);
-    m.sensor = { label: str(s.label), lat: Number(at[0]) || 0, lon: Number(at[1]) || 0 };
-    // Every answer (load or poll) lists the sources of the whole window as it is now, so the
-    // map is rebuilt from it: a source whose events have aged out goes, unless a bee or ring
-    // of its own is still on screen or queued.
-    const before = m.sources;
+    const sensor = obj(d.sensor);
+    const at = arr(sensor.point);
+    m.sensor = at.length === 2 && at.every(Number.isFinite) ? {
+      lat: at[0], lon: at[1], placed: sensor.placed === true, label: str(sensor.label).slice(0, 80),
+    } : null;
+    const items = arr(d.items).filter((it) => Number.isSafeInteger(obj(it).offset));
+    const previous = m.sources;
     m.sources = new Map();
-    for (const src of arr(d.sources)) {
-      const o = obj(src);
-      if (!str(o.src)) continue;
-      const known = before.get(o.src);
-      const p = arr(o.point);
-      m.sources.set(o.src, Object.assign(known || { seen: -1e9 }, {
-        src: o.src, events: Number(o.events) || 0, place: str(o.place),
-        judgement: str(o.judgement), lat: p.length === 2 ? Number(p[0]) : null, lon: p.length === 2 ? Number(p[1]) : null,
-      }));
+    for (const item of arr(d.sources)) {
+      const s = mapSource(obj(item));
+      if (s.src) m.sources.set(s.src, s);
     }
-    const items = arr(d.items).map(obj).filter((it) => typeof it.offset === "number");
-    for (const it of items) {
-      if (!m.sources.has(str(it.src)) && str(it.src)) {
-        const p = arr(it.point);
-        m.sources.set(it.src, Object.assign(before.get(it.src) || { seen: -1e9 }, { src: it.src, events: 1,
-          place: str(it.place), judgement: str(it.judgement),
-          lat: p.length === 2 ? Number(p[0]) : null, lon: p.length === 2 ? Number(p[1]) : null }));
-      }
-      if (Number.isInteger(it.dst_port)) m.ports.set(str(it.service), it.dst_port);
+    // The bounded API lists top sources separately from its newest events.
+    // Add recent event-only sources without letting them outlive the selected window.
+    for (const it of items.slice().reverse()) {
+      if (it.src && !m.sources.has(it.src) && m.sources.size < MAP_KEEP) m.sources.set(it.src, mapSource(it));
     }
-    const busy = new Set([...m.flights.map((f) => f.src.src), ...m.pulses.filter((q) => q.src).map((q) => q.src.src),
-      ...m.queue.map((q) => str(q.it.src))]);
-    for (const [key, s] of before) {
-      if (!m.sources.has(key) && busy.has(key)) m.sources.set(key, s);
-    }
-    trimSources(m);
-    const totals = obj(d.totals);
-    const services = Object.entries(obj(totals.services)).filter((e) => PROTOCOL_RE.test(e[0]));
-    for (const it of items) {
-      if (PROTOCOL_RE.test(str(it.service)) && !services.some((e) => e[0] === it.service)) services.push([it.service, 0]);
-    }
-    m.docks = services.slice(0, MAP_DOCKS).map((e) => e[0]);
-    drawLegend(m);
-    drawCounters(m, totals, d);
     if (fresh) {
-      m.feed = items.slice(-MAP_FEED).reverse();
-      drawFeed(m);
-      if (!m.still) {
-        items.slice(-MAP_REPLAY).forEach((it, i) => enqueue(m, it, m.t + 300 + i * 450, false));
-      }
+      m.flights = [];
+      m.rows.clear();
+      if (m.list) m.list.replaceChildren();
     } else {
-      const times = items.map((it) => parseTime(it.time));
-      const first = times.find((t) => t) || null;
-      const lastT = times.slice().reverse().find((t) => t) || null;
-      const span = first && lastT ? lastT - first : 0;
-      const scale = span > MAP_POLL_MS * 0.9 ? MAP_POLL_MS * 0.9 / span : 1;
-      items.forEach((it, i) => {
-        const t = times[i];
-        enqueue(m, it, m.t + (first && t ? (t - first) * scale : i * 80), true);
-      });
+      // A neutral moving dot can finish its trip when its source leaves the top list.
+      const busy = new Set(m.flights.map((f) => f.src));
+      for (const [key, source] of previous) {
+        if (busy.has(key) && !m.sources.has(key)) m.sources.set(key, source);
+      }
     }
-    const skipped = Number(d.skipped) || 0;
-    m.feedNote.textContent = skipped > 0
-      ? num(skipped) + " more events arrived than the map draws; they are counted above and listed in Activity." : "";
-    m.feedNote.hidden = skipped === 0;
+    const totals = obj(d.totals);
+    const services = Object.keys(obj(totals.services)).filter((name) => PROTOCOL_RE.test(name));
+    if (m.legend && (services.join(",") !== m.services.join(",") || !m.legend.childNodes.length)) {
+      m.services = services;
+      drawServices(m);
+    }
+    if (fresh) m.feed = [];
+    const minTime = m.lastOK - MAP_WINDOW_MS[m.win];
+    // Use the API window to admit events. Remove expired rows on later idle polls.
+    m.feed = m.feed.filter((it) => {
+      const t = parseTime(it.time);
+      return !t || t.getTime() >= minTime;
+    });
+    const freshOffsets = new Set(m.feed.map((it) => it.offset));
+    const added = items.filter((it) => !freshOffsets.has(it.offset));
+    m.feed = [...added].reverse().concat(m.feed).slice(0, MAP_FEED);
+    if (!m.still && !m.paused) {
+      const start = performance.now();
+      const flights = fresh ? added.slice(-MAP_REPLAY) : added.slice(-MAP_FLYING);
+      flights.forEach((it, i) => {
+        if (m.sources.has(it.src) && !m.off.has(str(it.service))) {
+          m.flights.push({ src: it.src, service: str(it.service), start: start + i * (fresh ? 150 : 24) });
+        }
+      });
+      m.flights = m.flights.slice(-MAP_FLYING);
+    }
+    setKids(m.note);
+    if (d.located === false) {
+      setKids(m.note, el("p", { cls: "muted", text: "Location data unavailable. Sources appear in the unlocated lane." }));
+    }
+    m.totals = totals;
+    const total = Number(totals.events) || 0;
+    const located = [...m.sources.values()].filter((s) => s.lat !== null).length;
+    m.canvas.setAttribute("aria-label", "World map: " + plural(m.sources.size, "source", "sources") + ", " +
+      num(located) + " placed, " + plural(total, "event", "events") + " in the last " + MAP_WINDOW_TEXT[m.win] + ".");
+    if (m.previewCount) {
+      m.previewCount.textContent = plural(total, "event", "events");
+    } else {
+      drawCounters(m, totals);
+      syncFeed(m);
+      const skipped = Number(d.skipped) || 0;
+      m.feedNote.textContent = skipped ? num(skipped) + " additional events counted." :
+        m.list.childElementCount ? "" : "No events to show in this window.";
+      m.feedNote.hidden = !m.feedNote.textContent;
+      drawDetail(m);
+    }
     kick(m);
   }
 
-  function trimSources(m) {
-    if (m.sources.size <= MAP_KEEP) return;
-    const keep = [...m.sources.values()].sort((a, b) => b.events - a.events || b.seen - a.seen).slice(0, MAP_KEEP);
-    m.sources = new Map(keep.map((s) => [s.src, s]));
+  function drawReadingKey(m) {
+    const [first, second] = MAP_AGE_MINUTES[m.win];
+    setKids(m.key, el("span", { cls: "map-key-malicious", text: "▲ Malicious" }),
+      el("span", { cls: "map-key-suspicious", text: "◆ Suspicious" }),
+      el("span", { cls: "map-key-benign", text: "● Benign" }),
+      el("span", { cls: "map-key-unknown", text: "□ Untriaged" }),
+      el("span", { cls: "muted", text: "Age · Bright < " + first + "m · Medium < " + second + "m · Faded thereafter" }));
   }
 
-  function enqueue(m, it, at, toFeed) {
-    m.queue.push({ it: it, at: at, feed: toFeed });
-    // Too far behind: the oldest go straight to the feed without a flight.
-    while (m.queue.length > MAP_QUEUE) release(m, m.queue.shift(), false);
+  function drawServices(m) {
+    setKids(m.legend, m.services.map((service) => {
+      const b = button(service, () => {
+        if (m.off.has(service)) m.off.delete(service);
+        else m.off.add(service);
+        b.setAttribute("aria-pressed", String(!m.off.has(service)));
+        if (m.totals) drawCounters(m, m.totals);
+        drawFeed(m);
+        drawDetail(m);
+        kick(m);
+      }, "btn-small map-key");
+      b.setAttribute("aria-pressed", String(!m.off.has(service)));
+      return b;
+    }));
   }
 
-  function release(m, q, fly) {
-    const it = q.it;
-    const src = m.sources.get(str(it.src));
-    if (src) src.seen = m.t;
-    if (q.feed) {
-      m.feed.unshift(it);
-      if (m.feed.length > MAP_FEED) m.feed.length = MAP_FEED;
-      addFeedRow(m, it);
+  function drawCounters(m, totals) {
+    const total = Number(totals.events) || 0;
+    const services = Object.entries(obj(totals.services));
+    const nServices = services.filter(([name]) => !m.off.has(name)).length;
+    if (m.breakdown) {
+      const list = (name, entries) => el("div", null, el("strong", { text: name }), " · ",
+        entries.map(([key, count]) => key + " (" + num(count) + ")").join(", ") || "None");
+      const countries = Object.entries(obj(totals.countries)).map(([key, count]) =>
+        [key === "unknown" ? "Unlocated" : countryName(key), count]);
+      setKids(m.breakdown, list("Top countries", countries), list("Top services", services));
     }
+    // Both the service and source lists can be capped by the server.
+    const metrics = [tile("Events in the last " + MAP_WINDOW_TEXT[m.win], num(total)),
+      tile("Sources shown", num(m.sources.size)), tile("Services shown", num(nServices))];
+    if (m.mode === "full") {
+      metrics.splice(1, 0, tile("Per minute", (total / (MAP_WINDOW_MS[m.win] / 60000)).toFixed(1)));
+      m.flyingNode = el("div", { cls: "tile-value", text: "0" });
+      metrics.push(el("div", "tile", el("div", { cls: "tile-label", text: "In flight" }), m.flyingNode));
+    }
+    setKids(m.counters, metrics);
+  }
+
+  function drawFeed(m) {
+    m.rows.clear();
+    m.list.replaceChildren();
+    syncFeed(m);
+  }
+
+  function syncFeed(m) {
+    // Insert deltas before existing rows so keyboard focus survives a poll.
+    const visible = m.feed.filter((it) => !m.off.has(str(it.service))).slice(0, m.mode === "wall" ? 4 : MAP_FEED);
+    const keys = new Set(visible.map((it) => it.offset));
+    for (const [id, row] of m.rows) {
+      if (!keys.has(id)) {
+        row.remove();
+        m.rows.delete(id);
+      }
+    }
+    for (const it of visible.slice().reverse()) {
+      if (!m.rows.has(it.offset)) {
+        const row = mapFeedRow(m, it);
+        m.rows.set(it.offset, row);
+        m.list.prepend(row);
+      }
+    }
+  }
+
+  function countryName(code) {
+    if (typeof code !== "string" || !/^[A-Z]{2}$/.test(code)) return "Unlocated";
+    return REGION_NAMES?.of(code) || code;
+  }
+
+  function mapFeedRow(m, it) {
+    const src = str(it.src);
+    const when = parseTime(it.time);
+    const region = m.sources.get(src)?.country;
+    const wall = m.mode === "wall";
     const service = str(it.service);
-    if (!fly || m.off.has(service) || !src) return;
-    m.pulses.push({ src: src, at: m.t, service: m.still ? service : null });
-    if (m.still) return;
-    const key = src.src + " " + service;
-    const same = m.flights.find((f) => f.key === key && m.t - f.start < f.dur * 0.6);
-    if (same) {
-      same.count += 1;
-      return;
+    const place = wall ? countryName(region) : str(it.place) || "Unlocated";
+    const shownService = wall && !PROTOCOL_RE.test(service) ? "Other" : service;
+    const port = !wall && Number.isInteger(it.dst_port) ? " " + it.dst_port : "";
+    const judgement = lookup(MAP_JUDGEMENT_VAR, it.judgement, null) ? it.judgement : "Untriaged";
+    const li = el("li", "map-row",
+      el("div", "map-row-head", el("span", { cls: "mono faint", text: when ? clockUtc(when) : "—" }),
+        judgementBadge(judgement), el("span", { cls: "map-svc", text: shownService + port }),
+        !wall ? el("span", { cls: "map-kind", text: kindLabel(it.kind) }) : null,
+        !wall && it.outcome ? outcomeBadge(it.outcome) : null),
+      el("div", "map-row-where", el("span", { text: place }),
+        !m.hide ? el("span", { cls: "mono muted", text: src }) : null),
+      !m.hide ? el("div", { cls: "map-row-what mono", text: str(it.summary) }) : null);
+    if (!m.hide && ADDRESS_RE.test(src)) {
+      li.tabIndex = 0;
+      const open = () => { location.hash = activityHref({ src, win: "1h" }); };
+      li.addEventListener("click", open);
+      li.addEventListener("keydown", (ev) => { if (ev.key === "Enter") open(); });
     }
-    if (m.flights.length >= MAP_FLYING) {
-      const any = m.flights.find((f) => f.service === service) || m.flights[0];
-      any.count += 1;
-      return;
+    if (!wall) {
+      for (const event of ["mouseenter", "focus"]) li.addEventListener(event, () => setHover(m, src));
+      for (const event of ["mouseleave", "blur"]) li.addEventListener(event, () => setHover(m, null));
     }
-    m.flights.push({ key: key, src: src, service: service, start: m.t, dur: 0, count: 1, phase: Math.random() * 4 });
+    return li;
   }
 
-  // ---- map: drawing ----
+  function drawDetail(m) {
+    if (!m.detail) return;
+    const s = m.sources.get(m.selected);
+    if (!s) m.selected = null;
+    m.detail.hidden = !s;
+    if (!s) {
+      m.detail.replaceChildren();
+      return;
+    }
+    const text = [m.hide ? s.place || "Unlocated" : s.src, s.judgement || "Untriaged",
+      s.last ? relative(s.last, Date.now()) : "Age unknown", s.service, plural(s.events, "event", "events")].join(" · ");
+    if (!m.detail.firstChild) {
+      m.detail.append(el("span"));
+      if (!m.hide && ADDRESS_RE.test(s.src)) m.detail.append(link(activityHref({ src: s.src, win: "1h" }), "View activity →"));
+      m.detail.append(button("Close", () => {
+        m.selected = null;
+        drawDetail(m);
+        m.canvas.focus();
+        kick(m);
+      }, "btn-small"));
+    }
+    m.detail.firstChild.textContent = text;
+  }
+
+  function setHover(m, src) {
+    if (m.hover === src) return;
+    m.hover = src;
+    m.canvas.classList.toggle("map-canvas-hot", Boolean(src));
+    kick(m);
+  }
+
+  function addMapControls(m) {
+    const zoomTo = (zoom) => {
+      const selected = m.sources.get(m.selected);
+      if (selected && selected.lat !== null) m.center = worldPoint(selected.lat, selected.lon);
+      m.zoom = Math.max(1, Math.min(4, zoom));
+      if (m.zoom === 1) m.center = [0.5, 0.5];
+      constrainCenter(m);
+      m.land = null;
+      kick(m);
+    };
+    const plus = button("+", () => zoomTo(m.zoom * 2), "btn-small");
+    const minus = button("−", () => zoomTo(m.zoom / 2), "btn-small");
+    plus.setAttribute("aria-label", "Zoom in");
+    minus.setAttribute("aria-label", "Zoom out");
+    m.wrap.append(el("div", "map-zoom", plus, minus, button("Reset", () => zoomTo(1), "btn-small")));
+    m.canvas.tabIndex = 0;
+    m.canvas.setAttribute("aria-describedby", "map-keyboard-help");
+    const help = el("p", { cls: "muted", attrs: { id: "map-keyboard-help" },
+      text: "Select a source on the map, or focus the map and use the arrow keys to browse sources." });
+    m.help = help;
+    const select = (src) => {
+      m.selected = src;
+      m.detail.replaceChildren();
+      drawDetail(m);
+      kick(m);
+    };
+    m.canvas.addEventListener("keydown", (ev) => {
+      if (!["ArrowLeft", "ArrowRight", "ArrowDown", "ArrowUp", "Escape"].includes(ev.key)) return;
+      ev.preventDefault();
+      if (ev.key === "Escape") { select(null); return; }
+      const sources = [...m.sources.values()];
+      if (!sources.length) return;
+      const delta = ev.key === "ArrowLeft" || ev.key === "ArrowUp" ? -1 : 1;
+      const index = sources.findIndex((s) => s.src === m.selected);
+      const next = sources[(index < 0 ? 0 : index + delta + sources.length) % sources.length];
+      select(next.src);
+      if (m.zoom > 1 && next.lat !== null) zoomTo(m.zoom);
+    });
+    let drag = null;
+    let moved = false;
+    m.canvas.addEventListener("pointerdown", (ev) => {
+      moved = false;
+      if (m.zoom <= 1) return;
+      drag = [ev.clientX, ev.clientY, ...m.center];
+      m.canvas.setPointerCapture(ev.pointerId);
+    });
+    m.canvas.addEventListener("pointermove", (ev) => {
+      if (drag) {
+        const dx = ev.clientX - drag[0], dy = ev.clientY - drag[1];
+        if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+        if (moved) {
+          m.center = [drag[2] - dx / m.w / m.zoom, drag[3] - dy / m.h / m.zoom];
+          constrainCenter(m);
+          m.land = null;
+          kick(m);
+        }
+        return;
+      }
+      setHover(m, hitSource(m, ev));
+    });
+    m.canvas.addEventListener("lostpointercapture", () => { drag = null; });
+    m.canvas.addEventListener("pointerleave", () => setHover(m, null));
+    m.canvas.addEventListener("click", (ev) => { if (!moved) select(hitSource(m, ev)); });
+  }
+
+  function constrainCenter(m) {
+    const edge = 0.5 / m.zoom;
+    m.center = m.center.map((v) => Math.min(1 - edge, Math.max(edge, v)));
+  }
+
+  function hitSource(m, ev) {
+    const rect = m.canvas.getBoundingClientRect();
+    let hit = null, nearest = 13;
+    for (const s of m.sources.values()) {
+      const [x, y] = sourcePos(m, s);
+      const distance = Math.hypot(ev.clientX - rect.left - x, ev.clientY - rect.top - y);
+      if (distance < nearest) { nearest = distance; hit = s.src; }
+    }
+    return hit;
+  }
 
   function sizeCanvas(m) {
-    const w = m.wrap.clientWidth;
-    const h = m.wrap.clientHeight;
-    const dpr = Math.min(3, window.devicePixelRatio || 1);
+    const w = m.wrap.clientWidth, h = m.wrap.clientHeight, dpr = Math.min(2, window.devicePixelRatio || 1);
     if (!w || !h || (w === m.w && h === m.h && dpr === m.dpr)) return;
     m.w = w;
     m.h = h;
     m.dpr = dpr;
-    m.bee = Math.max(15, Math.min(BEE, w / 34));
-    m.small = w < 600;
     m.canvas.width = Math.round(w * dpr);
     m.canvas.height = Math.round(h * dpr);
-    m.land = m.sheet = null;
+    m.land = null;
     kick(m);
   }
 
@@ -3388,47 +3810,21 @@
     return m.colors[name];
   }
 
+  function worldPoint(lat, lon) {
+    return [(lon + 180) / 360, (MAP_TOP - lat) / (MAP_TOP - MAP_BOTTOM)];
+  }
+
   function proj(m, lat, lon) {
-    return [(lon + 180) / 360 * m.w, (MAP_TOP - lat) / (MAP_TOP - MAP_BOTTOM) * m.h];
+    const [x, y] = worldPoint(lat, lon);
+    return [m.w * (0.5 + (x - m.center[0]) * m.zoom), m.h * (0.5 + (y - m.center[1]) * m.zoom)];
   }
 
-  // Where a source is drawn: its place, or a spot in the unlocated lane picked by its text.
   function sourcePos(m, s) {
-    if (s.lat !== null && s.lon !== null && isFinite(s.lat) && isFinite(s.lon)) {
-      return proj(m, Math.max(MAP_BOTTOM, Math.min(MAP_TOP, s.lat)), s.lon);
-    }
-    let h = 7;
-    for (const c of s.src) h = (h * 33 + c.charCodeAt(0)) % 10007;
-    const lane = laneBox(m);
-    return [lane[0] + 8 + (h % 97) / 96 * (lane[2] - 16), lane[1] + lane[3] / 2 + ((h >> 3) % 5 - 2) * lane[3] / 14];
+    if (s.lat !== null) return proj(m, Math.max(MAP_BOTTOM, Math.min(MAP_TOP, s.lat)), s.lon);
+    let hash = 7;
+    for (const c of s.src) hash = (hash * 33 + c.charCodeAt(0)) % 10007;
+    return [12 + (hash % 97) / 96 * (m.w * 0.24), m.h - 11 - (hash % 6)];
   }
-
-  function laneBox(m) {
-    const [x, y] = proj(m, -47, -178);
-    const [x2, y2] = proj(m, -57, -128);
-    return [x, y, x2 - x, y2 - y];
-  }
-
-  function potPos(m) {
-    const s = m.sensor || { lat: 0, lon: 0 };
-    const [x, y] = proj(m, s.lat, s.lon);
-    const pad = dockRadius(m) + (m.small ? 30 : 44);
-    return [Math.max(pad, Math.min(m.w - pad, x)), Math.max(pad * 0.8, Math.min(m.h - pad * 0.8, y))];
-  }
-
-  function dockRadius(m) {
-    return Math.max(22, Math.min(64, m.w * 0.046));
-  }
-
-  function dockPos(m, service) {
-    const i = Math.max(0, m.docks.indexOf(service));
-    const n = Math.max(1, m.docks.length);
-    const a = -Math.PI / 2 + i * 2 * Math.PI / n;
-    const [x, y] = potPos(m);
-    const r = dockRadius(m);
-    return [x + Math.cos(a) * r, y + Math.sin(a) * r, a];
-  }
-
   function drawLand(m) {
     if (!landRings) landRings = LAND.map((ring) => ring.split(",").map(Number));
     const c = document.createElement("canvas");
@@ -3436,6 +3832,7 @@
     c.height = m.canvas.height;
     const g = c.getContext("2d");
     g.setTransform(m.dpr, 0, 0, m.dpr, 0, 0);
+    g.globalAlpha = 0.42;
     g.strokeStyle = color(m, "--map-grid");
     g.lineWidth = 1;
     g.beginPath();
@@ -3450,6 +3847,7 @@
       g.lineTo(m.w, y);
     }
     g.stroke();
+    g.globalAlpha = 1;
     g.beginPath();
     for (const ring of landRings) {
       for (let i = 0; i + 1 < ring.length; i += 2) {
@@ -3468,443 +3866,136 @@
     m.land = c;
   }
 
-  // An original bee, drawn once per service colour in four wing positions.
-  function drawSheet(m) {
-    const k = m.bee / BEE;
-    const size = Math.ceil(m.bee * m.dpr);
-    const c = document.createElement("canvas");
-    c.width = size * 4;
-    c.height = size * (MAP_SVC_CLASS.length + 1);
-    const g = c.getContext("2d");
-    const ink = color(m, "--map-bee-ink");
-    for (let row = 0; row <= MAP_SVC_CLASS.length; row++) {
-      const body = row < MAP_SVC_CLASS.length ? color(m, "--map-svc-" + row) : color(m, "--unknown");
-      for (let f = 0; f < 4; f++) {
-        g.setTransform(m.dpr * k, 0, 0, m.dpr * k, f * size + size / 2, row * size + size / 2);
-        const lift = [1, 0.72, 0.4, 0.72][f];
-        g.fillStyle = color(m, "--map-wing");
-        g.strokeStyle = ink;
-        g.lineWidth = 0.8;
-        for (const side of [-1, 1]) {
-          g.beginPath();
-          g.ellipse(-1, side * (3.5 + 3.5 * lift), 5.2, 3.6 * lift + 0.6, side * 0.5, 0, 2 * Math.PI);
-          g.fill();
-          g.stroke();
-        }
-        g.beginPath();
-        g.ellipse(-1.5, 0, 7.5, 5, 0, 0, 2 * Math.PI);
-        g.fillStyle = body;
-        g.fill();
-        g.save();
-        g.clip();
-        g.fillStyle = ink;
-        for (const x of [-5.5, -1.5, 2.5]) g.fillRect(x, -6, 1.8, 12);
-        g.restore();
-        g.lineWidth = 1;
-        g.stroke();
-        g.beginPath();
-        g.moveTo(-9, -1.2);
-        g.lineTo(-11.5, 0);
-        g.lineTo(-9, 1.2);
-        g.fill();
-        g.beginPath();
-        g.arc(7.2, 0, 3.3, 0, 2 * Math.PI);
-        g.fill();
-        g.fillStyle = color(m, "--map-wing");
-        g.beginPath();
-        g.arc(8.4, -1.2, 0.9, 0, 2 * Math.PI);
-        g.fill();
-      }
-    }
-    m.sheet = { c: c, size: size };
+  function kick(m) {
+    if (!m.raf && alive(m) && !document.hidden) m.raf = requestAnimationFrame((ts) => frame(m, ts));
   }
 
-  function kick(m) {
-    if (!m.raf && alive(m)) m.raf = requestAnimationFrame((ts) => frame(m, ts));
+  function ageAlpha(m, s) {
+    if (!s.last) return 0.42;
+    const age = (m.lastOK - s.last.getTime()) / 60000;
+    const [first, second] = MAP_AGE_MINUTES[m.win];
+    return age < first ? 1 : age < second ? 0.73 : 0.45;
+  }
+
+  function traceMarker(g, s, x, y, r) {
+    g.beginPath();
+    if (s.judgement === "MALICIOUS") {
+      g.moveTo(x, y - r);
+      g.lineTo(x + r, y + r * 0.82);
+      g.lineTo(x - r, y + r * 0.82);
+      g.closePath();
+    } else if (s.judgement === "SUSPICIOUS") {
+      g.moveTo(x, y - r);
+      g.lineTo(x + r, y);
+      g.lineTo(x, y + r);
+      g.lineTo(x - r, y);
+      g.closePath();
+    } else if (s.judgement === "BENIGN") {
+      g.arc(x, y, r * 0.84, 0, 2 * Math.PI);
+    } else {
+      g.rect(x - r * 0.68, y - r * 0.68, r * 1.36, r * 1.36);
+    }
+  }
+
+  function drawPath(m, g, s, sensor, travel) {
+    const [x, y] = sourcePos(m, s), [endX, endY] = sensor;
+    const cx = (x + endX) / 2;
+    const cy = (y + endY) / 2 - Math.min(m.h * 0.16, Math.hypot(endX - x, endY - y) * 0.26);
+    if (travel === null) {
+      g.beginPath();
+      g.moveTo(x, y);
+      g.quadraticCurveTo(cx, cy, endX, endY);
+      g.stroke();
+    } else {
+      const a = 1 - travel, b = 2 * a * travel;
+      g.beginPath();
+      g.arc(a * a * x + b * cx + travel * travel * endX,
+        a * a * y + b * cy + travel * travel * endY, m.mode === "preview" ? 1.6 : 2.2, 0, 2 * Math.PI);
+      g.fill();
+    }
   }
 
   function frame(m, ts) {
     m.raf = 0;
-    if (!alive(m) || !m.w) return;
-    const dt = m.last ? Math.min(100, ts - m.last) : 0;
-    m.last = ts;
-    if (!m.paused) m.t += dt;
-    while (!m.paused && m.queue.length && m.queue[0].at <= m.t) release(m, m.queue.shift(), true);
+    if (!alive(m) || !m.w || document.hidden) return;
     if (!m.land) drawLand(m);
-    if (!m.sheet) drawSheet(m);
     const g = m.canvas.getContext("2d");
     g.setTransform(1, 0, 0, 1, 0, 0);
     g.clearRect(0, 0, m.canvas.width, m.canvas.height);
     g.drawImage(m.land, 0, 0);
     g.setTransform(m.dpr, 0, 0, m.dpr, 0, 0);
-    drawLane(m, g);
-    drawSources(m, g);
-    drawFlights(m, g, true);
-    drawPot(m, g);
-    drawPulses(m, g);
-    drawFlights(m, g, false);
-    drawTip(m, g);
-    m.flights = m.flights.filter((f) => !f.dur || m.t - f.start < f.dur);
-    m.pulses = m.pulses.filter((p) => m.t - p.at < 1400);
-    if (m.flights.length !== m.shownFlying) {
-      m.shownFlying = m.flights.length;
-      m.flyingNode.textContent = num(m.flights.length);
+    const sensor = m.sensor?.placed ? proj(m, m.sensor.lat, m.sensor.lon) : [m.w - 29, m.h - 22];
+    const sources = [...m.sources.values()];
+    if (sources.some((s) => s.lat === null)) {
+      g.fillStyle = color(m, "--map-water");
+      g.fillRect(4, m.h - 37, m.w * 0.24 + 17, 34);
+      g.strokeStyle = color(m, "--map-coast");
+      g.strokeRect(4.5, m.h - 36.5, m.w * 0.24 + 17, 34);
+      g.fillStyle = color(m, "--text-muted");
+      g.font = "10px " + color(m, "--font-ui");
+      g.fillText("Unlocated", 10, m.h - 24);
     }
-    const busy = !m.paused && (m.flights.length || m.pulses.length || m.queue.length);
-    if (busy && !document.hidden) kick(m);
-    else m.last = 0;
-  }
-
-  function drawLane(m, g) {
-    if (![...m.sources.values()].some((s) => s.lat === null)) return;
-    const [x, y, w, h] = laneBox(m);
-    g.setLineDash([4, 4]);
-    g.strokeStyle = color(m, "--map-coast");
+    const pathColor = color(m, "--text-muted");
+    g.strokeStyle = pathColor;
     g.lineWidth = 1;
-    g.strokeRect(x + 0.5, y + 0.5, w, h);
-    g.setLineDash([]);
-    g.fillStyle = color(m, "--text-muted");
-    g.font = "11px " + color(m, "--font-ui");
-    g.textAlign = "left";
-    g.textBaseline = "bottom";
-    g.fillText("Unlocated", x + 2, y - 3);
-  }
-
-  function dotRadius(s) {
-    return Math.min(8, 2 + 1.25 * Math.log2(1 + s.events));
-  }
-
-  function drawSources(m, g) {
-    const list = [...m.sources.values()].sort((a, b) => b.events - a.events);
-    for (const s of list) {
+    const paths = sources.filter((s) => s.lat !== null).sort((a, b) => (b.last || 0) - (a.last || 0));
+    for (const s of paths.slice(0, m.mode === "preview" ? 6 : 20)) {
+      g.globalAlpha = ageAlpha(m, s) * 0.48;
+      drawPath(m, g, s, sensor, null);
+    }
+    m.flights = m.flights.filter((f) => ts - f.start < 1800);
+    g.fillStyle = pathColor;
+    for (const f of m.flights) {
+      const src = m.sources.get(f.src);
+      if (!src || m.off.has(f.service) || ts < f.start) continue;
+      g.globalAlpha = ageAlpha(m, src);
+      drawPath(m, g, src, sensor, (ts - f.start) / 1800);
+    }
+    for (const s of sources) {
       const [x, y] = sourcePos(m, s);
-      const r = dotRadius(s);
+      const baseRadius = m.mode === "wall" ? 8 : m.mode === "preview" ? 3.5 : 5;
+      const r = baseRadius + Math.min(2, Math.log2(s.events + 1) / 2);
       const judged = lookup(MAP_JUDGEMENT_VAR, s.judgement, null);
-      g.globalAlpha = judged ? 0.9 : 0.6;
-      g.fillStyle = color(m, judged || "--unknown");
-      g.beginPath();
-      g.arc(x, y, r, 0, 2 * Math.PI);
-      g.fill();
-      g.globalAlpha = 1;
-      g.strokeStyle = color(m, "--surface");
-      g.lineWidth = 1;
-      g.stroke();
-      if (s.src === m.hover) {
+      g.globalAlpha = ageAlpha(m, s);
+      g.fillStyle = g.strokeStyle = color(m, judged || "--unknown");
+      traceMarker(g, s, x, y, r);
+      if (judged) g.fill();
+      else { g.lineWidth = 1.8; g.stroke(); }
+      if (s.src === m.hover || s.src === m.selected) {
+        g.globalAlpha = 1;
         g.strokeStyle = color(m, "--text");
-        g.lineWidth = 2;
+        g.lineWidth = 1.5;
         g.beginPath();
         g.arc(x, y, r + 3, 0, 2 * Math.PI);
         g.stroke();
       }
     }
-  }
-
-  function flightPath(m, f) {
-    const [x0, y0] = sourcePos(m, f.src);
-    const [x1, y1] = dockPos(m, f.service);
-    const dx = x1 - x0;
-    const dy = y1 - y0;
-    const dist = Math.hypot(dx, dy) || 1;
-    const bend = Math.min(dist * 0.28, m.h * 0.3);
-    // Bend towards the top of the map so arcs read as flights, not as lines.
-    const sx = dx >= 0 ? 1 : -1;
-    const cx = (x0 + x1) / 2 + (dy / dist) * bend * sx;
-    const cy = (y0 + y1) / 2 - Math.abs(dx / dist) * bend;
-    if (!f.dur) f.dur = Math.max(1300, Math.min(3400, 900 + dist * 2.6));
-    return [x0, y0, cx, cy, x1, y1];
-  }
-
-  function bezier(p, u) {
-    const a = (1 - u) * (1 - u);
-    const b = 2 * (1 - u) * u;
-    const c = u * u;
-    return [a * p[0] + b * p[2] + c * p[4], a * p[1] + b * p[3] + c * p[5]];
-  }
-
-  function drawFlights(m, g, trails) {
-    const sheet = m.sheet;
-    for (const f of m.flights) {
-      const p = flightPath(m, f);
-      const u = easeInOut(Math.min(1, (m.t - f.start) / f.dur));
-      const idx = svcIndex(f.service);
-      if (trails) {
-        g.strokeStyle = color(m, "--map-svc-" + idx);
-        g.lineWidth = 2;
-        g.lineCap = "round";
-        let prev = bezier(p, Math.max(0, u - 0.16));
-        for (let k = 1; k <= 8; k++) {
-          const next = bezier(p, Math.max(0, u - 0.16 + 0.02 * k));
-          g.globalAlpha = 0.07 * k;
-          g.beginPath();
-          g.moveTo(prev[0], prev[1]);
-          g.lineTo(next[0], next[1]);
-          g.stroke();
-          prev = next;
-        }
-        g.globalAlpha = 1;
-        continue;
-      }
-      const [x, y] = bezier(p, u);
-      const [ax, ay] = bezier(p, Math.min(1, u + 0.01));
-      const angle = Math.atan2(ay - y, ax - x);
-      const frameNo = Math.floor((m.t + f.phase * 40) / 40) % 4;
-      g.save();
-      g.translate(x, y);
-      g.rotate(isFinite(angle) ? angle : 0);
-      g.drawImage(sheet.c, frameNo * sheet.size, idx * sheet.size, sheet.size, sheet.size, -m.bee / 2, -m.bee / 2, m.bee, m.bee);
-      g.restore();
-      if (f.count > 1) {
-        g.font = "600 11px " + color(m, "--font-ui");
-        g.textAlign = "left";
-        g.textBaseline = "middle";
-        g.lineWidth = 3;
-        g.strokeStyle = color(m, "--surface");
-        g.strokeText("×" + f.count, x + m.bee * 0.4, y - m.bee * 0.4);
-        g.fillStyle = color(m, "--text");
-        g.fillText("×" + f.count, x + m.bee * 0.4, y - m.bee * 0.4);
-      }
-      if (m.t - f.start >= f.dur - 16 && !f.landed) {
-        f.landed = true;
-        m.pulses.push({ dock: f.service, at: m.t });
-      }
-    }
-  }
-
-  function drawPulses(m, g) {
-    for (const p of m.pulses) {
-      const k = Math.min(1, (m.t - p.at) / (p.dock ? 700 : 1400));
-      if (p.dock) {
-        const [x, y] = dockPos(m, p.dock);
-        g.strokeStyle = color(m, "--map-svc-" + svcIndex(p.dock));
-        g.globalAlpha = 1 - k;
-        g.lineWidth = 2;
-        g.beginPath();
-        g.arc(x, y, 5 + (m.small ? 8 : 13) * easeInOut(k), 0, 2 * Math.PI);
-        g.stroke();
-      } else if (p.src) {
-        // A new event at a source: a ring that grows (or, with reduced motion, fades).
-        const [x, y] = sourcePos(m, p.src);
-        const r = dotRadius(p.src);
-        g.strokeStyle = color(m, p.service ? "--map-svc-" + svcIndex(p.service) : "--text-muted");
-        g.globalAlpha = (1 - k) * 0.9;
-        g.lineWidth = 1.5;
-        g.beginPath();
-        g.arc(x, y, m.still ? r + 3 : r + 2 + 10 * k, 0, 2 * Math.PI);
-        g.stroke();
-      }
-      g.globalAlpha = 1;
-    }
-  }
-
-  // The sensor: a honey pot with one labelled dock per service around it.
-  function drawPot(m, g) {
-    const [x, y] = potPos(m);
-    const r = dockRadius(m);
-    // A pad under the ring keeps the docks readable over nearby sources.
-    g.fillStyle = color(m, "--map-water");
-    g.globalAlpha = 0.82;
-    g.beginPath();
-    g.arc(x, y, r + 6, 0, 2 * Math.PI);
-    g.fill();
     g.globalAlpha = 1;
-    g.strokeStyle = color(m, "--map-coast");
-    g.lineWidth = 1;
-    g.setLineDash([2, 3]);
-    g.beginPath();
-    g.arc(x, y, r, 0, 2 * Math.PI);
-    g.stroke();
-    g.setLineDash([]);
-    g.fillStyle = color(m, "--map-pot");
-    g.strokeStyle = color(m, "--map-pot-ink");
-    g.lineWidth = 1.5;
-    g.beginPath();
-    g.moveTo(x - 7, y - 8);
-    g.bezierCurveTo(x - 15, y - 6, x - 14, y + 9, x - 6, y + 10);
-    g.lineTo(x + 6, y + 10);
-    g.bezierCurveTo(x + 14, y + 9, x + 15, y - 6, x + 7, y - 8);
-    g.closePath();
-    g.fill();
-    g.stroke();
-    g.fillStyle = color(m, "--map-pot-ink");
-    g.fillRect(x - 9, y - 11, 18, 3.5);
-    g.beginPath();
-    g.ellipse(x + 3, y - 5, 2, 3.2, 0, 0, 2 * Math.PI);
-    g.fill();
-    const px = m.small ? 10 : 11;
-    g.font = "600 " + (px + 1) + "px " + color(m, "--font-ui");
-    g.textAlign = "center";
-    g.textBaseline = "top";
-    label(m, g, m.sensor ? m.sensor.label : "", x, y + r + px * 2 + 3);
-    g.font = px + "px " + color(m, "--font-ui");
-    for (const service of m.docks) {
-      const [dx, dy, a] = dockPos(m, service);
-      const shown = !m.off.has(service);
-      g.globalAlpha = shown ? 1 : 0.35;
-      g.fillStyle = color(m, "--map-svc-" + svcIndex(service));
-      g.strokeStyle = color(m, "--surface");
-      g.lineWidth = 1.5;
+    if (m.sensor) {
+      const [x, y] = sensor;
+      g.strokeStyle = g.fillStyle = color(m, "--accent");
+      g.lineWidth = 1.2;
       g.beginPath();
-      g.arc(dx, dy, 4.5, 0, 2 * Math.PI);
-      g.fill();
+      g.arc(x, y, 6, 0, 2 * Math.PI);
       g.stroke();
-      const c = Math.cos(a);
-      const sn = Math.sin(a);
-      g.textAlign = c > 0.35 ? "left" : c < -0.35 ? "right" : "center";
-      g.textBaseline = sn > 0.35 ? "top" : sn < -0.35 ? "bottom" : "middle";
-      const port = m.ports.get(service);
-      label(m, g, service.toUpperCase() + (port && !m.small ? " " + port : ""), dx + c * 8, dy + sn * 8);
-      g.globalAlpha = 1;
-    }
-  }
-
-  // Text with a halo in the surface colour so it reads over land, sea and trails.
-  function label(m, g, text, x, y) {
-    if (!text) return;
-    const w = g.measureText(text).width;
-    const align = g.textAlign;
-    const left = align === "left" ? x : align === "right" ? x - w : x - w / 2;
-    const dx = Math.max(2 - left, Math.min(0, m.w - 2 - (left + w)));
-    g.lineWidth = 3;
-    g.lineJoin = "round";
-    g.strokeStyle = color(m, "--surface");
-    g.strokeText(text, x + dx, y);
-    g.fillStyle = color(m, "--text");
-    g.fillText(text, x + dx, y);
-  }
-
-  function drawTip(m, g) {
-    const s = m.hover ? m.sources.get(m.hover) : null;
-    if (!s) return;
-    const [x, y] = sourcePos(m, s);
-    const lines = [s.place || "Unlocated", m.hide ? null : s.src, plural(s.events, "event", "events") + " in the window"]
-      .filter(Boolean).map((t) => t.slice(0, 80));
-    g.font = "12px " + color(m, "--font-ui");
-    const w = Math.max(...lines.map((t) => g.measureText(t).width)) + 16;
-    const h = lines.length * 16 + 10;
-    const bx = Math.max(4, Math.min(m.w - w - 4, x + 12));
-    const by = Math.max(4, Math.min(m.h - h - 4, y - h - 8));
-    g.fillStyle = color(m, "--surface");
-    g.strokeStyle = color(m, "--border-strong");
-    g.lineWidth = 1;
-    g.beginPath();
-    g.roundRect(bx + 0.5, by + 0.5, w, h, 4);
-    g.fill();
-    g.stroke();
-    g.fillStyle = color(m, "--text");
-    g.textAlign = "left";
-    g.textBaseline = "top";
-    lines.forEach((t, i) => g.fillText(t, bx + 8, by + 6 + i * 16));
-  }
-
-  function sourceAt(m, x, y) {
-    let best = null;
-    let bestD = Infinity;
-    for (const s of m.sources.values()) {
-      const [sx, sy] = sourcePos(m, s);
-      const d = Math.hypot(sx - x, sy - y);
-      if (d <= dotRadius(s) + 5 && d < bestD) {
-        best = s.src;
-        bestD = d;
+      g.beginPath();
+      g.arc(x, y, 2, 0, 2 * Math.PI);
+      g.fill();
+      if (m.mode !== "preview") {
+        g.font = "11px " + color(m, "--font-ui");
+        g.textAlign = "center";
+        const name = m.mode === "full" && !m.hide && m.sensor.label ? m.sensor.label : "Sensor";
+        const caption = m.sensor.placed ? name : name + " · unplaced";
+        const inset = Math.min(m.w / 2, g.measureText(caption).width / 2 + 4);
+        g.fillText(caption, Math.min(m.w - inset, Math.max(inset, x)), Math.max(12, y - 11), m.w - 8);
+        g.textAlign = "left";
       }
     }
-    return best;
-  }
-
-  function setHover(m, src) {
-    if (m.hover === src) return;
-    for (const li of m.rows.get(m.hover) || []) li.classList.remove("map-row-hot");
-    m.hover = src;
-    for (const li of m.rows.get(src) || []) li.classList.add("map-row-hot");
-    m.canvas.classList.toggle("map-canvas-hot", Boolean(src));
-    kick(m);
-  }
-
-  function openSource(src) {
-    if (typeof src === "string" && ADDRESS_RE.test(src)) location.hash = activityHref({ src: src, win: "1h" });
-  }
-
-  // ---- map: legend, counters and feed ----
-
-  function drawLegend(m) {
-    setKids(m.legend, m.docks.map((service) => {
-      const b = button(service, () => {
-        if (m.off.has(service)) m.off.delete(service);
-        else m.off.add(service);
-        b.setAttribute("aria-pressed", m.off.has(service) ? "false" : "true");
-        drawFeed(m);
-        kick(m);
-      }, "btn-small map-key " + MAP_SVC_CLASS[svcIndex(service)]);
-      b.setAttribute("aria-pressed", m.off.has(service) ? "false" : "true");
-      return b;
-    }));
-  }
-
-  function drawCounters(m, totals, d) {
-    const minutes = arr(totals.per_minute).map((x) => Number(obj(x).events) || 0);
-    const done = minutes.slice(0, -1);
-    const rate = done.length ? done.reduce((a, b) => a + b, 0) / done.length : (minutes[0] || 0);
-    const top = (o) => Object.entries(obj(o)).slice(0, 3).map(([k, n]) => k + " " + num(n)).join(" · ") || "-";
-    const total = Number(totals.events) || 0;
-    m.flyingNode = el("div", "tile-value");
-    m.shownFlying = -1;
-    setKids(m.counters,
-      tile("Events in the last " + lookup(MAP_WINDOW_TEXT, m.win, ""), num(total)),
-      tile("Per minute", rate < 10 ? rate.toFixed(1) : num(Math.round(rate))),
-      el("div", "tile", el("div", { cls: "tile-label", text: "Top countries" }), el("div", { cls: "map-top", text: top(totals.countries) })),
-      el("div", "tile", el("div", { cls: "tile-label", text: "Top services" }), el("div", { cls: "map-top", text: top(totals.services) })),
-      el("div", "tile", el("div", { cls: "tile-label", text: "In flight" }), m.flyingNode));
-    const located = [...m.sources.values()].filter((s) => s.lat !== null).length;
-    m.canvas.setAttribute("aria-label", "World map: " + plural(m.sources.size, "source", "sources") + ", " +
-      num(located) + " placed, " + plural(total, "event", "events") + " in the last " + lookup(MAP_WINDOW_TEXT, m.win, "") +
-      ". The list of live events beside it is the same information as text.");
-    if (d.located === false && !m.note.firstChild) {
-      setKids(m.note, notice("warn", "No IP location database is set ([geoip] in config.ini), so every source is in the unlocated lane."));
+    if (m.flyingNode) {
+      const count = String(m.flights.filter((f) => !m.off.has(f.service)).length);
+      if (m.flyingNode.textContent !== count) m.flyingNode.textContent = count;
     }
-  }
-
-  function drawFeed(m) {
-    m.rows.clear();
-    m.list.replaceChildren();
-    for (const it of m.feed.slice().reverse()) addFeedRow(m, it);
-  }
-
-  function addFeedRow(m, it) {
-    const service = str(it.service);
-    if (m.off.has(service)) return;
-    const src = str(it.src);
-    const when = parseTime(it.time);
-    const port = Number.isInteger(it.dst_port) ? " " + it.dst_port : "";
-    const li = el("li", { cls: "map-row", attrs: { tabindex: "0" } },
-      el("div", "map-row-head",
-        el("span", { cls: "mono faint", text: when ? clockUtc(when) : "-" }),
-        el("span", { cls: "map-svc " + MAP_SVC_CLASS[svcIndex(service)], text: service + port }),
-        el("span", { cls: "map-kind", text: kindLabel(it.kind) }),
-        it.outcome ? outcomeBadge(it.outcome) : null),
-      el("div", "map-row-where",
-        el("span", { text: str(it.place) || "Unlocated" }),
-        m.hide ? null : el("span", { cls: "mono muted", text: " " + src }),
-        it.judgement ? el("span", { text: " " }) : null, it.judgement ? judgementBadge(it.judgement) : null),
-      el("div", { cls: "map-row-what mono", text: str(it.summary) }));
-    const enter = () => setHover(m, src || null);
-    li.addEventListener("mouseenter", enter);
-    li.addEventListener("focus", enter);
-    li.addEventListener("mouseleave", () => setHover(m, null));
-    li.addEventListener("blur", () => setHover(m, null));
-    li.addEventListener("click", () => openSource(src));
-    li.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") openSource(src);
-    });
-    if (src) {
-      if (!m.rows.has(src)) m.rows.set(src, new Set());
-      m.rows.get(src).add(li);
-      if (src === m.hover) li.classList.add("map-row-hot");
-    }
-    m.list.prepend(li);
-    while (m.list.children.length > MAP_FEED) {
-      const old = m.list.lastElementChild;
-      for (const set of m.rows.values()) set.delete(old);
-      old.remove();
-    }
+    if (m.flights.length && !m.paused && !m.still) kick(m);
   }
 
   // ---- screen: not found ----------------------------------------------------------------
