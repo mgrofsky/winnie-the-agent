@@ -97,6 +97,8 @@ def all_requests(tree):
         ("/api/activity", {"service": "ssh", "kind": "input", "src": "198.51.100.0/24"}),
         ("/api/activity", {"outcome": "maybe"}), ("/api/activity", {"before": "x"}),
         ("/api/activity", {"after": "0"}),
+        ("/api/map", {}), ("/api/map", {"window": "1h"}), ("/api/map", {"window": "2d"}),
+        ("/api/map", {"after": "0"}), ("/api/map", {"after": "x"}),
         (f"/api/activity/session/{sa}", {}), ("/api/activity/session/redis-0001", {}),
         ("/api/activity/session/../x", {}),
         (f"/api/records/{sa}/replies", {}), (f"/api/records/{tree.ids['ftp']}/replies", {}),

