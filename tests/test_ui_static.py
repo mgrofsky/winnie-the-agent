@@ -345,3 +345,14 @@ def test_map_keeps_attacker_text_out_of_attributes_and_reloads_on_a_new_log():
     # Timers stop when the screen changes.
     assert "state.view.stop()" in _function(text, "render")
     assert "m.gen === state.gen" in _function(text, "alive")
+
+
+def test_map_drops_answers_to_superseded_requests_and_rebuilds_sources():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    load = _function(text, "loadMap")
+    assert "const req = ++m.req" in load and "req !== m.req" in load
+    poll = _function(text, "pollMap")
+    assert "const req = ++m.req" in poll and poll.count("req !== m.req") == 2
+    assert "m.loading" in poll
+    ingest = _function(text, "ingest")
+    assert "m.sources = new Map()" in ingest and "busy.has(key)" in ingest

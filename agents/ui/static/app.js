@@ -3089,7 +3089,7 @@
     setTitle("Map");
     const m = {
       gen: state.gen, win: "15m", cursor: null, logId: null, busy: false, timer: null,
-      raf: 0, last: 0, t: 0, bee: BEE, small: false, paused: false, hide: false, off: new Set(),
+      raf: 0, last: 0, t: 0, bee: BEE, small: false, req: 0, loading: 0, paused: false, hide: false, off: new Set(),
       still: false, w: 0, h: 0, dpr: 1, colors: {}, land: null, sheet: null,
       sensor: null, sources: new Map(), docks: [], ports: new Map(), feed: [],
       queue: [], flights: [], pulses: [], hover: null, rows: new Map(), shownFlying: -1,
@@ -3190,18 +3190,24 @@
     if (alive(m) && !document.hidden) m.timer = setTimeout(() => pollMap(m), delay);
   }
 
-  // A fresh window: everything on the map is replaced.
+  // A fresh window: everything on the map is replaced. Each load or poll takes a request
+  // number; an answer to anything but the latest request (an earlier window, or a poll
+  // overtaken by a reload) is dropped.
   async function loadMap(m) {
     clearTimeout(m.timer);
+    const req = ++m.req;
+    m.loading = req;
     let d;
     try {
       d = obj(await apiGet(API.map, { window: m.win }));
     } catch (err) {
-      if (!alive(m)) return false;
+      if (m.loading === req) m.loading = 0;
+      if (!alive(m) || req !== m.req) return false;
       setKids(m.note, errorState(err, () => loadMap(m)));
       return false;
     }
-    if (!alive(m)) return false;
+    if (m.loading === req) m.loading = 0;
+    if (!alive(m) || req !== m.req) return false;
     setKids(m.note);
     m.sources.clear();
     m.ports.clear();
@@ -3215,18 +3221,28 @@
   }
 
   async function pollMap(m) {
-    if (!alive(m) || m.busy || document.hidden) return;
+    // A window load in progress owns the next answer; polling resumes after it.
+    if (!alive(m) || m.busy || m.loading || document.hidden) return;
     if (m.cursor === null) {
       loadMap(m);
       return;
     }
     m.busy = true;
+    const req = ++m.req;
     let ok = true;
     try {
       const d = obj(await apiGet(API.map, { window: m.win, after: m.cursor, log_id: m.logId }));
+      if (req !== m.req) {
+        m.busy = false;
+        return;
+      }
       if (alive(m)) ingest(m, d, false);
     } catch (err) {
       ok = false;
+      if (req !== m.req) {
+        m.busy = false;
+        return;
+      }
       if (alive(m) && err.status === 409) {
         // The log was rotated or replaced (or the console restarted): start over.
         m.busy = false;
@@ -3247,10 +3263,15 @@
     const s = obj(d.sensor);
     const at = arr(s.point);
     m.sensor = { label: str(s.label), lat: Number(at[0]) || 0, lon: Number(at[1]) || 0 };
+    // Every answer (load or poll) lists the sources of the whole window as it is now, so the
+    // map is rebuilt from it: a source whose events have aged out goes, unless a bee or ring
+    // of its own is still on screen or queued.
+    const before = m.sources;
+    m.sources = new Map();
     for (const src of arr(d.sources)) {
       const o = obj(src);
       if (!str(o.src)) continue;
-      const known = m.sources.get(o.src);
+      const known = before.get(o.src);
       const p = arr(o.point);
       m.sources.set(o.src, Object.assign(known || { seen: -1e9 }, {
         src: o.src, events: Number(o.events) || 0, place: str(o.place),
@@ -3261,10 +3282,16 @@
     for (const it of items) {
       if (!m.sources.has(str(it.src)) && str(it.src)) {
         const p = arr(it.point);
-        m.sources.set(it.src, { src: it.src, events: 1, place: str(it.place), judgement: str(it.judgement), seen: -1e9,
-          lat: p.length === 2 ? Number(p[0]) : null, lon: p.length === 2 ? Number(p[1]) : null });
+        m.sources.set(it.src, Object.assign(before.get(it.src) || { seen: -1e9 }, { src: it.src, events: 1,
+          place: str(it.place), judgement: str(it.judgement),
+          lat: p.length === 2 ? Number(p[0]) : null, lon: p.length === 2 ? Number(p[1]) : null }));
       }
       if (Number.isInteger(it.dst_port)) m.ports.set(str(it.service), it.dst_port);
+    }
+    const busy = new Set([...m.flights.map((f) => f.src.src), ...m.pulses.filter((q) => q.src).map((q) => q.src.src),
+      ...m.queue.map((q) => str(q.it.src))]);
+    for (const [key, s] of before) {
+      if (!m.sources.has(key) && busy.has(key)) m.sources.set(key, s);
     }
     trimSources(m);
     const totals = obj(d.totals);

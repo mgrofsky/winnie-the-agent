@@ -3,6 +3,7 @@ end, and attacker-controlled strings shown as text with nothing executed."""
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -314,4 +315,73 @@ def test_a_feed_row_opens_activity_for_its_source(signed_in, lab):
     page.keyboard.press("Enter")
     expect(page.get_by_role("heading", level=1).first).to_have_text("Activity")
     assert "src=198.51.100.21" in page.url
+    assert seen.problems() == []
+
+
+def map_answer(total: int, sources: list[str], newest: int = 100, items=()) -> dict:
+    """A /api/map answer of the server's shape: ``sources`` each with one event."""
+    return {"items": list(items), "skipped": 0, "newest": newest, "log_id": "fake.0",
+            "window": "15m", "located": True,
+            "sources": [{"src": s, "events": 1, "point": [10.0, 10.0 + i], "place": "Somewhere",
+                         "country": "NL", "service": "ssh", "last": None}
+                        for i, s in enumerate(sources)],
+            "totals": {"events": total, "services": {"ssh": total}, "countries": {"NL": total},
+                       "per_minute": []},
+            "sensor": {"name": "fixture", "label": "Lab sensor", "point": [40.7, -74.0],
+                       "placed": True}}
+
+
+def map_sources_label(page) -> str:
+    return page.locator("canvas.map-canvas").get_attribute("aria-label")
+
+
+def test_map_drops_sources_whose_events_left_the_window(signed_in, lab):
+    page, seen = signed_in
+    answers = [map_answer(2, ["198.51.100.7", "198.51.100.8"]),
+               map_answer(1, ["198.51.100.7"], newest=101)]
+
+    def answer(route):
+        body = answers.pop(0) if len(answers) > 1 else answers[0]
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
+
+    page.route("**/api/map?*", answer)
+    page.goto(f"{lab.base_url}/#/map")
+    canvas = page.locator("canvas.map-canvas")
+    expect(canvas).to_have_attribute("aria-label", re.compile(r"^World map: 2 sources"))
+    # The next poll's window no longer holds 198.51.100.8: its dot and count go.
+    expect(canvas).to_have_attribute("aria-label", re.compile(r"^World map: 1 source,"),
+                                     timeout=12000)
+    tile = page.locator(".map-counters .tile").first
+    expect(tile).to_contain_text("1")
+    assert seen.problems() == []
+
+
+def test_a_slow_answer_for_an_earlier_window_is_dropped(signed_in, lab):
+    page, seen = signed_in
+    held = []
+
+    def answer(route):
+        url = route.request.url
+        if "window=15m" in url and "after=" not in url and not held:
+            held.append(route)          # the first load answers only after the switch
+            return
+        total = 111 if "window=1h" in url else 222
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(map_answer(total, ["198.51.100.7"])))
+
+    page.route("**/api/map?*", answer)
+    page.goto(f"{lab.base_url}/#/map")
+    expect(page.get_by_role("heading", level=1).first).to_have_text("Map")
+    page.wait_for_function("() => true")
+    assert held, "the first window load was not intercepted"
+    page.get_by_role("button", name="1 hour").click()
+    tile = page.locator(".map-counters .tile").first
+    expect(tile).to_contain_text("Events in the last hour")
+    expect(tile).to_contain_text("111")
+    held[0].fulfill(status=200, content_type="application/json",
+                    body=json.dumps(map_answer(999, ["198.51.100.8", "198.51.100.9"])))
+    page.wait_for_timeout(500)
+    expect(tile).to_contain_text("111")
+    expect(page.locator("canvas.map-canvas")).to_have_attribute(
+        "aria-label", re.compile(r"^World map: 1 source,"))
     assert seen.problems() == []
