@@ -82,6 +82,10 @@ class HttpState:
         while len(self.counters) > MAX_COUNTERS or \
                 next(iter(self.counters.values()))[1] < now - SOURCE_TTL:
             self.counters.popitem(last=False)
+        # Every request keeps an existing view alive (it never creates one) and drops views
+        # idle for a day, with their markers.
+        self._view(key, create=False)
+        self._trim(now, keep=None)
         return entry[0]
 
     def _view(self, key: str, create: bool) -> Optional[SourceView]:
@@ -100,7 +104,7 @@ class HttpState:
         self._trim(now, keep=key)
         return view
 
-    def _trim(self, now: float, keep: str) -> None:
+    def _trim(self, now: float, keep: Optional[str]) -> None:
         while self.sources:
             old_key, old = next(iter(self.sources.items()))
             if old_key == keep or (len(self.sources) <= MAX_SOURCES
@@ -161,6 +165,7 @@ class HttpState:
     def find_marker(self, texts: Iterable[Optional[str]]) -> Optional[tuple[str, str]]:
         """(marker name, source key it was issued to) for the first issued marker found in
         ``texts``. One dictionary probe per position of a bounded prefix of each text."""
+        self._trim(self.clock(), keep=None)      # an expired source's markers are forgotten
         if not self._issued:
             return None
         for text in texts:

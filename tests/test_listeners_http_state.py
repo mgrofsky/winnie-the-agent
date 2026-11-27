@@ -127,3 +127,28 @@ def test_ids_held_for_all_sources_are_bounded(monkeypatch):
         st.count_id("new", "/r/{id}", str(v))
     assert "old" not in st.sources and st.id_total == 4
     assert st.count_id("new", "/r/{id}", "x" * 100_000) == 5
+
+
+def test_any_request_keeps_the_view_alive_without_creating_one():
+    _, st, clock = make()
+    value = st.marker("a", "api_key")
+    st.show("a", ["/x"], "bundle")
+    for _ in range(3):                         # plain requests, each under a day apart
+        clock.now += hs.SOURCE_TTL - 10
+        st.next_seq("a")
+    assert st.discovery("a", "/x")[0] == "bundle" and st.find_marker([value]) == ("api_key", "a")
+    st.next_seq("scanner")
+    assert "scanner" not in st.sources
+
+
+def test_an_expired_sources_markers_are_not_recognised():
+    _, st, clock = make()
+    value = st.marker("a", "api_key")
+    st.next_seq("b")
+    clock.now += hs.SOURCE_TTL + 1
+    st.next_seq("b")                           # ordinary traffic from someone else
+    assert "a" not in st.sources and not st._issued
+    other = st.marker("c", "api_key")
+    clock.now += hs.SOURCE_TTL + 1
+    assert st.find_marker([value]) is None and st.find_marker([other]) is None
+    assert not st._issued                      # the lookup itself swept c's expired marker
