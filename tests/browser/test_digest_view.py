@@ -173,3 +173,40 @@ def test_a_cut_digest_offers_no_download(signed_in, lab):
     expect(main).to_contain_text("Cut at 200,000 characters; the full file is on the host")
     expect(main.get_by_role("button", name="Download Markdown")).to_have_count(0)
     assert seen.problems() == []
+
+
+# The lists of a digest as an outline: "ul[a, b ol[c]]" is a bulleted list of a and b with
+# a numbered list of c inside b; a numbered list that starts past 1 shows its start, ol3[...].
+OUTLINE_JS = """(md) => {
+  const isList = (n) => n.nodeName === "UL" || n.nodeName === "OL";
+  const list = (n) => n.nodeName.toLowerCase() + (n.nodeName === "OL" && n.start !== 1 ? n.start : "") +
+    "[" + [...n.children].map(item).join(", ") + "]";
+  const item = (li) => [...li.childNodes].map((c) => isList(c) ? list(c) : c.textContent.trim())
+    .filter(Boolean).join(" ");
+  return [...md.children].filter(isList).map(list).join(" ");
+}"""
+
+LIST_SWITCHES = {
+    "bullets then numbers": ("- first bullet\n\n1. first number\n",
+                             "ul[first bullet] ol[first number]"),
+    "numbers then bullets, no blank line": ("1. one\n2. two\n- three\n- four\n",
+                                            "ol[one, two] ul[three, four]"),
+    "back and forth": ("- a\n1. b\n- c\n3. d\n", "ul[a] ol[b] ul[c] ol3[d]"),
+    "numbers after a nested bullet list": ("- a\n  - b\n\n1. c\n", "ul[a ul[b]] ol[c]"),
+    "a switch inside an item": ("- a\n  - b\n  1. c\n- d\n", "ul[a ul[b] ol[c], d]"),
+    "a switch inside a numbered item": ("1. a\n   - b\n   2. c\n2. d\n",
+                                        "ol[a ul[b] ol2[c], d]"),
+    "another bullet marker": ("- x\n* y\n+ z\n", "ul[x, y, z]"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(LIST_SWITCHES))
+def test_a_list_that_changes_type_keeps_every_item(signed_in, lab, case):
+    page, seen = signed_in
+    text, outline = LIST_SWITCHES[case]
+    plant_digest(lab, text)
+    open_digest(page, lab)
+    md = page.locator("main .md")
+    expect(md).to_have_count(1)
+    assert md.evaluate(OUTLINE_JS) == outline
+    assert seen.problems() == []

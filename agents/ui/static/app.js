@@ -2828,7 +2828,8 @@
   // A run of list items, nested by indent: an item indented to at least the text column of
   // the item above it starts a list inside that item. A line that is indented but is not an
   // item continues the deepest item it is indented under. A line at the left margin that is
-  // not an item ends the list, with or without a blank line before it.
+  // not an item ends the list, with or without a blank line before it, and so does a
+  // top-level item of the other kind (bullets after numbers, or numbers after bullets).
   function mdList(lines, i, ctx, depth) {
     const stack = [];
     let root = null;
@@ -2864,6 +2865,9 @@
         if (!top || indent >= top.col) {
           open(indent, col, ordered, ordered ? Number.parseInt(m[2], 10) : 1);
         } else if (top.ordered !== ordered) {
+          // A switch between bullets and numbers ends a top-level list, and mdBlocks reads
+          // the new one from this line; inside an item it starts a sibling list there.
+          if (stack.length === 1) break;
           stack.pop();
           open(indent, col, ordered, ordered ? Number.parseInt(m[2], 10) : 1);
         }
