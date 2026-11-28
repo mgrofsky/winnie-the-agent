@@ -3,6 +3,7 @@ end, and attacker-controlled strings shown as text with nothing executed."""
 
 from __future__ import annotations
 
+import datetime
 import json
 import re
 
@@ -231,6 +232,23 @@ def flying(page) -> int:
                .locator(".tile-value").inner_text())
 
 
+IN_FLIGHT = """(least) => [...document.querySelectorAll('.map-counters .tile')]
+    .some((t) => t.textContent.startsWith('In flight')
+        && Number(t.querySelector('.tile-value').textContent) >= least)"""
+
+
+def wait_until_flying(page, least: int = 1, timeout: int = 15000) -> None:
+    page.wait_for_function(IN_FLIGHT, arg=least, timeout=timeout)
+
+
+def canvas_moves(page, gap_ms: int = 400) -> bool:
+    """True if the map canvas looks different ``gap_ms`` apart."""
+    canvas = page.locator("canvas.map-canvas")
+    first = canvas.screenshot()
+    page.wait_for_timeout(gap_ms)
+    return canvas.screenshot() != first
+
+
 def test_map_draws_the_world_lists_events_and_flies_them(signed_in, lab):
     page, seen = signed_in
     open_section(page, lab.base_url, "#/map")
@@ -242,9 +260,7 @@ def test_map_draws_the_world_lists_events_and_flies_them(signed_in, lab):
     assert page.evaluate(CANVAS_COLOURS) > 8
     # The newest events replay on open, and events written after it arrive by the next poll.
     _append(lab.tree.log, map_lines(lab.tree.now.now(lab.tree.now.tzinfo), 5, step=0.3, seed=21))
-    page.wait_for_function("""() => [...document.querySelectorAll('.map-counters .tile')]
-        .some((t) => t.textContent.startsWith('In flight') && !t.textContent.endsWith('0'))""",
-                           timeout=15000)
+    wait_until_flying(page)
     expect(page.get_by_role("group", name="Services shown").get_by_role("button")).not_to_have_count(0)
     assert seen.problems() == []
     assert_nothing_injected(page)
@@ -253,9 +269,7 @@ def test_map_draws_the_world_lists_events_and_flies_them(signed_in, lab):
 def test_map_pause_stops_movement(signed_in, lab):
     page, seen = signed_in
     open_section(page, lab.base_url, "#/map")
-    page.wait_for_function("""() => [...document.querySelectorAll('.map-counters .tile')]
-        .some((t) => t.textContent.startsWith('In flight') && !t.textContent.endsWith('0'))""",
-                           timeout=15000)
+    wait_until_flying(page)
     page.get_by_role("button", name="Pause").click()
     expect(page.get_by_role("button", name="Resume")).to_have_attribute("aria-pressed", "true")
     canvas = page.locator("canvas.map-canvas")
@@ -263,7 +277,20 @@ def test_map_pause_stops_movement(signed_in, lab):
     first = canvas.screenshot()
     page.wait_for_timeout(700)
     assert canvas.screenshot() == first
+    assert flying(page) == 0
     page.get_by_role("button", name="Resume").click()
+    wait_until_flying(page)
+    assert seen.problems() == []
+
+
+def test_map_keeps_moving_between_events(signed_in, lab):
+    page, seen = signed_in
+    open_section(page, lab.base_url, "#/map")
+    wait_until_flying(page)
+    # Nothing new arrives: the opening trips are over, and the window's events still loop.
+    page.wait_for_timeout(6000)
+    assert flying(page) > 0
+    assert canvas_moves(page)
     assert seen.problems() == []
 
 
@@ -280,6 +307,9 @@ def test_map_with_reduced_motion_shows_dots_and_no_flights(browser, lab):
         before = feed.locator("li").count()
         expect(feed.locator("li")).not_to_have_count(before, timeout=15000)
         assert flying(page) == 0
+        page.wait_for_timeout(3000)
+        assert flying(page) == 0
+        assert not canvas_moves(page)
         assert seen.problems() == []
     finally:
         context.close()
@@ -331,6 +361,42 @@ def map_answer(total: int, sources: list[str], newest: int = 100, items=()) -> d
                        "placed": True}}
 
 
+def test_a_service_filter_removes_its_looping_dots(signed_in, lab):
+    page, seen = signed_in
+    now = datetime.datetime.now(datetime.timezone.utc)
+    sources = ["198.51.100.7", "198.51.100.8"]
+    data = map_answer(2, sources, items=[
+        {"src": sources[0], "service": "ssh", "offset": 10,
+         "time": (now - datetime.timedelta(seconds=40)).isoformat()},
+        {"src": sources[1], "service": "ftp", "offset": 11,
+         "time": (now - datetime.timedelta(seconds=20)).isoformat()}])
+    data["totals"]["services"] = {"ftp": 1, "ssh": 1}
+    page.route("**/api/map?*", lambda route: route.fulfill(json=data))
+    open_section(page, lab.base_url, "#/map")
+    page.wait_for_timeout(3000)
+    assert flying(page) == 2
+    page.get_by_role("group", name="Services shown").get_by_role("button", name="ftp").click()
+    page.wait_for_timeout(300)
+    assert flying(page) == 1
+    page.get_by_role("group", name="Services shown").get_by_role("button", name="ssh").click()
+    page.wait_for_timeout(300)
+    assert flying(page) == 0
+    assert not canvas_moves(page)
+    assert seen.problems() == []
+
+
+def test_display_mode_and_overview_map_keep_moving(signed_in, lab):
+    page, seen = signed_in
+    page.locator(".map-preview canvas.map-canvas").wait_for()
+    page.wait_for_timeout(6000)
+    assert canvas_moves(page)
+    page.goto(f"{lab.base_url}/#/map?window=15m&display=1")
+    expect(page.get_by_role("heading", level=1)).to_have_text("Live activity")
+    page.wait_for_timeout(6000)
+    assert canvas_moves(page)
+    assert seen.problems() == []
+
+
 def map_sources_label(page) -> str:
     return page.locator("canvas.map-canvas").get_attribute("aria-label")
 
@@ -353,6 +419,35 @@ def test_map_drops_sources_whose_events_left_the_window(signed_in, lab):
                                      timeout=12000)
     tile = page.locator(".map-counters .tile").first
     expect(tile).to_contain_text("1")
+    assert seen.problems() == []
+
+
+def test_a_source_past_the_top_list_stays_while_its_events_loop(signed_in, lab):
+    page, seen = signed_in
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    first = map_answer(2, ["198.51.100.7"], items=[
+        {"src": "198.51.100.7", "service": "ssh", "offset": 10, "time": now},
+        {"src": "198.51.100.8", "service": "ftp", "offset": 11, "time": now,
+         "point": [20.0, 30.0], "place": "Elsewhere"}])
+    answers = [first, map_answer(2, ["198.51.100.7"], newest=101)]
+    deltas = []
+
+    def answer(route):
+        if "after=" in route.request.url:
+            deltas.append(route.request.url)
+        body = answers.pop(0) if len(answers) > 1 else answers[0]
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
+
+    page.route("**/api/map?*", answer)
+    page.goto(f"{lab.base_url}/#/map")
+    canvas = page.locator("canvas.map-canvas")
+    expect(canvas).to_have_attribute("aria-label", re.compile(r"^World map: 2 sources"))
+    # The delta lists only the top source; the other one's event is still in the window.
+    page.wait_for_timeout(6500)
+    assert deltas, "no delta poll was answered"
+    page.wait_for_timeout(300)
+    expect(canvas).to_have_attribute("aria-label", re.compile(r"^World map: 2 sources"))
+    assert flying(page) == 2
     assert seen.problems() == []
 
 

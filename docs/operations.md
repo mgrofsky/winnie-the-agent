@@ -1584,11 +1584,18 @@ diamonds suspicious, and mint circles benign. A neutral marker means the source 
 untriaged. Brightness shows how recently the sensor heard from that source. Older markers
 fade within the selected window. The feed gives event times and service names in text.
 
+- Every event in the window moves from its source to the sensor, again and again, until
+  it leaves the window. A new event first makes one larger, brighter trip. Newer events
+  move faster and brighter with longer trails, and older ones slow down and dim, following
+  the same age bands as the markers. One dot stands for each source and service, newest
+  first, up to 60 at a time (16 on Overview). A larger dot stands for more events. The
+  In flight count shows how many dots are moving.
 - Select a source to inspect it, then open its Activity history. You can also open a feed
   row with the keyboard. Service filters apply to the event feed and moving dots. Source
   markers summarize every service seen in the selected window.
-- **Pause motion** stops the animation while the feed continues receiving events. The map
-  respects the operating system's reduced-motion preference.
+- **Pause motion** stops all movement while the feed continues receiving events. With the
+  operating system's reduced-motion preference, the map shows markers and paths without
+  moving dots.
 - **Display mode** gives the map and recent activity the full browser window. Addresses
   are hidden when you enter. Use **Exit display** to return to the investigation view.
 - The map checks for events about every five seconds. If more than 300 arrive between
