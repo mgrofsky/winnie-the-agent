@@ -356,3 +356,21 @@ def test_map_drops_answers_to_superseded_requests_and_rebuilds_sources():
     assert "m.loading" in poll
     ingest = _function(text, "ingest")
     assert "m.sources = new Map()" in ingest and "busy.has(key)" in ingest
+
+
+def test_map_motion_is_time_based_bounded_and_stable():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    start = text.index("  // ---- screen: map")
+    end = text.index("  // ---- screen: not found")
+    view = text[start:end]
+    # A loop's phase comes from the event, so a redraw never reshuffles the dots.
+    assert "Math.random" not in view
+    motion = _function(text, "drawMotion")
+    assert "stableHash(loop.key)" in motion and "dt / trip" in motion
+    assert "const cap = flyingCap(m)" in motion and "flying >= cap" in motion
+    assert "MAP_FLYING_PREVIEW : MAP_FLYING" in _function(text, "flyingCap")
+    assert "slice(-flyingCap(m))" in _function(text, "ingest")
+    # Elapsed time drives motion, capped so a hidden tab does not jump the dots.
+    frame = _function(text, "frame")
+    assert "Math.min(100" in frame and "document.hidden" in frame
+    assert "m.paused || m.still ? 0 : drawMotion" in frame

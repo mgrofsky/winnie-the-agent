@@ -3122,6 +3122,19 @@
   const MAP_WINDOW_MS = { "5m": 300000, "15m": 900000, "1h": 3600000 };
   const MAP_AGE_MINUTES = { "5m": [1, 3], "15m": [2, 5], "1h": [10, 30] };
   const MAP_JUDGEMENT_VAR = { BENIGN: "--benign", SUSPICIOUS: "--suspicious", MALICIOUS: "--malicious" };
+  // Motion: a new event makes one distinct trip, and every event in the window then loops from
+  // its source to the sensor until it leaves the window. One dot stands for each source and
+  // service, newest first. Age, as a share of the window, sets speed, brightness and trail.
+  const MAP_FLIGHT_MS = 1800;             // a new arrival's first trip
+  const MAP_LOOP_FAST_MS = 2600;          // one loop for an event that just arrived
+  const MAP_LOOP_SLOW_MS = 9000;          // one loop for an event at the window's edge
+  const MAP_LOOP_EASE = 0.6;              // speed curve: trip = fast + (slow - fast) * age^ease
+  const MAP_LOOP_FLOOR = 0.38;            // brightness at the window's edge
+  const MAP_LOOP_TRAIL = [0.18, 0.05];    // trail length as a share of the trip, newest to oldest
+  const MAP_LOOP_FADE = 0.08;             // share of a trip spent fading in and fading out
+  const MAP_DOT_RADIUS = [1.6, 2.5, 3.4];   // moving dot radius: Overview, Map, display mode
+  const MAP_FLYING_PREVIEW = 16;          // dots in flight on the Overview map (MAP_FLYING elsewhere)
+  const MAP_EVENTS = 300;                 // events kept for looping, as many as one answer holds
 
   // Land outline: Natural Earth, public domain. 110m land, simplified, Antarctica left out;
   // each string is one ring of longitude,latitude pairs in tenths of a degree.
@@ -3241,6 +3254,7 @@
       timer: 0, staleTimer: 0, raf: 0, zoom: 1, center: [0.5, 0.5], w: 0, h: 0, dpr: 1,
       land: null, colors: {}, lastOK: 0, paused: false, still: false, hide: mode !== "full",
       off: new Set(), services: [], sources: new Map(), feed: [], flights: [], rows: new Map(),
+      events: new Map(), loops: [], laps: new Map(), paths: [], lastTs: 0, unlocated: false,
       sensor: null, hover: null, selected: null, status: el("span", { cls: "map-status", text: "Connecting" }),
       note: el("div", { cls: "stack", attrs: { "aria-live": "polite" } }),
       canvas: el("canvas", { cls: "map-canvas", attrs: { role: "img", "aria-label": "World map of recent activity" } }),
@@ -3317,6 +3331,8 @@
         m.sources.clear();
         m.feed = [];
         m.flights = [];
+        m.events.clear();
+        indexMap(m);
         m.counters.replaceChildren();
         drawFeed(m);
         drawDetail(m);
@@ -3502,6 +3518,15 @@
       lat: at[0], lon: at[1], placed: sensor.placed === true, label: str(sensor.label).slice(0, 80),
     } : null;
     const items = arr(d.items).filter((it) => Number.isSafeInteger(obj(it).offset));
+    if (fresh) m.events.clear();
+    for (const it of items) {
+      const t = parseTime(it.time);
+      if (it.src && t) m.events.set(it.offset, { src: str(it.src), service: str(it.service), t: t.getTime() });
+    }
+    const since = m.lastOK - MAP_WINDOW_MS[m.win];
+    for (const [offset, e] of m.events) {
+      if (e.t < since || m.events.size > MAP_EVENTS) m.events.delete(offset);
+    }
     const previous = m.sources;
     m.sources = new Map();
     for (const item of arr(d.sources)) {
@@ -3518,10 +3543,12 @@
       m.rows.clear();
       if (m.list) m.list.replaceChildren();
     } else {
-      // A neutral moving dot can finish its trip when its source leaves the top list.
+      // A moving dot keeps its source while the source has events in the window or a trip
+      // to finish, even after the source leaves the server's top list.
       const busy = new Set(m.flights.map((f) => f.src));
+      for (const e of m.events.values()) busy.add(e.src);
       for (const [key, source] of previous) {
-        if (busy.has(key) && !m.sources.has(key)) m.sources.set(key, source);
+        if (busy.has(key) && !m.sources.has(key) && m.sources.size < MAP_KEEP) m.sources.set(key, source);
       }
     }
     const totals = obj(d.totals);
@@ -3542,14 +3569,16 @@
     m.feed = [...added].reverse().concat(m.feed).slice(0, MAP_FEED);
     if (!m.still && !m.paused) {
       const start = performance.now();
-      const flights = fresh ? added.slice(-MAP_REPLAY) : added.slice(-MAP_FLYING);
+      const flights = fresh ? added.slice(-MAP_REPLAY) : added.slice(-flyingCap(m));
       flights.forEach((it, i) => {
         if (m.sources.has(it.src) && !m.off.has(str(it.service))) {
-          m.flights.push({ src: it.src, service: str(it.service), start: start + i * (fresh ? 150 : 24) });
+          m.flights.push({ src: it.src, service: str(it.service), key: loopKey(it.src, str(it.service)),
+            start: start + i * (fresh ? 150 : 24) });
         }
       });
-      m.flights = m.flights.slice(-MAP_FLYING);
+      m.flights = m.flights.slice(-flyingCap(m));
     }
+    indexMap(m);
     setKids(m.note);
     if (d.located === false) {
       setKids(m.note, el("p", { cls: "muted", text: "Location data unavailable. Sources appear in the unlocated lane." }));
@@ -3571,6 +3600,42 @@
       drawDetail(m);
     }
     kick(m);
+  }
+
+  function flyingCap(m) {
+    return m.mode === "preview" ? MAP_FLYING_PREVIEW : MAP_FLYING;
+  }
+
+  function loopKey(src, service) {
+    return src + " " + service;
+  }
+
+  function stableHash(text) {
+    let hash = 7;
+    for (const c of text) hash = (hash * 33 + c.charCodeAt(0)) % 10007;
+    return hash;
+  }
+
+  // Precompute what each frame draws: source paths and one loop per source and service.
+  function indexMap(m) {
+    const groups = new Map();
+    for (const e of m.events.values()) {
+      const key = loopKey(e.src, e.service);
+      const group = groups.get(key);
+      if (!group) groups.set(key, { key, src: e.src, service: e.service, t: e.t, count: 1 });
+      else {
+        group.count += 1;
+        group.t = Math.max(group.t, e.t);
+      }
+    }
+    m.loops = [...groups.values()].sort((a, b) => b.t - a.t);
+    for (const key of m.laps.keys()) {
+      if (!groups.has(key)) m.laps.delete(key);
+    }
+    const sources = [...m.sources.values()];
+    m.unlocated = sources.some((s) => s.lat === null);
+    m.paths = sources.filter((s) => s.lat !== null).sort((a, b) => (b.last || 0) - (a.last || 0))
+      .slice(0, m.mode === "preview" ? 6 : 20);
   }
 
   function drawReadingKey(m) {
@@ -3821,8 +3886,7 @@
 
   function sourcePos(m, s) {
     if (s.lat !== null) return proj(m, Math.max(MAP_BOTTOM, Math.min(MAP_TOP, s.lat)), s.lon);
-    let hash = 7;
-    for (const c of s.src) hash = (hash * 33 + c.charCodeAt(0)) % 10007;
+    const hash = stableHash(s.src);
     return [12 + (hash % 97) / 96 * (m.w * 0.24), m.h - 11 - (hash % 6)];
   }
   function drawLand(m) {
@@ -3897,22 +3961,98 @@
     }
   }
 
-  function drawPath(m, g, s, sensor, travel) {
+  // A quadratic curve from a source to the sensor, bowed upwards: [x, y, cx, cy, endX, endY].
+  function pathCurve(m, s, sensor) {
     const [x, y] = sourcePos(m, s), [endX, endY] = sensor;
-    const cx = (x + endX) / 2;
-    const cy = (y + endY) / 2 - Math.min(m.h * 0.16, Math.hypot(endX - x, endY - y) * 0.26);
-    if (travel === null) {
-      g.beginPath();
-      g.moveTo(x, y);
-      g.quadraticCurveTo(cx, cy, endX, endY);
-      g.stroke();
-    } else {
-      const a = 1 - travel, b = 2 * a * travel;
-      g.beginPath();
-      g.arc(a * a * x + b * cx + travel * travel * endX,
-        a * a * y + b * cy + travel * travel * endY, m.mode === "preview" ? 1.6 : 2.2, 0, 2 * Math.PI);
-      g.fill();
+    return [x, y, (x + endX) / 2, (y + endY) / 2 - Math.min(m.h * 0.16, Math.hypot(endX - x, endY - y) * 0.26),
+      endX, endY];
+  }
+
+  function curveAt(p, t) {
+    const a = 1 - t, b = 2 * a * t;
+    return [a * a * p[0] + b * p[2] + t * t * p[4], a * a * p[1] + b * p[3] + t * t * p[5]];
+  }
+
+  function drawPath(g, p) {
+    g.beginPath();
+    g.moveTo(p[0], p[1]);
+    g.quadraticCurveTo(p[2], p[3], p[4], p[5]);
+    g.stroke();
+  }
+
+  // A moving dot at share `head` of its trip, with a tapering trail `trail` long behind it.
+  function drawDot(g, p, head, trail, r, alpha) {
+    const tail = Math.max(0, head - trail);
+    if (head - tail > 0.004) {
+      for (let part = 0; part < 3; part++) {
+        g.globalAlpha = alpha * (0.14 + 0.16 * part);
+        g.lineWidth = r * (0.6 + 0.3 * part);
+        g.beginPath();
+        for (let i = 0; i <= 3; i++) {
+          const [x, y] = curveAt(p, tail + (head - tail) * (part + i / 3) / 3);
+          if (i === 0) g.moveTo(x, y);
+          else g.lineTo(x, y);
+        }
+        g.stroke();
+      }
     }
+    const [x, y] = curveAt(p, head);
+    g.globalAlpha = alpha;
+    g.beginPath();
+    g.arc(x, y, r, 0, 2 * Math.PI);
+    g.fill();
+  }
+
+  // Brightness of a looping dot: the marker age bands (1, 0.73, 0.45) joined into one curve
+  // that reaches MAP_LOOP_FLOOR at the window's edge.
+  function loopAlpha(m, age) {
+    const [first, second] = MAP_AGE_MINUTES[m.win].map((minutes) => minutes * 60000);
+    const end = MAP_WINDOW_MS[m.win];
+    if (age < first) return 1 - 0.27 * age / first;
+    if (age < second) return 0.73 - 0.28 * (age - first) / (second - first);
+    return Math.max(MAP_LOOP_FLOOR, 0.45 - (0.45 - MAP_LOOP_FLOOR) * (age - second) / (end - second));
+  }
+
+  // Draw arrivals and looping dots, advance each loop by the frame's elapsed time, and
+  // return how many dots are in flight.
+  function drawMotion(m, g, sensor, ts, dt) {
+    const preview = m.mode === "preview";
+    const radius = preview ? MAP_DOT_RADIUS[0] : m.mode === "wall" ? MAP_DOT_RADIUS[2] : MAP_DOT_RADIUS[1];
+    const arriving = new Set();
+    m.flights = m.flights.filter((f) => {
+      if (ts - f.start < MAP_FLIGHT_MS) return true;
+      m.laps.set(f.key, 0);
+      return false;
+    });
+    let flying = 0;
+    for (const f of m.flights) {
+      arriving.add(f.key);
+      const src = m.sources.get(f.src);
+      if (!src || m.off.has(f.service) || ts < f.start) continue;
+      const head = (ts - f.start) / MAP_FLIGHT_MS;
+      drawDot(g, pathCurve(m, src, sensor), head, MAP_LOOP_TRAIL[0] * 1.4, radius + 1, 1);
+      flying += 1;
+    }
+    const cap = flyingCap(m);
+    const now = Date.now(), end = MAP_WINDOW_MS[m.win];
+    for (const loop of m.loops) {
+      if (flying >= cap) break;
+      const age = Math.max(0, now - loop.t);
+      const src = m.sources.get(loop.src);
+      if (age > end || !src || m.off.has(loop.service) || arriving.has(loop.key)) continue;
+      const share = age / end;
+      const trip = MAP_LOOP_FAST_MS + (MAP_LOOP_SLOW_MS - MAP_LOOP_FAST_MS) * share ** MAP_LOOP_EASE;
+      // Progress accumulates per loop, so a changing speed never moves a dot backwards.
+      const lap = m.laps.has(loop.key) ? m.laps.get(loop.key) : stableHash(loop.key) / 10007;
+      const head = (lap + dt / trip) % 1;
+      m.laps.set(loop.key, head);
+      const fade = Math.min(1, head / MAP_LOOP_FADE, (1 - head) / MAP_LOOP_FADE);
+      const trail = MAP_LOOP_TRAIL[0] + (MAP_LOOP_TRAIL[1] - MAP_LOOP_TRAIL[0]) * share;
+      const r = radius + Math.min(1.5, Math.log2(loop.count) / 2);
+      drawDot(g, pathCurve(m, src, sensor), head, trail, r, loopAlpha(m, age) * fade);
+      flying += 1;
+    }
+    return flying;
   }
 
   function frame(m, ts) {
@@ -3925,8 +4065,9 @@
     g.drawImage(m.land, 0, 0);
     g.setTransform(m.dpr, 0, 0, m.dpr, 0, 0);
     const sensor = m.sensor?.placed ? proj(m, m.sensor.lat, m.sensor.lon) : [m.w - 29, m.h - 22];
-    const sources = [...m.sources.values()];
-    if (sources.some((s) => s.lat === null)) {
+    const dt = m.lastTs ? Math.min(100, Math.max(0, ts - m.lastTs)) : 0;
+    m.lastTs = ts;
+    if (m.unlocated) {
       g.fillStyle = color(m, "--map-water");
       g.fillRect(4, m.h - 37, m.w * 0.24 + 17, 34);
       g.strokeStyle = color(m, "--map-coast");
@@ -3938,20 +4079,15 @@
     const pathColor = color(m, "--text-muted");
     g.strokeStyle = pathColor;
     g.lineWidth = 1;
-    const paths = sources.filter((s) => s.lat !== null).sort((a, b) => (b.last || 0) - (a.last || 0));
-    for (const s of paths.slice(0, m.mode === "preview" ? 6 : 20)) {
+    for (const s of m.paths) {
       g.globalAlpha = ageAlpha(m, s) * 0.48;
-      drawPath(m, g, s, sensor, null);
+      drawPath(g, pathCurve(m, s, sensor));
     }
-    m.flights = m.flights.filter((f) => ts - f.start < 1800);
     g.fillStyle = pathColor;
-    for (const f of m.flights) {
-      const src = m.sources.get(f.src);
-      if (!src || m.off.has(f.service) || ts < f.start) continue;
-      g.globalAlpha = ageAlpha(m, src);
-      drawPath(m, g, src, sensor, (ts - f.start) / 1800);
-    }
-    for (const s of sources) {
+    g.lineCap = "round";
+    const flying = m.paused || m.still ? 0 : drawMotion(m, g, sensor, ts, dt);
+    g.lineCap = "butt";
+    for (const s of m.sources.values()) {
       const [x, y] = sourcePos(m, s);
       const baseRadius = m.mode === "wall" ? 8 : m.mode === "preview" ? 3.5 : 5;
       const r = baseRadius + Math.min(2, Math.log2(s.events + 1) / 2);
@@ -3992,10 +4128,10 @@
       }
     }
     if (m.flyingNode) {
-      const count = String(m.flights.filter((f) => !m.off.has(f.service)).length);
+      const count = String(flying);
       if (m.flyingNode.textContent !== count) m.flyingNode.textContent = count;
     }
-    if (m.flights.length && !m.paused && !m.still) kick(m);
+    if ((flying || m.flights.length) && !m.paused && !m.still) kick(m);
   }
 
   // ---- screen: not found ----------------------------------------------------------------
