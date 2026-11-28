@@ -5,8 +5,10 @@
 //   no HTML parsing anywhere in this file.
 // - Data never becomes an attribute. The exceptions: record, approval, digest, detection
 //   and honeytoken names that match the server's own patterns may build in-app routes or
-//   API paths, and a few fixed sets (judgement, status, tier, transcript role) choose a CSS
-//   class through a lookup table. Timestamps become a title only after they parse as dates.
+//   API paths, and a few fixed sets (judgement, status, tier, transcript role, table
+//   alignment) choose a CSS class through a lookup table. Timestamps become a title only
+//   after they parse as dates. A digest's Markdown link keeps its href only when the target
+//   is one of those in-app routes, rebuilt from its checked parts.
 // - State lives in memory and in the URL hash. Nothing is stored in the browser.
 //
 // Layout of this file: constants, DOM and format helpers, the API client, shared widgets,
@@ -27,6 +29,7 @@
   const TRANSCRIPT_PER = 100;
   const MORE_LINES = 6;
   const MORE_CHARS = 600;
+  const SAVE_REVOKE_MS = 60000;
 
   // Same patterns the server enforces (agents/ui/api.py).
   const RECORD_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
@@ -2627,6 +2630,529 @@
     return "no reply recorded";
   }
 
+  // ---- digest Markdown ------------------------------------------------------------------
+  //
+  // A small line-based reader for the Markdown the digest step writes (agents/triage.py):
+  // headings, paragraphs, bulleted and numbered lists (nested by indent), pipe tables,
+  // bold, italic and code spans; also fenced code, block quotes, horizontal rules and links.
+  // Anything else stays text, and raw HTML is text like any other. It builds a plain tree
+  // first (counting nodes, depth and table size), then DOM through el() and text nodes.
+  // A link becomes a link only when its target is a console route this file builds itself;
+  // other targets and image syntax are shown as the text they were written as, the same
+  // rule Records follows for addresses from attacker or model text. Past any limit below
+  // the whole digest is shown as plain text instead.
+
+  const MD_MAX_CHARS = 200000;      // the server's cap on one digest's text
+  const MD_MAX_LINE = 20000;        // characters in one line
+  const MD_MAX_NODES = 20000;       // tree nodes in all: blocks, list items, cells, inline runs
+  const MD_MAX_DEPTH = 8;           // nested lists and quotes; nested bold, italic and links
+  const MD_MAX_TABLE_ROWS = 500;
+  const MD_MAX_TABLE_COLS = 20;
+  const MD_MAX_TARGET = 600;        // characters in a link target
+
+  const MD_HEADING_RE = /^ {0,3}(#{1,6})(?=[ \t]|$)/;
+  const MD_HR_RE = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+  const MD_FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
+  const MD_QUOTE_RE = /^ {0,3}> ?/;
+  const MD_ITEM_RE = /^( *)([-*+]|\d{1,9}[.)])(?:([ \t]+)|$)/;
+  const MD_DELIM_CELL_RE = /^:?-+:?$/;
+  const MD_PUNCT_RE = /^[!-\/:-@[-`{-~]$/;
+  const MD_SPACE_RE = /^\s$/;
+  const MD_WORD_RE = /^[\p{L}\p{N}]$/u;
+  const MD_ALIGN_CLASS = { left: "md-left", center: "md-center", right: "md-right" };
+
+  class MdLimit extends Error {}
+
+  function mdCount(ctx, n) {
+    ctx.nodes += n || 1;
+    if (ctx.nodes > MD_MAX_NODES) throw new MdLimit("nodes");
+  }
+
+  // The digest's text as a list of block nodes. Throws MdLimit past any limit.
+  function mdParse(text) {
+    if (text.length > MD_MAX_CHARS) throw new MdLimit("chars");
+    const lines = text.split("\n").map((line) => {
+      if (line.length > MD_MAX_LINE) throw new MdLimit("line");
+      const l = line.endsWith("\r") ? line.slice(0, -1) : line;
+      // Leading tabs count as four spaces each.
+      let i = 0;
+      while (i < l.length && l[i] === "\t") i++;
+      return i ? "    ".repeat(i) + l.slice(i) : l;
+    });
+    return mdBlocks(lines, { nodes: 0 }, 0);
+  }
+
+  function mdBlank(line) {
+    return line.trim() === "";
+  }
+
+  function mdIndent(line) {
+    let n = 0;
+    while (n < line.length && line[n] === " ") n++;
+    return n;
+  }
+
+  // Splits a table row on its pipes. A pipe right after a backslash is part of the cell,
+  // as the digest writer escapes the pipes in its values.
+  function mdCells(line) {
+    let s = line.trim();
+    if (s.startsWith("|")) s = s.slice(1);
+    if (s.endsWith("|") && !s.endsWith("\\|")) s = s.slice(0, -1);
+    const cells = [];
+    let start = 0;
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === "|" && s[i - 1] !== "\\") {
+        cells.push(s.slice(start, i).trim());
+        start = i + 1;
+      }
+    }
+    cells.push(s.slice(start).trim());
+    return cells;
+  }
+
+  // The alignments of a table delimiter row ("|---|:-:|"), or null when the line is not one.
+  function mdDelimiter(line) {
+    if (!line.includes("-")) return null;
+    const cells = mdCells(line);
+    if (!cells.every((c) => MD_DELIM_CELL_RE.test(c))) return null;
+    return cells.map((c) => c.endsWith(":") ? (c.startsWith(":") ? "center" : "right")
+      : c.startsWith(":") ? "left" : "");
+  }
+
+  function mdTableStart(lines, i) {
+    if (!lines[i].includes("|") || i + 1 >= lines.length) return null;
+    const align = mdDelimiter(lines[i + 1]);
+    if (!align || mdCells(lines[i]).length !== align.length) return null;
+    if (align.length > MD_MAX_TABLE_COLS) throw new MdLimit("columns");
+    return align;
+  }
+
+  function mdStartsBlock(lines, i) {
+    const line = lines[i];
+    return MD_HEADING_RE.test(line) || MD_HR_RE.test(line) || MD_FENCE_RE.test(line) ||
+      MD_QUOTE_RE.test(line) || MD_ITEM_RE.test(line) || mdTableStart(lines, i) !== null;
+  }
+
+  function mdBlocks(lines, ctx, depth) {
+    if (depth > MD_MAX_DEPTH) throw new MdLimit("depth");
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (mdBlank(line)) { i++; continue; }
+      mdCount(ctx);
+      let m = MD_HEADING_RE.exec(line);
+      if (m) {
+        let rest = line.slice(m[0].length).trim();
+        // An optional closing run of #s, when a space sets it apart.
+        let end = rest.length;
+        while (end > 0 && rest[end - 1] === "#") end--;
+        if (end === 0) rest = "";
+        else if (end < rest.length && (rest[end - 1] === " " || rest[end - 1] === "\t")) rest = rest.slice(0, end).trim();
+        out.push({ t: "heading", level: m[1].length, kids: mdInline(rest, ctx, depth) });
+        i++;
+        continue;
+      }
+      if (MD_HR_RE.test(line)) {
+        out.push({ t: "hr" });
+        i++;
+        continue;
+      }
+      m = MD_FENCE_RE.exec(line);
+      if (m && !(m[1][0] === "`" && line.slice(m[0].length).includes("`"))) {
+        const fence = m[1];
+        const body = [];
+        i++;
+        while (i < lines.length) {
+          const close = MD_FENCE_RE.exec(lines[i]);
+          if (close && close[1][0] === fence[0] && close[1].length >= fence.length &&
+              mdBlank(lines[i].slice(close[0].length))) { i++; break; }
+          body.push(lines[i]);
+          i++;
+        }
+        out.push({ t: "pre", text: body.join("\n") });
+        continue;
+      }
+      if (MD_QUOTE_RE.test(line)) {
+        const inner = [];
+        while (i < lines.length && MD_QUOTE_RE.test(lines[i])) {
+          inner.push(lines[i].replace(MD_QUOTE_RE, ""));
+          i++;
+        }
+        out.push({ t: "quote", kids: mdBlocks(inner, ctx, depth + 1) });
+        continue;
+      }
+      if (MD_ITEM_RE.test(line)) {
+        const got = mdList(lines, i, ctx, depth);
+        out.push(got.node);
+        i = got.next;
+        continue;
+      }
+      const align = mdTableStart(lines, i);
+      if (align) {
+        const got = mdTable(lines, i, align, ctx, depth);
+        out.push(got.node);
+        i = got.next;
+        continue;
+      }
+      const para = [line.trim()];
+      i++;
+      while (i < lines.length && !mdBlank(lines[i]) && !mdStartsBlock(lines, i)) {
+        para.push(lines[i].trim());
+        i++;
+      }
+      out.push({ t: "p", kids: mdInline(para.join("\n"), ctx, depth) });
+    }
+    return out;
+  }
+
+  function mdTable(lines, i, align, ctx, depth) {
+    const cols = align.length;
+    const row = (line) => {
+      const cells = mdCells(line).slice(0, cols);
+      while (cells.length < cols) cells.push("");
+      mdCount(ctx, cols);
+      return cells.map((c) => mdInline(c, ctx, depth));
+    };
+    const head = row(lines[i]);
+    const rows = [];
+    i += 2;
+    while (i < lines.length && !mdBlank(lines[i]) && lines[i].includes("|")) {
+      if (rows.length >= MD_MAX_TABLE_ROWS) throw new MdLimit("rows");
+      rows.push(row(lines[i]));
+      i++;
+    }
+    return { node: { t: "table", align: align, head: head, rows: rows }, next: i };
+  }
+
+  // A run of list items, nested by indent: an item indented to at least the text column of
+  // the item above it starts a list inside that item. A line that is indented but is not an
+  // item continues the deepest item it is indented under. A line at the left margin that is
+  // not an item ends the list, with or without a blank line before it, and so does a
+  // top-level item of the other kind (bullets after numbers, or numbers after bullets).
+  function mdList(lines, i, ctx, depth) {
+    const stack = [];
+    let root = null;
+    const open = (indent, col, ordered, start) => {
+      if (depth + stack.length + 1 > MD_MAX_DEPTH) throw new MdLimit("depth");
+      mdCount(ctx);
+      const list = { t: "list", ordered: ordered, start: start, items: [] };
+      if (stack.length) {
+        const items = stack[stack.length - 1].list.items;
+        items[items.length - 1].kids.push(list);
+      } else {
+        root = list;
+      }
+      stack.push({ indent: indent, col: col, ordered: ordered, list: list });
+    };
+    while (i < lines.length) {
+      const line = lines[i];
+      if (mdBlank(line)) {
+        let j = i + 1;
+        while (j < lines.length && mdBlank(lines[j])) j++;
+        if (j >= lines.length || mdIndent(lines[j]) < stack[0].col && !MD_ITEM_RE.test(lines[j])) break;
+        i = j;
+        continue;
+      }
+      const m = MD_ITEM_RE.exec(line);
+      const indent = mdIndent(line);
+      if (m && !MD_HR_RE.test(line)) {
+        const ordered = /\d/.test(m[2]);
+        const gap = m[3] ? m[3].length : 1;
+        const col = indent + m[2].length + (gap > 4 ? 1 : gap);
+        while (stack.length && indent < stack[stack.length - 1].indent) stack.pop();
+        const top = stack[stack.length - 1];
+        if (!top || indent >= top.col) {
+          open(indent, col, ordered, ordered ? Number.parseInt(m[2], 10) : 1);
+        } else if (top.ordered !== ordered) {
+          // A switch between bullets and numbers ends a top-level list, and mdBlocks reads
+          // the new one from this line; inside an item it starts a sibling list there.
+          if (stack.length === 1) break;
+          stack.pop();
+          open(indent, col, ordered, ordered ? Number.parseInt(m[2], 10) : 1);
+        }
+        const cur = stack[stack.length - 1];
+        cur.col = col;
+        mdCount(ctx);
+        cur.list.items.push({ kids: [{ t: "text", s: line.slice(m[0].length).trim() }] });
+        i++;
+        continue;
+      }
+      if (indent === 0 || mdStartsBlock(lines, i) && indent < stack[0].col) break;
+      // A continuation line: the deepest open item whose text column it reaches.
+      while (stack.length > 1 && indent < stack[stack.length - 1].col) stack.pop();
+      const items = stack[stack.length - 1].list.items;
+      const kids = items[items.length - 1].kids;
+      const last = kids[kids.length - 1];
+      if (last.t === "text") last.s += "\n" + line.trim();
+      else { mdCount(ctx); kids.push({ t: "text", s: line.trim() }); }
+      i++;
+    }
+    mdListInline(root, ctx, depth);
+    return { node: root, next: i };
+  }
+
+  function mdListInline(list, ctx, depth) {
+    for (const item of list.items) {
+      item.kids = item.kids.map((k) => k.t === "text"
+        ? { t: "para", kids: mdInline(k.s, ctx, depth) }
+        : (mdListInline(k, ctx, depth), k));
+    }
+  }
+
+  // Inline text as nodes: text, code, strong, em and link. Code spans are read first, so
+  // nothing inside one is markup; then * and _ runs pair up from the innermost out.
+  function mdInline(s, ctx, depth) {
+    if (depth > MD_MAX_DEPTH) throw new MdLimit("depth");
+    const tokens = mdTokens(s, ctx, depth);
+    const frames = [{ opener: null, kids: [] }];
+    const top = () => frames[frames.length - 1].kids;
+    const pushText = (kids, text) => {
+      const last = kids[kids.length - 1];
+      if (last && last.t === "text") last.s += text;
+      else { mdCount(ctx); kids.push({ t: "text", s: text }); }
+    };
+    // Frames above index f become literal text inside frame f.
+    const collapse = (f) => {
+      while (frames.length - 1 > f) {
+        const g = frames.pop();
+        const kids = top();
+        pushText(kids, g.opener.ch.repeat(g.opener.n));
+        for (const k of g.kids) {
+          if (k.t === "text") pushText(kids, k.s);
+          else kids.push(k);
+        }
+      }
+    };
+    for (const tok of tokens) {
+      if (tok.t !== "delim") {
+        if (tok.t === "text") pushText(top(), tok.s);
+        else top().push(tok);
+        continue;
+      }
+      let f = -1;
+      if (tok.close) {
+        for (let k = frames.length - 1; k > 0; k--) {
+          if (frames[k].opener.ch === tok.ch) { f = k; break; }
+        }
+      }
+      if (f > 0) {
+        collapse(f);
+        const frame = frames.pop();
+        const use = frame.opener.n >= 2 && tok.n >= 2 ? 2 : 1;
+        let node = { t: use === 2 ? "strong" : "em", kids: frame.kids };
+        let before = frame.opener.n - use;
+        let after = tok.n - use;
+        mdCount(ctx);
+        if (before && after) {
+          // ***text***: bold inside italic.
+          mdCount(ctx);
+          node = { t: "em", kids: [node] };
+          before--;
+          after--;
+        }
+        const kids = top();
+        if (before) pushText(kids, tok.ch.repeat(before));
+        kids.push(node);
+        if (after) pushText(kids, tok.ch.repeat(after));
+      } else if (tok.open && frames.length <= MD_MAX_DEPTH) {
+        frames.push({ opener: tok, kids: [] });
+      } else {
+        pushText(top(), tok.ch.repeat(tok.n));
+      }
+    }
+    collapse(0);
+    return frames[0].kids;
+  }
+
+  // One pass over the text: code spans, backslash escapes, links, and * and _ runs marked
+  // with whether they can open or close. Each search for a closing mark that fails is
+  // remembered, so the pass stays linear in the text's length.
+  function mdTokens(s, ctx, depth) {
+    const out = [];
+    let buf = "";
+    const flush = () => {
+      if (buf) { out.push({ t: "text", s: buf }); buf = ""; }
+    };
+    const noTicks = new Set();     // backtick run lengths with no closing run further on
+    let bracket = -2;              // the next "]" at or after the current "[" (-1: none)
+    let bracketBad = -1;           // a "]" already known not to start a link target
+    let i = 0;
+    while (i < s.length) {
+      const c = s[i];
+      if (c === "\\" && i + 1 < s.length && MD_PUNCT_RE.test(s[i + 1])) {
+        buf += s[i + 1];
+        i += 2;
+        continue;
+      }
+      if (c === "`") {
+        let n = 1;
+        while (s[i + n] === "`") n++;
+        const end = noTicks.has(n) ? -1 : mdTickClose(s, i + n, n);
+        if (end < 0) {
+          noTicks.add(n);
+          buf += s.slice(i, i + n);
+          i += n;
+          continue;
+        }
+        let code = s.slice(i + n, end).replace(/\n/g, " ").replace(/\\\|/g, "|");
+        if (code.length > 1 && code[0] === " " && code[code.length - 1] === " " && code.trim()) {
+          code = code.slice(1, -1);
+        }
+        flush();
+        mdCount(ctx);
+        out.push({ t: "code", s: code });
+        i = end + n;
+        continue;
+      }
+      if (c === "[" || (c === "!" && s[i + 1] === "[")) {
+        const open = c === "[" ? i : i + 1;
+        if (bracket !== -1 && bracket <= open) bracket = s.indexOf("]", open + 1);
+        const close = bracket;
+        if (close > open && close !== bracketBad && s[close + 1] === "(") {
+          let j = close + 2;
+          while (j < s.length && j - close - 2 <= MD_MAX_TARGET && !/[\s()<>]/.test(s[j])) j++;
+          if (s[j] === ")") {
+            const source = s.slice(i, j + 1);
+            const href = c === "[" ? mdHref(s.slice(close + 2, j)) : null;
+            flush();
+            mdCount(ctx);
+            if (href) out.push({ t: "link", href: href, kids: mdInline(s.slice(open + 1, close), ctx, depth + 1) });
+            else out.push({ t: "text", s: source });
+            i = j + 1;
+            continue;
+          }
+          bracketBad = close;
+        }
+        buf += c;
+        i++;
+        continue;
+      }
+      if (c === "*" || c === "_") {
+        let n = 1;
+        while (s[i + n] === c) n++;
+        const before = i > 0 ? s[i - 1] : " ";
+        const after = i + n < s.length ? s[i + n] : " ";
+        const sb = MD_SPACE_RE.test(before);
+        const sa = MD_SPACE_RE.test(after);
+        let open = !sa;
+        let close = !sb;
+        if (c === "_") {
+          open = open && !MD_WORD_RE.test(before);
+          close = close && !MD_WORD_RE.test(after);
+        }
+        flush();
+        out.push({ t: "delim", ch: c, n: n, open: open, close: close });
+        i += n;
+        continue;
+      }
+      buf += c;
+      i++;
+    }
+    flush();
+    return out;
+  }
+
+  // Index of the next run of exactly n backticks at or after `from`, or -1.
+  function mdTickClose(s, from, n) {
+    const run = "`".repeat(n);
+    let at = s.indexOf(run, from);
+    while (at >= 0) {
+      let end = at;
+      while (s[end] === "`") end++;
+      if (end - at === n) return at;
+      at = s.indexOf(run, end);
+    }
+    return -1;
+  }
+
+  // A link target as an in-app route this file builds, rebuilt from its checked parts, or
+  // null. Every other target stays text.
+  function mdHref(target) {
+    for (const s of SECTIONS) {
+      if (s.hash === target) return s.hash;
+    }
+    let m = /^#\/records\/([^/?#]{1,600})$/.exec(target);
+    if (m) {
+      let id;
+      try { id = decodeURIComponent(m[1]); } catch (err) { return null; }
+      const href = recordHref(id);
+      return href === target ? href : null;
+    }
+    m = /^#\/digests\/([^/?#]{1,20})$/.exec(target);
+    if (m) {
+      const href = digestHref(m[1]);
+      return href === target ? href : null;
+    }
+    return null;
+  }
+
+  // DOM for the parsed tree. Markdown heading levels sit below the section's h2: # is h3.
+  function mdRender(blocks) {
+    return blocks.map((b) => {
+      switch (b.t) {
+        case "heading": return el("h" + Math.min(6, b.level + 2), "md-h", mdRenderInline(b.kids));
+        case "p": return el("p", null, mdRenderInline(b.kids));
+        case "hr": return el("hr");
+        case "pre": return el("pre", "md-pre", el("code", { text: b.text }));
+        case "quote": return el("blockquote", null, mdRender(b.kids));
+        case "list": return mdRenderList(b);
+        case "table": return mdRenderTable(b);
+        default: return null;
+      }
+    });
+  }
+
+  function mdRenderList(list) {
+    const node = el(list.ordered ? "ol" : "ul", null, list.items.map((item) =>
+      el("li", null, item.kids.map((k, n) => k.t === "list" ? mdRenderList(k)
+        : n === 0 ? mdRenderInline(k.kids) : el("p", null, mdRenderInline(k.kids))))));
+    if (list.ordered && list.start !== 1 && Number.isSafeInteger(list.start)) node.start = list.start;
+    return node;
+  }
+
+  function mdRenderTable(t) {
+    const cls = (n) => lookup(MD_ALIGN_CLASS, t.align[n], "");
+    return el("div", "md-table", el("table", null,
+      el("thead", null, el("tr", null, t.head.map((cell, n) =>
+        el("th", { cls: cls(n), attrs: { scope: "col" } }, mdRenderInline(cell))))),
+      el("tbody", null, t.rows.map((row) =>
+        el("tr", null, row.map((cell, n) => el("td", cls(n), mdRenderInline(cell))))))));
+  }
+
+  function mdRenderInline(kids) {
+    return kids.map((k) => {
+      switch (k.t) {
+        case "text": return k.s;
+        case "code": return el("code", { text: k.s });
+        case "strong": return el("strong", null, mdRenderInline(k.kids));
+        case "em": return el("em", null, mdRenderInline(k.kids));
+        case "link": return link(k.href, mdRenderInline(k.kids));
+        default: return null;
+      }
+    });
+  }
+
+  // The digest as formatted DOM, or null when it is past the reader's limits.
+  function markdownView(text) {
+    try {
+      return el("div", "md", mdRender(mdParse(text)));
+    } catch (err) {
+      if (!(err instanceof MdLimit)) console.error(err);
+      return null;
+    }
+  }
+
+  // Saves text the page already holds as a file. The name is built from checked values.
+  function saveText(text, name, type) {
+    const url = URL.createObjectURL(new Blob([text], { type: type }));
+    const a = el("a", { attrs: { href: url, download: name } });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), SAVE_REVOKE_MS);
+  }
+
   // ---- screen: digests ------------------------------------------------------------------
 
   function viewDigests(route, main) {
@@ -2676,11 +3202,37 @@
     }));
   }
 
+  // The day's digest formatted, with its Markdown one click away. The download is the text
+  // the page already holds, offered only when the server sent the whole file; its name is
+  // built from the checked day.
   function drawDigest(data, day) {
+    const text = str(data.text);
+    const cut = data.truncated === true;
+    const formatted = markdownView(text);
+    const body = el("div");
+    let raw = formatted === null;
+    const rawButton = formatted === null ? null : button("Raw Markdown", () => {
+      raw = !raw;
+      show();
+    }, "btn-small");
+    const show = () => {
+      setKids(body, raw ? textBlock(text, "tall") : formatted);
+      if (rawButton) rawButton.setAttribute("aria-pressed", raw ? "true" : "false");
+    };
+    const save = !cut && DAY_RE.test(day) ? button("Download Markdown",
+      () => saveText(text, "digest-" + day + ".md", "text/markdown;charset=utf-8"), "btn-small") : null;
     const s = section("Digest for " + day, {
-      extra: data.truncated === true ? el("span", { cls: "muted", text: "Cut at 200,000 characters" }) : null,
+      extra: [
+        cut ? el("span", { cls: "muted", text: "Cut at 200,000 characters; the full file is on the host" }) : null,
+        rawButton, save,
+      ],
     });
-    s.body.append(textBlock(data.text, "tall"));
+    if (formatted === null) {
+      s.body.append(el("p", { cls: "muted",
+        text: "Shown as plain text: this digest is past the console's limits for formatting." }));
+    }
+    show();
+    s.body.append(body);
     return s.node;
   }
 
