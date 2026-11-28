@@ -1607,6 +1607,22 @@ fade within the selected window. The feed gives event times and service names in
 
 The land outline is from Natural Earth (public domain).
 
+### Digests
+
+The Digests screen (key `4`) lists the days with a digest, newest first, and shows the
+chosen day's digest as formatted text: headings, lists, tables, bold, italic and code.
+
+- Attacker and model text sits in code spans and always shows as text. Raw HTML and
+  image syntax in a digest also show as text.
+- A link opens only when it points to a console screen, such as a record or another
+  day's digest. Any other web address shows as text.
+- **Raw Markdown** shows the file's Markdown. **Download Markdown** saves the file as
+  `digest-YYYY-MM-DD.md`.
+- A digest larger than 200,000 characters is shown cut, without the download; read
+  the full file in the reports directory's `daily/` folder (`/agents/reports/daily/` in
+  the `agentdata` volume). A digest too large or too deeply nested to format quickly is
+  shown as plain text.
+
 ### Decoy
 
 The Decoy screen shows how the fake system is being adjusted to stay convincing. Nothing on

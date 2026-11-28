@@ -374,3 +374,31 @@ def test_map_motion_is_time_based_bounded_and_stable():
     frame = _function(text, "frame")
     assert "Math.min(100" in frame and "document.hidden" in frame
     assert "m.paused || m.still ? 0 : drawMotion" in frame
+
+
+def test_digest_markdown_is_text_nodes_with_checked_links_and_named_limits():
+    text = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    # The reader's limits are named constants, each one checked somewhere.
+    for name in ("MD_MAX_CHARS", "MD_MAX_LINE", "MD_MAX_NODES", "MD_MAX_DEPTH",
+                 "MD_MAX_TABLE_ROWS", "MD_MAX_TABLE_COLS", "MD_MAX_TARGET"):
+        assert re.search(rf"const {name} = \d+;", text), name
+        assert text.count(name) >= 2, name
+    # A link keeps only a section's hash or a route rebuilt by recordHref or digestHref.
+    href = _function(text, "mdHref")
+    assert "recordHref(id)" in href and "digestHref(m[1])" in href
+    assert href.count("return href === target ? href : null;") == 2
+    assert "link(k.href" in _function(text, "mdRenderInline")
+    # Rendering takes no attribute from the text: header cells get a fixed scope and
+    # alignment chooses a class through a lookup table.
+    render = "".join(_function(text, n) for n in
+                     ("mdRender", "mdRenderList", "mdRenderTable", "mdRenderInline"))
+    assert "setAttribute" not in render
+    assert re.findall(r"attrs: \{[^}]*\}", render) == ['attrs: { scope: "col" }']
+    assert "lookup(MD_ALIGN_CLASS" in render
+    # Past a limit the whole digest is plain text.
+    assert "instanceof MdLimit" in _function(text, "markdownView")
+    # The download is the text the page holds, offered only for a whole file and named
+    # from the checked day.
+    draw = _function(text, "drawDigest")
+    assert "!cut && DAY_RE.test(day)" in draw and '"digest-" + day + ".md"' in draw
+    assert "createObjectURL(new Blob([text]" in _function(text, "saveText")

